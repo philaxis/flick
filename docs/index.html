@@ -142,8 +142,10 @@ const ACCENT = '#579eff';
 const FONT = '"IBM Plex Sans KR","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif';
 const qs = new URLSearchParams(location.search);
 const FREEZE = qs.has('t') ? parseFloat(qs.get('t')) : null;   // ?t=3.6 holds one frame of the loop
-const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const STILL = FREEZE !== null || REDUCED;
+// The loop is the page's content, like an embedded video, so it plays even
+// where the system asks for reduced motion (Windows reports that whenever
+// its animation effects are off, which left desktop visitors a still image).
+const STILL = FREEZE !== null;
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const inOut = t => (t = clamp(t, 0, 1), t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
