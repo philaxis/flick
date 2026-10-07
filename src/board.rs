@@ -41,7 +41,7 @@ use windows::{
                 BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
                 GetMonitorInfoW, HMONITOR,
                 InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, ValidateRect, BITMAPINFO, BITMAPINFOHEADER,
-                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
             },
         },
         System::LibraryLoader::GetModuleHandleW,
@@ -51,7 +51,7 @@ use windows::{
                 ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DrawIconEx, GetClassLongPtrW, GetCursorPos, LoadCursorW, RegisterClassW, IDC_ARROW, SendMessageTimeoutW,
+                CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, IDC_ARROW, SendMessageTimeoutW,
                 SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG,
                 SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON, WM_KEYDOWN,
                 WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
@@ -106,7 +106,9 @@ pub enum Action {
     Dismiss,
     /// Switch to a cell and close; optionally focus one of its windows.
     Go(CellId, Option<HWND>),
-    MoveWindow(HWND, CellId),
+    /// Move a window to another cell, another monitor (given in screen
+    /// coordinates), or both.
+    MoveWindow { window: HWND, cell: Option<CellId>, monitor: Option<RECT> },
     MoveCell { id: CellId, row: usize, index: usize },
     MoveCellToNewRow { id: CellId, at: usize },
     /// Add a desktop to a row, at its front or its end.
@@ -291,6 +293,8 @@ pub struct Board {
     nav: Grid,
     selected: CellId,
     layout: Layout,
+    /// The map again on every other monitor: (monitor index, its layout).
+    other_maps: Vec<(usize, Layout)>,
     size: (i32, i32),
     scale: f32,
     /// (source window, thumbnail handle, is a tile rather than part of the
@@ -305,9 +309,6 @@ pub struct Board {
     /// them all; `home` (the one the cursor was on) also holds the map.
     monitors: Vec<Rect>,
     home: Rect,
-    /// Tiles keep the order they were first shown in, so that pinning a
-    /// window (which moves it between lists) does not shuffle them.
-    tile_order: Vec<isize>,
     /// Screen position of the board window's top-left corner.
     origin: (i32, i32),
     /// Row whose close button was clicked once and waits for confirmation.
@@ -356,6 +357,7 @@ impl Board {
                 nav: Grid::default(),
                 selected: String::new(),
                 layout: Layout::default(),
+                other_maps: Vec::new(),
                 size: (0, 0),
                 scale: 1.0,
                 thumbs: Vec::new(),
@@ -366,7 +368,6 @@ impl Board {
                 cursor_before: (0.0, 0.0),
                 monitors: Vec::new(),
                 home: Rect::default(),
-                tile_order: Vec::new(),
                 origin: (0, 0),
                 armed_row: None,
                 editing: None,
@@ -393,9 +394,9 @@ impl Board {
             true.into()
         }
         unsafe {
-            let mut cursor = POINT::default();
-            let _ = GetCursorPos(&mut cursor);
-            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+            // The primary monitor is "home" (it carries the label and sets the
+            // scale), so the board looks the same wherever the cursor is.
+            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
             let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             if !GetMonitorInfoW(monitor, &mut info).as_bool() {
                 return;
@@ -430,7 +431,6 @@ impl Board {
             self.size = size;
             self.origin = (left, top);
             self.selected = model.current.clone();
-            self.tile_order.clear();
             self.hover = Hit::Nothing;
             self.press = None;
             self.armed_row = None;
@@ -455,7 +455,6 @@ impl Board {
         let selected = self.selected.clone();
         self.nav.visit(&selected);
         self.press = None;
-        self.settle_tile_order();
         self.relayout();
         self.register_thumbnails();
         self.invalidate();
@@ -482,8 +481,6 @@ impl Board {
             self.nav.visit(&id);
             self.selected = id;
             // Other windows to show, and the rows slide to stay lined up.
-            self.tile_order.clear();
-            self.settle_tile_order();
             self.relayout();
             self.register_thumbnails();
             self.invalidate();
@@ -504,19 +501,16 @@ impl Board {
 
     /// The windows shown as tiles: those of the selected cell, then the ones
     /// pinned to every desktop (flagged), which are visible there as well.
+    /// The windows shown as tiles: those of the selected cell and the ones
+    /// pinned to every desktop (flagged), which are visible there as well.
+    /// Their order depends only on what the windows are (app, then the
+    /// window's handle), never on which was used last, so the same windows
+    /// always appear in the same places.
     fn tile_windows(&self) -> Vec<(&WindowModel, bool)> {
         let cell = self.selected_cell().into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
         let mut windows: Vec<(&WindowModel, bool)> = cell.chain(self.model.pinned.iter().map(|w| (w, true))).collect();
-        let place = |hwnd: HWND| self.tile_order.iter().position(|h| *h == hwnd.0).unwrap_or(usize::MAX);
-        windows.sort_by_key(|(w, _)| place(w.hwnd));
+        windows.sort_by_cached_key(|(w, _)| (w.app_name.to_lowercase(), w.app.clone(), w.hwnd.0));
         windows
-    }
-
-    /// Remembers the order of the tiles now shown; windows seen for the
-    /// first time go after the ones already placed.
-    fn settle_tile_order(&mut self) {
-        let shown: Vec<isize> = self.tile_windows().iter().map(|(w, _)| w.hwnd.0).collect();
-        self.tile_order = shown;
     }
 
     /// Index of the monitor a window is on (by its centre), the home monitor
@@ -527,11 +521,6 @@ impl Board {
         let y = ((r.top + r.bottom) / 2 - self.origin.1) as f32;
         let home = self.monitors.iter().position(|m| *m == self.home).unwrap_or(0);
         self.monitors.iter().position(|m| contains(m, x, y)).unwrap_or(home)
-    }
-
-    /// The cursor in the home monitor's coordinates, which the map is laid out in.
-    fn local(&self, x: f32, y: f32) -> (f32, f32) {
-        (x - self.home.left, y - self.home.top)
     }
 
     fn relayout(&mut self) {
@@ -557,13 +546,25 @@ impl Board {
         layout.tiles_label = rect(margin, 22.0 * s, w - 2.0 * margin, 30.0 * s);
         let windows = self.tile_windows();
         let mut tiles = Vec::new();
+        let mut other_maps = Vec::new();
         for (m, monitor) in self.monitors.iter().enumerate() {
             let is_home = *monitor == self.home;
+            // Every monitor has the map at its bottom, so a window can be
+            // dropped on a cell on the very monitor it should appear on.
+            let map_top = if is_home {
+                layout.map_top
+            } else {
+                let size = (monitor.right - monitor.left, monitor.bottom - monitor.top - FOOTER * s);
+                let map = compute_layout(&self.model, &anchors, size, s * MAP_SCALE);
+                let top = map.map_top;
+                other_maps.push((m, map));
+                top
+            };
             let area = Rect {
                 left: monitor.left + margin,
                 top: monitor.top + if is_home { 64.0 * s } else { margin },
                 right: monitor.right - margin,
-                bottom: if is_home { self.home.top + layout.map_top - 26.0 * s } else { monitor.bottom - margin },
+                bottom: monitor.top + map_top - 26.0 * s,
             };
             if is_home {
                 layout.tiles_area = area;
@@ -573,6 +574,24 @@ impl Board {
         }
         layout.tiles = tiles;
         self.layout = layout;
+        self.other_maps = other_maps;
+    }
+
+    /// The map on each monitor: (monitor index, monitor rectangle, layout in
+    /// that monitor's own coordinates), the home monitor first.
+    fn maps(&self) -> Vec<(usize, Rect, &Layout)> {
+        let home = self.monitors.iter().position(|m| *m == self.home).unwrap_or(0);
+        let mut maps = vec![(home, self.home, &self.layout)];
+        maps.extend(self.other_maps.iter().filter_map(|(m, map)| Some((*m, *self.monitors.get(*m)?, map))));
+        maps
+    }
+
+    /// The map of the monitor the point is on (the home one otherwise), with
+    /// the point in that monitor's coordinates.
+    fn map_at(&self, x: f32, y: f32) -> (usize, &Layout, f32, f32) {
+        let maps = self.maps();
+        let (m, monitor, map) = maps.iter().find(|(_, monitor, _)| contains(monitor, x, y)).copied().unwrap_or(maps[0]);
+        (m, map, x - monitor.left, y - monitor.top)
     }
 
     /// A tile acts like its window in the map; one pinned everywhere belongs
@@ -592,14 +611,14 @@ impl Board {
             }
             return self.tile_hit(tile.hwnd);
         }
-        let (x, y) = self.local(x, y);
-        if contains(&self.layout.add_row, x, y) {
+        let (_, map, x, y) = self.map_at(x, y);
+        if contains(&map.add_row, x, y) {
             return Hit::AddRow;
         }
-        if contains(&self.layout.add_row_top, x, y) {
+        if contains(&map.add_row_top, x, y) {
             return Hit::AddRowTop;
         }
-        for (r, row) in self.layout.rows.iter().enumerate() {
+        for (r, row) in map.rows.iter().enumerate() {
             if contains(&row.plus_left, x, y) {
                 return Hit::PlusLeft(r);
             }
@@ -625,19 +644,21 @@ impl Board {
     }
 
     fn cell_count(&self) -> usize {
-        self.layout.rows.iter().map(|row| row.cells.len()).sum()
+        self.model.rows.iter().map(|row| row.cells.len()).sum()
     }
 
-    fn cell_at(&self, x: f32, y: f32) -> Option<&CellLayout> {
+    /// The map cell under a point, and the monitor whose map it is on.
+    fn cell_at(&self, x: f32, y: f32) -> Option<(&CellLayout, usize)> {
         // A little slack around each square makes it an easier drop target.
         let slack = 5.0 * self.scale;
-        let (x, y) = self.local(x, y);
-        self.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| contains(&grow(&cell.body, slack), x, y))
+        let (m, map, x, y) = self.map_at(x, y);
+        let cell = map.rows.iter().flat_map(|row| &row.cells).find(|cell| contains(&grow(&cell.body, slack), x, y))?;
+        Some((cell, m))
     }
 
     fn slot_at(&self, dragged: &str, x: f32, y: f32) -> Option<Slot> {
-        let (x, y) = self.local(x, y);
-        let rows = &self.layout.rows;
+        let (_, map, x, y) = self.map_at(x, y);
+        let rows = &map.rows;
         let (first, last) = (rows.first()?, rows.last()?);
         if y < first.top {
             return Some(Slot::NewRow { at: 0, y: first.top - 8.0 * self.scale });
@@ -910,8 +931,8 @@ impl Board {
         }
         let hover = self.hit_test(x, y);
         let over_header = |px: f32, py: f32| {
-            let (px, py) = self.local(px, py);
-            self.layout.rows.iter().position(|row| contains(&row.header, px, py))
+            let (m, map, px, py) = self.map_at(px, py);
+            map.rows.iter().position(|row| contains(&row.header, px, py)).map(|row| (m, row))
         };
         if hover != self.hover || over_header(x, y) != over_header(self.cursor_before.0, self.cursor_before.1) {
             self.hover = hover;
@@ -928,10 +949,27 @@ impl Board {
         self.invalidate();
         if press.dragging {
             let action = match &press.hit {
-                Hit::Window { cell, hwnd } => match self.cell_at(x, y) {
-                    Some(target) if target.id != *cell => Action::MoveWindow(HWND(*hwnd), target.id.clone()),
-                    _ => Action::None,
-                },
+                Hit::Window { cell, hwnd } => {
+                    // Dropped on a map cell: that cell, on the monitor whose
+                    // map it was. Dropped elsewhere: just that monitor.
+                    let from = self.tile_windows().iter().find(|(w, _)| w.hwnd.0 == *hwnd).map(|(w, _)| self.monitor_of(w));
+                    let (to_cell, to_monitor) = match self.cell_at(x, y) {
+                        Some((target, m)) => (Some(target.id.clone()), m),
+                        None => (None, self.map_at(x, y).0),
+                    };
+                    let cell = to_cell.filter(|id| id != cell);
+                    let monitor = (Some(to_monitor) != from).then(|| self.monitors.get(to_monitor)).flatten().map(|m| RECT {
+                        left: m.left as i32 + self.origin.0,
+                        top: m.top as i32 + self.origin.1,
+                        right: m.right as i32 + self.origin.0,
+                        bottom: m.bottom as i32 + self.origin.1,
+                    });
+                    if cell.is_none() && monitor.is_none() {
+                        Action::None
+                    } else {
+                        Action::MoveWindow { window: HWND(*hwnd), cell, monitor }
+                    }
+                }
                 Hit::Cell(id) => match self.slot_at(id, x, y) {
                     Some(Slot::Row { row, index, .. }) => Action::MoveCell { id: id.clone(), row, index },
                     Some(Slot::NewRow { at, .. }) => Action::MoveCellToNewRow { id: id.clone(), at },
@@ -1040,10 +1078,20 @@ impl Board {
         }
         self.draw_tiles(t, fonts, s)?;
         // Everything from here on belongs to the home monitor.
+        let mut hovered = Ok(None);
+        for (_, monitor, map) in self.maps() {
+            unsafe {
+                t.SetTransform(&Matrix3x2::translation(monitor.left, monitor.top));
+            }
+            let drawn = self.draw_map(t, map_fonts, s * MAP_SCALE, map, &monitor);
+            if hovered.is_ok() {
+                hovered = drawn;
+            }
+        }
+        // The label and the hint belong to the home monitor.
         unsafe {
             t.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
         }
-        let hovered = self.draw_map(t, map_fonts, s * MAP_SCALE);
         let footer = self.draw_footer(t, fonts, s, hovered.as_ref().ok().cloned().flatten());
         unsafe {
             t.SetTransform(&Matrix3x2::identity());
@@ -1163,7 +1211,7 @@ impl Board {
 
     /// The map of all rows and cells: plain squares holding each cell's apps
     /// (icon and count), with the controls appearing on hover.
-    fn draw_map(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32) -> Result<Option<String>> {
+    fn draw_map(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32, map: &Layout, monitor: &Rect) -> Result<Option<String>> {
         unsafe {
             let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
             let text = |string: &str, font: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F| {
@@ -1184,16 +1232,18 @@ impl Board {
                 Some(Press { hit: Hit::Cell(id), dragging: true, .. }) => Some(id.as_str()),
                 _ => None,
             };
-            let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|c| c.id.as_str());
+            let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
+            // Drag feedback is drawn only on the monitor the cursor is on.
+            let here = contains(monitor, self.cursor.0, self.cursor.1);
             let selected_row = self.nav.find(&self.selected).map(|pos| pos.row);
             let radius = 8.0 * s;
-            // The map is drawn shifted onto the home monitor.
-            let cursor = self.local(self.cursor.0, self.cursor.1);
+            // The map is drawn shifted onto its monitor.
+            let cursor = (self.cursor.0 - monitor.left, self.cursor.1 - monitor.top);
 
             // The column vertical moves travel along.
-            fill(&self.layout.spine, 10.0 * s, white(0.035));
+            fill(&map.spine, 10.0 * s, white(0.035));
 
-            for (r, (row, model)) in self.layout.rows.iter().zip(&self.model.rows).enumerate() {
+            for (r, (row, model)) in map.rows.iter().zip(&self.model.rows).enumerate() {
                 // Row label; memory and the close button only while pointed at.
                 let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
                 let pointed = contains(&row.header, cursor.0, cursor.1) && self.press.is_none();
@@ -1267,7 +1317,7 @@ impl Board {
                 }
             }
 
-            for (area, hit) in [(&self.layout.add_row, Hit::AddRow), (&self.layout.add_row_top, Hit::AddRowTop)] {
+            for (area, hit) in [(&map.add_row, Hit::AddRow), (&map.add_row_top, Hit::AddRowTop)] {
                 let hot = self.hover == hit;
                 if hot {
                     fill(area, radius, white(0.10));
@@ -1276,15 +1326,15 @@ impl Board {
             }
 
             // Drag feedback.
-            if let Some(id) = dragged_cell {
+            if let Some(id) = dragged_cell.filter(|_| here) {
                 match self.slot_at(id, self.cursor.0, self.cursor.1) {
                     Some(Slot::Row { row, x, .. }) => {
-                        let band = &self.layout.rows[row];
+                        let band = &map.rows[row];
                         let body = band.cells.first().map_or(band.plus, |c| c.body);
                         fill(&rect(x - 2.0 * s, body.top, 4.0 * s, body.bottom - body.top), 2.0 * s, accent(1.0));
                     }
                     Some(Slot::NewRow { y, .. }) => {
-                        let spine = &self.layout.spine;
+                        let spine = &map.spine;
                         fill(&rect(spine.left, y - 2.0 * s, spine.right - spine.left, 4.0 * s), 2.0 * s, accent(1.0));
                     }
                     None => {}
@@ -1292,7 +1342,7 @@ impl Board {
                 let (cx, cy) = cursor;
                 stroke(&rect(cx - 40.0 * s, cy - 25.0 * s, 80.0 * s, 50.0 * s), radius, 2.0 * s, accent(0.9));
             }
-            if let Some(hwnd) = self.dragged_window() {
+            if let Some(hwnd) = self.dragged_window().filter(|_| here) {
                 // A minimized window has no thumbnail to follow the cursor.
                 if !self.thumbs.iter().any(|&(h, _, _)| h == hwnd) {
                     let (cx, cy) = cursor;

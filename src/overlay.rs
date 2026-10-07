@@ -9,7 +9,7 @@ use std::{ffi::c_void, time::Instant};
 use windows::{
     core::{w, Result},
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+        Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F},
@@ -19,16 +19,17 @@ use windows::{
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
-                CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetMonitorInfoW, MonitorFromPoint,
+                CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
+                HMONITOR, MonitorFromPoint,
                 SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
             },
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
-                CreateWindowExW, GetCursorPos, KillTimer, RegisterClassW, SetTimer, ShowWindow,
+                CreateWindowExW, DestroyWindow, KillTimer, RegisterClassW, SetTimer, ShowWindow,
                 UpdateLayeredWindow, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
                 WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
@@ -81,6 +82,9 @@ pub struct Overlay {
     last_tick: Instant,
     scale: f32,
     monitor: RECT,
+    /// The same picture is shown on every other monitor through one more
+    /// window each: (window, that monitor's work area).
+    others: Vec<(HWND, RECT)>,
 }
 
 fn color(rgb: (f32, f32, f32), a: f32) -> D2D1_COLOR_F {
@@ -171,6 +175,7 @@ impl Overlay {
                 last_tick: Instant::now(),
                 scale: 1.0,
                 monitor: RECT::default(),
+                others: Vec::new(),
             })
         }
     }
@@ -200,6 +205,9 @@ impl Overlay {
         self.render();
         unsafe {
             ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            for (window, _) in &self.others {
+                ShowWindow(*window, SW_SHOWNOACTIVATE);
+            }
         }
     }
 
@@ -244,24 +252,66 @@ impl Overlay {
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_ID);
                 ShowWindow(self.hwnd, SW_HIDE);
+                for (window, _) in &self.others {
+                    ShowWindow(*window, SW_HIDE);
+                }
             }
             return;
         }
         self.render();
     }
 
+    /// Finds the monitors: the one under the cursor sets the scale, and each
+    /// of the others gets a window of its own to show the minimap too.
     fn place_on_cursor_monitor(&mut self) {
+        unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> BOOL {
+            (*(out.0 as *mut Vec<HMONITOR>)).push(monitor);
+            true.into()
+        }
         unsafe {
-            let mut cursor = POINT::default();
-            let _ = GetCursorPos(&mut cursor);
-            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-            if GetMonitorInfoW(monitor, &mut info).as_bool() {
-                self.monitor = info.rcWork;
+            // Scale by the primary monitor: the minimap is the same on every
+            // screen, wherever the cursor happens to be.
+            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
+            let work_area = |monitor: HMONITOR| {
+                let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                GetMonitorInfoW(monitor, &mut info).as_bool().then_some(info.rcWork)
+            };
+            if let Some(area) = work_area(monitor) {
+                self.monitor = area;
             }
             let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
             let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
             self.scale = dpi_x as f32 / 96.0;
+
+            let mut all: Vec<HMONITOR> = Vec::new();
+            EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut all as *mut _ as isize));
+            let areas: Vec<RECT> = all.into_iter().filter(|m| *m != monitor).filter_map(work_area).collect();
+            while self.others.len() > areas.len() {
+                if let Some((window, _)) = self.others.pop() {
+                    let _ = DestroyWindow(window);
+                }
+            }
+            while self.others.len() < areas.len() {
+                let Ok(instance) = GetModuleHandleW(None) else { break };
+                let window = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    w!("flick.overlay"),
+                    w!("Flick"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    instance,
+                    None,
+                );
+                self.others.push((window, RECT::default()));
+            }
+            for ((_, area), new) in self.others.iter_mut().zip(areas) {
+                *area = new;
+            }
         }
     }
 
@@ -309,28 +359,29 @@ impl Overlay {
         if !self.ensure_bitmap(size) || self.draw().is_err() {
             return;
         }
-        let origin = POINT {
-            x: (self.monitor.left + self.monitor.right - size.0) / 2,
-            y: (self.monitor.top + self.monitor.bottom - size.1) / 2,
-        };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
             SourceConstantAlpha: (self.alpha.clamp(0.0, 1.0) * 255.0) as u8,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        unsafe {
-            let _ = UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&origin),
-                Some(&SIZE { cx: size.0, cy: size.1 }),
-                self.dc,
-                Some(&POINT::default()),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+        let windows = std::iter::once((self.hwnd, self.monitor)).chain(self.others.iter().copied());
+        for (window, area) in windows {
+            // Centred on each monitor.
+            let origin = POINT { x: (area.left + area.right - size.0) / 2, y: (area.top + area.bottom - size.1) / 2 };
+            unsafe {
+                let _ = UpdateLayeredWindow(
+                    window,
+                    None,
+                    Some(&origin),
+                    Some(&SIZE { cx: size.0, cy: size.1 }),
+                    self.dc,
+                    Some(&POINT::default()),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+            }
         }
     }
 

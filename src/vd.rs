@@ -6,6 +6,7 @@ use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersio
 use windows::Win32::{
     Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE},
     Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
+    Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -19,7 +20,8 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
-            EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowPlacement, WINDOWPLACEMENT, GetWindowLongW,
+            EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowPlacement, SetWindowPlacement,
+            ShowWindow, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, GetWindowLongW,
             GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
             IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
         },
@@ -331,5 +333,39 @@ pub fn trim(pids: &[u32]) {
             let _ = K32EmptyWorkingSet(process);
             let _ = CloseHandle(process);
         }
+    }
+}
+
+/// Moves a window to another monitor, keeping its place and size relative to
+/// the monitor. A maximized window stays maximized there; a minimized one
+/// will be restored there.
+pub fn move_to_monitor(hwnd: HWND, to: RECT) {
+    unsafe {
+        let mut from = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut from).as_bool() {
+            return;
+        }
+        let from = from.rcMonitor;
+        let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        if GetWindowPlacement(hwnd, &mut placement).is_err() {
+            return;
+        }
+        let (fw, fh) = ((from.right - from.left).max(1) as f32, (from.bottom - from.top).max(1) as f32);
+        let (tw, th) = ((to.right - to.left) as f32, (to.bottom - to.top) as f32);
+        let r = placement.rcNormalPosition;
+        let w = (((r.right - r.left) as f32 * tw / fw) as i32).min(tw as i32);
+        let h = (((r.bottom - r.top) as f32 * th / fh) as i32).min(th as i32);
+        let x = (to.left + ((r.left - from.left) as f32 * tw / fw) as i32).clamp(to.left, to.right - w);
+        let y = (to.top + ((r.top - from.top) as f32 * th / fh) as i32).clamp(to.top, to.bottom - h);
+        let maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+        if maximized {
+            // A maximized window only changes monitor by way of its normal size.
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        placement.rcNormalPosition = RECT { left: x, top: y, right: x + w, bottom: y + h };
+        if maximized {
+            placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+        }
+        let _ = SetWindowPlacement(hwnd, &placement);
     }
 }

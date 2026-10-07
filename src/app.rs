@@ -494,12 +494,17 @@ impl App {
                 config::save_grid(&self.grid);
                 return;
             }
-            Action::MoveWindow(hwnd, id) => {
-                if let Some(target) = Desktops::read().and_then(|d| d.get(&id)) {
-                    if let Err(e) = winvd::move_window_to_desktop(target, &hwnd) {
-                        log(&format!("move_window_to_desktop failed: {e:?}"));
+            Action::MoveWindow { window, cell, monitor } => {
+                if let Some(id) = cell {
+                    if let Some(target) = Desktops::read().and_then(|d| d.get(&id)) {
+                        if let Err(e) = winvd::move_window_to_desktop(target, &window) {
+                            log(&format!("move_window_to_desktop failed: {e:?}"));
+                        }
+                        self.grid.ephemeral.retain(|cell| *cell != id);
                     }
-                    self.grid.ephemeral.retain(|cell| *cell != id);
+                }
+                if let Some(monitor) = monitor {
+                    vd::move_to_monitor(window, monitor);
                 }
             }
             Action::MoveCell { id, row, index } => self.grid.move_cell(&id, row, index),
