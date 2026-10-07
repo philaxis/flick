@@ -17,16 +17,17 @@ const DEFAULT_CONFIG: &str = r#"# KanKan 설정. 저장한 뒤 트레이 아이�
 # 누르고 있는 동안 마우스를 움직이면 칸을 이동하는 버튼. 쉼표로 여러 개를 함께 쓸 수 있습니다.
 #   마우스: "xbutton1"(뒤로), "xbutton2"(앞으로), "middle"(휠 버튼)
 #   키보드: "capslock", "scrolllock", "pause", "apps", "ralt", "rctrl", "f1" ~ "f24"
-#   동시 누르기: "e+r+t"처럼 +로 묶은 키들을 한 번에 누르고 있는 동안 (하나만 쓸 수 있음)
-#   예: trigger = "xbutton2, e+r+t"
+#   동시 누르기: "w+e+r"처럼 +로 묶은 키들을 한 번에 누르고 있는 동안 (하나만 쓸 수 있음)
+#   예: trigger = "xbutton2, w+e+r"
 trigger = "xbutton2"
 
 # 한 칸 넘어가는 데 필요한 이동 거리(픽셀). 세로를 더 길게 두면 실수로 행이 바뀌지 않습니다.
 step_x = 140
 step_y = 180
 
-# 격자 가장자리에서 이 횟수만큼 더 밀면 새 칸/새 행을 만듭니다. 0이면 만들지 않습니다.
-edge_create_pushes = 2
+# 새 칸/새 행은 전체 격자 뷰(딸깍)에서 마우스로 만듭니다.
+# 여기에 1 이상을 넣으면 격자 가장자리에서 그 횟수만큼 더 밀 때도 만들어집니다. 0이면 만들지 않습니다.
+edge_create_pushes = 0
 
 # 제스처 중에 이 키를 같이 누르고 있으면 지금 활성 창을 들고 이동합니다. "shift", "ctrl", "alt"
 carry_modifier = "shift"
@@ -57,7 +58,7 @@ impl Default for Config {
             trigger: "xbutton2".into(),
             step_x: 140,
             step_y: 180,
-            edge_create_pushes: 2,
+            edge_create_pushes: 0,
             carry_modifier: "shift".into(),
             hotkeys: true,
             sleep_after_minutes: 0,

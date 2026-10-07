@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use windows::{
     core::{w, ComInterface, Result},
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -17,7 +17,7 @@ use windows::{
                     D2D_RECT_F, D2D_SIZE_U,
                 },
                 D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget,
-                D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
                 D2D1_RENDER_TARGET_PROPERTIES,
                 D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
@@ -30,9 +30,9 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
             },
             Dwm::{
-                DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+                DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+                DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
@@ -48,7 +48,7 @@ use windows::{
                 ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DrawIconEx, GetClassLongPtrW, GetCursorPos, RegisterClassW, SendMessageTimeoutW,
+                CreateWindowExW, DrawIconEx, GetClassLongPtrW, GetCursorPos, LoadCursorW, RegisterClassW, IDC_ARROW, SendMessageTimeoutW,
                 SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG,
                 SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON, WM_KEYDOWN,
                 WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW,
@@ -63,6 +63,8 @@ pub struct WindowModel {
     /// Screen rectangle, `None` while minimized.
     pub rect: Option<RECT>,
     pub title: String,
+    /// Executable name; windows of one app are counted together in the map.
+    pub app: String,
     /// Follows the user from cell to cell inside its row.
     pub follows: bool,
 }
@@ -87,8 +89,6 @@ pub struct Model {
     /// Windows shown on every desktop.
     pub pinned: Vec<WindowModel>,
     pub current: CellId,
-    /// Bounding rectangle of all monitors; each cell is a miniature of it.
-    pub screen: RECT,
 }
 
 /// What the user asked for; carried out by the app.
@@ -108,11 +108,19 @@ pub enum Action {
     RemoveCell(CellId),
     /// Show the pin menu for a window.
     WindowMenu(HWND),
+    /// Set how one window is pinned: following within its row, shown on
+    /// every desktop, or neither (never both).
+    SetPin { window: HWND, row: bool, all: bool },
     CloseRow(usize),
     Rename(usize, String),
 }
 
 type Rect = D2D_RECT_F;
+
+/// The map is drawn at this fraction of the board's scale.
+const MAP_SCALE: f32 = 1.0;
+/// Height of the hint line at the bottom, in unscaled units.
+const FOOTER: f32 = 44.0;
 
 fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
     Rect { left: x, top: y, right: x + w, bottom: y + h }
@@ -155,23 +163,28 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-struct WindowLayout {
+/// One app in a map cell: its icon and how many windows it has there.
+struct AppBadge {
+    /// A window of the app, whose icon is shown.
     hwnd: HWND,
-    /// Where the window sits inside the miniature, before clipping to it.
-    full: Option<Rect>,
     icon: Rect,
+    count: usize,
+    /// Where the count is written (only when above one).
+    label: Rect,
 }
 
 struct CellLayout {
     id: CellId,
-    title: Rect,
     body: Rect,
     close: Rect,
-    strip: Rect,
-    windows: Vec<WindowLayout>,
+    apps: Vec<AppBadge>,
+    /// Apps that did not fit.
+    more: usize,
 }
 
 struct RowLayout {
+    /// The whole label area left of the row; its extras show on hover.
+    header: Rect,
     name: Rect,
     close: Rect,
     top: f32,
@@ -180,13 +193,30 @@ struct RowLayout {
     plus: Rect,
 }
 
+/// One window of the selected cell, shown large with its title.
+struct TileLayout {
+    hwnd: HWND,
+    frame: Rect,
+    icon: Rect,
+    title: Rect,
+    thumb: Rect,
+    /// The two pin toggles at the right of the title bar.
+    pin_row: Rect,
+    pin_all: Rect,
+}
+
 #[derive(Default)]
 struct Layout {
+    /// The selected cell's windows, the main content of the board.
+    tiles: Vec<TileLayout>,
+    tiles_area: Rect,
+    tiles_label: Rect,
+    /// Top edge of the map at the bottom of the board.
+    map_top: f32,
+    /// The column on which every row's landing cell is lined up.
+    spine: Rect,
     rows: Vec<RowLayout>,
     add_row: Rect,
-    /// Label and icons of the windows pinned to every desktop.
-    pinned_label: Rect,
-    pinned: Vec<WindowLayout>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -197,6 +227,9 @@ enum Hit {
     Window { cell: CellId, hwnd: isize },
     /// The cell's title bar or its bare background; the handle for dragging it.
     Cell(CellId),
+    /// The "follow within the row" / "on every desktop" toggle of a tile.
+    PinRow(isize),
+    PinAll(isize),
     CellClose(CellId),
     Plus(usize),
     AddRow,
@@ -231,6 +264,8 @@ pub struct Board {
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
+    /// The same fonts at the map's smaller scale.
+    map_fonts: Option<Fonts>,
     open: bool,
     model: Model,
     /// Copy of the grid used to move the selection, so that looking around
@@ -240,12 +275,14 @@ pub struct Board {
     layout: Layout,
     size: (i32, i32),
     scale: f32,
-    /// (source window, thumbnail handle), bottom-most first.
-    thumbs: Vec<(isize, isize)>,
+    /// (source window, thumbnail handle, is a tile rather than part of the
+    /// map), in drawing order.
+    thumbs: Vec<(isize, isize, bool)>,
     icons: HashMap<isize, ID2D1Bitmap>,
     hover: Hit,
     press: Option<Press>,
     cursor: (f32, f32),
+    cursor_before: (f32, f32),
     /// Row whose close button was clicked once and waits for confirmation.
     armed_row: Option<usize>,
     editing: Option<(usize, String)>,
@@ -258,6 +295,8 @@ impl Board {
             let class = w!("kankan.board");
             RegisterClassW(&WNDCLASSW {
                 style: CS_DBLCLKS,
+                // Without a class cursor Windows keeps showing the "busy" one.
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                 lpfnWndProc: Some(wndproc),
                 hInstance: instance.into(),
                 lpszClassName: class,
@@ -284,8 +323,9 @@ impl Board {
                 factory: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
                 canvas: None,
                 fonts: None,
+                map_fonts: None,
                 open: false,
-                model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new(), screen: RECT::default() },
+                model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new() },
                 nav: Grid::default(),
                 selected: String::new(),
                 layout: Layout::default(),
@@ -296,6 +336,7 @@ impl Board {
                 hover: Hit::Nothing,
                 press: None,
                 cursor: (0.0, 0.0),
+                cursor_before: (0.0, 0.0),
                 armed_row: None,
                 editing: None,
             })
@@ -330,6 +371,7 @@ impl Board {
             let size = (area.right - area.left, area.bottom - area.top);
             if self.scale != dpi as f32 / 96.0 {
                 self.fonts = None;
+                self.map_fonts = None;
             }
             self.scale = dpi as f32 / 96.0;
             self.size = size;
@@ -354,6 +396,9 @@ impl Board {
         if self.nav.find(&self.selected).is_none() {
             self.selected = self.model.current.clone();
         }
+        // Makes the selected cell its row's landing cell, which the map lines up.
+        let selected = self.selected.clone();
+        self.nav.visit(&selected);
         self.press = None;
         self.relayout();
         self.register_thumbnails();
@@ -380,6 +425,9 @@ impl Board {
         if let Some(id) = self.nav.target(from, dir).and_then(|pos| self.nav.id_at(pos).cloned()) {
             self.nav.visit(&id);
             self.selected = id;
+            // Other windows to show, and the rows slide to stay lined up.
+            self.relayout();
+            self.register_thumbnails();
             self.invalidate();
         }
     }
@@ -392,16 +440,59 @@ impl Board {
 
     // ---- layout -----------------------------------------------------------
 
+    fn selected_cell(&self) -> Option<&CellModel> {
+        self.model.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected)
+    }
+
+    /// The windows shown as tiles: those of the selected cell, then the ones
+    /// pinned to every desktop (flagged), which are visible there as well.
+    fn tile_windows(&self) -> Vec<(&WindowModel, bool)> {
+        let cell = self.selected_cell().into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
+        cell.chain(self.model.pinned.iter().map(|w| (w, true))).collect()
+    }
+
     fn relayout(&mut self) {
-        self.layout = compute_layout(&self.model, self.size, self.scale);
+        let s = self.scale;
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        // Each row is shifted so that the cell a vertical move would land on
+        // (the one it was last left on) sits in the same column for all rows.
+        let anchors: Vec<usize> = self
+            .model
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                let last = self.nav.rows.get(r).and_then(|nav| nav.last.as_ref());
+                last.and_then(|id| row.cells.iter().position(|cell| cell.id == *id)).unwrap_or(0)
+            })
+            .collect();
+        let mut layout = compute_layout(&self.model, &anchors, (w, h - FOOTER * s), s * MAP_SCALE);
+        let margin = 40.0 * s;
+        layout.tiles_label = rect(margin, 22.0 * s, w - 2.0 * margin, 30.0 * s);
+        layout.tiles_area = Rect { left: margin, top: 64.0 * s, right: w - margin, bottom: layout.map_top - 26.0 * s };
+        layout.tiles = layout_tiles(&self.tile_windows(), &layout.tiles_area, s);
+        self.layout = layout;
+    }
+
+    /// A tile acts like its window in the map; one pinned everywhere belongs
+    /// to no cell.
+    fn tile_hit(&self, hwnd: HWND) -> Hit {
+        let pinned = self.model.pinned.iter().any(|w| w.hwnd == hwnd);
+        Hit::Window { cell: if pinned { String::new() } else { self.selected.clone() }, hwnd: hwnd.0 }
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Hit {
+        if let Some(tile) = self.layout.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
+            if contains(&tile.pin_row, x, y) {
+                return Hit::PinRow(tile.hwnd.0);
+            }
+            if contains(&tile.pin_all, x, y) {
+                return Hit::PinAll(tile.hwnd.0);
+            }
+            return self.tile_hit(tile.hwnd);
+        }
         if contains(&self.layout.add_row, x, y) {
             return Hit::AddRow;
-        }
-        if let Some(window) = self.layout.pinned.iter().find(|w| contains(&w.icon, x, y)) {
-            return Hit::Window { cell: String::new(), hwnd: window.hwnd.0 };
         }
         for (r, row) in self.layout.rows.iter().enumerate() {
             if contains(&row.close, x, y) {
@@ -417,13 +508,7 @@ impl Board {
                 if contains(&cell.close, x, y) && self.cell_count() > 1 {
                     return Hit::CellClose(cell.id.clone());
                 }
-                for window in &cell.windows {
-                    let on_thumb = window.full.is_some_and(|full| contains(&full, x, y) && contains(&cell.body, x, y));
-                    if on_thumb || contains(&window.icon, x, y) {
-                        return Hit::Window { cell: cell.id.clone(), hwnd: window.hwnd.0 };
-                    }
-                }
-                if contains(&cell.title, x, y) || contains(&cell.body, x, y) || contains(&cell.strip, x, y) {
+                if contains(&cell.body, x, y) {
                     return Hit::Cell(cell.id.clone());
                 }
             }
@@ -436,19 +521,19 @@ impl Board {
     }
 
     fn cell_at(&self, x: f32, y: f32) -> Option<&CellLayout> {
-        self.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| {
-            contains(&Rect { left: cell.body.left, top: cell.title.top, right: cell.body.right, bottom: cell.strip.bottom }, x, y)
-        })
+        // A little slack around each square makes it an easier drop target.
+        let slack = 5.0 * self.scale;
+        self.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| contains(&grow(&cell.body, slack), x, y))
     }
 
     fn slot_at(&self, dragged: &str, x: f32, y: f32) -> Option<Slot> {
         let rows = &self.layout.rows;
         let (first, last) = (rows.first()?, rows.last()?);
         if y < first.top {
-            return Some(Slot::NewRow { at: 0, y: first.top - 12.0 * self.scale });
+            return Some(Slot::NewRow { at: 0, y: first.top - 8.0 * self.scale });
         }
         if y >= last.bottom {
-            return Some(Slot::NewRow { at: rows.len(), y: last.bottom + 12.0 * self.scale });
+            return Some(Slot::NewRow { at: rows.len(), y: last.bottom + 8.0 * self.scale });
         }
         for (r, row) in rows.iter().enumerate() {
             if y >= row.top && y < row.bottom {
@@ -473,31 +558,23 @@ impl Board {
     // ---- thumbnails -------------------------------------------------------
 
     fn clear_thumbnails(&mut self) {
-        for (_, thumb) in self.thumbs.drain(..) {
+        for (_, thumb, _) in self.thumbs.drain(..) {
             unsafe {
                 let _ = DwmUnregisterThumbnail(thumb);
             }
         }
     }
 
-    /// Registers a live thumbnail per visible window. Later registrations are
-    /// drawn above earlier ones, so each cell goes bottom-most first.
+    /// Registers a live thumbnail for every tile.
     fn register_thumbnails(&mut self) {
         self.clear_thumbnails();
-        for cell in self.model.rows.iter().flat_map(|row| &row.cells) {
-            for window in cell.windows.iter().rev().filter(|w| w.rect.is_some()) {
-                if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, window.hwnd) } {
-                    self.thumbs.push((window.hwnd.0, thumb));
-                }
+        let wanted: Vec<HWND> = self.tile_windows().into_iter().filter(|(w, _)| w.rect.is_some()).map(|(w, _)| w.hwnd).collect();
+        for hwnd in wanted {
+            if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
+                self.thumbs.push((hwnd.0, thumb, true));
             }
         }
         self.update_thumbnails();
-    }
-
-    fn window_layout(&self, hwnd: isize) -> Option<(&CellLayout, &WindowLayout)> {
-        self.layout.rows.iter().flat_map(|row| &row.cells).find_map(|cell| {
-            cell.windows.iter().find(|w| w.hwnd.0 == hwnd).map(|window| (cell, window))
-        })
     }
 
     fn dragged_window(&self) -> Option<isize> {
@@ -509,10 +586,13 @@ impl Board {
 
     fn update_thumbnails(&self) {
         let dragged = self.dragged_window();
-        for &(hwnd, thumb) in &self.thumbs {
-            let Some((cell, window)) = self.window_layout(hwnd) else { continue };
-            let Some(full) = window.full else { continue };
-            let (fw, fh) = (full.right - full.left, full.bottom - full.top);
+        let to_rect = |r: &Rect| RECT {
+            left: r.left.round() as i32,
+            top: r.top.round() as i32,
+            right: r.right.round() as i32,
+            bottom: r.bottom.round() as i32,
+        };
+        for &(hwnd, thumb, _) in &self.thumbs {
             let mut props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
                 opacity: 255,
@@ -520,40 +600,18 @@ impl Board {
                 fSourceClientAreaOnly: false.into(),
                 ..Default::default()
             };
-            let to_rect = |r: &Rect| RECT {
-                left: r.left.round() as i32,
-                top: r.top.round() as i32,
-                right: r.right.round() as i32,
-                bottom: r.bottom.round() as i32,
-            };
-            if dragged == Some(hwnd) {
-                // Follows the cursor, unclipped.
-                let (cx, cy) = self.cursor;
-                props.rcDestination = to_rect(&rect(cx - fw / 2.0, cy - fh / 2.0, fw, fh));
-                props.opacity = 215;
-            } else {
-                let clip = Rect {
-                    left: full.left.max(cell.body.left),
-                    top: full.top.max(cell.body.top),
-                    right: full.right.min(cell.body.right),
-                    bottom: full.bottom.min(cell.body.bottom),
-                };
-                if clip.right - clip.left < 1.0 || clip.bottom - clip.top < 1.0 || fw < 1.0 || fh < 1.0 {
-                    props.fVisible = false.into();
-                } else {
-                    props.rcDestination = to_rect(&clip);
-                    // Show only the part of the window that is inside the screen.
-                    if let Ok(SIZE { cx, cy }) = unsafe { DwmQueryThumbnailSourceSize(thumb) } {
-                        let (sw, sh) = (cx as f32, cy as f32);
-                        props.dwFlags |= DWM_TNP_RECTSOURCE;
-                        props.rcSource = RECT {
-                            left: ((clip.left - full.left) / fw * sw).round() as i32,
-                            top: ((clip.top - full.top) / fh * sh).round() as i32,
-                            right: ((clip.right - full.left) / fw * sw).round() as i32,
-                            bottom: ((clip.bottom - full.top) / fh * sh).round() as i32,
-                        };
-                    }
+            match self.layout.tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
+                Some(tile) if dragged == Some(hwnd) => {
+                    // Follows the cursor, small enough to see the map under it.
+                    let t = &tile.thumb;
+                    let aspect = (t.right - t.left) / (t.bottom - t.top).max(1.0);
+                    let (cx, cy) = self.cursor;
+                    let w = 200.0 * self.scale;
+                    props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - w / aspect / 2.0, w, w / aspect));
+                    props.opacity = 215;
                 }
+                Some(tile) => props.rcDestination = to_rect(&tile.thumb),
+                None => props.fVisible = false.into(),
             }
             unsafe {
                 let _ = DwmUpdateThumbnailProperties(thumb, &props);
@@ -561,15 +619,20 @@ impl Board {
         }
     }
 
-    /// Thumbnails stack in registration order; re-register one to lift it
-    /// above the rest while it is being dragged.
+    /// Thumbnails stack in registration order; re-register the one that will
+    /// follow the cursor to lift it above the rest.
     fn raise_thumbnail(&mut self, hwnd: isize) {
-        if let Some(i) = self.thumbs.iter().position(|(h, _)| *h == hwnd) {
-            let (_, old) = self.thumbs.remove(i);
+        let index = self
+            .thumbs
+            .iter()
+            .position(|&(h, _, tile)| h == hwnd && tile)
+            .or_else(|| self.thumbs.iter().position(|&(h, _, _)| h == hwnd));
+        if let Some(i) = index {
+            let (_, old, tile) = self.thumbs.remove(i);
             unsafe {
                 let _ = DwmUnregisterThumbnail(old);
                 if let Ok(thumb) = DwmRegisterThumbnail(self.hwnd, HWND(hwnd)) {
-                    self.thumbs.push((hwnd, thumb));
+                    self.thumbs.push((hwnd, thumb, tile));
                 }
             }
         }
@@ -718,10 +781,12 @@ impl Board {
             return;
         }
         let hover = self.hit_test(x, y);
-        if hover != self.hover {
+        let over_header = |px: f32, py: f32| self.layout.rows.iter().position(|row| contains(&row.header, px, py));
+        if hover != self.hover || over_header(x, y) != over_header(self.cursor_before.0, self.cursor_before.1) {
             self.hover = hover;
             self.invalidate();
         }
+        self.cursor_before = (x, y);
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Action {
@@ -753,6 +818,14 @@ impl Board {
         match press.hit {
             Hit::Window { cell, hwnd } => Action::Go(cell, Some(HWND(hwnd))),
             Hit::Cell(id) => Action::Go(id, None),
+            Hit::PinRow(hwnd) | Hit::PinAll(hwnd) => {
+                let windows = self.tile_windows();
+                let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
+                // Each toggle turns itself on or off and always clears the other.
+                let row = matches!(press.hit, Hit::PinRow(_)) && !window.follows;
+                let all = matches!(press.hit, Hit::PinAll(_)) && !everywhere;
+                Action::SetPin { window: HWND(hwnd), row, all }
+            }
             Hit::CellClose(id) => Action::RemoveCell(id),
             Hit::Plus(row) => Action::AddCell(row),
             Hit::AddRow => Action::AddRow,
@@ -785,8 +858,10 @@ impl Board {
 
     fn paint(&mut self) {
         let Some(target) = self.ensure_canvas() else { return };
-        if self.fonts.is_none() {
-            self.fonts = make_fonts(self.scale).map_err(|e| crate::app::log(&format!("board fonts failed: {e}"))).ok();
+        if self.fonts.is_none() || self.map_fonts.is_none() {
+            let log = |e| crate::app::log(&format!("board fonts failed: {e}"));
+            self.fonts = make_fonts(self.scale).map_err(log).ok();
+            self.map_fonts = make_fonts(self.scale * MAP_SCALE).map_err(log).ok();
         }
         self.load_icons(&target);
         unsafe {
@@ -820,9 +895,87 @@ impl Board {
 
     fn draw(&self, t: &ID2D1RenderTarget) -> Result<()> {
         let s = self.scale;
-        let Some(fonts) = &self.fonts else { return Ok(()) };
+        let (Some(fonts), Some(map_fonts)) = (&self.fonts, &self.map_fonts) else { return Ok(()) };
         unsafe {
             t.Clear(Some(&rgba(0.050, 0.055, 0.068, 1.0)));
+        }
+        self.draw_tiles(t, fonts, s)?;
+        let hovered = self.draw_map(t, map_fonts, s * MAP_SCALE)?;
+        unsafe {
+            let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
+            let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+            let footer = rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s);
+            let (line, alpha) = match &hovered {
+                Some(title) => (title.as_str(), 0.85),
+                None => ("창 클릭: 그 창으로 이동   ·   창을 아래 칸으로 끌기: 옮기기   ·   칸 클릭: 이동, 끌기: 재배치   ·   Esc: 닫기", 0.28),
+            };
+            let wide: Vec<u16> = line.encode_utf16().collect();
+            brush.SetColor(&white(alpha));
+            t.DrawText(&wide, &fonts.centered, &footer, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+        }
+        Ok(())
+    }
+
+    /// The selected cell's windows as large titled previews.
+    fn draw_tiles(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32) -> Result<()> {
+        unsafe {
+            let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
+            let text = |string: &str, font: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F| {
+                let wide: Vec<u16> = string.encode_utf16().collect();
+                brush.SetColor(&colour);
+                t.DrawText(&wide, font, area, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            };
+            let place = self.nav.find(&self.selected);
+            let row_name = place.and_then(|p| self.model.rows.get(p.row)).map(|row| row.name.clone()).unwrap_or_default();
+            if let Some(p) = place {
+                let row = if row_name.is_empty() { format!("워크스페이스 {}", p.row + 1) } else { row_name };
+                let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
+                text(&format!("{row}  ·  {}번 칸{here}", p.col + 1), &fonts.label, &self.layout.tiles_label, white(0.80));
+            }
+            if self.layout.tiles.is_empty() {
+                text("이 칸에는 창이 없습니다", &fonts.centered, &self.layout.tiles_area, white(0.28));
+            }
+            let dragged = self.dragged_window();
+            let windows = self.tile_windows();
+            for tile in &self.layout.tiles {
+                let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) else { continue };
+                let hot = self.hover == self.tile_hit(tile.hwnd);
+                let dim = if dragged == Some(tile.hwnd.0) { 0.35 } else { 1.0 };
+                brush.SetColor(&rgba(0.125, 0.135, 0.165, dim));
+                t.FillRoundedRectangle(&rounded(&tile.frame, 9.0 * s), &brush);
+                // Stand-in under the live thumbnail (and all there is for a minimized window).
+                brush.SetColor(&rgba(0.075, 0.08, 0.095, dim));
+                t.FillRectangle(&tile.thumb, &brush);
+                if let Some(bitmap) = self.icons.get(&tile.hwnd.0) {
+                    t.DrawBitmap(bitmap, Some(&tile.icon), dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                    let (cx, cy) = ((tile.thumb.left + tile.thumb.right) / 2.0, (tile.thumb.top + tile.thumb.bottom) / 2.0);
+                    let big = rect(cx - 20.0 * s, cy - 20.0 * s, 40.0 * s, 40.0 * s);
+                    t.DrawBitmap(bitmap, Some(&big), 0.8 * dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                }
+                text(&window.title, &fonts.small, &tile.title, white(if hot { 1.0 } else { 0.82 } * dim));
+
+                // Pin toggles: at most one of the two is on.
+                for (area, label, on, hit) in [
+                    (&tile.pin_row, "행 고정", window.follows, Hit::PinRow(tile.hwnd.0)),
+                    (&tile.pin_all, "전체 고정", *everywhere, Hit::PinAll(tile.hwnd.0)),
+                ] {
+                    let over = self.hover == hit;
+                    brush.SetColor(&if on { accent(dim) } else { white(if over { 0.20 } else { 0.07 } * dim) });
+                    t.FillRoundedRectangle(&rounded(area, 5.0 * s), &brush);
+                    text(label, &fonts.centered, area, white(if on || over { 1.0 } else { 0.50 } * dim));
+                }
+
+                brush.SetColor(&if hot { accent(1.0) } else { white(0.10 * dim) });
+                t.DrawRoundedRectangle(&rounded(&grow(&tile.frame, 1.0 * s), 10.0 * s), &brush, if hot { 2.5 * s } else { 1.0 }, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// The map of all rows and cells: plain squares holding each cell's apps
+    /// (icon and count), with the controls appearing on hover.
+    fn draw_map(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32) -> Result<Option<String>> {
+        unsafe {
             let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
             let text = |string: &str, font: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F| {
                 let wide: Vec<u16> = string.encode_utf16().collect();
@@ -843,119 +996,89 @@ impl Board {
                 _ => None,
             };
             let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|c| c.id.as_str());
-            let mut hovered_title = None;
+            let selected_row = self.nav.find(&self.selected).map(|pos| pos.row);
+            let radius = 8.0 * s;
 
-            if !self.layout.pinned.is_empty() {
-                text("모든 칸에 고정", &fonts.small, &self.layout.pinned_label, white(0.50));
-                for (window, window_model) in self.layout.pinned.iter().zip(&self.model.pinned) {
-                    if self.hover == (Hit::Window { cell: String::new(), hwnd: window.hwnd.0 }) {
-                        hovered_title = Some(window_model.title.as_str());
-                        fill(&grow(&window.icon, 3.0 * s), 5.0 * s, white(0.16));
-                    }
-                    match self.icons.get(&window.hwnd.0) {
-                        Some(bitmap) => t.DrawBitmap(bitmap, Some(&window.icon), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
-                        None => fill(&window.icon, 4.0 * s, white(0.25)),
-                    }
-                }
-            }
+            // The column vertical moves travel along.
+            fill(&self.layout.spine, 10.0 * s, white(0.035));
 
             for (r, (row, model)) in self.layout.rows.iter().zip(&self.model.rows).enumerate() {
-                // Row header: name, memory, close button.
+                // Row label; memory and the close button only while pointed at.
                 let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
+                let pointed = contains(&row.header, self.cursor.0, self.cursor.1) && self.press.is_none();
                 let name = match editing {
                     Some((_, typed)) => format!("{typed}▏"),
                     None if model.name.is_empty() => format!("워크스페이스 {}", r + 1),
                     None => model.name.clone(),
                 };
-                if editing.is_some() || self.hover == Hit::RowName(r) {
-                    fill(&grow(&row.name, 4.0 * s), 5.0 * s, white(if editing.is_some() { 0.10 } else { 0.05 }));
+                if editing.is_some() {
+                    fill(&grow(&row.name, 3.0 * s), 5.0 * s, white(0.10));
                 }
-                text(&name, &fonts.label, &row.name, white(0.92));
-                let windows: usize = model.cells.iter().map(|c| c.windows.len()).sum();
-                let info = Rect { top: row.name.bottom + 4.0 * s, bottom: row.name.bottom + 24.0 * s, ..row.name };
-                let asleep = if model.asleep { " · 재움" } else { "" };
-                text(&format!("{} · 창 {windows}개{asleep}", format_memory(model.memory)), &fonts.small, &info, white(0.50));
+                text(&name, &fonts.small, &row.name, white(if selected_row == Some(r) { 0.90 } else { 0.45 }));
                 if self.armed_row == Some(r) {
                     fill(&row.close, 5.0 * s, danger(0.90));
-                    text("한 번 더 누르면 닫음", &fonts.centered, &row.close, white(1.0));
-                } else {
+                    text("한 번 더: 닫기", &fonts.centered, &row.close, white(1.0));
+                } else if pointed {
                     let hot = self.hover == Hit::RowClose(r);
-                    fill(&row.close, 5.0 * s, white(if hot { 0.14 } else { 0.05 }));
-                    text("이 행 닫기", &fonts.centered, &row.close, white(if hot { 0.95 } else { 0.50 }));
+                    fill(&row.close, 5.0 * s, white(if hot { 0.18 } else { 0.08 }));
+                    let asleep = if model.asleep { " · 재움" } else { "" };
+                    text(&format!("닫기 · {}{asleep}", format_memory(model.memory)), &fonts.centered, &row.close, white(if hot { 0.95 } else { 0.60 }));
                 }
 
-                for (c, (cell, cell_model)) in row.cells.iter().zip(&model.cells).enumerate() {
+                for cell in &row.cells {
                     let dim = if dragged_cell == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
-                    let is_current = cell.id == self.model.current;
                     let is_selected = cell.id == self.selected;
-                    let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) | Hit::Window { cell: id, .. } if *id == cell.id);
-
+                    let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) if *id == cell.id);
                     if is_selected {
-                        for (by, a) in [(7.0, 0.10), (4.5, 0.20)] {
-                            fill(&grow(&cell.body, by * s), (6.0 + by) * s, accent(a * dim));
+                        for (by, a) in [(5.0, 0.08), (3.0, 0.14)] {
+                            fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
                         }
                     }
-                    fill(&cell.body, 6.0 * s, rgba(0.115, 0.125, 0.150, dim));
-                    let (width, colour) = if drop_cell == Some(cell.id.as_str()) {
-                        (2.5 * s, accent(1.0))
+                    fill(&cell.body, radius, white(if selected_row == Some(r) { 0.14 } else { 0.07 } * dim));
+                    if drop_cell == Some(cell.id.as_str()) {
+                        stroke(&cell.body, radius, 2.5 * s, accent(1.0));
                     } else if is_selected {
-                        (2.0 * s, accent(dim))
-                    } else {
-                        (1.0, white(if hovering { 0.30 } else { 0.10 } * dim))
-                    };
-                    stroke(&grow(&cell.body, 1.5 * s), 7.0 * s, width, colour);
-
-                    let label = if is_current { format!("{}  ● 현재", c + 1) } else { format!("{}", c + 1) };
-                    text(&label, &fonts.small, &cell.title, if is_current { accent(dim) } else { white(0.55 * dim) });
+                        stroke(&cell.body, radius, 2.0 * s, accent(dim));
+                    } else if hovering {
+                        stroke(&cell.body, radius, 1.0, white(0.35 * dim));
+                    }
+                    if cell.id == self.model.current {
+                        // Where the user actually is, as opposed to what is selected.
+                        let dot = rect(cell.body.left + 7.0 * s, cell.body.top + 7.0 * s, 6.0 * s, 6.0 * s);
+                        fill(&dot, 3.0 * s, accent(dim));
+                    }
+                    for badge in &cell.apps {
+                        match self.icons.get(&badge.hwnd.0) {
+                            Some(bitmap) => t.DrawBitmap(bitmap, Some(&badge.icon), dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                            None => fill(&badge.icon, 4.0 * s, white(0.25 * dim)),
+                        }
+                        if badge.count > 1 {
+                            text(&badge.count.to_string(), &fonts.small, &badge.label, white(0.75 * dim));
+                        }
+                    }
+                    if cell.more > 0 {
+                        let area = Rect { top: cell.body.bottom - 18.0 * s, ..cell.body };
+                        text(&format!("+{}", cell.more), &fonts.centered, &area, white(0.45 * dim));
+                    }
                     if hovering && self.cell_count() > 1 && self.press.is_none() {
                         let hot = self.hover == Hit::CellClose(cell.id.clone());
-                        fill(&cell.close, 4.0 * s, if hot { danger(0.90) } else { white(0.10) });
-                        text("✕", &fonts.centered, &cell.close, white(if hot { 1.0 } else { 0.70 }));
-                    }
-
-                    if cell_model.windows.is_empty() {
-                        text("비어 있음", &fonts.centered, &cell.body, white(0.22 * dim));
-                    }
-                    // Stand-ins under the live thumbnails, bottom-most first, so a
-                    // window whose thumbnail cannot be shown is still visible.
-                    t.PushAxisAlignedClip(&cell.body, D2D1_ANTIALIAS_MODE_ALIASED);
-                    for window in cell.windows.iter().rev() {
-                        let Some(full) = window.full else { continue };
-                        fill(&full, 3.0 * s, rgba(0.19, 0.205, 0.24, dim));
-                        stroke(&full, 3.0 * s, 1.0, white(0.14 * dim));
-                        if let Some(bitmap) = self.icons.get(&window.hwnd.0) {
-                            let (cx, cy) = ((full.left + full.right) / 2.0, (full.top + full.bottom) / 2.0);
-                            let half = (10.0 * s).min((full.right - full.left) / 2.0).min((full.bottom - full.top) / 2.0);
-                            let area = rect(cx - half, cy - half, half * 2.0, half * 2.0);
-                            t.DrawBitmap(bitmap, Some(&area), dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-                        }
-                    }
-                    t.PopAxisAlignedClip();
-                    for (window, window_model) in cell.windows.iter().zip(&cell_model.windows) {
-                        let hot = self.hover == Hit::Window { cell: cell.id.clone(), hwnd: window.hwnd.0 };
-                        if hot {
-                            hovered_title = Some(window_model.title.as_str());
-                            fill(&grow(&window.icon, 3.0 * s), 5.0 * s, white(0.16));
-                        }
-                        match self.icons.get(&window.hwnd.0) {
-                            Some(bitmap) => t.DrawBitmap(bitmap, Some(&window.icon), dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
-                            None => fill(&window.icon, 4.0 * s, white(0.25 * dim)),
-                        }
-                        if window_model.follows {
-                            let x = (window.icon.left + window.icon.right) / 2.0;
-                            fill(&rect(x - 2.0 * s, window.icon.bottom + 2.5 * s, 4.0 * s, 4.0 * s), 2.0 * s, accent(dim));
-                        }
+                        fill(&cell.close, 4.0 * s, if hot { danger(0.90) } else { rgba(0.2, 0.21, 0.25, 1.0) });
+                        text("✕", &fonts.centered, &cell.close, white(if hot { 1.0 } else { 0.75 }));
                     }
                 }
 
                 let hot = self.hover == Hit::Plus(r);
-                fill(&row.plus, 6.0 * s, white(if hot { 0.12 } else { 0.04 }));
-                text("+", &fonts.big, &row.plus, white(if hot { 0.95 } else { 0.40 }));
+                if hot {
+                    fill(&row.plus, radius, white(0.10));
+                }
+                text("+", &fonts.big, &row.plus, white(if hot { 0.95 } else { 0.22 }));
             }
 
             let hot = self.hover == Hit::AddRow;
-            fill(&self.layout.add_row, 6.0 * s, white(if hot { 0.12 } else { 0.04 }));
-            text("+  새 워크스페이스", &fonts.centered, &self.layout.add_row, white(if hot { 0.95 } else { 0.45 }));
+            if hot {
+                fill(&self.layout.add_row, radius, white(0.10));
+            }
+            text("+", &fonts.big, &self.layout.add_row, white(if hot { 0.95 } else { 0.22 }));
 
             // Drag feedback.
             if let Some(id) = dragged_cell {
@@ -966,38 +1089,26 @@ impl Board {
                         fill(&rect(x - 2.0 * s, body.top, 4.0 * s, body.bottom - body.top), 2.0 * s, accent(1.0));
                     }
                     Some(Slot::NewRow { y, .. }) => {
-                        let left = self.layout.add_row.left;
-                        fill(&rect(left, y - 2.0 * s, self.layout.add_row.right - left, 4.0 * s), 2.0 * s, accent(1.0));
+                        let spine = &self.layout.spine;
+                        fill(&rect(spine.left, y - 2.0 * s, spine.right - spine.left, 4.0 * s), 2.0 * s, accent(1.0));
                     }
                     None => {}
                 }
                 let (cx, cy) = self.cursor;
-                stroke(&rect(cx - 50.0 * s, cy - 30.0 * s, 100.0 * s, 60.0 * s), 6.0 * s, 2.0 * s, accent(0.9));
+                stroke(&rect(cx - 40.0 * s, cy - 25.0 * s, 80.0 * s, 50.0 * s), radius, 2.0 * s, accent(0.9));
             }
             if let Some(hwnd) = self.dragged_window() {
                 // A minimized window has no thumbnail to follow the cursor.
-                if self.window_layout(hwnd).is_some_and(|(_, w)| w.full.is_none()) {
+                if !self.thumbs.iter().any(|&(h, _, _)| h == hwnd) {
                     let (cx, cy) = self.cursor;
-                    let area = rect(cx - 14.0 * s, cy - 14.0 * s, 28.0 * s, 28.0 * s);
+                    let area = rect(cx - 16.0 * s, cy - 16.0 * s, 32.0 * s, 32.0 * s);
                     if let Some(bitmap) = self.icons.get(&hwnd) {
                         t.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                     }
                 }
             }
-
-            let (w, h) = (self.size.0 as f32, self.size.1 as f32);
-            let footer = rect(0.0, h - 44.0 * s, w, 28.0 * s);
-            match hovered_title {
-                Some(title) => text(title, &fonts.centered, &footer, white(0.85)),
-                None => text(
-                    "칸 클릭: 이동   ·   창을 끌어 다른 칸으로   ·   칸을 끌어 재배치   ·   창 우클릭: 고정   ·   이름 더블클릭: 변경   ·   Esc: 닫기",
-                    &fonts.centered,
-                    &footer,
-                    white(0.30),
-                ),
-            }
+            Ok(None)
         }
-        Ok(())
     }
 
     /// Draws the board (without live thumbnails) into a bitmap and returns the
@@ -1008,8 +1119,11 @@ impl Board {
         self.selected = model.current.clone();
         self.model = model;
         self.nav = grid;
+        let selected = self.selected.clone();
+        self.nav.visit(&selected);
         self.relayout();
         self.fonts = make_fonts(scale).ok();
+        self.map_fonts = make_fonts(scale * MAP_SCALE).ok();
         let target = self.ensure_canvas()?;
         self.load_icons(&target);
         unsafe {
@@ -1172,94 +1286,176 @@ fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D
     }
 }
 
-/// Places rows top to bottom and each row's cells left to right, sizing the
-/// miniatures so that the longest row and all rows fit the window.
-fn compute_layout(model: &Model, size: (i32, i32), s: f32) -> Layout {
-    let (w, h) = (size.0 as f32, size.1 as f32);
-    let (margin, header_w, row_gap, cell_gap) = (48.0 * s, 190.0 * s, 26.0 * s, 20.0 * s);
-    let (title_h, strip_h, add_row_h, footer_h) = (24.0 * s, 38.0 * s, 36.0 * s, 40.0 * s);
-    const PLUS: f32 = 0.35;
-
-    let rows = model.rows.len().max(1) as f32;
-    let columns = model.rows.iter().map(|r| r.cells.len()).max().unwrap_or(1).max(1) as f32;
-    let (screen_w, screen_h) = ((model.screen.right - model.screen.left).max(1) as f32, (model.screen.bottom - model.screen.top).max(1) as f32);
-    let aspect = screen_w / screen_h;
-
-    let available_w = w - 2.0 * margin - header_w;
-    let available_h = h - 2.0 * margin - footer_h - add_row_h - row_gap;
-    let mut cell_w = ((available_w - columns * cell_gap) / (columns + PLUS)).min(460.0 * s);
-    let mut cell_h = cell_w / aspect;
-    let pinned_room = if model.pinned.is_empty() { 0.0 } else { 40.0 * s };
-    let max_h = (available_h - pinned_room - (rows - 1.0) * row_gap) / rows - title_h - strip_h;
-    if cell_h > max_h {
-        cell_h = max_h.max(40.0 * s);
-        cell_w = cell_h * aspect;
+/// Lays out the windows of one cell as rows of previews that keep each
+/// window's proportions, as large as fits (like Task View).
+fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<TileLayout> {
+    if windows.is_empty() {
+        return Vec::new();
     }
-    let row_h = title_h + cell_h + strip_h;
-    let total_w = header_w + columns * (cell_w + cell_gap) + cell_w * PLUS;
-    let pinned_h = if model.pinned.is_empty() { 0.0 } else { 40.0 * s };
-    let total_h = pinned_h + rows * row_h + (rows - 1.0) * row_gap + row_gap + add_row_h;
-    let x0 = ((w - total_w) / 2.0).max(margin);
-    let mut y = ((h - footer_h - total_h) / 2.0).max(margin);
-    let cells_x = x0 + header_w;
-    let icon = 20.0 * s;
+    let aspects: Vec<f32> = windows
+        .iter()
+        .map(|(w, _)| match w.rect {
+            // Not narrower than the title bar needs for the pin toggles.
+            Some(r) => ((r.right - r.left).max(1) as f32 / (r.bottom - r.top).max(1) as f32).clamp(0.9, 2.4),
+            None => 1.6,
+        })
+        .collect();
+    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+    let (title_h, gap) = (34.0 * s, 26.0 * s);
+    let total: f32 = aspects.iter().sum();
 
-    let mut layout = Layout::default();
-    if !model.pinned.is_empty() {
-        layout.pinned_label = rect(x0, y, header_w - 28.0 * s, icon);
-        layout.pinned = model
-            .pinned
+    // Try 1..4 rows and keep the split that gives the tallest previews.
+    let mut best: (f32, Vec<Vec<usize>>) = (0.0, Vec::new());
+    for rows in 1..=windows.len().min(4) {
+        let target = total / rows as f32;
+        let mut split: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut filled = 0.0;
+        for (i, aspect) in aspects.iter().enumerate() {
+            if filled + aspect / 2.0 > target && split.len() < rows && !split[split.len() - 1].is_empty() {
+                split.push(Vec::new());
+                filled = 0.0;
+            }
+            let last = split.len() - 1;
+            split[last].push(i);
+            filled += aspect;
+        }
+        let count = split.len() as f32;
+        let by_height = (ah - gap * (count - 1.0)) / count - title_h;
+        let by_width = split
             .iter()
-            .enumerate()
-            .map(|(i, window)| WindowLayout {
-                hwnd: window.hwnd,
-                full: None,
-                icon: rect(cells_x + i as f32 * (icon + 7.0 * s), y, icon, icon),
-            })
-            .collect();
-        y += pinned_h;
+            .map(|row| (aw - gap * (row.len() as f32 - 1.0)) / row.iter().map(|i| aspects[*i]).sum::<f32>())
+            .fold(f32::INFINITY, f32::min);
+        let height = by_height.min(by_width).min(430.0 * s);
+        if height > best.0 {
+            best = (height, split);
+        }
     }
-    for row in &model.rows {
-        let body_top = y + title_h;
-        let mut x = cells_x;
+    let (height, split) = best;
+    if height <= 8.0 {
+        return Vec::new();
+    }
+    let block = split.len() as f32 * (title_h + height) + (split.len() as f32 - 1.0) * gap;
+    let mut y = area.top + (ah - block) / 2.0;
+    let icon = 18.0 * s;
+    let mut tiles = Vec::new();
+    for row in &split {
+        let width: f32 = row.iter().map(|i| aspects[*i] * height).sum::<f32>() + gap * (row.len() as f32 - 1.0);
+        let mut x = area.left + (aw - width) / 2.0;
+        for &i in row {
+            let w = aspects[i] * height;
+            let (pin_w, all_w, pin_h) = (50.0 * s, 62.0 * s, 22.0 * s);
+            let pin_y = y + (title_h - pin_h) / 2.0;
+            let pin_all = rect(x + w - 8.0 * s - all_w, pin_y, all_w, pin_h);
+            let pin_row = rect(pin_all.left - 6.0 * s - pin_w, pin_y, pin_w, pin_h);
+            tiles.push(TileLayout {
+                hwnd: windows[i].0.hwnd,
+                frame: rect(x, y, w, title_h + height),
+                icon: rect(x + 10.0 * s, y + (title_h - icon) / 2.0, icon, icon),
+                title: rect(x + 18.0 * s + icon, y, (pin_row.left - 8.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
+                thumb: rect(x, y + title_h, w, height),
+                pin_row,
+                pin_all,
+            });
+            x += w + gap;
+        }
+        y += title_h + height + gap;
+    }
+    tiles
+}
+
+/// Lays out the map at the bottom of the board: rows top to bottom, each
+/// shifted sideways so that its landing cell (`anchors[row]`) sits on a common
+/// column, the spine. `size` is the space above the footer; `s` the scale.
+fn compute_layout(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Layout {
+    let (w, h) = size;
+    let (margin, header_w, gap) = (60.0 * s, 170.0 * s, 10.0 * s);
+    /// Share of the board's height the map may take.
+    const MAX_SHARE: f32 = 0.34;
+
+    let anchor = |r: usize| anchors.get(r).copied().unwrap_or(0);
+    let rows = model.rows.len().max(1) as f32;
+    let lead = (0..model.rows.len()).map(anchor).max().unwrap_or(0);
+    let tail = model.rows.iter().enumerate().map(|(r, row)| row.cells.len().saturating_sub(anchor(r))).max().unwrap_or(1).max(1);
+    let columns = (lead + tail) as f32;
+
+    // Squares of a fixed look, shrunk only when the grid would not fit.
+    let fit_w = (w - 2.0 * margin - header_w) / (columns + 0.6) - gap;
+    let fit_h = (h * MAX_SHARE) / (rows + 0.6) - gap;
+    let cell_h = (62.0 * s).min(fit_h).min(fit_w * 0.62).max(22.0 * s);
+    let cell_w = cell_h / 0.62;
+    let pitch = cell_w + gap;
+    let row_pitch = cell_h + gap;
+    let plus = cell_h * 0.6;
+
+    let total_w = header_w + columns * pitch + plus;
+    let total_h = rows * row_pitch + plus;
+    let x0 = ((w - total_w) / 2.0).max(margin);
+    let mut y = h - total_h - 10.0 * s;
+    let cells_x = x0 + header_w;
+    let spine_x = cells_x + lead as f32 * pitch;
+    let icon = (cell_h * 0.36).min(22.0 * s);
+    let count_w = icon * 0.62;
+
+    let mut layout = Layout { map_top: y, ..Layout::default() };
+    let rows_top = y;
+    for (r, row) in model.rows.iter().enumerate() {
+        let mut x = spine_x - anchor(r) as f32 * pitch;
         let mut cells = Vec::new();
         for cell in &row.cells {
-            let body = rect(x, body_top, cell_w, cell_h);
-            let windows = cell
-                .windows
+            let body = rect(x, y, cell_w, cell_h);
+            // One badge per app, in the order its windows are stacked.
+            let mut apps: Vec<(HWND, &str, usize)> = Vec::new();
+            for window in &cell.windows {
+                match apps.iter_mut().find(|(_, app, _)| *app == window.app.as_str() && !window.app.is_empty()) {
+                    Some(entry) => entry.2 += 1,
+                    None => apps.push((window.hwnd, window.app.as_str(), 1)),
+                }
+            }
+            let width = |count: usize| icon + if count > 1 { count_w } else { 0.0 };
+            let room = cell_w - 16.0 * s;
+            let between = 5.0 * s;
+            let mut shown = 0;
+            let mut used = 0.0;
+            for (_, _, count) in &apps {
+                let next = used + width(*count) + if shown > 0 { between } else { 0.0 };
+                if next > room {
+                    break;
+                }
+                used = next;
+                shown += 1;
+            }
+            let mut bx = body.left + (cell_w - used) / 2.0;
+            let by = body.top + (cell_h - icon) / 2.0;
+            let badges = apps[..shown]
                 .iter()
-                .enumerate()
-                .map(|(i, window)| WindowLayout {
-                    hwnd: window.hwnd,
-                    full: window.rect.map(|r| Rect {
-                        left: body.left + (r.left - model.screen.left) as f32 / screen_w * cell_w,
-                        top: body.top + (r.top - model.screen.top) as f32 / screen_h * cell_h,
-                        right: body.left + (r.right - model.screen.left) as f32 / screen_w * cell_w,
-                        bottom: body.top + (r.bottom - model.screen.top) as f32 / screen_h * cell_h,
-                    }),
-                    icon: rect(x + i as f32 * (icon + 7.0 * s), body.bottom + 8.0 * s, icon, icon),
+                .map(|&(hwnd, _, count)| {
+                    let badge = AppBadge { hwnd, icon: rect(bx, by, icon, icon), count, label: rect(bx + icon + 1.0 * s, by, count_w, icon) };
+                    bx += width(count) + between;
+                    badge
                 })
                 .collect();
             cells.push(CellLayout {
                 id: cell.id.clone(),
-                title: rect(x + 2.0 * s, y, cell_w - 26.0 * s, title_h - 4.0 * s),
                 body,
-                close: rect(body.right - 20.0 * s, y, 20.0 * s, 20.0 * s),
-                strip: rect(x, body.bottom, cell_w, strip_h),
-                windows,
+                close: rect(body.right - 15.0 * s, body.top - 5.0 * s, 20.0 * s, 20.0 * s),
+                apps: badges,
+                more: apps.len() - shown,
             });
-            x += cell_w + cell_gap;
+            x += pitch;
         }
+        let first_x = spine_x - anchor(r) as f32 * pitch;
         layout.rows.push(RowLayout {
-            name: rect(x0, body_top + 2.0 * s, header_w - 28.0 * s, 24.0 * s),
-            close: rect(x0, body_top + 58.0 * s, 130.0 * s, 24.0 * s),
-            top: y,
-            bottom: y + row_h,
+            header: rect(x0, y, header_w, cell_h),
+            name: rect(x0, y + cell_h / 2.0 - 20.0 * s, (first_x - x0 - 12.0 * s).min(header_w - 12.0 * s).max(40.0 * s), 20.0 * s),
+            close: rect(x0, y + cell_h / 2.0 + 2.0 * s, 140.0 * s, 20.0 * s),
+            top: y - gap / 2.0,
+            bottom: y + cell_h + gap / 2.0,
             cells,
-            plus: rect(x, body_top, cell_w * PLUS, cell_h),
+            plus: rect(x, y + (cell_h - plus) / 2.0, plus, plus),
         });
-        y += row_h + row_gap;
+        y += row_pitch;
     }
-    layout.add_row = rect(cells_x, y, cell_w, add_row_h);
+    layout.spine = rect(spine_x - gap / 2.0, rows_top - gap / 2.0, pitch, (y - rows_top).max(0.0));
+    layout.add_row = rect(spine_x + (cell_w - plus) / 2.0, y - gap / 2.0 + 2.0 * s, plus, plus);
     layout
 }

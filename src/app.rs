@@ -117,6 +117,12 @@ impl App {
                 .iter()
                 .map(|row| row.cells.iter().map(|id| self.grid.ephemeral.contains(id)).collect())
                 .collect(),
+            anchors: self
+                .grid
+                .rows
+                .iter()
+                .map(|row| row.last.as_ref().and_then(|id| row.cells.iter().position(|c| c == id)).unwrap_or(0))
+                .collect(),
             cur: self.grid.find(current),
             pushing,
         }
@@ -377,7 +383,7 @@ impl App {
                         pids.extend(here.iter().map(|w| w.pid));
                         let windows = here
                             .into_iter()
-                            .map(|w| WindowModel { follows: self.follows(&w), hwnd: w.hwnd, rect: w.rect, title: w.title })
+                            .map(|w| WindowModel { follows: self.follows(&w), app: vd::exe_name(w.pid).unwrap_or_default(), hwnd: w.hwnd, rect: w.rect, title: w.title })
                             .collect();
                         CellModel { id: id.clone(), windows }
                     })
@@ -392,9 +398,9 @@ impl App {
             .collect();
         let pinned = vd::pinned_windows()
             .into_iter()
-            .map(|w| WindowModel { follows: false, hwnd: w.hwnd, rect: w.rect, title: w.title })
+            .map(|w| WindowModel { follows: false, app: vd::exe_name(w.pid).unwrap_or_default(), hwnd: w.hwnd, rect: w.rect, title: w.title })
             .collect();
-        Model { rows, pinned, current: desktops.current.clone(), screen: vd::virtual_screen() }
+        Model { rows, pinned, current: desktops.current.clone() }
     }
 
     fn open_board(&mut self) {
@@ -487,6 +493,25 @@ impl App {
                 }
             }
             Action::RemoveCell(id) => self.remove_cells(&[id]),
+            Action::SetPin { window, row, all } => {
+                if row {
+                    self.following.insert(window.0);
+                } else {
+                    self.following.remove(&window.0);
+                }
+                let result = if all {
+                    winvd::pin_window(window)
+                } else {
+                    // Being shown everywhere can also come from its app being pinned.
+                    if winvd::is_pinned_app(window).unwrap_or(false) {
+                        let _ = winvd::unpin_app(window);
+                    }
+                    if winvd::is_pinned_window(window).unwrap_or(false) { winvd::unpin_window(window) } else { Ok(()) }
+                };
+                if let Err(e) = result {
+                    log(&format!("pin change failed: {e:?}"));
+                }
+            }
             Action::WindowMenu(hwnd) => {
                 self.pending_menu = Some((hwnd, self.pin_state(hwnd)));
                 return;
@@ -850,6 +875,7 @@ pub fn render_sample(path: &str) {
     let Ok(mut overlay) = Overlay::new(wndproc) else { return };
     let view = View {
         rows: vec![vec![false; 4], vec![false, false], vec![false, false, true]],
+        anchors: vec![2, 1, 0],
         cur: Some(Pos { row: 1, col: 1 }),
         pushing: Some(Dir::Right),
     };

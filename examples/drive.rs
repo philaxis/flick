@@ -105,6 +105,18 @@ fn main() {
                 windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&events, std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32);
             }
             Some("typetest") => typetest(),
+            Some("idle") => {
+                // Milliseconds since anyone (or anything) last produced input.
+                use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+                let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+                let _ = GetLastInputInfo(&mut info);
+                println!("{}", windows::Win32::System::SystemInformation::GetTickCount().wrapping_sub(info.dwTime));
+            }
+            Some("cursor") => {
+                let mut p = windows::Win32::Foundation::POINT::default();
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
+                println!("cursor {},{}", p.x, p.y);
+            }
             Some("info") => {
                 use windows::Win32::Foundation::RECT;
                 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -181,7 +193,7 @@ fn typetest() {
         };
         pump(300);
         // Ordinary typing, one key at a time, with overlap between neighbours.
-        for word in ["ert", "the", "tree"] {
+        for word in ["wer", "the", "were"] {
             let letters: Vec<char> = word.chars().collect();
             for (i, c) in letters.iter().enumerate() {
                 send(&[key(*c, false)]);
@@ -194,7 +206,7 @@ fn typetest() {
             }
         }
         pump(200);
-        println!("typed one by one: {:?} (expected \"ertthetree\")", text(edit));
+        println!("typed one by one: {:?} (expected \"werthewere\")", text(edit));
         // Fast rollover: next key goes down before the previous one is up.
         send(&[key('r', false)]);
         pump(20);
@@ -204,11 +216,11 @@ fn typetest() {
         pump(20);
         send(&[key('e', true)]);
         pump(200);
-        println!("after rollover re: {:?} (expected \"ertthetreere\")", text(edit));
+        println!("after rollover re: {:?} (expected \"werthewerere\")", text(edit));
         // The chord: all three at once, held, released.
-        send(&[key('e', false), key('r', false), key('t', false)]);
+        send(&[key('w', false), key('e', false), key('r', false)]);
         pump(400);
-        send(&[key('e', true), key('r', true), key('t', true)]);
+        send(&[key('w', true), key('e', true), key('r', true)]);
         pump(400);
         println!("after chord: {:?} (expected unchanged)", text(edit));
         let _ = DestroyWindow(edit);

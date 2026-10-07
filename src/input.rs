@@ -4,6 +4,10 @@
 //! keyboard event through that thread, so it must never wait on anything: it
 //! only does arithmetic and posts messages to the app window, and the app can
 //! take as long as it likes without the cursor stuttering.
+//!
+//! While the trigger is held the cursor does not move: the hook swallows
+//! every mouse move, and the movement is read from raw input instead, which
+//! reports what the device did regardless of where the cursor is.
 
 use crate::grid::Dir;
 use std::{
@@ -14,18 +18,25 @@ use std::{
     },
 };
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{
-        Input::KeyboardAndMouse::{
-            MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-            MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+        Input::{
+            GetRawInputData,
+            KeyboardAndMouse::{
+                MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+                KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+            },
+            RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
+            RID_INPUT, RIM_TYPEMOUSE,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, PostMessageW, PostThreadMessageW,
-            SetCursorPos, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-            WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-            WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+            CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, KillTimer,
+            PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
+            HC_ACTION, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+            SM_CYVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
+            WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
         },
     },
 };
@@ -150,8 +161,10 @@ thread_local! {
     static STEPPED: Cell<bool> = const { Cell::new(false) };
     /// Mouse travel not yet converted into steps.
     static ACCUM: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
-    /// Where the cursor was when the trigger went down; it is put back there.
-    static ANCHOR: Cell<Option<POINT>> = const { Cell::new(None) };
+    /// The hook thread's hidden window, which receives raw mouse input.
+    static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
+    /// Last position reported by an absolute pointer (remote desktop, pen).
+    static LAST_ABSOLUTE: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// Chord keys held back while waiting to see whether the chord completes.
     static PENDING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// Chord keys still down after the chord fired; their events are dropped.
@@ -186,7 +199,9 @@ fn reload() {
     SETTINGS.with(|slot| *slot.borrow_mut() = settings);
     flush_pending(None);
     SWALLOW.with(|keys| keys.borrow_mut().clear());
-    HELD.set(false);
+    if HELD.replace(false) {
+        listen_raw(false);
+    }
 }
 
 fn hook_thread() {
@@ -194,6 +209,16 @@ fn hook_thread() {
         THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
         reload();
         let module = GetModuleHandleW(None).unwrap_or_default();
+        let class = windows::core::w!("kankan.input");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(raw_window_proc),
+            hInstance: module.into(),
+            lpszClassName: class,
+            ..Default::default()
+        });
+        let window =
+            CreateWindowExW(WINDOW_EX_STYLE(0), class, None, WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, module, None);
+        RAW_WINDOW.set(window.0);
         let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
         let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
         if mouse.is_err() || keyboard.is_err() {
@@ -220,25 +245,83 @@ fn post(s: &Settings, message: u32, wparam: usize) {
     }
 }
 
+/// Starts or stops receiving raw mouse input (only wanted while held).
+fn listen_raw(on: bool) {
+    let window = HWND(RAW_WINDOW.get());
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 1, // generic desktop
+        usUsage: 2,     // mouse
+        dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+        hwndTarget: if on { window } else { HWND(0) },
+    };
+    unsafe {
+        let _ = RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+    }
+}
+
 fn press() {
     if !HELD.replace(true) {
         STEPPED.set(false);
         ACCUM.set((0, 0));
-        let mut cursor = POINT::default();
-        ANCHOR.set(unsafe { GetCursorPos(&mut cursor) }.is_ok().then_some(cursor));
+        LAST_ABSOLUTE.set(None);
+        listen_raw(true);
     }
 }
 
 fn release(s: &Settings) {
     if HELD.replace(false) {
-        // The gesture is not meant to move the pointer.
-        if let (Some(anchor), true) = (ANCHOR.take(), STEPPED.get()) {
-            unsafe {
-                let _ = SetCursorPos(anchor.x, anchor.y);
-            }
-        }
+        listen_raw(false);
         post(s, if STEPPED.get() { WM_RELEASE } else { WM_CLICK }, 0);
     }
+}
+
+/// Raw mouse input while the trigger is held: the device's own movement,
+/// unaffected by the cursor being frozen.
+fn on_raw_input(handle: HRAWINPUT) {
+    const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
+    const MOUSE_VIRTUAL_DESKTOP: u16 = 0x02;
+    if !HELD.get() {
+        return;
+    }
+    let mut raw = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(&mut raw as *mut _ as *mut _), &mut size, header) };
+    if read == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE.0 {
+        return;
+    }
+    let mouse = unsafe { raw.data.mouse };
+    let (dx, dy) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
+        // Absolute pointers report a position in 0..65535 across the screen;
+        // the movement is the difference from the previous report.
+        let (w, h) = unsafe {
+            if mouse.usFlags & MOUSE_VIRTUAL_DESKTOP != 0 {
+                (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN))
+            } else {
+                (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+            }
+        };
+        let now = ((mouse.lLastX as i64 * w as i64 / 65535) as i32, (mouse.lLastY as i64 * h as i64 / 65535) as i32);
+        match LAST_ABSOLUTE.replace(Some(now)) {
+            Some(before) => (now.0 - before.0, now.1 - before.1),
+            None => (0, 0),
+        }
+    } else {
+        (mouse.lLastX, mouse.lLastY)
+    };
+    if dx != 0 || dy != 0 {
+        with_settings(|s| {
+            travel(s, dx, dy);
+            false
+        });
+    }
+}
+
+unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message == WM_INPUT {
+        on_raw_input(HRAWINPUT(lparam.0));
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
 /// Adds mouse travel and emits one step per threshold crossed. A step is taken
@@ -287,18 +370,9 @@ fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
         }
         return true;
     }
-    if message == WM_MOUSEMOVE && HELD.get() {
-        // The event carries where the cursor is about to go and the cursor
-        // is still where it was, so the difference is this movement. That
-        // holds for a mouse (relative) and for remote desktop, pens and
-        // touchpads in absolute mode alike, which is why the move is not
-        // swallowed: a frozen cursor would make absolute positions pile up.
-        let mut cursor = POINT::default();
-        if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
-            travel(s, info.pt.x - cursor.x, info.pt.y - cursor.y);
-        }
-    }
-    false
+    // The cursor stays put while the trigger is held; the movement itself is
+    // read from raw input (`on_raw_input`).
+    message == WM_MOUSEMOVE && HELD.get()
 }
 
 fn key_event(key: u32, up: bool) -> INPUT {

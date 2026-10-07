@@ -18,10 +18,9 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
-            EnumWindows, GetForegroundWindow, GetShellWindow, GetSystemMetrics, GetWindow, GetWindowLongW,
+            EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
             GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-            IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, SM_CXVIRTUALSCREEN,
-            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
+            IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -209,14 +208,6 @@ pub fn windows(current: &str) -> Vec<WindowInfo> {
             Some(describe(hwnd, desktop))
         })
         .collect()
-}
-
-/// Bounding rectangle of all monitors.
-pub fn virtual_screen() -> RECT {
-    unsafe {
-        let (x, y) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
-        RECT { left: x, top: y, right: x + GetSystemMetrics(SM_CXVIRTUALSCREEN), bottom: y + GetSystemMetrics(SM_CYVIRTUALSCREEN) }
-    }
 }
 
 /// Parent pid of every running process.

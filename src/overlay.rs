@@ -53,6 +53,9 @@ const ACCENT: (f32, f32, f32) = (0.34, 0.62, 1.0);
 #[derive(Clone, Default)]
 pub struct View {
     pub rows: Vec<Vec<bool>>,
+    /// Per row, the column a vertical move would land on. Rows are shifted
+    /// sideways so that these line up in one column.
+    pub anchors: Vec<usize>,
     pub cur: Option<Pos>,
     /// The user is pushing against this edge; one more push creates a cell.
     pub pushing: Option<Dir>,
@@ -68,7 +71,10 @@ pub struct Overlay {
     size: (i32, i32),
     view: View,
     /// Highlight position in (column, row) cell units, eased toward `view.cur`.
+    /// The column is measured on screen, i.e. after the row's shift.
     highlight: (f32, f32),
+    /// Each row's sideways shift in cells, eased toward `View::shift`.
+    shifts: Vec<f32>,
     alpha: f32,
     visible: bool,
     hide_at: Option<Instant>,
@@ -86,6 +92,28 @@ fn rounded(x: f32, y: f32, w: f32, h: f32, radius: f32) -> D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
         radiusX: radius,
         radiusY: radius,
+    }
+}
+
+impl View {
+    fn anchor(&self, row: usize) -> usize {
+        self.anchors.get(row).copied().unwrap_or(0)
+    }
+
+    /// Cells in front of the lined-up column.
+    fn lead(&self) -> usize {
+        (0..self.rows.len()).map(|r| self.anchor(r)).max().unwrap_or(0)
+    }
+
+    /// How far `row` is shifted right, in cells.
+    fn shift(&self, row: usize) -> f32 {
+        (self.lead() - self.anchor(row)) as f32
+    }
+
+    /// Width of the whole shifted grid, in cells.
+    fn columns(&self) -> usize {
+        let tail = self.rows.iter().enumerate().map(|(r, row)| row.len().saturating_sub(self.anchor(r))).max().unwrap_or(1);
+        (self.lead() + tail).max(1)
     }
 }
 
@@ -136,6 +164,7 @@ impl Overlay {
                 size: (0, 0),
                 view: View::default(),
                 highlight: (0.0, 0.0),
+                shifts: Vec::new(),
                 alpha: 0.0,
                 visible: false,
                 hide_at: None,
@@ -158,7 +187,8 @@ impl Overlay {
         if !self.visible {
             self.place_on_cursor_monitor();
             let start = from.or(view.cur).unwrap_or(Pos { row: 0, col: 0 });
-            self.highlight = (start.col as f32, start.row as f32);
+            self.shifts = (0..view.rows.len()).map(|r| view.shift(r)).collect();
+            self.highlight = (start.col as f32 + view.shift(start.row), start.row as f32);
             self.visible = true;
             self.last_tick = Instant::now();
             unsafe {
@@ -198,9 +228,13 @@ impl Overlay {
         let hiding = self.hide_at.is_some_and(|at| now >= at);
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
+        let k = 1.0 - (-dt / SLIDE_TAU).exp();
+        self.shifts.resize(self.view.rows.len(), 0.0);
+        for (r, shift) in self.shifts.iter_mut().enumerate() {
+            *shift += (self.view.shift(r) - *shift) * k;
+        }
         if let Some(cur) = self.view.cur {
-            let k = 1.0 - (-dt / SLIDE_TAU).exp();
-            self.highlight.0 += (cur.col as f32 - self.highlight.0) * k;
+            self.highlight.0 += (cur.col as f32 + self.view.shift(cur.row) - self.highlight.0) * k;
             self.highlight.1 += (cur.row as f32 - self.highlight.1) * k;
         }
 
@@ -232,7 +266,7 @@ impl Overlay {
     }
 
     fn wanted_size(&self) -> (i32, i32) {
-        let cols = self.view.rows.iter().map(Vec::len).max().unwrap_or(1).max(1) as f32;
+        let cols = self.view.columns() as f32;
         let rows = self.view.rows.len().max(1) as f32;
         let w = PAD * 2.0 + cols * CELL_W + (cols - 1.0) * GAP;
         let h = PAD * 2.0 + rows * CELL_H + (rows - 1.0) * GAP;
@@ -327,8 +361,9 @@ impl Overlay {
             let cur = self.view.cur;
             for (r, row) in self.view.rows.iter().enumerate() {
                 let in_current_row = cur.is_some_and(|c| c.row == r);
+                let shift = self.shifts.get(r).copied().unwrap_or_else(|| self.view.shift(r));
                 for (c, &fresh) in row.iter().enumerate() {
-                    let shape = rounded(cell_x(c as f32), cell_y(r as f32), cw, ch, radius);
+                    let shape = rounded(cell_x(c as f32 + shift), cell_y(r as f32), cw, ch, radius);
                     if fresh {
                         // A cell that will vanish again if left empty: outline only.
                         brush.SetColor(&color(WHITE, 0.30));
@@ -366,8 +401,9 @@ impl Overlay {
     /// Draws `view` at full opacity and returns the premultiplied BGRA pixels,
     /// for checking the design without showing a window.
     pub fn render_to_pixels(&mut self, view: View, highlight: (f32, f32), scale: f32) -> Option<(i32, i32, Vec<u8>)> {
+        self.shifts = (0..view.rows.len()).map(|r| view.shift(r)).collect();
+        self.highlight = (highlight.0 + view.shift(highlight.1 as usize), highlight.1);
         self.view = view;
-        self.highlight = highlight;
         self.scale = scale;
         let size = self.wanted_size();
         if !self.ensure_bitmap(size) || self.draw().is_err() {
