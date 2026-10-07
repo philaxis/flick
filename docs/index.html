@@ -290,25 +290,25 @@ function fit(cv) {
 }
 
 /* ---------- hero: a desktop, Flick's switcher and the board, played on a loop ---------- */
-const HOME = { x: .45, y: .79 }, HOP = { x: .09, y: .09 };
 const SCRIPT = [
-  [1.2, h => h.press()],
-  [2.1, h => h.flick('right')],
-  [3.7, h => h.flick('down')],
-  [5.2, h => h.release()],
-  [6.2, h => h.tap()],
-  [6.9, h => h.cursorTo(h.tilePoint(), .8)],
-  [7.9, h => h.grab()],
-  [8.1, h => h.cursorTo(h.cellPoint(1, 2), 1.2)],
-  [9.6, h => h.drop()],
-  [10.0, h => h.cursorTo({ x: HOME.x + HOP.x, y: HOME.y + HOP.y }, .7)],
-  [10.9, h => h.tap()],
-  [11.9, h => h.press()],
-  [12.6, h => h.flick('up')],
-  [13.9, h => h.flick('left')],
-  [15.0, h => h.release()],
+  [.5, h => h.press()],
+  [1.1, h => h.flick('right')],
+  [2.3, h => h.flick('down')],
+  [3.4, h => h.release()],
+  [3.9, h => h.tap()],
+  [4.4, h => h.cursorTo(h.tilePoint(), .6)],
+  [5.1, h => h.grab()],
+  [5.25, h => h.cursorTo(h.cellPoint(1, 2), 1.0)],
+  [6.45, h => h.drop()],
+  [7.2, h => h.tap()],
+  [7.9, h => h.press()],
+  [8.4, h => h.flick('up')],
+  [9.5, h => h.flick('left')],
+  [10.3, h => h.release()],
 ];
-const LOOP = 15.9, STILL_AT = 3.0;   // the loop ends on the desktop it starts on
+const LOOP = 11;   // the loop ends on the desktop it starts on
+/* A flick of the hand: out at once, held a moment, then a slow drift back to rest. */
+const jolt = t => t < 0 ? 0 : t < .07 ? 1 - Math.pow(1 - t / .07, 3) : t < .2 ? 1 : 1 - inOut((t - .2) / .75);
 
 class Hero {
   constructor(cv) {
@@ -318,7 +318,7 @@ class Hero {
   }
   reset() {
     this.grid = new Grid(heroModel()); this.t = 0; this.si = 0; this.held = false; this.hideAt = 0;
-    this.cur = { ...HOME }; this.tween = null; this.ring = 0; this.pulse = 0; this.grip = 0; this.trail = null; this.beatAt = null; this.hand = { x: 0, y: 0, side: 0 };
+    this.cur = { x: .5, y: .56 }; this.tween = null; this.tapUntil = 0; this.grip = 0; this.beatAt = null; this.hand = { vx: 0, vy: 0, t0: -9, side: 0 };
     this.board = { open: false, a: 0, cell: null, rects: new Map(), drag: null, drop: null };
   }
   resize() {
@@ -328,18 +328,17 @@ class Hero {
   }
   cell(pos) { return this.grid.m.rows[pos.r].cells[pos.c]; }
   beat(i) { if (!this.quiet) this.onBeat(i); }
-  press() { this.held = true; this.ring = 1.6; this.beat(0); }
-  release() { this.held = false; this.hideAt = this.t + .5; }
-  /* The screen changes at once; only the cursor hops and the switcher's highlight glides. */
+  press() { this.held = true; this.beat(0); }
+  release() { this.held = false; this.hideAt = this.t + .3; }
+  /* The screen changes at once and the cursor is frozen, as in the app: only the hand moves and the switcher's highlight glides. */
   flick(dir) {
     const v = { left: [-1, 0], right: [1, 0], up: [0, -1], down: [0, 1] }[dir];
-    this.trail = { x: this.cur.x, y: this.cur.y, a: 1 }; this.hand.x = v[0]; this.hand.y = v[1];
-    this.cursorTo({ x: this.cur.x + v[0] * HOP.x, y: this.cur.y + v[1] * HOP.y }, .16);
+    Object.assign(this.hand, { vx: v[0], vy: v[1], t0: this.t });
     this.beat(1);
     if (this.grid.move(dir)) this.beatAt = this.t + .28;
   }
   tap() {
-    this.pulse = 1; const b = this.board;
+    this.tapUntil = this.t + .2; const b = this.board;
     if (b.open) { b.open = false; b.drag = null; return; }
     b.open = true; b.cell = { ...this.grid.cur }; b.rects.clear(); b.drag = null; b.drop = null; this.hideAt = 0;
     const DH = this.H - this.TB, th = this.boardLayout().th;
@@ -368,7 +367,7 @@ class Hero {
     const spine = { x: spineX - gap / 2, y: mapTop - gap / 2, w: pitch, h: n * rp };
     const wins = this.cell(cell).wins, tm = (narrow ? 16 : 70) * s, top = (narrow ? 20 : 34) * s, th = (narrow ? 28 : 34) * s, tg = (narrow ? 10 : 28) * s;
     const area = { x: tm, y: top, w: w - 2 * tm, h: mapTop - (narrow ? 20 : 28) * s - top };
-    const asp = wins.map(win => clamp((win.r[2] * w) / (win.r[3] * (H - this.TB)), 1.1, 2.4)), sum = asp.reduce((a, b) => a + b, 0) || 1;
+    const asp = wins.map(win => (win.r[2] * w) / (win.r[3] * (H - this.TB))), sum = asp.reduce((a, b) => a + b, 0) || 1;
     const ph = Math.max(10, Math.min(area.h - th, (area.w - tg * (wins.length - 1)) / sum));
     let tx = area.x + (area.w - (sum * ph + tg * (wins.length - 1))) / 2; const ty = area.y + (area.h - (ph + th)) / 2;
     const tiles = wins.map((win, i) => { const t = { win, x: tx, y: ty, w: asp[i] * ph, h: ph + th }; tx += t.w + tg; return t; });
@@ -381,9 +380,8 @@ class Hero {
     if (this.t >= LOOP) this.reset();
     if (this.tween) { const k = (this.t - this.tween.t0) / this.tween.d, e = inOut(k); this.cur.x = this.tween.x0 + (this.tween.x1 - this.tween.x0) * e; this.cur.y = this.tween.y0 + (this.tween.y1 - this.tween.y0) * e; if (k >= 1) this.tween = null; }
     if (this.beatAt !== null && this.t >= this.beatAt) { this.beatAt = null; this.beat(2); }
-    this.ring = follow(this.ring, this.held ? 1 : 0, dt, .09); this.pulse = follow(this.pulse, 0, dt, .16); this.grip = follow(this.grip, b.drag ? 1 : 0, dt, .05);
-    const hd = this.hand; hd.x = follow(hd.x, 0, dt, .16); hd.y = follow(hd.y, 0, dt, .16); hd.side = follow(hd.side, this.held || this.pulse > .35 ? 1 : 0, dt, .04);
-    if (this.trail) { this.trail.a = follow(this.trail.a, 0, dt, .16); if (this.trail.a < .02) this.trail = null; }
+    this.grip = follow(this.grip, b.drag ? 1 : 0, dt, .05);
+    this.hand.side = follow(this.hand.side, this.held || this.t < this.tapUntil ? 1 : 0, dt, .04);
     g.show = !b.open && (this.held || this.t < this.hideAt);
     g.step(dt);
     b.a = follow(b.a, b.open ? 1 : 0, dt, b.open ? .06 : .05);
@@ -453,34 +451,33 @@ class Hero {
     }));
     /* the preview riding on the cursor */
     if (b.drag) {
-      const r = b.rects.get(b.drag.id), sp = this.sprite(r.win), k = 1 - (1 - 70 * s / (r.h - th)) * b.drag.k, gw = r.w * k, gh = (r.h - th) * k, gx = px + 10 * s, gy = py - gh - 4 * s;
+      const r = b.rects.get(b.drag.id), sp = this.sprite(r.win), k = 1 - (1 - 70 * s / (r.h - th)) * b.drag.k, gw = r.w * k, gh = (r.h - th) * k, gx = px - gw / 2, gy = py - gh - 8 * s;
       g.globalAlpha = b.a * .96;
       g.save(); g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 22 * s * this.dpr; g.shadowOffsetY = 8 * s * this.dpr; bar(g, gx, gy, gw, gh, '#111', 6 * s); g.restore();
       g.drawImage(sp.c, gx, gy, gw, gh); g.strokeStyle = accent(.9); g.lineWidth = 1.5 * s; rr(g, gx, gy, gw, gh, 6 * s); g.stroke();
     }
     g.restore();
   }
-  /* The hand: a small mouse whose side button turns blue while it is held; it leans with each flick. */
+  /* The hand: a small mouse whose side button is blue while held. Each flick throws it one way; it drifts back. */
   drawMouse() {
-    const g = this.g, U = this.u, u = U * (this.narrow ? .9 : 1), hd = this.hand, w = 30 * u, h = 46 * u;
-    const x = this.W - w - 22 * U + hd.x * 7 * u, y = this.H - this.TB - h - 16 * U + hd.y * 7 * u, lit = hd.side > .5;
-    g.save(); g.shadowColor = lit ? accent(.9) : 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; bar(g, x - 6 * u, y + 15 * u, 11 * u, 15 * u, lit ? ACCENT : '#aeb4c0', 4 * u); g.restore();
-    g.save(); g.shadowColor = 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; g.shadowOffsetY = 3 * u * this.dpr; bar(g, x, y, w, h, '#14161c', 15 * u); g.restore();
-    if (this.grip > .05) { g.save(); rr(g, x, y, w, h, 15 * u); g.clip(); bar(g, x, y, w / 2, 19 * u, white(.85 * this.grip)); g.restore(); }
-    g.strokeStyle = white(.92); g.lineWidth = 1.6 * u; rr(g, x, y, w, h, 15 * u); g.stroke();
-    g.lineCap = 'round'; g.lineWidth = 2 * u; g.beginPath(); g.moveTo(x + w / 2, y + 8 * u); g.lineTo(x + w / 2, y + 14 * u); g.stroke();
+    const g = this.g, U = this.u, u = U * (this.narrow ? .9 : 1), hd = this.hand, w = 34 * u, h = 52 * u, k = jolt(this.t - hd.t0), far = 40 * u;
+    const rx = this.W - w - 64 * U, ry = this.H - this.TB - h - 56 * U, x = rx + hd.vx * far * k, y = ry + hd.vy * far * k, lit = hd.side > .5;
+    if (k > .02) { g.strokeStyle = accent(.42 * k); g.lineWidth = w * .7; g.lineCap = 'round'; g.beginPath(); g.moveTo(rx + w / 2, ry + h / 2); g.lineTo(x + w / 2, y + h / 2); g.stroke(); }
+    g.save(); g.shadowColor = lit ? accent(.9) : 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; bar(g, x - 6 * u, y + 17 * u, 12 * u, 17 * u, lit ? ACCENT : '#aeb4c0', 4 * u); g.restore();
+    g.save(); g.shadowColor = 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; g.shadowOffsetY = 3 * u * this.dpr; bar(g, x, y, w, h, '#14161c', 17 * u); g.restore();
+    if (this.grip > .05) { g.save(); rr(g, x, y, w, h, 17 * u); g.clip(); bar(g, x, y, w / 2, 21 * u, white(.85 * this.grip)); g.restore(); }
+    g.strokeStyle = white(.92); g.lineWidth = 1.6 * u; rr(g, x, y, w, h, 17 * u); g.stroke();
+    g.lineCap = 'round'; g.lineWidth = 2 * u; g.beginPath(); g.moveTo(x + w / 2, y + 9 * u); g.lineTo(x + w / 2, y + 16 * u); g.stroke();
   }
-  /* The cursor: a blue ring while the button is held, a streak on each flick, a ripple on a tap. */
+  /* The cursor exists only on the board, where it picks a window up and carries it. */
   drawCursor() {
-    const g = this.g, u = this.u, x = this.cur.x * this.W, y = this.cur.y * this.H, k = (this.narrow ? 1.25 : 1.12) * u, disc = (r, fill, stroke, lw) => { g.beginPath(); g.arc(x, y, r, 0, 7); if (fill) { g.fillStyle = fill; g.fill(); } g.strokeStyle = stroke; g.lineWidth = lw; g.stroke(); };
-    if (this.trail) { g.strokeStyle = accent(.75 * this.trail.a); g.lineWidth = 5 * u; g.lineCap = 'round'; g.beginPath(); g.moveTo(this.trail.x * this.W, this.trail.y * this.H); g.lineTo(x, y); g.stroke(); }
-    if (this.ring > .02) disc((16 + 11 * Math.max(0, this.ring - 1)) * u, accent(.22 * Math.min(1, this.ring)), accent(.95 * Math.min(1, this.ring)), 2 * u);
-    if (this.pulse > .03) disc((10 + 22 * (1 - this.pulse)) * u, null, accent(this.pulse), 2 * u);
-    if (this.grip > .05) disc(9 * u, null, white(.55 * this.grip), 1.5 * u);
+    const g = this.g, u = this.u, x = this.cur.x * this.W, y = this.cur.y * this.H, k = (this.narrow ? 1.25 : 1.12) * u;
+    g.save(); g.globalAlpha = this.board.a;
+    if (this.grip > .05) { g.strokeStyle = white(.55 * this.grip); g.lineWidth = 1.5 * u; g.beginPath(); g.arc(x, y, 9 * u, 0, 7); g.stroke(); }
     g.save(); g.translate(x, y); g.scale(k, k); g.beginPath();
     [[0, 0], [0, 16.5], [4.3, 12.7], [7.1, 19], [9.7, 17.8], [6.9, 11.7], [12.2, 11.7]].forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1])); g.closePath();
     g.shadowColor = 'rgba(0,0,0,.45)'; g.shadowBlur = 5 * this.dpr; g.shadowOffsetY = 1.5 * this.dpr; g.fillStyle = '#fff'; g.fill(); g.shadowColor = 'transparent';
-    g.strokeStyle = '#111'; g.lineWidth = 1.1; g.lineJoin = 'round'; g.stroke(); g.restore();
+    g.strokeStyle = '#111'; g.lineWidth = 1.1; g.lineJoin = 'round'; g.stroke(); g.restore(); g.restore();
   }
   draw() {
     const g = this.g, { W, H, dpr } = this;
@@ -490,8 +487,8 @@ class Hero {
       this.drawDesktop();
       if (this.grid.alpha > .01) drawMini(g, this.grid, W / 2, H / 2, this.u * (this.narrow ? .95 : 1.3), this.grid.alpha);
     }
-    if (this.board.a > .005) this.drawBoard();
-    this.drawCursor(); this.drawMouse();
+    if (this.board.a > .005) { this.drawBoard(); this.drawCursor(); }
+    this.drawMouse();
   }
 }
 
@@ -502,7 +499,7 @@ const words = [...document.querySelectorAll('#line span')];
 let beatTimer = 0;
 hero.onBeat = i => { words.forEach((w, j) => w.classList.toggle('on', j === i)); clearTimeout(beatTimer); beatTimer = setTimeout(() => words.forEach(w => w.classList.remove('on')), 650); };
 
-function redrawStill() { hero.seek(FREEZE !== null ? FREEZE : STILL_AT); hero.draw(); }
+function redrawStill() { hero.seek(FREEZE); hero.draw(); }
 /* Text on the canvases changes with the language and once the web font arrives. */
 function repaint() { hero.sprites.clear(); if (STILL) redrawStill(); }
 
