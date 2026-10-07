@@ -7,6 +7,8 @@ mod grid;
 mod app;
 #[cfg(windows)]
 mod board;
+#[cfg(any(windows, test))]
+mod hold;
 #[cfg(windows)]
 mod input;
 #[cfg(windows)]

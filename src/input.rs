@@ -9,7 +9,10 @@
 //! every mouse move, and the movement is read from raw input instead, which
 //! reports what the device did regardless of where the cursor is.
 
-use crate::grid::Dir;
+use crate::{
+    grid::Dir,
+    hold::{Chord, Held, Source},
+};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -194,11 +197,15 @@ struct Settings {
 }
 
 impl Settings {
-    fn chord(&self) -> Option<&[u32]> {
-        self.triggers.iter().find_map(|t| match t {
-            Trigger::Chord(keys) => Some(keys.as_slice()),
-            _ => None,
-        })
+    /// The keys of the chord among the triggers (only one is used).
+    fn chord(&self) -> Vec<u32> {
+        self.triggers
+            .iter()
+            .find_map(|t| match t {
+                Trigger::Chord(keys) => Some(keys.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -261,10 +268,8 @@ static THREAD: AtomicU32 = AtomicU32::new(0);
 // State of the hook thread.
 thread_local! {
     static SETTINGS: RefCell<Option<Settings>> = const { RefCell::new(None) };
-    /// Which triggers are down right now (bits below). The gesture lasts
-    /// while any of them is, so letting go of one does not end a hold kept
-    /// by another.
-    static SOURCES: Cell<u8> = const { Cell::new(0) };
+    /// Which triggers are down right now.
+    static HELD: RefCell<Held> = RefCell::new(Held::default());
     static STEPPED: Cell<bool> = const { Cell::new(false) };
     /// Mouse travel not yet converted into steps.
     static ACCUM: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
@@ -278,10 +283,8 @@ thread_local! {
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
     static LAST_ABSOLUTE: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
-    /// Chord keys held back while waiting to see whether the chord completes.
-    static PENDING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-    /// Chord keys still down after the chord fired; their events are dropped.
-    static SWALLOW: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// The chord among the triggers (one without keys when there is none).
+    static CHORD: RefCell<Chord> = RefCell::new(Chord::default());
     /// The timer that gives up waiting for the rest of the chord, 0 for none.
     static CHORD_TIMER: Cell<usize> = const { Cell::new(0) };
     /// Keys pressed so far while a new trigger is being chosen.
@@ -313,10 +316,16 @@ pub fn uninstall() {
 
 fn reload() {
     let settings = SHARED.lock().unwrap().clone();
+    // Keys held back for the old chord are typing now.
+    let keys = settings.as_ref().map(Settings::chord).unwrap_or_default();
+    let held_back = CHORD.with(|chord| {
+        let mut old = chord.replace(Chord::new(keys));
+        old.timeout()
+    });
+    replay(&held_back);
+    watch_chord();
     SETTINGS.with(|slot| *slot.borrow_mut() = settings);
-    flush_pending(None);
-    SWALLOW.with(|keys| keys.borrow_mut().clear());
-    if SOURCES.replace(0) != 0 {
+    if HELD.with(|held| held.borrow_mut().clear()) {
         listen_raw(false);
     }
 }
@@ -378,20 +387,12 @@ fn listen_raw(on: bool) {
     }
 }
 
-const SRC_XBUTTON1: u8 = 1;
-const SRC_XBUTTON2: u8 = 2;
-const SRC_MIDDLE: u8 = 4;
-const SRC_KEY: u8 = 8;
-const SRC_CHORD: u8 = 16;
-
 fn held() -> bool {
-    SOURCES.get() != 0
+    HELD.with(|held| held.borrow().any())
 }
 
-fn press(source: u8) {
-    let before = SOURCES.get();
-    SOURCES.set(before | source);
-    if before == 0 {
+fn press(source: Source) {
+    if HELD.with(|held| held.borrow_mut().press(source)) {
         STEPPED.set(false);
         ACCUM.set((0, 0));
         FLICKED.set(0);
@@ -402,10 +403,8 @@ fn press(source: u8) {
     }
 }
 
-fn release(s: &Settings, source: u8) {
-    let before = SOURCES.get();
-    SOURCES.set(before & !source);
-    if before != 0 && SOURCES.get() == 0 {
+fn release(s: &Settings, source: Source) {
+    if HELD.with(|held| held.borrow_mut().release(source)) {
         listen_raw(false);
         post(s, if STEPPED.get() { WM_RELEASE } else { WM_CLICK }, 0);
     }
@@ -553,9 +552,9 @@ fn travel_linear(s: &Settings, dx: i32, dy: i32) {
 fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     let xbutton = (info.mouseData >> 16) as u16;
     let button = match message {
-        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 1 => Some((Trigger::XButton1, SRC_XBUTTON1)),
-        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 2 => Some((Trigger::XButton2, SRC_XBUTTON2)),
-        WM_MBUTTONDOWN | WM_MBUTTONUP => Some((Trigger::Middle, SRC_MIDDLE)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 1 => Some((Trigger::XButton1, Source::XButton1)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 2 => Some((Trigger::XButton2, Source::XButton2)),
+        WM_MBUTTONDOWN | WM_MBUTTONUP => Some((Trigger::Middle, Source::Middle)),
         _ => None,
     };
     let down = matches!(message, WM_XBUTTONDOWN | WM_MBUTTONDOWN);
@@ -599,22 +598,27 @@ fn key_event(key: u32, up: bool) -> INPUT {
     }
 }
 
-/// Gives the held-back chord keys to the apps after all (they were ordinary
-/// typing), followed by `then`, the event that showed it was not a chord.
-fn flush_pending(then: Option<(u32, bool)>) {
-    stop_chord_timer();
-    let mut events: Vec<INPUT> = PENDING.with(|keys| keys.borrow_mut().drain(..).map(|key| key_event(key, false)).collect());
-    events.extend(then.map(|(key, up)| key_event(key, up)));
-    if !events.is_empty() {
-        unsafe {
-            SendInput(&events, std::mem::size_of::<INPUT>() as i32);
-        }
+/// Gives key events to the apps: (key, is a release).
+fn replay(events: &[(u32, bool)]) {
+    if events.is_empty() {
+        return;
+    }
+    let events: Vec<INPUT> = events.iter().map(|&(key, up)| key_event(key, up)).collect();
+    unsafe {
+        SendInput(&events, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
-fn stop_chord_timer() {
-    let timer = CHORD_TIMER.replace(0);
-    if timer != 0 {
+/// Keeps the timer that ends the wait for the rest of the chord in step with
+/// the chord: running, from the first key held back, while any is.
+fn watch_chord() {
+    let (waiting, keys) = CHORD.with(|chord| (chord.borrow().waiting(), chord.borrow().len()));
+    let timer = CHORD_TIMER.get();
+    if waiting && timer == 0 {
+        let window = if keys <= 2 { PAIR_WINDOW_MS } else { CHORD_WINDOW_MS };
+        CHORD_TIMER.set(unsafe { SetTimer(None, 0, window, Some(chord_timeout)) });
+    } else if !waiting && timer != 0 {
+        CHORD_TIMER.set(0);
         unsafe {
             let _ = KillTimer(None, timer);
         }
@@ -623,63 +627,9 @@ fn stop_chord_timer() {
 
 /// The rest of the chord did not follow in time.
 unsafe extern "system" fn chord_timeout(_: HWND, _: u32, _: usize, _: u32) {
-    flush_pending(None);
-}
-
-/// Whether `key` is one of the chord's keys still down after the chord
-/// fired. Its release ends that.
-fn swallowed(key: u32, up: bool) -> bool {
-    SWALLOW.with(|keys| {
-        let mut keys = keys.borrow_mut();
-        let found = keys.contains(&key);
-        if found && up {
-            keys.retain(|k| *k != key);
-        }
-        found
-    })
-}
-
-/// Handles a key that is part of the chord. Returns true to swallow the event.
-///
-/// The first keys of a chord cannot be told from typing, so they are held
-/// back briefly. If the rest follow in time the chord acts as the trigger and
-/// nothing is typed; otherwise the keys are replayed in order.
-fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
-    if swallowed(key, up) {
-        // The chord is over as soon as one of its keys comes up.
-        if up {
-            release(s, SRC_CHORD);
-        }
-        return true;
-    }
-    let pending = PENDING.with(|keys| keys.borrow().contains(&key));
-    if up {
-        // Released before the chord was complete: it was typing. A key no
-        // longer held back was replayed already, and its release goes through.
-        if pending {
-            flush_pending(Some((key, true)));
-        }
-        return pending;
-    }
-    if pending {
-        return true; // auto-repeat while waiting
-    }
-    let complete = PENDING.with(|keys| {
-        let mut keys = keys.borrow_mut();
-        keys.push(key);
-        chord.iter().all(|k| keys.contains(k))
-    });
-    if complete {
-        stop_chord_timer();
-        let keys = PENDING.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
-        SWALLOW.with(|slot| *slot.borrow_mut() = keys);
-        press(SRC_CHORD);
-    } else if CHORD_TIMER.get() == 0 {
-        // The wait is counted from the chord's first key.
-        let window = if chord.len() <= 2 { PAIR_WINDOW_MS } else { CHORD_WINDOW_MS };
-        CHORD_TIMER.set(unsafe { SetTimer(None, 0, window, Some(chord_timeout)) });
-    }
-    true
+    let held_back = CHORD.with(|chord| chord.borrow_mut().timeout());
+    replay(&held_back);
+    watch_chord();
 }
 
 fn on_key(s: &Settings, key: u32, up: bool) -> bool {
@@ -688,24 +638,28 @@ fn on_key(s: &Settings, key: u32, up: bool) -> bool {
     }
     if s.triggers.contains(&Trigger::Key(key)) {
         if up {
-            release(s, SRC_KEY);
+            release(s, Source::Key(key));
         } else {
-            press(SRC_KEY);
+            press(Source::Key(key));
         }
         return true;
     }
-    if let Some(chord) = s.chord() {
-        if chord.contains(&key) {
-            return on_chord_key(s, chord, key, up);
+    let verdict = CHORD.with(|chord| {
+        let mut chord = chord.borrow_mut();
+        if chord.has(key) {
+            chord.key(key, up)
+        } else {
+            chord.other_key(key, up)
         }
-        // Another key in between: what was held back was typing. Replay it
-        // together with this key so the order is kept.
-        if PENDING.with(|keys| !keys.borrow().is_empty()) {
-            flush_pending(Some((key, up)));
-            return true;
-        }
+    });
+    replay(&verdict.replay);
+    watch_chord();
+    match verdict.trigger {
+        Some(true) => press(Source::Chord),
+        Some(false) => release(s, Source::Chord),
+        None => {}
     }
-    false
+    verdict.swallow
 }
 
 fn with_settings(f: impl FnOnce(&Settings) -> bool) -> bool {
