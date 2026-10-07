@@ -813,7 +813,7 @@ fn init() -> windows::core::Result<HWND> {
         });
         // Never shown; it only receives messages.
         let hwnd =
-            CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("KanKan"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, instance, None);
+            CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("Flick"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, instance, None);
         Ok(hwnd)
     }
 }

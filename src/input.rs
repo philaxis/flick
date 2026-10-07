@@ -209,7 +209,7 @@ fn hook_thread() {
         THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
         reload();
         let module = GetModuleHandleW(None).unwrap_or_default();
-        let class = windows::core::w!("kankan.input");
+        let class = windows::core::w!("flick.input");
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(raw_window_proc),
             hInstance: module.into(),

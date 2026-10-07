@@ -300,7 +300,7 @@ impl Board {
     pub fn new(wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) -> Result<Board> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
-            let class = w!("kankan.board");
+            let class = w!("flick.board");
             RegisterClassW(&WNDCLASSW {
                 style: CS_DBLCLKS,
                 // Without a class cursor Windows keeps showing the "busy" one.
@@ -315,7 +315,7 @@ impl Board {
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 class,
-                w!("KanKan"),
+                w!("Flick"),
                 WS_POPUP,
                 0,
                 0,

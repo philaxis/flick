@@ -121,7 +121,7 @@ impl Overlay {
     pub fn new(wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) -> Result<Overlay> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
-            let class = w!("kankan.overlay");
+            let class = w!("flick.overlay");
             RegisterClassW(&WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
                 hInstance: instance.into(),
@@ -131,7 +131,7 @@ impl Overlay {
             let hwnd = CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 class,
-                w!("KanKan"),
+                w!("Flick"),
                 WS_POPUP,
                 0,
                 0,

@@ -1,13 +1,16 @@
 [package]
-name = "kankan"
-version = "0.1.3"
+name = "flick"
+version = "0.2.0"
 edition = "2021"
 description = "2D grid navigation on top of Windows 11 virtual desktops"
+license = "MIT"
+repository = "https://github.com/philaxis/flick"
+homepage = "https://philaxis.github.io/flick/"
 build = "build.rs"
 
 # The exe is named after the app; keep in step with APP_NAME in src/config.rs.
 [[bin]]
-name = "KanKan"
+name = "Flick"
 path = "src/main.rs"
 
 [dependencies]

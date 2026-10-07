@@ -21,7 +21,7 @@ use windows::{
 };
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("KanKan");
+const RUN_VALUE: PCWSTR = w!("Flick");
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {

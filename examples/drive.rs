@@ -23,7 +23,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let app = FindWindowW(w!("kankan.main"), None);
+        let app = FindWindowW(w!("flick.main"), None);
         let post = |message: u32, wparam: usize| {
             let _ = PostMessageW(app, message, WPARAM(wparam), LPARAM(0));
         };
@@ -121,7 +121,7 @@ fn main() {
                 use windows::Win32::Foundation::RECT;
                 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
                 use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GetWindowRect, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow};
-                let board = FindWindowW(w!("kankan.board"), None);
+                let board = FindWindowW(w!("flick.board"), None);
                 let mut r = RECT::default();
                 let _ = GetWindowRect(board, &mut r);
                 let mut cloaked = 0u32;

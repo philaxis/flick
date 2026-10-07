@@ -15,19 +15,26 @@ NAME = re.search(r'APP_NAME: &str = "([^"]+)"', (ROOT / "src/config.rs").read_te
 VERSION = re.search(r'^version = "([^"]+)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
 
 TILE = (20, 22, 28)
+SPINE = (35, 39, 51)
 CELL = (228, 231, 238)
-ACCENT = (87, 158, 255)
+FAR = (107, 114, 128)
+ACCENT = (124, 201, 234)
 
 
 def shapes():
-    """(x, y, w, h, radius, colour) in unit coordinates: a dark tile holding a
-    ragged grid of cells with one lit."""
-    yield (0.04, 0.04, 0.92, 0.92, 0.21, TILE)
-    w, h, gx, gy, x0, y0 = 0.18, 0.15, 0.045, 0.075, 0.19, 0.20
-    for r, cols in enumerate((3, 2, 3)):
-        for c in range(cols):
-            lit = (r, c) == (1, 1)
-            yield (x0 + c * (w + gx), y0 + r * (h + gy), w, h, 0.04, ACCENT if lit else CELL)
+    """(x, y, w, h, radius, colour) in unit coordinates: three rows of cells
+    shifted sideways so that one cell of each lines up in a lit column, the
+    cell in the middle being the current one."""
+    u = 1 / 96
+    yield (4 * u, 4 * u, 88 * u, 88 * u, 20 * u, TILE)
+    yield (38 * u, 13 * u, 20 * u, 70 * u, 7 * u, SPINE)
+    cells = [
+        (18, 19, FAR), (39.5, 19, CELL),
+        (39.5, 41, ACCENT), (61, 41, FAR),
+        (18, 63, FAR), (39.5, 63, CELL), (61, 63, FAR),
+    ]
+    for x, y, colour in cells:
+        yield (x * u, y * u, 17 * u, 14 * u, 4 * u, colour)
 
 
 def render(n):

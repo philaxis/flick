@@ -50,7 +50,7 @@ fn main() {
         }
     }
     // One instance only: two sets of hooks would step twice per gesture.
-    let _mutex = unsafe { CreateMutexW(None, true, w!("kankan.single-instance")) };
+    let _mutex = unsafe { CreateMutexW(None, true, w!("flick.single-instance")) };
     if unsafe { GetLastError() } == Err(ERROR_ALREADY_EXISTS.into()) {
         return;
     }

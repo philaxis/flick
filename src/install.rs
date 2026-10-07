@@ -27,10 +27,10 @@ use windows::{
 };
 
 /// Window class of the running app's message window.
-pub const MAIN_CLASS: PCWSTR = w!("kankan.main");
-/// Names used before the app had one, cleaned up on install.
-const OLD_CLASS: PCWSTR = w!("desk2d.main");
-const OLD_NAME: &str = "desk2d";
+pub const MAIN_CLASS: PCWSTR = w!("flick.main");
+/// Earlier names of the app, cleaned up on install.
+const OLD_CLASSES: [PCWSTR; 2] = [w!("kankan.main"), w!("desk2d.main")];
+const OLD_NAMES: [&str; 2] = ["KanKan", "desk2d"];
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -62,7 +62,7 @@ pub fn running_installed() -> bool {
 
 /// Asks a running instance to quit and waits for it to go.
 fn stop_running() {
-    for class in [MAIN_CLASS, OLD_CLASS] {
+    for class in [MAIN_CLASS, OLD_CLASSES[0], OLD_CLASSES[1]] {
         for _ in 0..50 {
             let window = unsafe { FindWindowW(class, None) };
             if window.0 == 0 {
@@ -130,11 +130,16 @@ pub fn install() -> std::io::Result<()> {
     set_flag(&key, w!("NoModify"));
     set_flag(&key, w!("NoRepair"));
 
-    // Leftovers of the unnamed versions.
-    unsafe {
-        let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &HSTRING::from(OLD_NAME));
+    // Leftovers of installs under earlier names.
+    for old in OLD_NAMES {
+        unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &HSTRING::from(old));
+            let key = HSTRING::from(format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{old}"));
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &key);
+        }
+        let _ = fs::remove_file(env_dir("APPDATA").join("Microsoft\\Windows\\Start Menu\\Programs").join(format!("{old}.lnk")));
+        let _ = fs::remove_dir_all(env_dir("LOCALAPPDATA").join(old));
     }
-    let _ = fs::remove_dir_all(env_dir("LOCALAPPDATA").join(OLD_NAME));
 
     Command::new(&exe).arg("--first-run").spawn()?;
     Ok(())

@@ -646,7 +646,7 @@ impl ComObjects {
         Ok(())
     }
 
-    // kankan addition: upstream declares IVirtualDesktopManagerInternal::MoveDesktop
+    // flick addition: upstream declares IVirtualDesktopManagerInternal::MoveDesktop
     // but does not expose it.
     #[apply(retry_function)]
     pub fn move_desktop(&self, desktop: &DesktopInternal, index: u32) -> Result<()> {

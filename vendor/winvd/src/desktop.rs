@@ -166,7 +166,7 @@ where
     })
 }
 
-/// Move desktop to a new position in the desktop order (kankan addition)
+/// Move desktop to a new position in the desktop order (flick addition)
 pub fn move_desktop<T>(desktop: T, index: u32) -> Result<()>
 where
     T: Into<Desktop>,

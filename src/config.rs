@@ -1,18 +1,18 @@
 //! User settings (`config.toml`) and the saved grid (`state.json`), both in
-//! `%APPDATA%\KanKan`.
+//! `%APPDATA%\Flick`.
 
 use crate::grid::Grid;
 
 /// The app's display name. Also used for the install folder, the settings
 /// folder, the Start menu shortcut and the registry entries; the exe name in
 /// Cargo.toml and the icon resource (scripts/make-icon.py) follow it too.
-pub const APP_NAME: &str = "KanKan";
-/// Settings folder of versions before the app had a name.
-const OLD_DIR: &str = "desk2d";
+pub const APP_NAME: &str = "Flick";
+/// Settings folders of versions under earlier names, newest first.
+const OLD_DIRS: [&str; 2] = ["KanKan", "desk2d"];
 use serde::Deserialize;
 use std::{fs, path::PathBuf};
 
-const DEFAULT_CONFIG: &str = r#"# KanKan 설정. 저장한 뒤 트레이 아이콘 메뉴의 "설정 다시 읽기"를 누르면 적용됩니다.
+const DEFAULT_CONFIG: &str = r#"# Flick 설정. 저장한 뒤 트레이 아이콘 메뉴의 "설정 다시 읽기"를 누르면 적용됩니다.
 
 # 누르고 있는 동안 마우스를 움직이면 칸을 이동하는 버튼. 쉼표로 여러 개를 함께 쓸 수 있습니다.
 #   마우스: "xbutton1"(뒤로), "xbutton2"(앞으로), "middle"(휠 버튼)
@@ -69,9 +69,10 @@ impl Default for Config {
 fn dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
     let dir = base.join(APP_NAME);
-    let old = base.join(OLD_DIR);
-    if !dir.exists() && old.exists() {
-        let _ = fs::rename(old, &dir);
+    if !dir.exists() {
+        if let Some(old) = OLD_DIRS.iter().map(|name| base.join(name)).find(|old| old.exists()) {
+            let _ = fs::rename(old, &dir);
+        }
     }
     dir
 }

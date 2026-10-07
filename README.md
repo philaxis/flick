@@ -1,19 +1,18 @@
-# KanKan (칸칸) — 가상 데스크톱 2D 격자
+# Flick — 가상 데스크톱 2D 격자
+
+**Flick turns Windows 11 virtual desktops into a 2D grid.** Hold a button and flick the mouse to move between desktops; rows are workspaces. Free, open source (MIT), one small exe. · [Website](https://philaxis.github.io/flick/) · [Download](https://github.com/philaxis/flick/releases/latest/download/Flick.exe)
 
 윈도우 11의 가상 데스크톱을 일렬이 아닌 **2D 격자**로 쓰게 해 주는 상주 프로그램입니다.
 행은 워크스페이스, 그 안의 칸은 그 작업의 화면들입니다. 행마다 길이가 달라도 됩니다.
 
-> 이름은 임시입니다. `src/config.rs`의 `APP_NAME`, `Cargo.toml`의 `[[bin]] name`을 바꾸고
-> `python3 scripts/make-icon.py`를 다시 돌리면 전체가 바뀝니다.
-
 ## 설치
 
-`KanKan.exe`를 한 번 실행하면 스스로 설치하고 실행합니다.
+[Flick.exe](https://github.com/philaxis/flick/releases/latest/download/Flick.exe)를 받아 한 번 실행하면 스스로 설치하고 실행합니다.
 
-- 설치 위치: `%LOCALAPPDATA%\KanKan`
+- 설치 위치: `%LOCALAPPDATA%\Flick`
 - 시작 메뉴 바로가기, 윈도우 시작 시 자동 실행, "설치된 앱" 목록 등록
-- 제거: 설정 → 앱 → 설치된 앱 → KanKan → 제거 (또는 `KanKan.exe --uninstall`)
-- 설치 없이 그 자리에서 실행: `KanKan.exe --portable`
+- 제거: 설정 → 앱 → 설치된 앱 → Flick → 제거 (또는 `Flick.exe --uninstall`)
+- 설치 없이 그 자리에서 실행: `Flick.exe --portable`
 
 윈도우 11 23H2(22631.3085 이상) 전용입니다. 24H2는 `vendor/winvd`를 0.0.49 기준으로 올려야 합니다.
 
@@ -48,7 +47,7 @@
 
 ## 설정
 
-트레이 아이콘 우클릭 → "설정 파일 열기" (`%APPDATA%\KanKan\config.toml`), 저장 후 "설정 다시 읽기".
+트레이 아이콘 우클릭 → "설정 파일 열기" (`%APPDATA%\Flick\config.toml`), 저장 후 "설정 다시 읽기".
 
 | 항목 | 기본값 | 설명 |
 |---|---|---|
@@ -59,7 +58,7 @@
 | `hotkeys` | `true` | 키보드 단축키 사용 |
 | `sleep_after_minutes` | 0 | 이 시간 동안 안 간 행의 앱 메모리를 내보냄 (0 = 끔) |
 
-격자 배치는 `%APPDATA%\KanKan\state.json`, 오류 기록은 같은 폴더의 `log.txt`에 남습니다.
+격자 배치는 `%APPDATA%\Flick\state.json`, 오류 기록은 같은 폴더의 `log.txt`에 남습니다.
 
 ## 빌드
 
@@ -69,7 +68,7 @@ scripts/build-wsl.sh build --release   # WSL에서 (윈도우 쪽 MSVC·SDK 라�
 cargo test                         # 격자 규칙 테스트 (리눅스에서도 실행됨)
 ```
 
-결과물은 `target/x86_64-pc-windows-msvc/release/KanKan.exe` 하나입니다.
+결과물은 `target/x86_64-pc-windows-msvc/release/Flick.exe` 하나입니다.
 
 ## 구조
 
@@ -87,3 +86,7 @@ cargo test                         # 격자 규칙 테스트 (리눅스에서도
 | `examples/drive.rs` | 실행 중인 앱을 조작하고 화면을 캡처하는 점검 도구 |
 
 가상 데스크톱 전환은 윈도우의 비공식 인터페이스를 쓰므로, 윈도우 대규모 업데이트 뒤에는 `vendor/winvd`를 맞는 버전으로 바꿔야 할 수 있습니다.
+
+## 라이선스
+
+[MIT](LICENSE). `vendor/winvd`는 Jari Pennanen의 [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor)(MIT)에서 가져온 것입니다.
