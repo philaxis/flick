@@ -616,7 +616,7 @@ impl App {
     /// Carries out what the user asked for in the board.
     fn perform(&mut self, action: Action) {
         match action {
-            // These leave the grid and the windows as they are.
+            // These are done with here: no grid to commit, no board to rebuild.
             Action::None => return,
             Action::Dismiss => return self.board.close(),
             Action::Cancel => return self.cancel_board(),
