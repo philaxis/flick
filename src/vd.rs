@@ -1,7 +1,8 @@
 //! Thin layer over `winvd` plus the window bookkeeping the grid needs.
 
 use std::collections::{HashMap, HashSet};
-use windows::core::PWSTR;
+use windows::core::{w, HSTRING, PWSTR};
+use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::{
     Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE},
     Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
@@ -18,7 +19,7 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
-            EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
+            EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowPlacement, WINDOWPLACEMENT, GetWindowLongW,
             GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
             IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
         },
@@ -129,18 +130,23 @@ fn pinned_everywhere(hwnd: HWND) -> bool {
 }
 
 fn describe(hwnd: HWND, desktop: String) -> WindowInfo {
-    let rect = (!unsafe { IsIconic(hwnd) }.as_bool()).then(|| {
+    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    let rect = if minimized {
+        let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+        let _ = unsafe { GetWindowPlacement(hwnd, &mut placement) };
+        placement.rcNormalPosition
+    } else {
         dwm_attribute::<RECT>(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS).unwrap_or_else(|| {
             let mut rect = RECT::default();
             let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
             rect
         })
-    });
+    };
     let mut buffer = [0u16; 256];
     let len = unsafe { GetWindowTextW(hwnd, &mut buffer) }.max(0) as usize;
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    WindowInfo { hwnd, desktop, rect, title: String::from_utf16_lossy(&buffer[..len]), pid }
+    WindowInfo { hwnd, desktop, rect, minimized, title: String::from_utf16_lossy(&buffer[..len]), pid }
 }
 
 /// App windows shown on every desktop (pinned themselves or through their app).
@@ -152,17 +158,71 @@ pub fn pinned_windows() -> Vec<WindowInfo> {
         .collect()
 }
 
-/// File name of a process's executable, lower case ("chrome.exe").
-pub fn exe_name(pid: u32) -> Option<String> {
+/// Full path of a process's executable.
+fn exe_path(pid: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buffer = [0u16; 520];
         let mut len = buffer.len() as u32;
         let found = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut len).is_ok();
         let _ = CloseHandle(process);
-        let path = found.then(|| String::from_utf16_lossy(&buffer[..len as usize]))?;
-        Some(path.rsplit(['\\', '/']).next()?.to_lowercase())
+        found.then(|| String::from_utf16_lossy(&buffer[..len as usize]))
     }
+}
+
+/// File name of a process's executable, lower case ("chrome.exe").
+pub fn exe_name(pid: u32) -> Option<String> {
+    Some(exe_path(pid)?.rsplit(['\\', '/']).next()?.to_lowercase())
+}
+
+/// The description stored in an executable's version information, which is
+/// the app's name as people know it ("Windows Terminal", "Google Chrome").
+fn file_description(path: &str) -> Option<String> {
+    unsafe {
+        let path = HSTRING::from(path);
+        let size = GetFileVersionInfoSizeW(&path, None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        GetFileVersionInfoW(&path, 0, size, data.as_mut_ptr().cast()).ok()?;
+        let mut value = std::ptr::null_mut();
+        let mut len = 0u32;
+        // The strings are stored per language; take the first one listed.
+        if !VerQueryValueW(data.as_ptr().cast(), w!("\\VarFileInfo\\Translation"), &mut value, &mut len).as_bool() || len < 4 {
+            return None;
+        }
+        let pair = std::slice::from_raw_parts(value as *const u16, 2);
+        let key = HSTRING::from(format!("\\StringFileInfo\\{:04x}{:04x}\\FileDescription", pair[0], pair[1]));
+        if !VerQueryValueW(data.as_ptr().cast(), &key, &mut value, &mut len).as_bool() || len == 0 {
+            return None;
+        }
+        let text = std::slice::from_raw_parts(value as *const u16, len as usize);
+        let text = String::from_utf16_lossy(text).trim_end_matches('\0').trim().to_owned();
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+/// The app's display name for a process, or an empty string when the process
+/// is only a host for other apps' windows.
+pub fn app_label(pid: u32) -> String {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<String, String>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let Some(path) = exe_path(pid) else { return String::new() };
+    CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let file = path.rsplit(['\\', '/']).next().unwrap_or_default();
+                if file.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+                    return String::new();
+                }
+                file_description(&path).unwrap_or_else(|| file.trim_end_matches(".exe").to_owned())
+            })
+            .clone()
+    })
 }
 
 pub fn exe_of_window(hwnd: HWND) -> Option<String> {
@@ -175,8 +235,9 @@ pub struct WindowInfo {
     pub hwnd: HWND,
     /// Id of the desktop the window lives on.
     pub desktop: String,
-    /// Screen rectangle, `None` while minimized.
-    pub rect: Option<RECT>,
+    /// Screen rectangle; for a minimized window, where it will be restored to.
+    pub rect: RECT,
+    pub minimized: bool,
     pub title: String,
     pub pid: u32,
 }

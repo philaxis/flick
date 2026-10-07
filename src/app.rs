@@ -383,7 +383,7 @@ impl App {
                         pids.extend(here.iter().map(|w| w.pid));
                         let windows = here
                             .into_iter()
-                            .map(|w| WindowModel { follows: self.follows(&w), app: vd::exe_name(w.pid).unwrap_or_default(), hwnd: w.hwnd, rect: w.rect, title: w.title })
+                            .map(|w| WindowModel { follows: self.follows(&w), app: vd::exe_name(w.pid).unwrap_or_default(), app_name: vd::app_label(w.pid), hwnd: w.hwnd, rect: w.rect, minimized: w.minimized, title: w.title })
                             .collect();
                         CellModel { id: id.clone(), windows }
                     })
@@ -398,7 +398,7 @@ impl App {
             .collect();
         let pinned = vd::pinned_windows()
             .into_iter()
-            .map(|w| WindowModel { follows: false, app: vd::exe_name(w.pid).unwrap_or_default(), hwnd: w.hwnd, rect: w.rect, title: w.title })
+            .map(|w| WindowModel { follows: false, app: vd::exe_name(w.pid).unwrap_or_default(), app_name: vd::app_label(w.pid), hwnd: w.hwnd, rect: w.rect, minimized: w.minimized, title: w.title })
             .collect();
         Model { rows, pinned, current: desktops.current.clone() }
     }
@@ -512,8 +512,12 @@ impl App {
                     log(&format!("pin change failed: {e:?}"));
                 }
             }
-            Action::WindowMenu(hwnd) => {
-                self.pending_menu = Some((hwnd, self.pin_state(hwnd)));
+            Action::CloseWindow(hwnd) => {
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                    // The window needs a moment to go (or to ask about saving).
+                    SetTimer(self.hwnd, REFRESH_TIMER_ID, 500, None);
+                }
                 return;
             }
             Action::CloseRow(row) => {

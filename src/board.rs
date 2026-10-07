@@ -27,10 +27,11 @@ use windows::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
                 DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL,
                 DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
-                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                DWRITE_WORD_WRAPPING_NO_WRAP,
             },
             Dwm::{
-                DwmRegisterThumbnail, DwmUnregisterThumbnail,
+                DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
@@ -51,7 +52,7 @@ use windows::{
                 CreateWindowExW, DrawIconEx, GetClassLongPtrW, GetCursorPos, LoadCursorW, RegisterClassW, IDC_ARROW, SendMessageTimeoutW,
                 SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG,
                 SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON, WM_KEYDOWN,
-                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW,
+                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
@@ -60,11 +61,14 @@ use windows::{
 
 pub struct WindowModel {
     pub hwnd: HWND,
-    /// Screen rectangle, `None` while minimized.
-    pub rect: Option<RECT>,
+    /// Screen rectangle; for a minimized window, where it will be restored to.
+    pub rect: RECT,
+    pub minimized: bool,
     pub title: String,
     /// Executable name; windows of one app are counted together in the map.
     pub app: String,
+    /// The app's name as people know it; may be empty.
+    pub app_name: String,
     /// Follows the user from cell to cell inside its row.
     pub follows: bool,
 }
@@ -106,8 +110,8 @@ pub enum Action {
     AddCell(usize),
     AddRow,
     RemoveCell(CellId),
-    /// Show the pin menu for a window.
-    WindowMenu(HWND),
+    /// Ask a window to close.
+    CloseWindow(HWND),
     /// Set how one window is pinned: following within its row, shown on
     /// every desktop, or neither (never both).
     SetPin { window: HWND, row: bool, all: bool },
@@ -200,9 +204,10 @@ struct TileLayout {
     icon: Rect,
     title: Rect,
     thumb: Rect,
-    /// The two pin toggles at the right of the title bar.
-    pin_row: Rect,
-    pin_all: Rect,
+    /// The pin button (cycles off / workspace / everywhere) and the close
+    /// button at the right of the title bar.
+    pin: Rect,
+    close: Rect,
 }
 
 #[derive(Default)]
@@ -227,9 +232,9 @@ enum Hit {
     Window { cell: CellId, hwnd: isize },
     /// The cell's title bar or its bare background; the handle for dragging it.
     Cell(CellId),
-    /// The "follow within the row" / "on every desktop" toggle of a tile.
-    PinRow(isize),
-    PinAll(isize),
+    /// A tile's pin button and its close button.
+    Pin(isize),
+    TileClose(isize),
     CellClose(CellId),
     Plus(usize),
     AddRow,
@@ -253,6 +258,9 @@ struct Press {
 }
 
 struct Fonts {
+    /// A tile's window title and, above it, the smaller app name.
+    title: IDWriteTextFormat,
+    sub: IDWriteTextFormat,
     label: IDWriteTextFormat,
     small: IDWriteTextFormat,
     centered: IDWriteTextFormat,
@@ -483,11 +491,11 @@ impl Board {
 
     fn hit_test(&self, x: f32, y: f32) -> Hit {
         if let Some(tile) = self.layout.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
-            if contains(&tile.pin_row, x, y) {
-                return Hit::PinRow(tile.hwnd.0);
+            if contains(&tile.pin, x, y) {
+                return Hit::Pin(tile.hwnd.0);
             }
-            if contains(&tile.pin_all, x, y) {
-                return Hit::PinAll(tile.hwnd.0);
+            if contains(&tile.close, x, y) {
+                return Hit::TileClose(tile.hwnd.0);
             }
             return self.tile_hit(tile.hwnd);
         }
@@ -568,7 +576,7 @@ impl Board {
     /// Registers a live thumbnail for every tile.
     fn register_thumbnails(&mut self) {
         self.clear_thumbnails();
-        let wanted: Vec<HWND> = self.tile_windows().into_iter().filter(|(w, _)| w.rect.is_some()).map(|(w, _)| w.hwnd).collect();
+        let wanted: Vec<HWND> = self.tile_windows().into_iter().map(|(w, _)| w.hwnd).collect();
         for hwnd in wanted {
             if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
                 self.thumbs.push((hwnd.0, thumb, true));
@@ -610,7 +618,16 @@ impl Board {
                     props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - w / aspect / 2.0, w, w / aspect));
                     props.opacity = 215;
                 }
-                Some(tile) => props.rcDestination = to_rect(&tile.thumb),
+                Some(tile) => {
+                    props.rcDestination = to_rect(&tile.thumb);
+                    // A minimized window shows what it last looked like, faded.
+                    // (Without a kept picture the source is only a sliver.)
+                    if self.tile_windows().iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized) {
+                        props.opacity = 150;
+                        let kept = unsafe { DwmQueryThumbnailSourceSize(thumb) }.is_ok_and(|size| size.cy >= 80);
+                        props.fVisible = kept.into();
+                    }
+                }
                 None => props.fVisible = false.into(),
             }
             unsafe {
@@ -675,13 +692,6 @@ impl Board {
             WM_LBUTTONUP => {
                 let (x, y) = point();
                 self.mouse_up(x, y)
-            }
-            WM_RBUTTONUP => {
-                let (x, y) = point();
-                match self.hit_test(x, y) {
-                    Hit::Window { hwnd, .. } => Action::WindowMenu(HWND(hwnd)),
-                    _ => Action::None,
-                }
             }
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_CHAR => {
@@ -818,14 +828,18 @@ impl Board {
         match press.hit {
             Hit::Window { cell, hwnd } => Action::Go(cell, Some(HWND(hwnd))),
             Hit::Cell(id) => Action::Go(id, None),
-            Hit::PinRow(hwnd) | Hit::PinAll(hwnd) => {
+            Hit::Pin(hwnd) => {
                 let windows = self.tile_windows();
                 let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
-                // Each toggle turns itself on or off and always clears the other.
-                let row = matches!(press.hit, Hit::PinRow(_)) && !window.follows;
-                let all = matches!(press.hit, Hit::PinAll(_)) && !everywhere;
+                // Cycles: off -> within the workspace -> everywhere -> off.
+                let (row, all) = match (window.follows, *everywhere) {
+                    (false, false) => (true, false),
+                    (true, false) => (false, true),
+                    _ => (false, false),
+                };
                 Action::SetPin { window: HWND(hwnd), row, all }
             }
+            Hit::TileClose(hwnd) => Action::CloseWindow(HWND(hwnd)),
             Hit::CellClose(id) => Action::RemoveCell(id),
             Hit::Plus(row) => Action::AddCell(row),
             Hit::AddRow => Action::AddRow,
@@ -837,7 +851,9 @@ impl Board {
                 self.armed_row = Some(row);
                 Action::None
             }
-            Hit::RowName(_) | Hit::Nothing => Action::None,
+            Hit::RowName(_) => Action::None,
+            // A click on nothing dismisses the board, like Task View.
+            Hit::Nothing => Action::Cancel,
         }
     }
 
@@ -905,9 +921,19 @@ impl Board {
             let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
             let (w, h) = (self.size.0 as f32, self.size.1 as f32);
             let footer = rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s);
+            let pointed = match &self.hover {
+                Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
+                _ => None,
+            };
+            // The full title of the tile under the cursor, in case it was shortened.
+            let hovered = hovered.or_else(|| {
+                let windows = self.tile_windows();
+                let (window, _) = windows.iter().find(|(w, _)| Some(w.hwnd.0) == pointed)?;
+                Some(if window.app_name.is_empty() { window.title.clone() } else { format!("{}  —  {}", window.app_name, window.title) })
+            });
             let (line, alpha) = match &hovered {
                 Some(title) => (title.as_str(), 0.85),
-                None => ("창 클릭: 그 창으로 이동   ·   창을 아래 칸으로 끌기: 옮기기   ·   칸 클릭: 이동, 끌기: 재배치   ·   Esc: 닫기", 0.28),
+                None => ("창을 아래 칸으로 끌면 옮겨집니다   ·   칸을 끌면 재배치됩니다", 0.22),
             };
             let wide: Vec<u16> = line.encode_utf16().collect();
             brush.SetColor(&white(alpha));
@@ -952,18 +978,43 @@ impl Board {
                     let big = rect(cx - 20.0 * s, cy - 20.0 * s, 40.0 * s, 40.0 * s);
                     t.DrawBitmap(bitmap, Some(&big), 0.8 * dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                 }
-                text(&window.title, &fonts.small, &tile.title, white(if hot { 1.0 } else { 0.82 } * dim));
-
-                // Pin toggles: at most one of the two is on.
-                for (area, label, on, hit) in [
-                    (&tile.pin_row, "행 고정", window.follows, Hit::PinRow(tile.hwnd.0)),
-                    (&tile.pin_all, "전체 고정", *everywhere, Hit::PinAll(tile.hwnd.0)),
-                ] {
-                    let over = self.hover == hit;
-                    brush.SetColor(&if on { accent(dim) } else { white(if over { 0.20 } else { 0.07 } * dim) });
-                    t.FillRoundedRectangle(&rounded(area, 5.0 * s), &brush);
-                    text(label, &fonts.centered, area, white(if on || over { 1.0 } else { 0.50 } * dim));
+                if window.minimized {
+                    let note = Rect { top: tile.thumb.bottom - 26.0 * s, ..tile.thumb };
+                    text("최소화됨", &fonts.centered, &note, white(0.40 * dim));
                 }
+                // Two lines: the app, then what this window of it is about.
+                let width = tile.title.right - tile.title.left;
+                let title = display_title(&window.title, &window.app_name, (width / (7.4 * s)) as usize);
+                let bright = white(if hot { 1.0 } else { 0.88 } * dim);
+                if window.app_name.is_empty() || title.is_empty() || title.eq_ignore_ascii_case(&window.app_name) {
+                    let only = if title.is_empty() { &window.app_name } else { &title };
+                    text(only, &fonts.title, &tile.title, bright);
+                } else {
+                    let middle = (tile.title.top + tile.title.bottom) / 2.0;
+                    let upper = Rect { top: tile.title.top + 5.0 * s, bottom: middle, ..tile.title };
+                    let lower = Rect { top: middle - 2.0 * s, bottom: tile.title.bottom - 4.0 * s, ..tile.title };
+                    text(&window.app_name, &fonts.sub, &upper, white(0.50 * dim));
+                    text(&title, &fonts.title, &lower, bright);
+                }
+
+                // One pin button cycling through its three states.
+                let over = self.hover == Hit::Pin(tile.hwnd.0);
+                let (label, colour) = match (window.follows, *everywhere) {
+                    (_, true) => ("전체 고정", rgba(0.62, 0.45, 1.0, dim)),
+                    (true, _) => ("워크스페이스 고정", accent(dim)),
+                    _ => ("고정", white(if over { 0.20 } else { 0.07 } * dim)),
+                };
+                brush.SetColor(&colour);
+                t.FillRoundedRectangle(&rounded(&tile.pin, 5.0 * s), &brush);
+                let on = window.follows || *everywhere;
+                text(label, &fonts.centered, &tile.pin, white(if on || over { 1.0 } else { 0.50 } * dim));
+
+                let over = self.hover == Hit::TileClose(tile.hwnd.0);
+                if over {
+                    brush.SetColor(&danger(0.90));
+                    t.FillRoundedRectangle(&rounded(&tile.close, 5.0 * s), &brush);
+                }
+                text("✕", &fonts.centered, &tile.close, white(if over { 1.0 } else { 0.55 } * dim));
 
                 brush.SetColor(&if hot { accent(1.0) } else { white(0.10 * dim) });
                 t.DrawRoundedRectangle(&rounded(&grow(&tile.frame, 1.0 * s), 10.0 * s), &brush, if hot { 2.5 * s } else { 1.0 }, None);
@@ -1214,9 +1265,15 @@ fn make_fonts(scale: f32) -> Result<Fonts> {
             format.SetTextAlignment(alignment)?;
             format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            // Text that does not fit ends in an ellipsis instead of being cut.
+            let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+            let sign = factory.CreateEllipsisTrimmingSign(&format)?;
+            format.SetTrimming(&trimming, &sign)?;
             Ok(format)
         };
         Ok(Fonts {
+            title: make(13.5, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+            sub: make(11.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             label: make(15.0, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             small: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             centered: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
@@ -1286,6 +1343,27 @@ fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D
     }
 }
 
+/// What to show as a window's title next to its app's name: the part that
+/// tells this window from the app's others, shortened where it is long.
+fn display_title(title: &str, app: &str, max_chars: usize) -> String {
+    let mut title = title.trim();
+    // "Document - App" repeats the app line; keep the document.
+    if let Some((head, tail)) = title.rsplit_once(" - ") {
+        let (tail, app) = (tail.trim().to_lowercase(), app.to_lowercase());
+        if !head.trim().is_empty() && !app.is_empty() && (app.contains(&tail) || tail.contains(&app)) {
+            title = head.trim();
+        }
+    }
+    // The telling part of a path is its end, so cut paths at the front.
+    let count = title.chars().count();
+    let is_path = title.contains(":\\") || title.starts_with('/') || title.starts_with('~');
+    if is_path && max_chars > 4 && count > max_chars {
+        let tail: String = title.chars().skip(count - (max_chars - 1)).collect();
+        return format!("…{tail}");
+    }
+    title.to_owned()
+}
+
 /// Lays out the windows of one cell as rows of previews that keep each
 /// window's proportions, as large as fits (like Task View).
 fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<TileLayout> {
@@ -1294,14 +1372,14 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     }
     let aspects: Vec<f32> = windows
         .iter()
-        .map(|(w, _)| match w.rect {
-            // Not narrower than the title bar needs for the pin toggles.
-            Some(r) => ((r.right - r.left).max(1) as f32 / (r.bottom - r.top).max(1) as f32).clamp(0.9, 2.4),
-            None => 1.6,
+        .map(|(w, _)| {
+            // Not narrower than the title bar needs for its buttons.
+            let r = w.rect;
+            ((r.right - r.left).max(1) as f32 / (r.bottom - r.top).max(1) as f32).clamp(1.1, 2.4)
         })
         .collect();
     let (aw, ah) = (area.right - area.left, area.bottom - area.top);
-    let (title_h, gap) = (34.0 * s, 26.0 * s);
+    let (title_h, gap) = (46.0 * s, 26.0 * s);
     let total: f32 = aspects.iter().sum();
 
     // Try 1..4 rows and keep the split that gives the tallest previews.
@@ -1336,25 +1414,31 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     }
     let block = split.len() as f32 * (title_h + height) + (split.len() as f32 - 1.0) * gap;
     let mut y = area.top + (ah - block) / 2.0;
-    let icon = 18.0 * s;
+    let icon = 24.0 * s;
     let mut tiles = Vec::new();
     for row in &split {
         let width: f32 = row.iter().map(|i| aspects[*i] * height).sum::<f32>() + gap * (row.len() as f32 - 1.0);
         let mut x = area.left + (aw - width) / 2.0;
         for &i in row {
             let w = aspects[i] * height;
-            let (pin_w, all_w, pin_h) = (50.0 * s, 62.0 * s, 22.0 * s);
+            // The pin button is only as wide as its current label.
+            let pin_w = match (windows[i].0.follows, windows[i].1) {
+                (_, true) => 74.0,
+                (true, _) => 118.0,
+                _ => 46.0,
+            } * s;
+            let (close_w, pin_h) = (28.0 * s, 24.0 * s);
             let pin_y = y + (title_h - pin_h) / 2.0;
-            let pin_all = rect(x + w - 8.0 * s - all_w, pin_y, all_w, pin_h);
-            let pin_row = rect(pin_all.left - 6.0 * s - pin_w, pin_y, pin_w, pin_h);
+            let close = rect(x + w - 6.0 * s - close_w, pin_y, close_w, pin_h);
+            let pin = rect(close.left - 4.0 * s - pin_w, pin_y, pin_w, pin_h);
             tiles.push(TileLayout {
                 hwnd: windows[i].0.hwnd,
                 frame: rect(x, y, w, title_h + height),
                 icon: rect(x + 10.0 * s, y + (title_h - icon) / 2.0, icon, icon),
-                title: rect(x + 18.0 * s + icon, y, (pin_row.left - 8.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
+                title: rect(x + 18.0 * s + icon, y, (pin.left - 8.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
                 thumb: rect(x, y + title_h, w, height),
-                pin_row,
-                pin_all,
+                pin,
+                close,
             });
             x += w + gap;
         }
