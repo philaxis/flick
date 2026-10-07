@@ -4,47 +4,36 @@
 //! It is a click-through layered tool window (tool windows are shown on every
 //! virtual desktop) drawn with Direct2D into a premultiplied-alpha bitmap.
 
-use crate::grid::{Dir, Pos};
-use std::{ffi::c_void, time::Instant};
+use crate::{
+    grid::{Dir, Pos},
+    paint::{self, accent, rect, rgba, white, DcTarget, Dib, Painter},
+    vd,
+};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 use windows::{
-    core::{w, Result},
+    core::{w, Result, PCWSTR},
     Win32::{
-        Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
-            DirectWrite::{
-                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-                DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL,
-                DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
-            },
+            Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+            DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER},
             Dwm::DwmFlush,
-            Direct2D::{
-                Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F},
-                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
-            },
-            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{
-                CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetMonitorInfoW,
-                HMONITOR, MonitorFromPoint,
-                SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
-            },
+            Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION},
         },
         System::LibraryLoader::GetModuleHandleW,
-        UI::{
-            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
-            WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW, SetWindowPos,
-                ShowWindow, HWND_TOPMOST, MSG, PM_REMOVE,
-                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-                UpdateLayeredWindow, SW_HIDE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
-                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-            },
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW,
+            SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
 };
+
+const WINDOW_CLASS: PCWSTR = w!("flick.overlay");
 
 const CELL_W: f32 = 46.0;
 const CELL_H: f32 = 30.0;
@@ -56,8 +45,6 @@ const TITLE_H: f32 = 26.0;
 const SLIDE_TAU: f32 = 0.018;
 const FADE_TAU: f32 = 0.025;
 
-const ACCENT: (f32, f32, f32) = (0.34, 0.62, 1.0);
-
 /// What the minimap should show. `rows[r][c]` is true for a cell that was
 /// just created and is still empty.
 #[derive(Clone, Default)]
@@ -67,23 +54,67 @@ pub struct View {
     /// sideways so that these line up in one column.
     pub anchors: Vec<usize>,
     pub cur: Option<Pos>,
-    /// The user is pushing against this edge; one more push creates a cell.
+    /// The user is pushing against this edge; enough pushes create a cell.
     pub pushing: Option<Dir>,
     /// Name of the current workspace, shown under the grid.
     pub title: String,
 }
 
+impl View {
+    fn anchor(&self, row: usize) -> usize {
+        self.anchors.get(row).copied().unwrap_or(0)
+    }
+
+    /// Cells in front of the lined-up column.
+    fn lead(&self) -> usize {
+        (0..self.rows.len()).map(|r| self.anchor(r)).max().unwrap_or(0)
+    }
+
+    /// How far `row` is shifted right, in cells.
+    fn shift(&self, row: usize) -> f32 {
+        (self.lead() - self.anchor(row)) as f32
+    }
+
+    fn shifts(&self) -> Vec<f32> {
+        (0..self.rows.len()).map(|r| self.shift(r)).collect()
+    }
+
+    /// Width of the whole shifted grid, in cells.
+    fn columns(&self) -> usize {
+        let tail = self.rows.iter().enumerate().map(|(r, row)| row.len().saturating_sub(self.anchor(r))).max().unwrap_or(1);
+        (self.lead() + tail).max(1)
+    }
+}
+
+/// One hidden, click-through window; `Overlay::render` gives it its picture
+/// and its place.
+fn create_window() -> Result<HWND> {
+    unsafe {
+        Ok(CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WINDOW_CLASS,
+            w!("Flick"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            GetModuleHandleW(None)?,
+            None,
+        ))
+    }
+}
+
 pub struct Overlay {
     hwnd: HWND,
-    target: ID2D1DCRenderTarget,
+    target: DcTarget,
     /// Text format for the workspace name, made for `text_scale`.
     text: Option<IDWriteTextFormat>,
     text_scale: f32,
-    dc: HDC,
-    bitmap: HBITMAP,
-    stock: HGDIOBJ,
-    bits: *mut c_void,
-    size: (i32, i32),
+    /// The bitmap the minimap is drawn into, remade when its size changes.
+    canvas: Option<Dib>,
     view: View,
     /// Highlight position in (column, row) cell units, eased toward `view.cur`.
     /// The column is measured on screen, i.e. after the row's shift.
@@ -103,102 +134,36 @@ pub struct Overlay {
     others: Vec<(HWND, RECT)>,
 }
 
-fn color(rgb: (f32, f32, f32), a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r: rgb.0, g: rgb.1, b: rgb.2, a }
-}
-
-fn rounded(x: f32, y: f32, w: f32, h: f32, radius: f32) -> D2D1_ROUNDED_RECT {
-    D2D1_ROUNDED_RECT {
-        rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
-        radiusX: radius,
-        radiusY: radius,
-    }
-}
-
-impl View {
-    fn anchor(&self, row: usize) -> usize {
-        self.anchors.get(row).copied().unwrap_or(0)
-    }
-
-    /// Cells in front of the lined-up column.
-    fn lead(&self) -> usize {
-        (0..self.rows.len()).map(|r| self.anchor(r)).max().unwrap_or(0)
-    }
-
-    /// How far `row` is shifted right, in cells.
-    fn shift(&self, row: usize) -> f32 {
-        (self.lead() - self.anchor(row)) as f32
-    }
-
-    /// Width of the whole shifted grid, in cells.
-    fn columns(&self) -> usize {
-        let tail = self.rows.iter().enumerate().map(|(r, row)| row.len().saturating_sub(self.anchor(r))).max().unwrap_or(1);
-        (self.lead() + tail).max(1)
-    }
-}
-
 impl Overlay {
     pub fn new() -> Result<Overlay> {
         unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         unsafe {
-            let instance = GetModuleHandleW(None)?;
-            let class = w!("flick.overlay");
             RegisterClassW(&WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
-                hInstance: instance.into(),
-                lpszClassName: class,
+                hInstance: GetModuleHandleW(None)?.into(),
+                lpszClassName: WINDOW_CLASS,
                 ..Default::default()
             });
-            let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                class,
-                w!("Flick"),
-                WS_POPUP,
-                0,
-                0,
-                0,
-                0,
-                None,
-                None,
-                instance,
-                None,
-            );
-            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let target = factory.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 0.0,
-                dpiY: 0.0,
-                usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            })?;
-            Ok(Overlay {
-                hwnd,
-                target,
-                text: None,
-                text_scale: 0.0,
-                dc: CreateCompatibleDC(None),
-                bitmap: HBITMAP(0),
-                stock: HGDIOBJ(0),
-                bits: std::ptr::null_mut(),
-                size: (0, 0),
-                view: View::default(),
-                highlight: (0.0, 0.0),
-                shifts: Vec::new(),
-                alpha: 0.0,
-                visible: false,
-                hide_at: None,
-                last_tick: Instant::now(),
-                scale: 1.0,
-                monitor: RECT::default(),
-                others: Vec::new(),
-            })
         }
+        Ok(Overlay {
+            hwnd: create_window()?,
+            target: DcTarget::new(&paint::d2d_factory()?, D2D1_ALPHA_MODE_PREMULTIPLIED, 0.0)?,
+            text: None,
+            text_scale: 0.0,
+            canvas: None,
+            view: View::default(),
+            highlight: (0.0, 0.0),
+            shifts: Vec::new(),
+            alpha: 0.0,
+            visible: false,
+            hide_at: None,
+            last_tick: Instant::now(),
+            scale: 1.0,
+            monitor: RECT::default(),
+            others: Vec::new(),
+        })
     }
 
     pub fn is_visible(&self) -> bool {
@@ -212,7 +177,7 @@ impl Overlay {
         if !self.visible {
             self.place_on_monitors();
             let start = from.or(view.cur).unwrap_or(Pos { row: 0, col: 0 });
-            self.shifts = (0..view.rows.len()).map(|r| view.shift(r)).collect();
+            self.shifts = view.shifts();
             self.highlight = (start.col as f32 + view.shift(start.row), start.row as f32);
             self.visible = true;
             self.last_tick = Instant::now();
@@ -240,7 +205,7 @@ impl Overlay {
 
     pub fn hide_after(&mut self, ms: u64) {
         if self.visible {
-            self.hide_at = Some(Instant::now() + std::time::Duration::from_millis(ms));
+            self.hide_at = Some(Instant::now() + Duration::from_millis(ms));
         }
     }
 
@@ -281,56 +246,29 @@ impl Overlay {
     }
 
     /// Finds the monitors: the primary one sets the scale, and each of the
-    /// others gets a window of its own to show the minimap too.
+    /// others gets a window of its own to show the minimap too. The primary
+    /// monitor rather than the one under the cursor, so that the minimap is
+    /// the same on every screen wherever the cursor is.
     fn place_on_monitors(&mut self) {
-        unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> BOOL {
-            (*(out.0 as *mut Vec<HMONITOR>)).push(monitor);
-            true.into()
+        let monitors = vd::monitors();
+        if let Some(primary) = monitors.iter().find(|m| m.primary) {
+            self.monitor = primary.work;
+            self.scale = primary.scale;
         }
-        unsafe {
-            // The primary monitor rather than the one under the cursor: the
-            // minimap is the same on every screen, wherever the cursor is.
-            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let work_area = |monitor: HMONITOR| {
-                let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-                GetMonitorInfoW(monitor, &mut info).as_bool().then_some(info.rcWork)
-            };
-            if let Some(area) = work_area(monitor) {
-                self.monitor = area;
-            }
-            let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
-            let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
-            self.scale = dpi_x as f32 / 96.0;
-
-            let mut all: Vec<HMONITOR> = Vec::new();
-            EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut all as *mut _ as isize));
-            let areas: Vec<RECT> = all.into_iter().filter(|m| *m != monitor).filter_map(work_area).collect();
-            while self.others.len() > areas.len() {
-                if let Some((window, _)) = self.others.pop() {
+        let areas: Vec<RECT> = monitors.iter().filter(|m| !m.primary).map(|m| m.work).collect();
+        while self.others.len() > areas.len() {
+            if let Some((window, _)) = self.others.pop() {
+                unsafe {
                     let _ = DestroyWindow(window);
                 }
             }
-            while self.others.len() < areas.len() {
-                let Ok(instance) = GetModuleHandleW(None) else { break };
-                let window = CreateWindowExW(
-                    WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                    w!("flick.overlay"),
-                    w!("Flick"),
-                    WS_POPUP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    None,
-                    None,
-                    instance,
-                    None,
-                );
-                self.others.push((window, RECT::default()));
-            }
-            for ((_, area), new) in self.others.iter_mut().zip(areas) {
-                *area = new;
-            }
+        }
+        while self.others.len() < areas.len() {
+            let Ok(window) = create_window() else { break };
+            self.others.push((window, RECT::default()));
+        }
+        for ((_, area), new) in self.others.iter_mut().zip(areas) {
+            *area = new;
         }
     }
 
@@ -343,53 +281,33 @@ impl Overlay {
         ((w * self.scale).ceil() as i32, (h * self.scale).ceil() as i32)
     }
 
-    fn ensure_bitmap(&mut self, size: (i32, i32)) -> bool {
-        if size == self.size && self.bitmap.0 != 0 {
-            return true;
-        }
-        unsafe {
-            if self.bitmap.0 != 0 {
-                SelectObject(self.dc, self.stock);
-                DeleteObject(self.bitmap);
-                self.bitmap = HBITMAP(0);
-            }
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: size.0,
-                    biHeight: -size.1,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let Ok(bitmap) = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut self.bits, None, 0) else {
-                return false;
-            };
-            self.bitmap = bitmap;
-            self.stock = SelectObject(self.dc, bitmap);
-            self.size = size;
-        }
-        true
-    }
-
-    fn render(&mut self) {
+    /// Draws the minimap as it is now into the canvas, which is remade when
+    /// the size it needs has changed. `None` when that failed.
+    fn draw_to_canvas(&mut self) -> Option<&Dib> {
         if self.text.is_none() || self.text_scale != self.scale {
-            self.text = make_text_format(self.scale).ok();
+            self.text = text_format(self.scale).ok();
             self.text_scale = self.scale;
         }
         let size = self.wanted_size();
-        if !self.ensure_bitmap(size) || self.draw().is_err() {
-            return;
+        if !self.canvas.as_ref().is_some_and(|canvas| canvas.size == size) {
+            self.canvas = Dib::new(size).ok();
         }
+        let canvas = self.canvas.as_ref()?;
+        self.draw(canvas).ok()?;
+        Some(canvas)
+    }
+
+    /// Redraws the minimap and hands the picture to its windows.
+    fn render(&mut self) {
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
             SourceConstantAlpha: (self.alpha.clamp(0.0, 1.0) * 255.0) as u8,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        let windows = std::iter::once((self.hwnd, self.monitor)).chain(self.others.iter().copied());
+        let windows: Vec<(HWND, RECT)> = std::iter::once((self.hwnd, self.monitor)).chain(self.others.iter().copied()).collect();
+        let Some(canvas) = self.draw_to_canvas() else { return };
+        let size = canvas.size;
         for (window, area) in windows {
             // Centred on each monitor.
             let origin = POINT { x: (area.left + area.right - size.0) / 2, y: (area.top + area.bottom - size.1) / 2 };
@@ -399,7 +317,7 @@ impl Overlay {
                     None,
                     Some(&origin),
                     Some(&SIZE { cx: size.0, cy: size.1 }),
-                    self.dc,
+                    canvas.dc,
                     Some(&POINT::default()),
                     COLORREF(0),
                     Some(&blend),
@@ -409,124 +327,85 @@ impl Overlay {
         }
     }
 
-    fn draw(&self) -> Result<()> {
+    fn draw(&self, canvas: &Dib) -> Result<()> {
         let s = self.scale;
-        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        let (w, h) = (canvas.size.0 as f32, canvas.size.1 as f32);
         let cell_x = |col: f32| (PAD + col * (CELL_W + GAP)) * s;
         let cell_y = |row: f32| (PAD + row * (CELL_H + GAP)) * s;
         let (cw, ch, radius) = (CELL_W * s, CELL_H * s, 7.0 * s);
-        const WHITE: (f32, f32, f32) = (1.0, 1.0, 1.0);
 
+        self.target.bind(canvas)?;
+        let target = &self.target.target;
         unsafe {
-            let t = &self.target;
-            t.BindDC(self.dc, &RECT { left: 0, top: 0, right: self.size.0, bottom: self.size.1 })?;
-            t.BeginDraw();
-            t.Clear(Some(&color((0.0, 0.0, 0.0), 0.0)));
-            let brush = t.CreateSolidColorBrush(&color(WHITE, 1.0), None)?;
-            let fill = |shape: &D2D1_ROUNDED_RECT, c: D2D1_COLOR_F| {
-                brush.SetColor(&c);
-                t.FillRoundedRectangle(shape, &brush);
-            };
-
-            // Panel with a hairline border.
-            fill(&rounded(0.5, 0.5, w - 1.0, h - 1.0, 16.0 * s), color((0.075, 0.08, 0.095), 0.86));
-            brush.SetColor(&color(WHITE, 0.10));
-            t.DrawRoundedRectangle(&rounded(0.5, 0.5, w - 1.0, h - 1.0, 16.0 * s), &brush, 1.0, None);
-
-            let cur = self.view.cur;
-            for (r, row) in self.view.rows.iter().enumerate() {
-                let in_current_row = cur.is_some_and(|c| c.row == r);
-                let shift = self.shifts.get(r).copied().unwrap_or_else(|| self.view.shift(r));
-                for (c, &fresh) in row.iter().enumerate() {
-                    let shape = rounded(cell_x(c as f32 + shift), cell_y(r as f32), cw, ch, radius);
-                    if fresh {
-                        // A cell that will vanish again if left empty: outline only.
-                        brush.SetColor(&color(WHITE, 0.30));
-                        t.DrawRoundedRectangle(&shape, &brush, 1.2 * s, None);
-                    } else {
-                        fill(&shape, color(WHITE, if in_current_row { 0.17 } else { 0.08 }));
-                    }
-                }
-            }
-
-            if cur.is_some() {
-                let (x, y) = (cell_x(self.highlight.0), cell_y(self.highlight.1));
-                for (grow, a) in [(5.0, 0.07), (3.0, 0.12), (1.5, 0.20)] {
-                    let g = grow * s;
-                    fill(&rounded(x - g, y - g, cw + 2.0 * g, ch + 2.0 * g, radius + g), color(ACCENT, a));
-                }
-                fill(&rounded(x, y, cw, ch, radius), color(ACCENT, 1.0));
-
-                // Pushing against an edge: a bar on that side of the current cell.
-                if let Some(dir) = self.view.pushing {
-                    let (bar, off) = (4.0 * s, 8.0 * s);
-                    let shape = match dir {
-                        Dir::Left => rounded(x - off - bar, y + ch * 0.2, bar, ch * 0.6, bar / 2.0),
-                        Dir::Right => rounded(x + cw + off, y + ch * 0.2, bar, ch * 0.6, bar / 2.0),
-                        Dir::Up => rounded(x + cw * 0.25, y - off - bar, cw * 0.5, bar, bar / 2.0),
-                        Dir::Down => rounded(x + cw * 0.25, y + ch + off, cw * 0.5, bar, bar / 2.0),
-                    };
-                    fill(&shape, color(ACCENT, 0.95));
-                }
-            }
-            if let (Some(format), false) = (&self.text, self.view.title.is_empty()) {
-                let area = D2D_RECT_F { left: PAD * s, top: h - (PAD * 0.55 + TITLE_H) * s, right: w - PAD * s, bottom: h - PAD * 0.55 * s };
-                let wide: Vec<u16> = self.view.title.encode_utf16().collect();
-                brush.SetColor(&color(WHITE, 0.88));
-                t.DrawText(&wide, format, &area, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-            }
-            t.EndDraw(None, None)
+            target.BeginDraw();
+            target.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
         }
+        let p = Painter::new(target)?;
+
+        // Panel with a hairline border.
+        let panel = rect(0.5, 0.5, w - 1.0, h - 1.0);
+        p.fill(&panel, 16.0 * s, rgba(0.075, 0.08, 0.095, 0.86));
+        p.stroke(&panel, 16.0 * s, 1.0, white(0.10));
+
+        let cur = self.view.cur;
+        for (r, row) in self.view.rows.iter().enumerate() {
+            let in_current_row = cur.is_some_and(|c| c.row == r);
+            let shift = self.shifts.get(r).copied().unwrap_or_else(|| self.view.shift(r));
+            for (c, &fresh) in row.iter().enumerate() {
+                let cell = rect(cell_x(c as f32 + shift), cell_y(r as f32), cw, ch);
+                if fresh {
+                    // A cell that will vanish again if left empty: outline only.
+                    p.stroke(&cell, radius, 1.2 * s, white(0.30));
+                } else {
+                    p.fill(&cell, radius, white(if in_current_row { 0.17 } else { 0.08 }));
+                }
+            }
+        }
+
+        if cur.is_some() {
+            let (x, y) = (cell_x(self.highlight.0), cell_y(self.highlight.1));
+            for (grow, a) in [(5.0, 0.07), (3.0, 0.12), (1.5, 0.20)] {
+                let g = grow * s;
+                p.fill(&rect(x - g, y - g, cw + 2.0 * g, ch + 2.0 * g), radius + g, accent(a));
+            }
+            p.fill(&rect(x, y, cw, ch), radius, accent(1.0));
+
+            // Pushing against an edge: a bar on that side of the current cell.
+            if let Some(dir) = self.view.pushing {
+                let (bar, off) = (4.0 * s, 8.0 * s);
+                let shape = match dir {
+                    Dir::Left => rect(x - off - bar, y + ch * 0.2, bar, ch * 0.6),
+                    Dir::Right => rect(x + cw + off, y + ch * 0.2, bar, ch * 0.6),
+                    Dir::Up => rect(x + cw * 0.25, y - off - bar, cw * 0.5, bar),
+                    Dir::Down => rect(x + cw * 0.25, y + ch + off, cw * 0.5, bar),
+                };
+                p.fill(&shape, bar / 2.0, accent(0.95));
+            }
+        }
+        if let (Some(format), false) = (&self.text, self.view.title.is_empty()) {
+            let bottom = h - PAD * 0.55 * s;
+            let area = paint::Rect { left: PAD * s, top: h - (PAD * 0.55 + TITLE_H) * s, right: w - PAD * s, bottom };
+            p.text(&self.view.title, format, &area, white(0.88));
+        }
+        unsafe { target.EndDraw(None, None) }
     }
 
-    /// Draws `view` at full opacity and returns the premultiplied BGRA pixels,
-    /// for checking the design without showing a window.
-    pub fn render_to_pixels(&mut self, view: View, highlight: (f32, f32), scale: f32) -> Option<(i32, i32, Vec<u8>)> {
-        self.shifts = (0..view.rows.len()).map(|r| view.shift(r)).collect();
+    /// Draws `view` at full opacity and returns the size and the
+    /// premultiplied BGRA pixels, for checking the design without showing a
+    /// window. `highlight` is in (column, row) cell units, the column counted
+    /// within its row.
+    pub fn render_to_pixels(&mut self, view: View, highlight: (f32, f32), scale: f32) -> Option<((i32, i32), Vec<u8>)> {
+        self.shifts = view.shifts();
         self.highlight = (highlight.0 + view.shift(highlight.1 as usize), highlight.1);
         self.view = view;
         self.scale = scale;
-        self.text = make_text_format(scale).ok();
-        self.text_scale = scale;
-        let size = self.wanted_size();
-        if !self.ensure_bitmap(size) || self.draw().is_err() {
-            return None;
-        }
-        let len = (size.0 * size.1 * 4) as usize;
-        let pixels = unsafe { std::slice::from_raw_parts(self.bits as *const u8, len) }.to_vec();
-        Some((size.0, size.1, pixels))
+        let canvas = self.draw_to_canvas()?;
+        Some((canvas.size, canvas.pixels().to_vec()))
     }
 }
 
-impl Drop for Overlay {
-    fn drop(&mut self) {
-        unsafe {
-            if self.bitmap.0 != 0 {
-                SelectObject(self.dc, self.stock);
-                DeleteObject(self.bitmap);
-            }
-            DeleteDC(self.dc);
-        }
-    }
-}
-
-fn make_text_format(scale: f32) -> Result<IDWriteTextFormat> {
-    unsafe {
-        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-        let format = factory.CreateTextFormat(
-            w!("Segoe UI"),
-            None,
-            DWRITE_FONT_WEIGHT(600),
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            13.0 * scale,
-            w!("ko-kr"),
-        )?;
-        format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-        Ok(format)
-    }
+fn text_format(scale: f32) -> Result<IDWriteTextFormat> {
+    paint::text_format(&paint::dwrite_factory()?, 13.0 * scale, 600, DWRITE_TEXT_ALIGNMENT_CENTER)
 }
 
 /// What the app asks of the minimap.
@@ -541,12 +420,12 @@ enum Request {
 /// highlight moved in jerks. Here it is redrawn once per screen refresh no
 /// matter what the app is doing.
 pub struct Minimap {
-    requests: std::sync::mpsc::Sender<Request>,
+    requests: mpsc::Sender<Request>,
 }
 
 impl Minimap {
     pub fn spawn() -> Minimap {
-        let (requests, inbox) = std::sync::mpsc::channel::<Request>();
+        let (requests, inbox) = mpsc::channel::<Request>();
         std::thread::spawn(move || {
             let Ok(mut overlay) = Overlay::new() else { return };
             let apply = |overlay: &mut Overlay, request: Request| match request {
@@ -574,7 +453,7 @@ impl Minimap {
                         overlay.tick();
                         // Wait for the next refresh of the screen.
                         if DwmFlush().is_err() {
-                            std::thread::sleep(std::time::Duration::from_millis(8));
+                            std::thread::sleep(Duration::from_millis(8));
                         }
                     }
                 }

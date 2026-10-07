@@ -5,32 +5,27 @@
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
 //! not touch desktops itself; input is turned into an `Action` for the app.
 
-use crate::grid::{CellId, Dir, Grid};
+use crate::{
+    grid::{self, CellId, Dir, Grid, Row},
+    paint::{self, accent, rect, rgba, white, DcTarget, Dib, Painter, Rect},
+    vd,
+};
 use std::collections::HashMap;
 use windows::{
-    core::{w, ComInterface, Result},
+    core::{w, Result},
     Foundation::Numerics::Matrix3x2,
     Win32::{
-        Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
-                    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
-                    D2D_RECT_F, D2D_SIZE_U,
+                    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
                 },
-                D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-                D2D1_RENDER_TARGET_PROPERTIES,
-                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
-                D2D1_ROUNDED_RECT,
+                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_PROPERTIES,
             },
             DirectWrite::{
-                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-                DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL,
-                DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER,
-                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                DWRITE_WORD_WRAPPING_NO_WRAP,
+                IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             },
             Dwm::{
                 DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
@@ -38,22 +33,16 @@ use windows::{
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{
-                BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-                GetMonitorInfoW, HMONITOR,
-                InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, ValidateRect, BITMAPINFO, BITMAPINFOHEADER,
-                DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
-            },
+            Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::{
                 ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, IDC_ARROW, SendMessageTimeoutW,
-                SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG,
+                CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
+                SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG, IDC_ARROW,
                 SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON, WM_KEYDOWN,
                 WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -98,6 +87,16 @@ pub struct Model {
     pub current: CellId,
 }
 
+impl Model {
+    fn cell_count(&self) -> usize {
+        self.rows.iter().map(|row| row.cells.len()).sum()
+    }
+
+    fn cell(&self, id: &str) -> Option<&CellModel> {
+        self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)
+    }
+}
+
 /// What the user asked for; carried out by the app.
 pub enum Action {
     None,
@@ -105,7 +104,8 @@ pub enum Action {
     Cancel,
     /// The board lost focus; close without touching focus.
     Dismiss,
-    /// Switch to a cell and close; optionally focus one of its windows.
+    /// Switch to a cell and close; optionally focus one of its windows. An
+    /// empty id (a window shown on every desktop) stays on the current cell.
     Go(CellId, Option<HWND>),
     /// Move a window to another cell, another monitor (given in screen
     /// coordinates), or both.
@@ -127,37 +127,23 @@ pub enum Action {
     Rename(usize, String),
 }
 
-type Rect = D2D_RECT_F;
-
 /// Height of the hint line at the bottom, in unscaled units.
 const FOOTER: f32 = 44.0;
 
-fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
-    Rect { left: x, top: y, right: x + w, bottom: y + h }
-}
-
 fn contains(r: &Rect, x: f32, y: f32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
-}
-
-fn rounded(r: &Rect, radius: f32) -> D2D1_ROUNDED_RECT {
-    D2D1_ROUNDED_RECT { rect: *r, radiusX: radius, radiusY: radius }
 }
 
 fn grow(r: &Rect, by: f32) -> Rect {
     Rect { left: r.left - by, top: r.top - by, right: r.right + by, bottom: r.bottom + by }
 }
 
-fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F { r, g, b, a }
+fn size(r: &Rect) -> (f32, f32) {
+    (r.right - r.left, r.bottom - r.top)
 }
 
-fn white(a: f32) -> D2D1_COLOR_F {
-    rgba(1.0, 1.0, 1.0, a)
-}
-
-fn accent(a: f32) -> D2D1_COLOR_F {
-    rgba(0.34, 0.62, 1.0, a)
+fn centre(r: &Rect) -> (f32, f32) {
+    ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0)
 }
 
 fn danger(a: f32) -> D2D1_COLOR_F {
@@ -170,6 +156,44 @@ fn format_memory(bytes: u64) -> String {
         format!("≈ {:.1} GB", mb / 1024.0)
     } else {
         format!("≈ {mb:.0} MB")
+    }
+}
+
+/// How a window is pinned, as the one pin button of its tile shows it.
+/// Clicking the button goes on to the next state.
+#[derive(Clone, Copy, PartialEq)]
+enum Pin {
+    Off,
+    /// Follows the user within its workspace.
+    Row,
+    /// Shown on every desktop.
+    Everywhere,
+}
+
+impl Pin {
+    fn of(window: &WindowModel, everywhere: bool) -> Pin {
+        match (window.follows, everywhere) {
+            (_, true) => Pin::Everywhere,
+            (true, _) => Pin::Row,
+            _ => Pin::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Pin::Off => "고정",
+            Pin::Row => "워크스페이스 고정",
+            Pin::Everywhere => "전체 고정",
+        }
+    }
+
+    /// Width of the button, which is only as wide as its label, unscaled.
+    fn width(self) -> f32 {
+        match self {
+            Pin::Off => 46.0,
+            Pin::Row => 118.0,
+            Pin::Everywhere => 74.0,
+        }
     }
 }
 
@@ -212,20 +236,15 @@ struct TileLayout {
     icon: Rect,
     title: Rect,
     thumb: Rect,
-    /// The pin button (cycles off / workspace / everywhere) and the close
-    /// button at the right of the title bar.
+    /// The pin button and the close button at the right of the title bar.
     pin: Rect,
     close: Rect,
 }
 
+/// The map of all rows and cells, in the coordinates of the monitor it is on.
 #[derive(Default)]
-struct Layout {
-    /// The selected cell's windows, the main content of the board.
-    tiles: Vec<TileLayout>,
-    tiles_area: Rect,
-    tiles_label: Rect,
-    /// Top edge of the map at the bottom of the board.
-    map_top: f32,
+struct MapLayout {
+    top: f32,
     /// The column on which every row's landing cell is lined up.
     spine: Rect,
     rows: Vec<RowLayout>,
@@ -234,13 +253,22 @@ struct Layout {
     add_row_top: Rect,
 }
 
+/// The map as laid out for one monitor.
+#[derive(Default)]
+struct Map {
+    /// Index of the monitor in `Board::monitors`, and its rectangle there.
+    monitor: usize,
+    area: Rect,
+    layout: MapLayout,
+}
+
 #[derive(Clone, PartialEq, Default)]
 enum Hit {
     #[default]
     Nothing,
-    /// `cell` is empty for a window pinned to every desktop.
+    /// A tile. `cell` is empty for a window pinned to every desktop.
     Window { cell: CellId, hwnd: isize },
-    /// The cell's title bar or its bare background; the handle for dragging it.
+    /// A cell of the map; also the handle for dragging it.
     Cell(CellId),
     /// A tile's pin button and its close button.
     Pin(isize),
@@ -289,9 +317,15 @@ pub struct Board {
     /// does not disturb the real per-row memory until a cell is chosen.
     nav: Grid,
     selected: CellId,
-    layout: Layout,
-    /// The map again on every other monitor: (monitor index, its layout).
-    other_maps: Vec<(usize, Layout)>,
+    /// The selected cell's windows, the main content of the board, in the
+    /// board window's coordinates.
+    tiles: Vec<TileLayout>,
+    /// Where the home monitor's tiles go; says so when there are none.
+    tiles_area: Rect,
+    /// Where the selected cell is named, in the home monitor's coordinates.
+    label: Rect,
+    /// The map on every monitor, the home monitor's first. Never empty.
+    maps: Vec<Map>,
     size: (i32, i32),
     scale: f32,
     /// (source window, thumbnail handle) of every tile, in stacking order.
@@ -345,15 +379,17 @@ impl Board {
             );
             Ok(Board {
                 hwnd,
-                factory: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
+                factory: paint::d2d_factory()?,
                 canvas: None,
                 fonts: None,
                 open: false,
                 model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new() },
                 nav: Grid::default(),
                 selected: String::new(),
-                layout: Layout::default(),
-                other_maps: Vec::new(),
+                tiles: Vec::new(),
+                tiles_area: Rect::default(),
+                label: Rect::default(),
+                maps: vec![Map::default()],
                 size: (0, 0),
                 scale: 1.0,
                 thumbs: Vec::new(),
@@ -378,13 +414,13 @@ impl Board {
         self.open
     }
 
-    /// A workspace's label for its menu: name, memory estimate, window count.
+    /// A workspace's label for its menu: name, then window count and memory
+    /// estimate.
     pub fn row_summary(&self, row: usize) -> Option<(String, String)> {
         let model = self.model.rows.get(row)?;
-        let name = if model.name.is_empty() { format!("워크스페이스 {}", row + 1) } else { model.name.clone() };
         let windows: usize = model.cells.iter().map(|c| c.windows.len()).sum();
         let asleep = if model.asleep { ", 재움" } else { "" };
-        Some((name, format!("창 {windows}개, {}{asleep}", format_memory(model.memory))))
+        Some((grid::row_title(&model.name, row), format!("창 {windows}개, {}{asleep}", format_memory(model.memory))))
     }
 
     pub fn set_modal(&mut self, modal: bool) {
@@ -397,52 +433,36 @@ impl Board {
 
     /// Covers every monitor and shows `model`.
     pub fn open(&mut self, model: Model, grid: Grid) {
-        unsafe extern "system" fn collect(_: HMONITOR, _: HDC, area: *mut RECT, out: LPARAM) -> BOOL {
-            (*(out.0 as *mut Vec<RECT>)).push(*area);
-            true.into()
+        let monitors = vd::monitors();
+        // Home is the primary monitor rather than the one under the cursor,
+        // so the board looks the same wherever the cursor is.
+        let Some(home) = monitors.iter().find(|m| m.primary) else { return };
+        // One window over every monitor, so no screen is left showing the
+        // desktop while the board is up.
+        let bounds = || monitors.iter().map(|m| m.bounds);
+        let (left, top) = (bounds().map(|r| r.left).min().unwrap_or(0), bounds().map(|r| r.top).min().unwrap_or(0));
+        let (right, bottom) = (bounds().map(|r| r.right).max().unwrap_or(0), bounds().map(|r| r.bottom).max().unwrap_or(0));
+        let local = |r: &RECT| Rect {
+            left: (r.left - left) as f32,
+            top: (r.top - top) as f32,
+            right: (r.right - left) as f32,
+            bottom: (r.bottom - top) as f32,
+        };
+        self.monitors = monitors.iter().map(|m| local(&m.bounds)).collect();
+        self.home = local(&home.bounds);
+        if self.scale != home.scale {
+            self.fonts = None;
         }
+        self.scale = home.scale;
+        self.size = (right - left, bottom - top);
+        self.origin = (left, top);
+        self.selected = model.current.clone();
+        self.hover = Hit::Nothing;
+        self.press = None;
+        self.editing = None;
+        self.open = true;
         unsafe {
-            // Home is the primary monitor rather than the one under the
-            // cursor, so the board looks the same wherever the cursor is.
-            let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
-            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-                return;
-            }
-            let (mut dpi, mut dpi_y) = (96u32, 96u32);
-            let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
-            let mut screens: Vec<RECT> = Vec::new();
-            EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut screens as *mut _ as isize));
-            if screens.is_empty() {
-                screens.push(info.rcMonitor);
-            }
-            // One window over every monitor, so no screen is left showing
-            // the desktop while the board is up.
-            let left = screens.iter().map(|r| r.left).min().unwrap_or(0);
-            let top = screens.iter().map(|r| r.top).min().unwrap_or(0);
-            let right = screens.iter().map(|r| r.right).max().unwrap_or(0);
-            let bottom = screens.iter().map(|r| r.bottom).max().unwrap_or(0);
-            let local = |r: &RECT| Rect {
-                left: (r.left - left) as f32,
-                top: (r.top - top) as f32,
-                right: (r.right - left) as f32,
-                bottom: (r.bottom - top) as f32,
-            };
-            self.monitors = screens.iter().map(local).collect();
-            self.home = local(&info.rcMonitor);
-            let size = (right - left, bottom - top);
-            if self.scale != dpi as f32 / 96.0 {
-                self.fonts = None;
-            }
-            self.scale = dpi as f32 / 96.0;
-            self.size = size;
-            self.origin = (left, top);
-            self.selected = model.current.clone();
-            self.hover = Hit::Nothing;
-            self.press = None;
-            self.editing = None;
-            self.open = true;
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, size.0, size.1, SWP_SHOWWINDOW);
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_SHOWWINDOW);
         }
         self.set_model(model, grid);
     }
@@ -501,20 +521,20 @@ impl Board {
 
     // ---- layout -----------------------------------------------------------
 
-    fn selected_cell(&self) -> Option<&CellModel> {
-        self.model.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected)
-    }
-
     /// The windows shown as tiles: those of the selected cell and the ones
     /// pinned to every desktop (flagged), which are visible there as well.
     /// Their order depends only on what the windows are (app, then the
     /// window's handle), never on which was used last, so the same windows
     /// always appear in the same places.
     fn tile_windows(&self) -> Vec<(&WindowModel, bool)> {
-        let cell = self.selected_cell().into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
+        let cell = self.model.cell(&self.selected).into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
         let mut windows: Vec<(&WindowModel, bool)> = cell.chain(self.model.pinned.iter().map(|w| (w, true))).collect();
         windows.sort_by_cached_key(|(w, _)| (w.app_name.to_lowercase(), w.app.clone(), w.hwnd.0));
         windows
+    }
+
+    fn home_index(&self) -> usize {
+        self.monitors.iter().position(|m| *m == self.home).unwrap_or(0)
     }
 
     /// Index of the monitor a window is on (by its centre), the home monitor
@@ -523,79 +543,66 @@ impl Board {
         let r = window.rect;
         let x = ((r.left + r.right) / 2 - self.origin.0) as f32;
         let y = ((r.top + r.bottom) / 2 - self.origin.1) as f32;
-        let home = self.monitors.iter().position(|m| *m == self.home).unwrap_or(0);
-        self.monitors.iter().position(|m| contains(m, x, y)).unwrap_or(home)
+        self.monitors.iter().position(|m| contains(m, x, y)).unwrap_or_else(|| self.home_index())
     }
 
+    /// A monitor's rectangle in screen coordinates.
+    fn monitor_on_screen(&self, monitor: usize) -> Option<RECT> {
+        let m = self.monitors.get(monitor)?;
+        Some(RECT {
+            left: m.left as i32 + self.origin.0,
+            top: m.top as i32 + self.origin.1,
+            right: m.right as i32 + self.origin.0,
+            bottom: m.bottom as i32 + self.origin.1,
+        })
+    }
+
+    /// Lays out every monitor: the map at its bottom, so that a window can be
+    /// dropped on a cell on the very monitor it should appear on, and above
+    /// it the tiles of the windows that are on that monitor.
     fn relayout(&mut self) {
+        if self.monitors.is_empty() {
+            return;
+        }
         let s = self.scale;
-        let (w, h) = (self.home.right - self.home.left, self.home.bottom - self.home.top);
-        // Each row is shifted so that the cell a vertical move would land on
-        // (the one it was last left on) sits in the same column for all rows.
-        let anchors: Vec<usize> = self
-            .model
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(r, row)| {
-                let last = self.nav.rows.get(r).and_then(|nav| nav.last.as_ref());
-                last.and_then(|id| row.cells.iter().position(|cell| cell.id == *id)).unwrap_or(0)
-            })
-            .collect();
-        // The map and the label are laid out inside the home monitor (and
-        // drawn shifted to it); the tiles are placed in window coordinates,
-        // each on the monitor its window is on.
-        let mut layout = compute_layout(&self.model, &anchors, (w, h - FOOTER * s), s);
         let margin = 40.0 * s;
-        layout.tiles_label = rect(margin, 22.0 * s, w - 2.0 * margin, 30.0 * s);
+        // Each row is shifted so that the cell a vertical move would land on
+        // sits in the same column for all rows.
+        let anchors: Vec<usize> = self.nav.rows.iter().map(Row::anchor).collect();
         let windows = self.tile_windows();
         let mut tiles = Vec::new();
-        let mut other_maps = Vec::new();
+        let mut tiles_area = Rect::default();
+        let mut maps = Vec::new();
         for (m, monitor) in self.monitors.iter().enumerate() {
             let is_home = *monitor == self.home;
-            // Every monitor has the map at its bottom, so a window can be
-            // dropped on a cell on the very monitor it should appear on.
-            let map_top = if is_home {
-                layout.map_top
-            } else {
-                let size = (monitor.right - monitor.left, monitor.bottom - monitor.top - FOOTER * s);
-                let map = compute_layout(&self.model, &anchors, size, s);
-                let top = map.map_top;
-                other_maps.push((m, map));
-                top
-            };
+            let (w, h) = size(monitor);
+            let layout = layout_map(&self.model, &anchors, (w, h - FOOTER * s), s);
+            // The home monitor has the cell's label above its tiles.
             let area = Rect {
                 left: monitor.left + margin,
                 top: monitor.top + if is_home { 64.0 * s } else { margin },
                 right: monitor.right - margin,
-                bottom: monitor.top + map_top - 26.0 * s,
+                bottom: monitor.top + layout.top - 26.0 * s,
             };
             if is_home {
-                layout.tiles_area = area;
+                tiles_area = area;
             }
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
             tiles.extend(layout_tiles(&here, &area, s));
+            maps.push(Map { monitor: m, area: *monitor, layout });
         }
-        layout.tiles = tiles;
-        self.layout = layout;
-        self.other_maps = other_maps;
-    }
-
-    /// The map on each monitor: (monitor index, monitor rectangle, layout in
-    /// that monitor's own coordinates), the home monitor first.
-    fn maps(&self) -> Vec<(usize, Rect, &Layout)> {
-        let home = self.monitors.iter().position(|m| *m == self.home).unwrap_or(0);
-        let mut maps = vec![(home, self.home, &self.layout)];
-        maps.extend(self.other_maps.iter().filter_map(|(m, map)| Some((*m, *self.monitors.get(*m)?, map))));
-        maps
+        maps.sort_by_key(|map| map.area != self.home);
+        self.label = rect(margin, 22.0 * s, size(&self.home).0 - 2.0 * margin, 30.0 * s);
+        self.tiles = tiles;
+        self.tiles_area = tiles_area;
+        self.maps = maps;
     }
 
     /// The map of the monitor the point is on (the home one otherwise), with
     /// the point in that monitor's coordinates.
-    fn map_at(&self, x: f32, y: f32) -> (usize, &Layout, f32, f32) {
-        let maps = self.maps();
-        let (m, monitor, map) = maps.iter().find(|(_, monitor, _)| contains(monitor, x, y)).copied().unwrap_or(maps[0]);
-        (m, map, x - monitor.left, y - monitor.top)
+    fn map_at(&self, x: f32, y: f32) -> (&Map, f32, f32) {
+        let map = self.maps.iter().find(|map| contains(&map.area, x, y)).unwrap_or(&self.maps[0]);
+        (map, x - map.area.left, y - map.area.top)
     }
 
     /// A tile acts like its window in the map; one pinned everywhere belongs
@@ -606,7 +613,7 @@ impl Board {
     }
 
     fn hit_test(&self, x: f32, y: f32) -> Hit {
-        if let Some(tile) = self.layout.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
+        if let Some(tile) = self.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
             if contains(&tile.pin, x, y) {
                 return Hit::Pin(tile.hwnd.0);
             }
@@ -615,14 +622,16 @@ impl Board {
             }
             return self.tile_hit(tile.hwnd);
         }
-        let (_, map, x, y) = self.map_at(x, y);
-        if contains(&map.add_row, x, y) {
+        let (map, x, y) = self.map_at(x, y);
+        if contains(&map.layout.add_row, x, y) {
             return Hit::AddRow;
         }
-        if contains(&map.add_row_top, x, y) {
+        if contains(&map.layout.add_row_top, x, y) {
             return Hit::AddRowTop;
         }
-        for (r, row) in map.rows.iter().enumerate() {
+        // The last cell cannot be removed, so it has no close button.
+        let removable = self.model.cell_count() > 1;
+        for (r, row) in map.layout.rows.iter().enumerate() {
             if contains(&row.plus_left, x, y) {
                 return Hit::PlusLeft(r);
             }
@@ -633,7 +642,7 @@ impl Board {
                 return Hit::Plus(r);
             }
             for cell in &row.cells {
-                if contains(&cell.close, x, y) && self.cell_count() > 1 {
+                if contains(&cell.close, x, y) && removable {
                     return Hit::CellClose(cell.id.clone());
                 }
                 if contains(&cell.body, x, y) {
@@ -644,22 +653,26 @@ impl Board {
         Hit::Nothing
     }
 
-    fn cell_count(&self) -> usize {
-        self.model.rows.iter().map(|row| row.cells.len()).sum()
+    /// The row whose label area the point is in.
+    fn row_header_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (map, x, y) = self.map_at(x, y);
+        map.layout.rows.iter().position(|row| contains(&row.header, x, y))
     }
 
     /// The map cell under a point, and the monitor whose map it is on.
     fn cell_at(&self, x: f32, y: f32) -> Option<(&CellLayout, usize)> {
         // A little slack around each square makes it an easier drop target.
         let slack = 5.0 * self.scale;
-        let (m, map, x, y) = self.map_at(x, y);
-        let cell = map.rows.iter().flat_map(|row| &row.cells).find(|cell| contains(&grow(&cell.body, slack), x, y))?;
-        Some((cell, m))
+        let (map, x, y) = self.map_at(x, y);
+        let cell = map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| contains(&grow(&cell.body, slack), x, y))?;
+        Some((cell, map.monitor))
     }
 
+    /// Where the dragged cell would land if dropped at a point. The `x` or
+    /// `y` of the slot is where to draw its marker, in the map's coordinates.
     fn slot_at(&self, dragged: &str, x: f32, y: f32) -> Option<Slot> {
-        let (_, map, x, y) = self.map_at(x, y);
-        let rows = &map.rows;
+        let (map, x, y) = self.map_at(x, y);
+        let rows = &map.layout.rows;
         let (first, last) = (rows.first()?, rows.last()?);
         if y < first.top {
             return Some(Slot::NewRow { at: 0, y: first.top - 8.0 * self.scale });
@@ -670,7 +683,7 @@ impl Board {
         for (r, row) in rows.iter().enumerate() {
             if y >= row.top && y < row.bottom {
                 let others: Vec<&CellLayout> = row.cells.iter().filter(|c| c.id != dragged).collect();
-                let index = others.iter().filter(|c| (c.body.left + c.body.right) / 2.0 < x).count();
+                let index = others.iter().filter(|c| centre(&c.body).0 < x).count();
                 let gap = 10.0 * self.scale;
                 let x = match others.get(index) {
                     Some(next) => next.body.left - gap,
@@ -716,8 +729,18 @@ impl Board {
         }
     }
 
+    fn dragged_cell(&self) -> Option<&str> {
+        match &self.press {
+            Some(Press { hit: Hit::Cell(id), dragging: true, .. }) => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Puts every thumbnail where its tile is, or under the cursor while its
+    /// window is being dragged.
     fn update_thumbnails(&self) {
         let dragged = self.dragged_window();
+        let windows = self.tile_windows();
         let to_rect = |r: &Rect| RECT {
             left: r.left.round() as i32,
             top: r.top.round() as i32,
@@ -732,11 +755,11 @@ impl Board {
                 fSourceClientAreaOnly: false.into(),
                 ..Default::default()
             };
-            match self.layout.tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
+            match self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
                 Some(tile) if dragged == Some(hwnd) => {
                     // Follows the cursor, small enough to see the map under it.
-                    let t = &tile.thumb;
-                    let aspect = (t.right - t.left) / (t.bottom - t.top).max(1.0);
+                    let (tw, th) = size(&tile.thumb);
+                    let aspect = tw / th.max(1.0);
                     let (cx, cy) = self.cursor;
                     let w = 200.0 * self.scale;
                     props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - w / aspect / 2.0, w, w / aspect));
@@ -746,26 +769,25 @@ impl Board {
                     // Fill the tile's width without distorting the picture:
                     // a window taller than the tile shows its upper part, a
                     // shorter one sits at the top.
-                    let t = &tile.thumb;
-                    let (tw, th) = (t.right - t.left, t.bottom - t.top);
-                    let mut dest = *t;
-                    if let Ok(size) = unsafe { DwmQueryThumbnailSourceSize(thumb) } {
-                        let (sw, sh) = (size.cx.max(1) as f32, size.cy.max(1) as f32);
+                    let (tw, th) = size(&tile.thumb);
+                    let mut dest = tile.thumb;
+                    let source = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok();
+                    if let Some(source) = source {
+                        let (sw, sh) = (source.cx.max(1) as f32, source.cy.max(1) as f32);
                         let shown = th * sw / tw;
                         if shown < sh {
                             props.dwFlags |= DWM_TNP_RECTSOURCE;
-                            props.rcSource = RECT { left: 0, top: 0, right: size.cx, bottom: shown.round() as i32 };
+                            props.rcSource = RECT { left: 0, top: 0, right: source.cx, bottom: shown.round() as i32 };
                         } else {
-                            dest.bottom = t.top + sh * tw / sw;
+                            dest.bottom = dest.top + sh * tw / sw;
                         }
                     }
                     props.rcDestination = to_rect(&dest);
                     // A minimized window shows what it last looked like, faded.
                     // (Without a kept picture the source is only a sliver.)
-                    if self.tile_windows().iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized) {
+                    if windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized) {
                         props.opacity = 150;
-                        let kept = unsafe { DwmQueryThumbnailSourceSize(thumb) }.is_ok_and(|size| size.cy >= 80);
-                        props.fVisible = kept.into();
+                        props.fVisible = source.is_some_and(|source| source.cy >= 80).into();
                     }
                 }
                 None => props.fVisible = false.into(),
@@ -797,7 +819,8 @@ impl Board {
         if !self.open {
             return None;
         }
-        let point = || ((lparam.0 & 0xFFFF) as i16 as f32, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32);
+        // Mouse messages carry the position as two signed 16-bit numbers.
+        let (x, y) = ((lparam.0 & 0xFFFF) as i16 as f32, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32);
         Some(match message {
             WM_PAINT => {
                 self.paint();
@@ -809,34 +832,19 @@ impl Board {
             WM_ERASEBKGND => return None,
             // Losing focus closes the board, except to its own confirmation box.
             WM_ACTIVATE if wparam.0 & 0xFFFF == 0 && !self.modal => Action::Dismiss,
-            WM_LBUTTONDOWN => {
-                let (x, y) = point();
-                self.mouse_down(x, y)
-            }
+            WM_LBUTTONDOWN => self.mouse_down(x, y),
             WM_LBUTTONDBLCLK => {
-                let (x, y) = point();
                 if let Hit::RowName(r) = self.hit_test(x, y) {
                     self.start_rename(r);
                 }
                 Action::None
             }
             WM_MOUSEMOVE => {
-                let (x, y) = point();
                 self.mouse_move(x, y);
                 Action::None
             }
-            WM_LBUTTONUP => {
-                let (x, y) = point();
-                self.mouse_up(x, y)
-            }
-            WM_RBUTTONUP => {
-                let (x, y) = point();
-                let (_, map, lx, ly) = self.map_at(x, y);
-                match map.rows.iter().position(|row| contains(&row.header, lx, ly)) {
-                    Some(row) => Action::RowMenu(row),
-                    None => Action::None,
-                }
-            }
+            WM_LBUTTONUP => self.mouse_up(x, y),
+            WM_RBUTTONUP => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_CHAR => {
                 if let (Some((_, text)), Some(c)) = (&mut self.editing, char::from_u32(wparam.0 as u32)) {
@@ -899,7 +907,7 @@ impl Board {
             SetCapture(self.hwnd);
         }
         self.invalidate();
-        // A click anywhere else finishes a rename in progress.
+        // A click anywhere finishes a rename in progress.
         match self.editing.take() {
             Some((row, text)) => Action::Rename(row, text.trim().to_owned()),
             None => Action::None,
@@ -909,13 +917,14 @@ impl Board {
     fn mouse_move(&mut self, x: f32, y: f32) {
         self.cursor = (x, y);
         let threshold = 6.0 * self.scale;
-        let mut raise = None;
         if let Some(press) = &mut self.press {
+            // A window shown on every desktop has no cell to be dragged out of.
             let draggable = match &press.hit {
                 Hit::Window { cell, .. } => !cell.is_empty(),
                 Hit::Cell(_) => true,
                 _ => false,
             };
+            let mut raise = None;
             if !press.dragging && draggable && (x - press.x).hypot(y - press.y) > threshold {
                 press.dragging = true;
                 if let Hit::Window { hwnd, .. } = press.hit {
@@ -946,27 +955,7 @@ impl Board {
         self.invalidate();
         if press.dragging {
             let action = match &press.hit {
-                Hit::Window { cell, hwnd } => {
-                    // Dropped on a map cell: that cell, on the monitor whose
-                    // map it was. Dropped elsewhere: just that monitor.
-                    let from = self.tile_windows().iter().find(|(w, _)| w.hwnd.0 == *hwnd).map(|(w, _)| self.monitor_of(w));
-                    let (to_cell, to_monitor) = match self.cell_at(x, y) {
-                        Some((target, m)) => (Some(target.id.clone()), m),
-                        None => (None, self.map_at(x, y).0),
-                    };
-                    let cell = to_cell.filter(|id| id != cell);
-                    let monitor = (Some(to_monitor) != from).then(|| self.monitors.get(to_monitor)).flatten().map(|m| RECT {
-                        left: m.left as i32 + self.origin.0,
-                        top: m.top as i32 + self.origin.1,
-                        right: m.right as i32 + self.origin.0,
-                        bottom: m.bottom as i32 + self.origin.1,
-                    });
-                    if cell.is_none() && monitor.is_none() {
-                        Action::None
-                    } else {
-                        Action::MoveWindow { window: HWND(*hwnd), cell, monitor }
-                    }
-                }
+                Hit::Window { cell, hwnd } => self.drop_window(cell, *hwnd, x, y),
                 Hit::Cell(id) => match self.slot_at(id, x, y) {
                     Some(Slot::Row { row, index, .. }) => Action::MoveCell { id: id.clone(), row, index },
                     Some(Slot::NewRow { at, .. }) => Action::MoveCellToNewRow { id: id.clone(), at },
@@ -981,17 +970,39 @@ impl Board {
         if self.hit_test(x, y) != press.hit {
             return Action::None;
         }
-        match press.hit {
+        self.click(press.hit)
+    }
+
+    /// A window of cell `from` was dragged to a point. Dropped on a map cell
+    /// it goes to that cell, on the monitor whose map that was; dropped
+    /// elsewhere it only changes monitor.
+    fn drop_window(&self, from: &str, hwnd: isize, x: f32, y: f32) -> Action {
+        let from_monitor = self.tile_windows().iter().find(|(w, _)| w.hwnd.0 == hwnd).map(|(w, _)| self.monitor_of(w));
+        let (to_cell, to_monitor) = match self.cell_at(x, y) {
+            Some((target, m)) => (Some(target.id.clone()), m),
+            None => (None, self.map_at(x, y).0.monitor),
+        };
+        let cell = to_cell.filter(|id| id != from);
+        let monitor = if Some(to_monitor) != from_monitor { self.monitor_on_screen(to_monitor) } else { None };
+        if cell.is_none() && monitor.is_none() {
+            Action::None
+        } else {
+            Action::MoveWindow { window: HWND(hwnd), cell, monitor }
+        }
+    }
+
+    /// The button was pressed and released on the same thing without dragging.
+    fn click(&self, hit: Hit) -> Action {
+        match hit {
             Hit::Window { cell, hwnd } => Action::Go(cell, Some(HWND(hwnd))),
             Hit::Cell(id) => Action::Go(id, None),
             Hit::Pin(hwnd) => {
                 let windows = self.tile_windows();
                 let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
-                // Cycles: off -> within the workspace -> everywhere -> off.
-                let (row, all) = match (window.follows, *everywhere) {
-                    (false, false) => (true, false),
-                    (true, false) => (false, true),
-                    _ => (false, false),
+                let (row, all) = match Pin::of(window, *everywhere) {
+                    Pin::Off => (true, false),
+                    Pin::Row => (false, true),
+                    Pin::Everywhere => (false, false),
                 };
                 Action::SetPin { window: HWND(hwnd), row, all }
             }
@@ -1001,6 +1012,7 @@ impl Board {
             Hit::PlusLeft(row) => Action::AddCell { row, front: true },
             Hit::AddRow => Action::AddRow { top: false },
             Hit::AddRowTop => Action::AddRow { top: true },
+            // Renaming takes a double click.
             Hit::RowName(_) => Action::None,
             // A click on nothing dismisses the board, like Task View.
             Hit::Nothing => Action::Cancel,
@@ -1013,17 +1025,19 @@ impl Board {
     /// the window. (Drawing straight to the window with a Direct2D window
     /// target left the window blank on the machine this was developed on.)
     fn ensure_canvas(&mut self) -> Option<ID2D1RenderTarget> {
-        if !self.canvas.as_ref().is_some_and(|c| c.size == self.size) {
+        if !self.canvas.as_ref().is_some_and(|c| c.dib.size == self.size) {
+            // Icons are bitmaps of the target and go with it.
             self.icons.clear();
             self.canvas = Canvas::new(&self.factory, self.size)
                 .map_err(|e| crate::app::log(&format!("board canvas failed: {e}")))
                 .ok();
         }
-        self.canvas.as_ref().map(|c| c.target.clone())
+        self.canvas.as_ref().map(|c| c.target.target.clone())
     }
 
-    fn paint(&mut self) {
-        let Some(target) = self.ensure_canvas() else { return };
+    /// Draws the board into the canvas; `None` when there is no canvas.
+    fn draw_to_canvas(&mut self) -> Option<Result<()>> {
+        let target = self.ensure_canvas()?;
         if self.fonts.is_none() {
             self.fonts = make_fonts(self.scale).map_err(|e| crate::app::log(&format!("board fonts failed: {e}"))).ok();
         }
@@ -1031,15 +1045,26 @@ impl Board {
         unsafe {
             target.BeginDraw();
             let drawn = self.draw(&target);
-            if let Err(e) = target.EndDraw(None, None).and(drawn) {
+            Some(target.EndDraw(None, None).and(drawn))
+        }
+    }
+
+    fn paint(&mut self) {
+        match self.draw_to_canvas() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
                 crate::app::log(&format!("board draw failed: {e}"));
                 // Rebuild everything on the next paint.
                 self.canvas = None;
                 return;
             }
-            if let Some(canvas) = &self.canvas {
+            None => return,
+        }
+        if let Some(canvas) = &self.canvas {
+            let (w, h) = canvas.dib.size;
+            unsafe {
                 let window = GetDC(self.hwnd);
-                let _ = BitBlt(window, 0, 0, canvas.size.0, canvas.size.1, canvas.dc, 0, 0, SRCCOPY);
+                let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
                 ReleaseDC(self.hwnd, window);
             }
         }
@@ -1057,281 +1082,248 @@ impl Board {
         }
     }
 
-    fn draw(&self, t: &ID2D1RenderTarget) -> Result<()> {
-        let s = self.scale;
+    fn draw(&self, target: &ID2D1RenderTarget) -> Result<()> {
         let Some(fonts) = &self.fonts else { return Ok(()) };
         unsafe {
-            t.Clear(Some(&rgba(0.050, 0.055, 0.068, 1.0)));
+            target.Clear(Some(&rgba(0.050, 0.055, 0.068, 1.0)));
         }
-        self.draw_tiles(t, fonts, s)?;
-        // Each map is laid out in its own monitor's coordinates.
-        let mut maps = Ok(());
-        for (_, monitor, map) in self.maps() {
+        let p = Painter::new(target)?;
+        // The tiles are placed in the window's coordinates; each map, and the
+        // label and the hint of the home monitor, in its monitor's own.
+        self.draw_tiles(&p, fonts);
+        for map in &self.maps {
             unsafe {
-                t.SetTransform(&Matrix3x2::translation(monitor.left, monitor.top));
+                target.SetTransform(&Matrix3x2::translation(map.area.left, map.area.top));
             }
-            let drawn = self.draw_map(t, fonts, s, map, &monitor);
-            maps = maps.and(drawn);
+            self.draw_map(&p, fonts, map);
         }
-        // So are the label and the hint, which belong to the home monitor.
         unsafe {
-            t.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
+            target.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
         }
-        let captions = self.draw_captions(t, fonts, s);
+        self.draw_captions(&p, fonts);
         unsafe {
-            t.SetTransform(&Matrix3x2::identity());
+            target.SetTransform(&Matrix3x2::identity());
         }
-        maps.and(captions)
+        Ok(())
     }
 
     /// The cell label at the top and the hint line at the bottom of the home monitor.
-    fn draw_captions(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32) -> Result<()> {
-        unsafe {
-            let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
-            let (w, h) = (self.home.right - self.home.left, self.home.bottom - self.home.top);
-            let place = self.nav.find(&self.selected);
-            if let Some(p) = place {
-                let name = self.model.rows.get(p.row).map(|row| row.name.clone()).unwrap_or_default();
-                let row = if name.is_empty() { format!("워크스페이스 {}", p.row + 1) } else { name };
-                let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
-                let wide: Vec<u16> = format!("{row}  ·  {}번 칸{here}", p.col + 1).encode_utf16().collect();
-                brush.SetColor(&white(0.80));
-                t.DrawText(&wide, &fonts.label, &self.layout.tiles_label, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-            }
-            let footer = rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s);
-            let pointed = match &self.hover {
-                Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
-                _ => None,
-            };
-            // The full title of the tile under the cursor, in case it was shortened.
-            let windows = self.tile_windows();
-            let hovered = windows.iter().find(|(w, _)| Some(w.hwnd.0) == pointed).map(|(window, _)| {
-                if window.app_name.is_empty() { window.title.clone() } else { format!("{}  —  {}", window.app_name, window.title) }
-            });
-            let (line, alpha) = match &hovered {
-                Some(title) => (title.as_str(), 0.85),
-                None => ("창을 아래 칸으로 끌면 옮겨집니다   ·   칸을 끌면 재배치됩니다", 0.22),
-            };
-            let wide: Vec<u16> = line.encode_utf16().collect();
-            brush.SetColor(&white(alpha));
-            t.DrawText(&wide, &fonts.centered, &footer, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+    fn draw_captions(&self, p: &Painter, fonts: &Fonts) {
+        let s = self.scale;
+        let (w, h) = size(&self.home);
+        if let Some(pos) = self.nav.find(&self.selected) {
+            let row = grid::row_title(self.model.rows.get(pos.row).map_or("", |row| &row.name), pos.row);
+            let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
+            p.text(&format!("{row}  ·  {}번 칸{here}", pos.col + 1), &fonts.label, &self.label, white(0.80));
         }
-        Ok(())
+        let pointed = match &self.hover {
+            Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
+            _ => None,
+        };
+        // The full title of the tile under the cursor, in case it was shortened.
+        let windows = self.tile_windows();
+        let hovered = windows.iter().find(|(w, _)| Some(w.hwnd.0) == pointed).map(|(window, _)| {
+            if window.app_name.is_empty() { window.title.clone() } else { format!("{}  —  {}", window.app_name, window.title) }
+        });
+        let (line, alpha) = match &hovered {
+            Some(title) => (title.as_str(), 0.85),
+            None => ("창을 아래 칸으로 끌면 옮겨집니다   ·   칸을 끌면 재배치됩니다", 0.22),
+        };
+        p.text(line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
     }
 
     /// The selected cell's windows as large titled previews.
-    fn draw_tiles(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32) -> Result<()> {
-        unsafe {
-            let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
-            let text = |string: &str, font: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F| {
-                let wide: Vec<u16> = string.encode_utf16().collect();
-                brush.SetColor(&colour);
-                t.DrawText(&wide, font, area, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-            };
-            if self.layout.tiles.is_empty() {
-                text("이 칸에는 창이 없습니다", &fonts.centered, &self.layout.tiles_area, white(0.28));
-            }
-            let dragged = self.dragged_window();
-            let windows = self.tile_windows();
-            for tile in &self.layout.tiles {
-                let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) else { continue };
-                let hot = self.hover == self.tile_hit(tile.hwnd);
-                let dim = if dragged == Some(tile.hwnd.0) { 0.35 } else { 1.0 };
-                brush.SetColor(&rgba(0.125, 0.135, 0.165, dim));
-                t.FillRoundedRectangle(&rounded(&tile.frame, 9.0 * s), &brush);
-                // Stand-in under the live thumbnail (and all there is for a minimized window).
-                brush.SetColor(&rgba(0.075, 0.08, 0.095, dim));
-                t.FillRectangle(&tile.thumb, &brush);
-                if let Some(bitmap) = self.icons.get(&tile.hwnd.0) {
-                    t.DrawBitmap(bitmap, Some(&tile.icon), dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-                    let (cx, cy) = ((tile.thumb.left + tile.thumb.right) / 2.0, (tile.thumb.top + tile.thumb.bottom) / 2.0);
-                    let big = rect(cx - 20.0 * s, cy - 20.0 * s, 40.0 * s, 40.0 * s);
-                    t.DrawBitmap(bitmap, Some(&big), 0.8 * dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-                }
-                if window.minimized {
-                    let note = Rect { top: tile.thumb.bottom - 26.0 * s, ..tile.thumb };
-                    text("최소화됨", &fonts.centered, &note, white(0.40 * dim));
-                }
-                // Two lines: the app, then what this window of it is about.
-                let width = tile.title.right - tile.title.left;
-                let title = display_title(&window.title, &window.app_name, (width / (7.4 * s)) as usize);
-                let bright = white(if hot { 1.0 } else { 0.88 } * dim);
-                if window.app_name.is_empty() || title.is_empty() || title.eq_ignore_ascii_case(&window.app_name) {
-                    let only = if title.is_empty() { &window.app_name } else { &title };
-                    text(only, &fonts.title, &tile.title, bright);
-                } else {
-                    let middle = (tile.title.top + tile.title.bottom) / 2.0;
-                    let upper = Rect { top: tile.title.top + 5.0 * s, bottom: middle, ..tile.title };
-                    let lower = Rect { top: middle - 2.0 * s, bottom: tile.title.bottom - 4.0 * s, ..tile.title };
-                    text(&window.app_name, &fonts.sub, &upper, white(0.50 * dim));
-                    text(&title, &fonts.title, &lower, bright);
-                }
-
-                // One pin button cycling through its three states.
-                let over = self.hover == Hit::Pin(tile.hwnd.0);
-                let (label, colour) = match (window.follows, *everywhere) {
-                    (_, true) => ("전체 고정", rgba(0.62, 0.45, 1.0, dim)),
-                    (true, _) => ("워크스페이스 고정", accent(dim)),
-                    _ => ("고정", white(if over { 0.20 } else { 0.07 } * dim)),
-                };
-                brush.SetColor(&colour);
-                t.FillRoundedRectangle(&rounded(&tile.pin, 5.0 * s), &brush);
-                let on = window.follows || *everywhere;
-                text(label, &fonts.centered, &tile.pin, white(if on || over { 1.0 } else { 0.50 } * dim));
-
-                let over = self.hover == Hit::TileClose(tile.hwnd.0);
-                if over {
-                    brush.SetColor(&danger(0.90));
-                    t.FillRoundedRectangle(&rounded(&tile.close, 5.0 * s), &brush);
-                }
-                text("✕", &fonts.centered, &tile.close, white(if over { 1.0 } else { 0.55 } * dim));
-
-                brush.SetColor(&if hot { accent(1.0) } else { white(0.10 * dim) });
-                t.DrawRoundedRectangle(&rounded(&grow(&tile.frame, 1.0 * s), 10.0 * s), &brush, if hot { 2.5 * s } else { 1.0 }, None);
+    fn draw_tiles(&self, p: &Painter, fonts: &Fonts) {
+        if self.tiles.is_empty() {
+            p.text("이 칸에는 창이 없습니다", &fonts.centered, &self.tiles_area, white(0.28));
+        }
+        let windows = self.tile_windows();
+        for tile in &self.tiles {
+            if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
+                self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere));
             }
         }
-        Ok(())
+    }
+
+    fn draw_tile(&self, p: &Painter, fonts: &Fonts, tile: &TileLayout, window: &WindowModel, pin: Pin) {
+        let s = self.scale;
+        let hot = self.hover == self.tile_hit(tile.hwnd);
+        let dim = if self.dragged_window() == Some(tile.hwnd.0) { 0.35 } else { 1.0 };
+        p.fill(&tile.frame, 9.0 * s, rgba(0.125, 0.135, 0.165, dim));
+        // Stand-in under the live thumbnail (and all there is for a minimized window).
+        p.fill_square(&tile.thumb, rgba(0.075, 0.08, 0.095, dim));
+        if let Some(bitmap) = self.icons.get(&tile.hwnd.0) {
+            p.bitmap(bitmap, &tile.icon, dim);
+            let (cx, cy) = centre(&tile.thumb);
+            p.bitmap(bitmap, &rect(cx - 20.0 * s, cy - 20.0 * s, 40.0 * s, 40.0 * s), 0.8 * dim);
+        }
+        if window.minimized {
+            let note = Rect { top: tile.thumb.bottom - 26.0 * s, ..tile.thumb };
+            p.text("최소화됨", &fonts.centered, &note, white(0.40 * dim));
+        }
+
+        // Two lines: the app, then what this window of it is about.
+        let title = display_title(&window.title, &window.app_name, (size(&tile.title).0 / (7.4 * s)) as usize);
+        let bright = white(if hot { 1.0 } else { 0.88 } * dim);
+        if window.app_name.is_empty() || title.is_empty() || title.eq_ignore_ascii_case(&window.app_name) {
+            let only = if title.is_empty() { &window.app_name } else { &title };
+            p.text(only, &fonts.title, &tile.title, bright);
+        } else {
+            let middle = centre(&tile.title).1;
+            let upper = Rect { top: tile.title.top + 5.0 * s, bottom: middle, ..tile.title };
+            let lower = Rect { top: middle - 2.0 * s, bottom: tile.title.bottom - 4.0 * s, ..tile.title };
+            p.text(&window.app_name, &fonts.sub, &upper, white(0.50 * dim));
+            p.text(&title, &fonts.title, &lower, bright);
+        }
+
+        let over = self.hover == Hit::Pin(tile.hwnd.0);
+        let colour = match pin {
+            Pin::Everywhere => rgba(0.62, 0.45, 1.0, dim),
+            Pin::Row => accent(dim),
+            Pin::Off => white(if over { 0.20 } else { 0.07 } * dim),
+        };
+        p.fill(&tile.pin, 5.0 * s, colour);
+        p.text(pin.label(), &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
+
+        let over = self.hover == Hit::TileClose(tile.hwnd.0);
+        if over {
+            p.fill(&tile.close, 5.0 * s, danger(0.90));
+        }
+        p.text("✕", &fonts.centered, &tile.close, white(if over { 1.0 } else { 0.55 } * dim));
+
+        let (width, colour) = if hot { (2.5 * s, accent(1.0)) } else { (1.0, white(0.10 * dim)) };
+        p.stroke(&grow(&tile.frame, 1.0 * s), 10.0 * s, width, colour);
     }
 
     /// The map of all rows and cells: plain squares holding each cell's apps
     /// (icon and count), with the controls appearing on hover.
-    fn draw_map(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32, map: &Layout, monitor: &Rect) -> Result<()> {
-        unsafe {
-            let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
-            let text = |string: &str, font: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F| {
-                let wide: Vec<u16> = string.encode_utf16().collect();
-                brush.SetColor(&colour);
-                t.DrawText(&wide, font, area, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
-            };
-            let fill = |area: &Rect, radius: f32, colour: D2D1_COLOR_F| {
-                brush.SetColor(&colour);
-                t.FillRoundedRectangle(&rounded(area, radius), &brush);
-            };
-            let stroke = |area: &Rect, radius: f32, width: f32, colour: D2D1_COLOR_F| {
-                brush.SetColor(&colour);
-                t.DrawRoundedRectangle(&rounded(area, radius), &brush, width, None);
-            };
+    fn draw_map(&self, p: &Painter, fonts: &Fonts, map: &Map) {
+        let s = self.scale;
+        let layout = &map.layout;
+        let selected_row = self.nav.find(&self.selected).map(|pos| pos.row);
+        // The cell a dragged window would be dropped on.
+        let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
 
-            let dragged_cell = match &self.press {
-                Some(Press { hit: Hit::Cell(id), dragging: true, .. }) => Some(id.as_str()),
-                _ => None,
-            };
-            let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
-            // Drag feedback is drawn only on the monitor the cursor is on.
-            let here = contains(monitor, self.cursor.0, self.cursor.1);
-            let selected_row = self.nav.find(&self.selected).map(|pos| pos.row);
-            let radius = 8.0 * s;
-            // The map is drawn shifted onto its monitor.
-            let cursor = (self.cursor.0 - monitor.left, self.cursor.1 - monitor.top);
+        // The column vertical moves travel along.
+        p.fill(&layout.spine, 10.0 * s, white(0.035));
+        for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
+            let in_selected_row = selected_row == Some(r);
+            self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
+            for cell in &row.cells {
+                self.draw_cell(p, fonts, cell, in_selected_row, drop_cell == Some(cell.id.as_str()));
+            }
+            self.draw_plus(p, fonts, &row.plus, Hit::Plus(r));
+            self.draw_plus(p, fonts, &row.plus_left, Hit::PlusLeft(r));
+        }
+        self.draw_plus(p, fonts, &layout.add_row, Hit::AddRow);
+        self.draw_plus(p, fonts, &layout.add_row_top, Hit::AddRowTop);
 
-            // The column vertical moves travel along.
-            fill(&map.spine, 10.0 * s, white(0.035));
+        // What is being dragged is drawn only on the monitor the cursor is on.
+        if contains(&map.area, self.cursor.0, self.cursor.1) {
+            self.draw_drag(p, map);
+        }
+    }
 
-            for (r, (row, model)) in map.rows.iter().zip(&self.model.rows).enumerate() {
-                // Row label, in a box as wide as its text (right-click: menu).
-                let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
-                let name = match editing {
-                    Some((_, typed)) => format!("{typed}▏"),
-                    None if model.name.is_empty() => format!("워크스페이스 {}", r + 1),
-                    None => model.name.clone(),
-                };
-                let hot = self.hover == Hit::RowName(r) && self.press.is_none();
-                if editing.is_some() || hot {
-                    // While typing the box follows the text being typed.
-                    let width = text_width(&name, 12.0 * s) + 4.0 * s;
-                    let area = Rect { right: row.name.left + width.max(row.name.right - row.name.left), ..row.name };
-                    fill(&grow(&area, 4.0 * s), 5.0 * s, white(if editing.is_some() { 0.12 } else { 0.06 }));
+    /// A row's name, in a box as wide as its text while hovered or edited.
+    fn draw_row_name(&self, p: &Painter, fonts: &Fonts, r: usize, row: &RowLayout, name: &str, in_selected_row: bool) {
+        let s = self.scale;
+        let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
+        let name = match editing {
+            Some((_, typed)) => format!("{typed}▏"),
+            None => grid::row_title(name, r),
+        };
+        let hot = self.hover == Hit::RowName(r) && self.press.is_none();
+        if editing.is_some() || hot {
+            // While typing the box follows the text being typed.
+            let width = text_width(&name, 12.0 * s) + 4.0 * s;
+            let area = Rect { right: row.name.left + width.max(size(&row.name).0), ..row.name };
+            p.fill(&grow(&area, 4.0 * s), 5.0 * s, white(if editing.is_some() { 0.12 } else { 0.06 }));
+        }
+        let wide = Rect { right: row.header.right, ..row.name };
+        p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 }));
+    }
+
+    fn draw_cell(&self, p: &Painter, fonts: &Fonts, cell: &CellLayout, in_selected_row: bool, drop_target: bool) {
+        let s = self.scale;
+        let radius = 8.0 * s;
+        let dim = if self.dragged_cell() == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
+        let is_selected = cell.id == self.selected;
+        let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) if *id == cell.id);
+        if is_selected {
+            for (by, a) in [(5.0, 0.08), (3.0, 0.14)] {
+                p.fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
+            }
+        }
+        p.fill(&cell.body, radius, white(if in_selected_row { 0.14 } else { 0.07 } * dim));
+        if drop_target {
+            p.stroke(&cell.body, radius, 2.5 * s, accent(1.0));
+        } else if is_selected {
+            p.stroke(&cell.body, radius, 2.0 * s, accent(dim));
+        } else if hovering {
+            p.stroke(&cell.body, radius, 1.0, white(0.35 * dim));
+        }
+        if cell.id == self.model.current {
+            // Where the user actually is, as opposed to what is selected.
+            let dot = rect(cell.body.left + 7.0 * s, cell.body.top + 7.0 * s, 6.0 * s, 6.0 * s);
+            p.fill(&dot, 3.0 * s, accent(dim));
+        }
+        for badge in &cell.apps {
+            match self.icons.get(&badge.hwnd.0) {
+                Some(bitmap) => p.bitmap(bitmap, &badge.icon, dim),
+                None => p.fill(&badge.icon, 4.0 * s, white(0.25 * dim)),
+            }
+            if badge.count > 1 {
+                p.text(&badge.count.to_string(), &fonts.small, &badge.label, white(0.75 * dim));
+            }
+        }
+        if cell.more > 0 {
+            let area = Rect { top: cell.body.bottom - 18.0 * s, ..cell.body };
+            p.text(&format!("+{}", cell.more), &fonts.centered, &area, white(0.45 * dim));
+        }
+        if hovering && self.model.cell_count() > 1 && self.press.is_none() {
+            let hot = self.hover == Hit::CellClose(cell.id.clone());
+            p.fill(&cell.close, 4.0 * s, if hot { danger(0.90) } else { rgba(0.2, 0.21, 0.25, 1.0) });
+            p.text("✕", &fonts.centered, &cell.close, white(if hot { 1.0 } else { 0.75 }));
+        }
+    }
+
+    /// One of the "+" buttons, which `hit` is the hit-test result of.
+    fn draw_plus(&self, p: &Painter, fonts: &Fonts, area: &Rect, hit: Hit) {
+        let hot = self.hover == hit;
+        if hot {
+            p.fill(area, 8.0 * self.scale, white(0.10));
+        }
+        p.text("+", &fonts.big, area, white(if hot { 0.95 } else { 0.22 }));
+    }
+
+    /// Drag feedback on the map under the cursor: where a dragged cell would
+    /// land, and something at the cursor to stand for what is dragged.
+    fn draw_drag(&self, p: &Painter, map: &Map) {
+        let s = self.scale;
+        let (cx, cy) = (self.cursor.0 - map.area.left, self.cursor.1 - map.area.top);
+        if let Some(id) = self.dragged_cell() {
+            match self.slot_at(id, self.cursor.0, self.cursor.1) {
+                Some(Slot::Row { row, x, .. }) => {
+                    let band = &map.layout.rows[row];
+                    let body = band.cells.first().map_or(band.plus, |c| c.body);
+                    p.fill(&rect(x - 2.0 * s, body.top, 4.0 * s, size(&body).1), 2.0 * s, accent(1.0));
                 }
-                let wide = Rect { right: row.header.right, ..row.name };
-                text(&name, &fonts.small, &wide, white(if selected_row == Some(r) || hot { 0.90 } else { 0.45 }));
-
-                for cell in &row.cells {
-                    let dim = if dragged_cell == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
-                    let is_selected = cell.id == self.selected;
-                    let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) if *id == cell.id);
-                    if is_selected {
-                        for (by, a) in [(5.0, 0.08), (3.0, 0.14)] {
-                            fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
-                        }
-                    }
-                    fill(&cell.body, radius, white(if selected_row == Some(r) { 0.14 } else { 0.07 } * dim));
-                    if drop_cell == Some(cell.id.as_str()) {
-                        stroke(&cell.body, radius, 2.5 * s, accent(1.0));
-                    } else if is_selected {
-                        stroke(&cell.body, radius, 2.0 * s, accent(dim));
-                    } else if hovering {
-                        stroke(&cell.body, radius, 1.0, white(0.35 * dim));
-                    }
-                    if cell.id == self.model.current {
-                        // Where the user actually is, as opposed to what is selected.
-                        let dot = rect(cell.body.left + 7.0 * s, cell.body.top + 7.0 * s, 6.0 * s, 6.0 * s);
-                        fill(&dot, 3.0 * s, accent(dim));
-                    }
-                    for badge in &cell.apps {
-                        match self.icons.get(&badge.hwnd.0) {
-                            Some(bitmap) => t.DrawBitmap(bitmap, Some(&badge.icon), dim, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
-                            None => fill(&badge.icon, 4.0 * s, white(0.25 * dim)),
-                        }
-                        if badge.count > 1 {
-                            text(&badge.count.to_string(), &fonts.small, &badge.label, white(0.75 * dim));
-                        }
-                    }
-                    if cell.more > 0 {
-                        let area = Rect { top: cell.body.bottom - 18.0 * s, ..cell.body };
-                        text(&format!("+{}", cell.more), &fonts.centered, &area, white(0.45 * dim));
-                    }
-                    if hovering && self.cell_count() > 1 && self.press.is_none() {
-                        let hot = self.hover == Hit::CellClose(cell.id.clone());
-                        fill(&cell.close, 4.0 * s, if hot { danger(0.90) } else { rgba(0.2, 0.21, 0.25, 1.0) });
-                        text("✕", &fonts.centered, &cell.close, white(if hot { 1.0 } else { 0.75 }));
-                    }
+                Some(Slot::NewRow { y, .. }) => {
+                    let spine = &map.layout.spine;
+                    p.fill(&rect(spine.left, y - 2.0 * s, size(spine).0, 4.0 * s), 2.0 * s, accent(1.0));
                 }
-
-                for (area, hit) in [(&row.plus, Hit::Plus(r)), (&row.plus_left, Hit::PlusLeft(r))] {
-                    let hot = self.hover == hit;
-                    if hot {
-                        fill(area, radius, white(0.10));
-                    }
-                    text("+", &fonts.big, area, white(if hot { 0.95 } else { 0.22 }));
+                None => {}
+            }
+            p.stroke(&rect(cx - 40.0 * s, cy - 25.0 * s, 80.0 * s, 50.0 * s), 8.0 * s, 2.0 * s, accent(0.9));
+        }
+        if let Some(hwnd) = self.dragged_window() {
+            // With no thumbnail to follow the cursor (it could not be
+            // registered), the window's icon does.
+            if !self.thumbs.iter().any(|&(h, _)| h == hwnd) {
+                if let Some(bitmap) = self.icons.get(&hwnd) {
+                    p.bitmap(bitmap, &rect(cx - 16.0 * s, cy - 16.0 * s, 32.0 * s, 32.0 * s), 1.0);
                 }
             }
-
-            for (area, hit) in [(&map.add_row, Hit::AddRow), (&map.add_row_top, Hit::AddRowTop)] {
-                let hot = self.hover == hit;
-                if hot {
-                    fill(area, radius, white(0.10));
-                }
-                text("+", &fonts.big, area, white(if hot { 0.95 } else { 0.22 }));
-            }
-
-            // Drag feedback.
-            if let Some(id) = dragged_cell.filter(|_| here) {
-                match self.slot_at(id, self.cursor.0, self.cursor.1) {
-                    Some(Slot::Row { row, x, .. }) => {
-                        let band = &map.rows[row];
-                        let body = band.cells.first().map_or(band.plus, |c| c.body);
-                        fill(&rect(x - 2.0 * s, body.top, 4.0 * s, body.bottom - body.top), 2.0 * s, accent(1.0));
-                    }
-                    Some(Slot::NewRow { y, .. }) => {
-                        let spine = &map.spine;
-                        fill(&rect(spine.left, y - 2.0 * s, spine.right - spine.left, 4.0 * s), 2.0 * s, accent(1.0));
-                    }
-                    None => {}
-                }
-                let (cx, cy) = cursor;
-                stroke(&rect(cx - 40.0 * s, cy - 25.0 * s, 80.0 * s, 50.0 * s), radius, 2.0 * s, accent(0.9));
-            }
-            if let Some(hwnd) = self.dragged_window().filter(|_| here) {
-                // A minimized window has no thumbnail to follow the cursor.
-                if !self.thumbs.iter().any(|&(h, _)| h == hwnd) {
-                    let (cx, cy) = cursor;
-                    let area = rect(cx - 16.0 * s, cy - 16.0 * s, 32.0 * s, 32.0 * s);
-                    if let Some(bitmap) = self.icons.get(&hwnd) {
-                        t.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-                    }
-                }
-            }
-            Ok(())
         }
     }
 
@@ -1348,172 +1340,76 @@ impl Board {
         let selected = self.selected.clone();
         self.nav.visit(&selected);
         self.relayout();
-        self.fonts = make_fonts(scale).ok();
-        let target = self.ensure_canvas()?;
-        self.load_icons(&target);
-        unsafe {
-            target.BeginDraw();
-            let _ = self.draw(&target);
-            let _ = target.EndDraw(None, None);
-        }
-        let canvas = self.canvas.as_ref()?;
-        Some(unsafe { std::slice::from_raw_parts(canvas.bits as *const u8, (size.0 * size.1 * 4) as usize) }.to_vec())
+        self.fonts = None;
+        let _ = self.draw_to_canvas()?;
+        Some(self.canvas.as_ref()?.dib.pixels().to_vec())
     }
 }
 
 /// A memory bitmap with a Direct2D target bound to it.
 struct Canvas {
-    dc: HDC,
-    bitmap: HBITMAP,
-    stock: HGDIOBJ,
-    bits: *mut std::ffi::c_void,
-    size: (i32, i32),
-    target: ID2D1RenderTarget,
+    dib: Dib,
+    target: DcTarget,
 }
 
 impl Canvas {
     fn new(factory: &ID2D1Factory, size: (i32, i32)) -> Result<Canvas> {
-        unsafe {
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: size.0,
-                    biHeight: -size.1,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let target = factory.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            })?;
-            let mut bits = std::ptr::null_mut();
-            let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
-            let dc = CreateCompatibleDC(None);
-            let stock = SelectObject(dc, bitmap);
-            // From here on `Canvas::drop` releases the GDI objects.
-            let base = target.cast::<ID2D1RenderTarget>();
-            let bound = target.BindDC(dc, &RECT { left: 0, top: 0, right: size.0, bottom: size.1 });
-            match (base, bound) {
-                (Ok(target), Ok(())) => Ok(Canvas { dc, bitmap, stock, bits, size, target }),
-                (Err(e), _) | (_, Err(e)) => {
-                    SelectObject(dc, stock);
-                    DeleteObject(bitmap);
-                    DeleteDC(dc);
-                    Err(e)
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Canvas {
-    fn drop(&mut self) {
-        unsafe {
-            SelectObject(self.dc, self.stock);
-            DeleteObject(self.bitmap);
-            DeleteDC(self.dc);
-        }
+        let target = DcTarget::new(factory, D2D1_ALPHA_MODE_IGNORE, 96.0)?;
+        let dib = Dib::new(size)?;
+        target.bind(&dib)?;
+        Ok(Canvas { dib, target })
     }
 }
 
 fn make_fonts(scale: f32) -> Result<Fonts> {
-    unsafe {
-        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-        let make = |size: f32, weight: i32, alignment: DWRITE_TEXT_ALIGNMENT| -> Result<IDWriteTextFormat> {
-            let format = factory.CreateTextFormat(
-                w!("Segoe UI"),
-                None,
-                DWRITE_FONT_WEIGHT(weight),
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                size * scale,
-                w!("ko-kr"),
-            )?;
-            format.SetTextAlignment(alignment)?;
-            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            // Text that does not fit ends in an ellipsis instead of being cut.
-            let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+    let factory = paint::dwrite_factory()?;
+    let make = |size: f32, weight: i32, alignment: DWRITE_TEXT_ALIGNMENT| -> Result<IDWriteTextFormat> {
+        let format = paint::text_format(&factory, size * scale, weight, alignment)?;
+        // Text that does not fit ends in an ellipsis instead of being cut.
+        let trimming = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, delimiter: 0, delimiterCount: 0 };
+        unsafe {
             let sign = factory.CreateEllipsisTrimmingSign(&format)?;
             format.SetTrimming(&trimming, &sign)?;
-            Ok(format)
-        };
-        Ok(Fonts {
-            title: make(13.5, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-            sub: make(11.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-            label: make(15.0, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-            small: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
-            centered: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-            big: make(22.0, 300, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-        })
-    }
+        }
+        Ok(format)
+    };
+    Ok(Fonts {
+        title: make(13.5, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+        sub: make(11.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+        label: make(15.0, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+        small: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+        centered: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+        big: make(22.0, 300, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+    })
 }
 
 /// The window's icon as a Direct2D bitmap of `size` pixels.
 fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D1Bitmap> {
     unsafe {
-        let mut result = 0usize;
-        SendMessageTimeoutW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0), SMTO_ABORTIFHUNG, 40, Some(&mut result));
-        if result == 0 {
-            result = GetClassLongPtrW(hwnd, GCLP_HICON);
+        let mut icon = 0usize;
+        SendMessageTimeoutW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0), SMTO_ABORTIFHUNG, 40, Some(&mut icon));
+        if icon == 0 {
+            icon = GetClassLongPtrW(hwnd, GCLP_HICON);
         }
-        if result == 0 {
+        if icon == 0 {
             return None;
         }
-        let dc = CreateCompatibleDC(None);
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size,
-                biPlanes: 1,
-                biBitCount: 32,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits = std::ptr::null_mut();
-        let Ok(bitmap) = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
-            DeleteDC(dc);
-            return None;
-        };
-        let stock = SelectObject(dc, bitmap);
-        let drawn = DrawIconEx(dc, 0, 0, HICON(result as isize), size, size, 0, None, DI_NORMAL).is_ok();
-        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
+        let mut dib = Dib::new((size, size)).ok()?;
+        DrawIconEx(dib.dc, 0, 0, HICON(icon as isize), size, size, 0, None, DI_NORMAL).ok()?;
         // Icons without an alpha channel leave alpha at zero; make what they drew opaque.
+        let pixels = dib.pixels_mut();
         if pixels.chunks_exact(4).all(|p| p[3] == 0) {
             for p in pixels.chunks_exact_mut(4).filter(|p| p[0] | p[1] | p[2] != 0) {
                 p[3] = 255;
             }
         }
-        let made = drawn
-            .then(|| {
-                target.CreateBitmap(
-                    D2D_SIZE_U { width: size as u32, height: size as u32 },
-                    Some(bits as *const _),
-                    (size * 4) as u32,
-                    &D2D1_BITMAP_PROPERTIES {
-                        pixelFormat: D2D1_PIXEL_FORMAT {
-                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                        },
-                        dpiX: 96.0,
-                        dpiY: 96.0,
-                    },
-                )
-            })
-            .and_then(|bitmap| bitmap.ok());
-        SelectObject(dc, stock);
-        DeleteObject(bitmap);
-        DeleteDC(dc);
-        made
+        let (bits, pitch) = dib.raw();
+        let properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        target.CreateBitmap(D2D_SIZE_U { width: size as u32, height: size as u32 }, Some(bits), pitch, &properties).ok()
     }
 }
 
@@ -1544,27 +1440,14 @@ fn display_title(title: &str, app: &str, max_chars: usize) -> String {
     title.to_owned()
 }
 
-/// Lays out the windows of one cell as rows of previews that keep each
-/// window's proportions, as large as fits (like Task View).
-fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<TileLayout> {
-    if windows.is_empty() {
-        return Vec::new();
-    }
-    let aspects: Vec<f32> = windows
-        .iter()
-        .map(|(w, _)| {
-            // Not narrower than the title bar needs for its buttons.
-            let r = w.rect;
-            ((r.right - r.left).max(1) as f32 / (r.bottom - r.top).max(1) as f32).clamp(1.1, 2.4)
-        })
-        .collect();
-    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
-    let (title_h, gap) = (46.0 * s, 26.0 * s);
+/// Splits windows of the given proportions (width over height) into rows of
+/// previews of one common height that fit an area of `aw` by `ah`, trying one
+/// to four rows and keeping the split that gives the tallest previews.
+/// Returns that height and the indices of each row's windows.
+fn split_into_rows(aspects: &[f32], (aw, ah): (f32, f32), title_h: f32, gap: f32, max_height: f32) -> (f32, Vec<Vec<usize>>) {
     let total: f32 = aspects.iter().sum();
-
-    // Try 1..4 rows and keep the split that gives the tallest previews.
     let mut best: (f32, Vec<Vec<usize>>) = (0.0, Vec::new());
-    for rows in 1..=windows.len().min(4) {
+    for rows in 1..=aspects.len().min(4) {
         let target = total / rows as f32;
         let mut split: Vec<Vec<usize>> = vec![Vec::new()];
         let mut filled = 0.0;
@@ -1583,12 +1466,28 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
             .iter()
             .map(|row| (aw - gap * (row.len() as f32 - 1.0)) / row.iter().map(|i| aspects[*i]).sum::<f32>())
             .fold(f32::INFINITY, f32::min);
-        let height = by_height.min(by_width).min(430.0 * s);
+        let height = by_height.min(by_width).min(max_height);
         if height > best.0 {
             best = (height, split);
         }
     }
-    let (height, split) = best;
+    best
+}
+
+/// Lays out windows as rows of previews that keep each window's
+/// proportions, as large as fits (like Task View), centred in `area`.
+fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<TileLayout> {
+    let aspects: Vec<f32> = windows
+        .iter()
+        .map(|(w, _)| {
+            // Not narrower than the title bar needs for its buttons.
+            let r = w.rect;
+            ((r.right - r.left).max(1) as f32 / (r.bottom - r.top).max(1) as f32).clamp(1.1, 2.4)
+        })
+        .collect();
+    let (aw, ah) = size(area);
+    let (title_h, gap) = (46.0 * s, 26.0 * s);
+    let (height, split) = split_into_rows(&aspects, (aw, ah), title_h, gap, 430.0 * s);
     if height <= 8.0 {
         return Vec::new();
     }
@@ -1600,19 +1499,15 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
         let width: f32 = row.iter().map(|i| aspects[*i] * height).sum::<f32>() + gap * (row.len() as f32 - 1.0);
         let mut x = area.left + (aw - width) / 2.0;
         for &i in row {
+            let (window, everywhere) = windows[i];
             let w = aspects[i] * height;
-            // The pin button is only as wide as its current label.
-            let pin_w = match (windows[i].0.follows, windows[i].1) {
-                (_, true) => 74.0,
-                (true, _) => 118.0,
-                _ => 46.0,
-            } * s;
+            let pin_w = Pin::of(window, everywhere).width() * s;
             let (close_w, pin_h) = (28.0 * s, 24.0 * s);
             let pin_y = y + (title_h - pin_h) / 2.0;
             let close = rect(x + w - 6.0 * s - close_w, pin_y, close_w, pin_h);
             let pin = rect(close.left - 4.0 * s - pin_w, pin_y, pin_w, pin_h);
             tiles.push(TileLayout {
-                hwnd: windows[i].0.hwnd,
+                hwnd: window.hwnd,
                 frame: rect(x, y, w, title_h + height),
                 icon: rect(x + 10.0 * s, y + (title_h - icon) / 2.0, icon, icon),
                 title: rect(x + 18.0 * s + icon, y, (pin.left - 8.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
@@ -1627,13 +1522,51 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     tiles
 }
 
-/// Lays out the map at the bottom of the board: rows top to bottom, each
+/// The badges of one map cell (`body`, of size `cell_w` by `cell_h`), one per
+/// app in the order its windows are stacked, centred in the cell: as many as
+/// fit, and how many did not.
+fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32) -> (Vec<AppBadge>, usize) {
+    let mut apps: Vec<(HWND, &str, usize)> = Vec::new();
+    for window in &cell.windows {
+        match apps.iter_mut().find(|(_, app, _)| *app == window.app.as_str() && !window.app.is_empty()) {
+            Some(entry) => entry.2 += 1,
+            None => apps.push((window.hwnd, window.app.as_str(), 1)),
+        }
+    }
+    let count_w = icon * 0.62;
+    let width = |count: usize| icon + if count > 1 { count_w } else { 0.0 };
+    let room = cell_w - 16.0 * s;
+    let between = 5.0 * s;
+    let mut shown = 0;
+    let mut used = 0.0;
+    for (_, _, count) in &apps {
+        let next = used + width(*count) + if shown > 0 { between } else { 0.0 };
+        if next > room {
+            break;
+        }
+        used = next;
+        shown += 1;
+    }
+    let mut x = body.left + (cell_w - used) / 2.0;
+    let y = body.top + (cell_h - icon) / 2.0;
+    let badges = apps[..shown]
+        .iter()
+        .map(|&(hwnd, _, count)| {
+            let badge = AppBadge { hwnd, icon: rect(x, y, icon, icon), count, label: rect(x + icon + 1.0 * s, y, count_w, icon) };
+            x += width(count) + between;
+            badge
+        })
+        .collect();
+    (badges, apps.len() - shown)
+}
+
+/// Lays out the map at the bottom of a monitor: rows top to bottom, each
 /// shifted sideways so that its landing cell (`anchors[row]`) sits on a common
 /// column, the spine. `size` is the space above the footer; `s` the scale.
-fn compute_layout(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Layout {
+fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> MapLayout {
     let (w, h) = size;
     let (margin, header_w, gap) = (60.0 * s, 170.0 * s, 10.0 * s);
-    /// Share of the board's height the map may take.
+    /// Share of the monitor's height the map may take.
     const MAX_SHARE: f32 = 0.34;
 
     let anchor = |r: usize| anchors.get(r).copied().unwrap_or(0);
@@ -1658,66 +1591,32 @@ fn compute_layout(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) ->
     let cells_x = x0 + header_w + plus + gap;
     let spine_x = cells_x + lead as f32 * pitch;
     let icon = (cell_h * 0.36).min(22.0 * s);
-    let count_w = icon * 0.62;
 
-    let mut layout = Layout { map_top: y, ..Layout::default() };
+    let mut layout = MapLayout { top: y, ..MapLayout::default() };
     layout.add_row_top = rect(spine_x + (cell_w - plus) / 2.0, y, plus, plus);
     y += plus + gap;
     let rows_top = y;
     for (r, row) in model.rows.iter().enumerate() {
-        let mut x = spine_x - anchor(r) as f32 * pitch;
+        let first_x = spine_x - anchor(r) as f32 * pitch;
+        let mut x = first_x;
         let mut cells = Vec::new();
         for cell in &row.cells {
             let body = rect(x, y, cell_w, cell_h);
-            // One badge per app, in the order its windows are stacked.
-            let mut apps: Vec<(HWND, &str, usize)> = Vec::new();
-            for window in &cell.windows {
-                match apps.iter_mut().find(|(_, app, _)| *app == window.app.as_str() && !window.app.is_empty()) {
-                    Some(entry) => entry.2 += 1,
-                    None => apps.push((window.hwnd, window.app.as_str(), 1)),
-                }
-            }
-            let width = |count: usize| icon + if count > 1 { count_w } else { 0.0 };
-            let room = cell_w - 16.0 * s;
-            let between = 5.0 * s;
-            let mut shown = 0;
-            let mut used = 0.0;
-            for (_, _, count) in &apps {
-                let next = used + width(*count) + if shown > 0 { between } else { 0.0 };
-                if next > room {
-                    break;
-                }
-                used = next;
-                shown += 1;
-            }
-            let mut bx = body.left + (cell_w - used) / 2.0;
-            let by = body.top + (cell_h - icon) / 2.0;
-            let badges = apps[..shown]
-                .iter()
-                .map(|&(hwnd, _, count)| {
-                    let badge = AppBadge { hwnd, icon: rect(bx, by, icon, icon), count, label: rect(bx + icon + 1.0 * s, by, count_w, icon) };
-                    bx += width(count) + between;
-                    badge
-                })
-                .collect();
+            let (apps, more) = layout_badges(cell, &body, (cell_w, cell_h), icon, s);
             cells.push(CellLayout {
                 id: cell.id.clone(),
                 body,
                 close: rect(body.right - 15.0 * s, body.top - 5.0 * s, 20.0 * s, 20.0 * s),
-                apps: badges,
-                more: apps.len() - shown,
+                apps,
+                more,
             });
             x += pitch;
         }
-        let first_x = spine_x - anchor(r) as f32 * pitch;
+        // As wide as the name itself, so the clickable box matches what is read.
+        let name_w = (text_width(&grid::row_title(&row.name, r), 12.0 * s) + 4.0 * s).min(header_w - 12.0 * s);
         layout.rows.push(RowLayout {
             header: rect(x0, y, header_w, cell_h),
-            name: {
-                // As wide as the name itself, so the clickable box matches what is read.
-                let name = if row.name.is_empty() { format!("워크스페이스 {}", r + 1) } else { row.name.clone() };
-                let width = (text_width(&name, 12.0 * s) + 4.0 * s).min(header_w - 12.0 * s);
-                rect(x0, y + (cell_h - 20.0 * s) / 2.0, width, 20.0 * s)
-            },
+            name: rect(x0, y + (cell_h - 20.0 * s) / 2.0, name_w, 20.0 * s),
             top: y - gap / 2.0,
             bottom: y + cell_h + gap / 2.0,
             cells,

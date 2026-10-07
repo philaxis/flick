@@ -3,7 +3,7 @@
 //! Windows' installed-apps list, and starts the installed copy.
 //! `--uninstall` (what that entry runs) undoes it.
 
-use crate::config::APP_NAME;
+use crate::{config::APP_NAME, tray::RUN_KEY};
 use std::{
     fs,
     os::windows::process::CommandExt,
@@ -33,27 +33,29 @@ pub const MAIN_CLASS: PCWSTR = w!("flick.main");
 /// Earlier names of the app, cleaned up on install.
 const OLD_CLASSES: [PCWSTR; 2] = [w!("kankan.main"), w!("desk2d.main")];
 const OLD_NAMES: [&str; 2] = ["KanKan", "desk2d"];
-const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn env_dir(variable: &str) -> PathBuf {
     std::env::var_os(variable).map(PathBuf::from).unwrap_or_default()
 }
 
-fn install_dir() -> PathBuf {
-    env_dir("LOCALAPPDATA").join(APP_NAME)
+// Where an install under the name `app` keeps its files, its Start menu
+// shortcut and its entry in the installed-apps list.
+
+fn install_dir(app: &str) -> PathBuf {
+    env_dir("LOCALAPPDATA").join(app)
 }
 
-pub fn installed_exe() -> PathBuf {
-    install_dir().join(format!("{APP_NAME}.exe"))
+fn installed_exe() -> PathBuf {
+    install_dir(APP_NAME).join(format!("{APP_NAME}.exe"))
 }
 
-fn shortcut() -> PathBuf {
-    env_dir("APPDATA").join("Microsoft\\Windows\\Start Menu\\Programs").join(format!("{APP_NAME}.lnk"))
+fn shortcut(app: &str) -> PathBuf {
+    env_dir("APPDATA").join("Microsoft\\Windows\\Start Menu\\Programs").join(format!("{app}.lnk"))
 }
 
-fn uninstall_key() -> HSTRING {
-    HSTRING::from(format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}"))
+fn uninstall_key(app: &str) -> HSTRING {
+    HSTRING::from(format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{app}"))
 }
 
 /// Whether this process is the installed copy.
@@ -64,7 +66,7 @@ pub fn running_installed() -> bool {
 
 /// Asks a running instance to quit and waits for it to go.
 fn stop_running() {
-    for class in [MAIN_CLASS, OLD_CLASSES[0], OLD_CLASSES[1]] {
+    for class in std::iter::once(MAIN_CLASS).chain(OLD_CLASSES) {
         for _ in 0..50 {
             let window = unsafe { FindWindowW(class, None) };
             if window.0 == 0 {
@@ -99,7 +101,7 @@ fn create_shortcut(exe: &Path) -> windows::core::Result<()> {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.SetPath(&HSTRING::from(exe.as_os_str()))?;
         link.SetDescription(w!("가상 데스크톱을 2D 격자로 이동"))?;
-        link.cast::<IPersistFile>()?.Save(&HSTRING::from(shortcut().as_os_str()), true)
+        link.cast::<IPersistFile>()?.Save(&HSTRING::from(shortcut(APP_NAME).as_os_str()), true)
     }
 }
 
@@ -107,7 +109,7 @@ fn create_shortcut(exe: &Path) -> windows::core::Result<()> {
 pub fn install() -> std::io::Result<()> {
     stop_running();
     let exe = installed_exe();
-    fs::create_dir_all(install_dir())?;
+    fs::create_dir_all(install_dir(APP_NAME))?;
     // The old copy stays locked for a moment after its process has gone.
     let mut copied = fs::copy(std::env::current_exe()?, &exe);
     for _ in 0..30 {
@@ -122,12 +124,12 @@ pub fn install() -> std::io::Result<()> {
     if let Err(e) = create_shortcut(&exe) {
         crate::app::log(&format!("shortcut failed: {e}"));
     }
-    let key = uninstall_key();
+    let key = uninstall_key(APP_NAME);
     let path = exe.to_string_lossy();
     set_string(&key, w!("DisplayName"), APP_NAME);
     set_string(&key, w!("DisplayVersion"), env!("CARGO_PKG_VERSION"));
     set_string(&key, w!("DisplayIcon"), &path);
-    set_string(&key, w!("InstallLocation"), &install_dir().to_string_lossy());
+    set_string(&key, w!("InstallLocation"), &install_dir(APP_NAME).to_string_lossy());
     set_string(&key, w!("UninstallString"), &format!("\"{path}\" --uninstall"));
     set_flag(&key, w!("NoModify"));
     set_flag(&key, w!("NoRepair"));
@@ -136,11 +138,10 @@ pub fn install() -> std::io::Result<()> {
     for old in OLD_NAMES {
         unsafe {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &HSTRING::from(old));
-            let key = HSTRING::from(format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{old}"));
-            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &key);
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &uninstall_key(old));
         }
-        let _ = fs::remove_file(env_dir("APPDATA").join("Microsoft\\Windows\\Start Menu\\Programs").join(format!("{old}.lnk")));
-        let _ = fs::remove_dir_all(env_dir("LOCALAPPDATA").join(old));
+        let _ = fs::remove_file(shortcut(old));
+        let _ = fs::remove_dir_all(install_dir(old));
     }
 
     Command::new(&exe).arg("--first-run").spawn()?;
@@ -149,11 +150,11 @@ pub fn install() -> std::io::Result<()> {
 
 pub fn uninstall() {
     stop_running();
+    crate::tray::set_autostart(false);
     unsafe {
-        let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &HSTRING::from(APP_NAME));
-        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &uninstall_key());
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &uninstall_key(APP_NAME));
     }
-    let _ = fs::remove_file(shortcut());
+    let _ = fs::remove_file(shortcut(APP_NAME));
     let text = format!("{APP_NAME}을(를) 제거했습니다.\n설정과 격자 배치는 %APPDATA%\\{APP_NAME} 에 남아 있습니다.");
     unsafe {
         MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(APP_NAME), MB_OK | MB_ICONINFORMATION);
@@ -161,7 +162,7 @@ pub fn uninstall() {
     // A running exe cannot delete itself; a detached shell removes the folder
     // once this process has exited.
     if running_installed() {
-        let command = format!("ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", install_dir().display());
+        let command = format!("ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"", install_dir(APP_NAME).display());
         let _ = Command::new("cmd").args(["/c", &command]).creation_flags(CREATE_NO_WINDOW).spawn();
     }
 }

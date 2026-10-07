@@ -1,33 +1,42 @@
 //! Thin layer over `vdapi` plus the window bookkeeping the grid needs.
 
+use crate::vdapi::{self, Desktop};
 use std::collections::{HashMap, HashSet};
-use windows::core::{w, HSTRING, PWSTR};
-use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-use windows::Win32::{
-    Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE},
-    Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
-    Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST},
-    System::{
-        Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+use windows::{
+    core::{w, HSTRING, PWSTR},
+    Win32::{
+        Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, TRUE, WPARAM},
+        Graphics::{
+            Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE},
+            Gdi::{
+                EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
+                MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+            },
         },
-        ProcessStatus::{K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
-        Threading::{
-            AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+        Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+            },
+            ProcessStatus::{K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+            Threading::{
+                AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+            },
         },
-    },
-    UI::{
-        Input::KeyboardAndMouse::SetFocus,
-        WindowsAndMessaging::{
-            EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowPlacement, SetWindowPlacement,
-            FindWindowExW, ShowWindow, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, GetWindowLongW,
-            GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-            IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
+        UI::{
+            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+            Input::KeyboardAndMouse::SetFocus,
+            WindowsAndMessaging::{
+                EnumWindows, FindWindowExW, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
+                GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+                IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, ShowWindow,
+                GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
+                WINDOWPLACEMENT, WM_CLOSE, WS_EX_TOOLWINDOW,
+            },
         },
     },
 };
-use crate::vdapi::{self, Desktop};
 
 /// Snapshot of the desktops that exist right now, in Windows' own order.
 pub struct Desktops {
@@ -114,16 +123,42 @@ pub fn focus_top_window() {
     force_foreground(top.unwrap_or_else(|| unsafe { GetShellWindow() }));
 }
 
+/// Asks a window to close, as its own close button would.
+pub fn ask_to_close(hwnd: HWND) {
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
 fn pinned_everywhere(hwnd: HWND) -> bool {
     vdapi::is_pinned_window(hwnd).unwrap_or(false) || vdapi::is_pinned_app(hwnd).unwrap_or(false)
+}
+
+/// Whether the shell or DWM is hiding the window although it counts as visible.
+fn cloaked(hwnd: HWND) -> bool {
+    dwm_attribute::<u32>(hwnd, DWMWA_CLOAKED).unwrap_or(0) != 0
+}
+
+fn placement(hwnd: HWND) -> Option<WINDOWPLACEMENT> {
+    let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(hwnd, &mut placement) }.ok().map(|_| placement)
+}
+
+pub struct WindowInfo {
+    pub hwnd: HWND,
+    /// Id of the desktop the window lives on; empty for one shown on all.
+    pub desktop: String,
+    /// Screen rectangle; for a minimized window, where it will be restored to.
+    pub rect: RECT,
+    pub minimized: bool,
+    pub title: String,
+    pub pid: u32,
 }
 
 fn describe(hwnd: HWND, desktop: String) -> WindowInfo {
     let minimized = unsafe { IsIconic(hwnd) }.as_bool();
     let rect = if minimized {
-        let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
-        let _ = unsafe { GetWindowPlacement(hwnd, &mut placement) };
-        placement.rcNormalPosition
+        placement(hwnd).unwrap_or_default().rcNormalPosition
     } else {
         dwm_attribute::<RECT>(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS).unwrap_or_else(|| {
             let mut rect = RECT::default();
@@ -142,7 +177,7 @@ fn describe(hwnd: HWND, desktop: String) -> WindowInfo {
 pub fn pinned_windows() -> Vec<WindowInfo> {
     app_windows()
         .into_iter()
-        .filter(|hwnd| pinned_everywhere(*hwnd) && dwm_attribute::<u32>(*hwnd, DWMWA_CLOAKED).unwrap_or(0) == 0)
+        .filter(|hwnd| pinned_everywhere(*hwnd) && !cloaked(*hwnd))
         .map(|hwnd| describe(hwnd, String::new()))
         .collect()
 }
@@ -220,18 +255,7 @@ pub fn exe_of_window(hwnd: HWND) -> Option<String> {
     exe_name(pid)
 }
 
-pub struct WindowInfo {
-    pub hwnd: HWND,
-    /// Id of the desktop the window lives on.
-    pub desktop: String,
-    /// Screen rectangle; for a minimized window, where it will be restored to.
-    pub rect: RECT,
-    pub minimized: bool,
-    pub title: String,
-    pub pid: u32,
-}
-
-fn dwm_attribute<T: Default>(hwnd: HWND, attribute: windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE) -> Option<T> {
+fn dwm_attribute<T: Default>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE) -> Option<T> {
     let mut value = T::default();
     unsafe {
         DwmGetWindowAttribute(hwnd, attribute, &mut value as *mut T as *mut _, std::mem::size_of::<T>() as u32)
@@ -252,7 +276,7 @@ pub fn windows(current: &str) -> Vec<WindowInfo> {
             let desktop = vdapi::get_desktop_by_window(hwnd).ok()?.id();
             // On the desktop being shown nothing is hidden by the shell, so a
             // cloaked window there is a suspended store app, not a real window.
-            if desktop == current && dwm_attribute::<u32>(hwnd, DWMWA_CLOAKED).unwrap_or(0) != 0 {
+            if desktop == current && cloaked(hwnd) {
                 return None;
             }
             Some(describe(hwnd, desktop))
@@ -323,20 +347,53 @@ pub fn trim(pids: &[u32]) {
     }
 }
 
+/// A display, in screen coordinates.
+#[derive(Clone, Copy)]
+pub struct Monitor {
+    /// The whole screen.
+    pub bounds: RECT,
+    /// The part of it the taskbar leaves free.
+    pub work: RECT,
+    pub primary: bool,
+    /// Its scaling setting: 1.0 at 100%.
+    pub scale: f32,
+}
+
+fn monitor_info(monitor: HMONITOR) -> Option<MONITORINFO> {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool().then_some(info)
+}
+
+/// Every display, in the order Windows lists them.
+pub fn monitors() -> Vec<Monitor> {
+    unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> BOOL {
+        (*(out.0 as *mut Vec<HMONITOR>)).push(monitor);
+        TRUE
+    }
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    let primary = unsafe {
+        EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut handles as *mut _ as isize));
+        MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY)
+    };
+    handles
+        .into_iter()
+        .filter_map(|handle| {
+            let info = monitor_info(handle)?;
+            let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+            let _ = unsafe { GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+            Some(Monitor { bounds: info.rcMonitor, work: info.rcWork, primary: handle == primary, scale: dpi_x as f32 / 96.0 })
+        })
+        .collect()
+}
+
 /// Moves a window to another monitor, keeping its place and size relative to
 /// the monitor. A maximized window stays maximized there; a minimized one
 /// will be restored there.
 pub fn move_to_monitor(hwnd: HWND, to: RECT) {
     unsafe {
-        let mut from = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut from).as_bool() {
-            return;
-        }
+        let Some(from) = monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) else { return };
         let from = from.rcMonitor;
-        let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
-        if GetWindowPlacement(hwnd, &mut placement).is_err() {
-            return;
-        }
+        let Some(mut placement) = placement(hwnd) else { return };
         let (fw, fh) = ((from.right - from.left).max(1) as f32, (from.bottom - from.top).max(1) as f32);
         let (tw, th) = ((to.right - to.left) as f32, (to.bottom - to.top) as f32);
         let r = placement.rcNormalPosition;

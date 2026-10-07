@@ -1,5 +1,6 @@
 //! Notification-area icon, its menu, and the "run at startup" registry entry.
 
+use crate::config::APP_NAME;
 use windows::{
     core::{w, HSTRING, PCWSTR},
     Win32::{
@@ -13,15 +14,16 @@ use windows::{
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadIconW, LoadImageW,
-                SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED,
-                MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+                SetForegroundWindow, TrackPopupMenu, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR,
+                MF_CHECKED, MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
             },
         },
     },
 };
 
-const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("Flick");
+/// Where Windows keeps what to start at sign-in; the app's entry there is
+/// named after the app.
+pub const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {
@@ -54,7 +56,7 @@ pub fn add(hwnd: HWND, callback_message: u32) {
     data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     data.uCallbackMessage = callback_message;
     data.hIcon = app_icon();
-    for (slot, unit) in data.szTip.iter_mut().zip(crate::config::APP_NAME.encode_utf16()) {
+    for (slot, unit) in data.szTip.iter_mut().zip(APP_NAME.encode_utf16()) {
         *slot = unit;
     }
     unsafe {
@@ -84,50 +86,69 @@ pub fn remove(hwnd: HWND) {
     }
 }
 
-/// Shows the context menu at the cursor and returns what was picked.
-pub fn menu(hwnd: HWND) -> Option<Command> {
+fn add_item(menu: HMENU, id: usize, text: PCWSTR, checked: bool) {
+    let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
     unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let item = |command: Command, text: PCWSTR, checked: bool| {
-            let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
-            let _ = AppendMenuW(menu, flags, command as usize, text);
-        };
-        item(Command::Peek, w!("격자 보기"), false);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        item(Command::ChangeTrigger, w!("트리거 버튼 바꾸기…"), false);
-        item(Command::OpenConfig, w!("설정 파일 열기"), false);
-        item(Command::ReloadConfig, w!("설정 다시 읽기"), false);
-        item(Command::ToggleAutostart, w!("윈도우 시작 시 실행"), autostart_enabled());
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        item(Command::Exit, w!("종료"), false);
-
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        // Required so the menu closes when the user clicks elsewhere.
-        let _ = SetForegroundWindow(hwnd);
-        let picked =
-            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd, None);
-        let _ = DestroyMenu(menu);
-        [Command::Peek, Command::ChangeTrigger, Command::OpenConfig, Command::ReloadConfig, Command::ToggleAutostart, Command::Exit]
-            .into_iter()
-            .find(|c| *c as i32 == picked.0)
+        let _ = AppendMenuW(menu, flags, id, text);
     }
 }
 
+fn add_separator(menu: HMENU) {
+    unsafe {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+    }
+}
+
+/// Shows a menu at the cursor, waits for the user and returns the id of the
+/// item picked (0 for none). The menu is destroyed. `owner` must be the
+/// foreground window, or the menu does not close on a click elsewhere.
+fn pick(menu: HMENU, owner: HWND) -> usize {
+    unsafe {
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let picked =
+            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, owner, None);
+        let _ = DestroyMenu(menu);
+        picked.0 as usize
+    }
+}
+
+/// Shows the tray icon's menu at the cursor and returns what was picked.
+pub fn menu(hwnd: HWND) -> Option<Command> {
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
+    add_item(menu, Command::Peek as usize, w!("격자 보기"), false);
+    add_separator(menu);
+    add_item(menu, Command::ChangeTrigger as usize, w!("트리거 버튼 바꾸기…"), false);
+    add_item(menu, Command::OpenConfig as usize, w!("설정 파일 열기"), false);
+    add_item(menu, Command::ReloadConfig as usize, w!("설정 다시 읽기"), false);
+    add_item(menu, Command::ToggleAutostart as usize, w!("윈도우 시작 시 실행"), autostart_enabled());
+    add_separator(menu);
+    add_item(menu, Command::Exit as usize, w!("종료"), false);
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+    }
+    let picked = pick(menu, hwnd);
+    [Command::Peek, Command::ChangeTrigger, Command::OpenConfig, Command::ReloadConfig, Command::ToggleAutostart, Command::Exit]
+        .into_iter()
+        .find(|c| *c as usize == picked)
+}
+
 pub fn autostart_enabled() -> bool {
-    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None).is_ok() }
+    let name = HSTRING::from(APP_NAME);
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, &name, RRF_RT_REG_SZ, None, None, None).is_ok() }
 }
 
 pub fn set_autostart(enabled: bool) {
+    let name = HSTRING::from(APP_NAME);
     unsafe {
         if !enabled {
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &name);
             return;
         }
         let Ok(exe) = std::env::current_exe() else { return };
         let command = HSTRING::from(format!("\"{}\"", exe.display()));
         let bytes = (command.len() + 1) * 2;
-        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ.0, Some(command.as_ptr().cast()), bytes as u32);
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &name, REG_SZ.0, Some(command.as_ptr().cast()), bytes as u32);
     }
 }
 
@@ -149,29 +170,18 @@ pub enum PinCommand {
 }
 
 /// Shows the pin menu for one window at the cursor. The caller must make
-/// `owner` the foreground window first so the menu closes on an outside click.
+/// `owner` the foreground window first (see `pick`).
 pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let item = |command: PinCommand, text: PCWSTR, checked: bool| {
-            let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
-            let _ = AppendMenuW(menu, flags, command as usize, text);
-        };
-        item(PinCommand::RowWindow, w!("이 창을 행 안에서 따라오게"), state.row_window);
-        item(PinCommand::RowApp, w!("이 앱의 창을 행 안에서 따라오게"), state.row_app);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        item(PinCommand::AllWindow, w!("이 창을 모든 칸에 고정"), state.all_window);
-        item(PinCommand::AllApp, w!("이 앱을 모든 칸에 고정"), state.all_app);
-
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        let picked =
-            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, owner, None);
-        let _ = DestroyMenu(menu);
-        [PinCommand::RowWindow, PinCommand::RowApp, PinCommand::AllWindow, PinCommand::AllApp]
-            .into_iter()
-            .find(|c| *c as i32 == picked.0)
-    }
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
+    add_item(menu, PinCommand::RowWindow as usize, w!("이 창을 행 안에서 따라오게"), state.row_window);
+    add_item(menu, PinCommand::RowApp as usize, w!("이 앱의 창을 행 안에서 따라오게"), state.row_app);
+    add_separator(menu);
+    add_item(menu, PinCommand::AllWindow as usize, w!("이 창을 모든 칸에 고정"), state.all_window);
+    add_item(menu, PinCommand::AllApp as usize, w!("이 앱을 모든 칸에 고정"), state.all_app);
+    let picked = pick(menu, owner);
+    [PinCommand::RowWindow, PinCommand::RowApp, PinCommand::AllWindow, PinCommand::AllApp]
+        .into_iter()
+        .find(|c| *c as usize == picked)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -183,18 +193,12 @@ pub enum RowCommand {
 /// The menu of a workspace in the board, at the cursor. `summary` says what
 /// closing would close; `removable` is false for the only workspace.
 pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowCommand> {
-    unsafe {
-        let menu = CreatePopupMenu().ok()?;
-        let close = HSTRING::from(format!("열린 창 닫기  ({summary})"));
-        let _ = AppendMenuW(menu, MF_STRING, RowCommand::CloseWindows as usize, &close);
-        if removable {
-            let _ = AppendMenuW(menu, MF_STRING, RowCommand::Remove as usize, w!("워크스페이스 없애기  (창은 가장 가까운 칸으로)"));
-        }
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        let picked =
-            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, owner, None);
-        let _ = DestroyMenu(menu);
-        [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as i32 == picked.0)
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
+    let close = HSTRING::from(format!("열린 창 닫기  ({summary})"));
+    add_item(menu, RowCommand::CloseWindows as usize, PCWSTR(close.as_ptr()), false);
+    if removable {
+        add_item(menu, RowCommand::Remove as usize, w!("워크스페이스 없애기  (창은 가장 가까운 칸으로)"), false);
     }
+    let picked = pick(menu, owner);
+    [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as usize == picked)
 }

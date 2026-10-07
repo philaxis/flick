@@ -4,7 +4,7 @@
 use crate::{
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
-    grid::{Dir, Grid, Pos, Row},
+    grid::{self, Dir, Grid, Pos, Row},
     input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_RELEASE, WM_STEP},
     overlay::{Minimap, Overlay, View},
     tray::{self, Command, PinCommand, PinState},
@@ -37,7 +37,7 @@ use windows::{
                 GetSystemMetrics, IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
                 RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2,
                 MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP,
                 WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
                 WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
             },
@@ -142,18 +142,13 @@ impl App {
                 .iter()
                 .map(|row| row.cells.iter().map(|id| self.grid.ephemeral.contains(id)).collect())
                 .collect(),
-            anchors: self
-                .grid
-                .rows
-                .iter()
-                .map(|row| row.last.as_ref().and_then(|id| row.cells.iter().position(|c| c == id)).unwrap_or(0))
-                .collect(),
+            anchors: self.grid.rows.iter().map(Row::anchor).collect(),
             cur: self.grid.find(current),
             pushing,
-            title: self.grid.find(current).map_or(String::new(), |pos| {
-                let name = &self.grid.rows[pos.row].name;
-                if name.is_empty() { format!("워크스페이스 {}", pos.row + 1) } else { name.clone() }
-            }),
+            title: self
+                .grid
+                .find(current)
+                .map_or(String::new(), |pos| grid::row_title(&self.grid.rows[pos.row].name, pos.row)),
         }
     }
 
@@ -546,7 +541,7 @@ impl App {
             Action::AddRow { top } => {
                 if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
                     let at = if top { 0 } else { self.grid.rows.len() };
-                    self.grid.rows.insert(at, Row { name: String::new(), cells: vec![id], last: None });
+                    self.grid.rows.insert(at, Row::with_cell(id));
                 }
             }
             Action::RemoveCell(id) => self.remove_cell(&id),
@@ -570,9 +565,9 @@ impl App {
                 }
             }
             Action::CloseWindow(hwnd) => {
+                vd::ask_to_close(hwnd);
+                // The window needs a moment to go (or to ask about saving).
                 unsafe {
-                    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-                    // The window needs a moment to go (or to ask about saving).
                     SetTimer(self.hwnd, REFRESH_TIMER_ID, 500, None);
                 }
                 return;
@@ -597,9 +592,7 @@ impl App {
         let Some(desktops) = self.sync() else { return };
         let Some(ids) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
         for window in vd::windows(&desktops.current).iter().filter(|w| ids.contains(&w.desktop)) {
-            unsafe {
-                let _ = PostMessageW(window.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
+            vd::ask_to_close(window.hwnd);
         }
         unsafe {
             SetTimer(self.hwnd, REFRESH_TIMER_ID, 600, None);
@@ -1062,7 +1055,7 @@ pub fn render_sample(path: &str) {
         cur: Some(Pos { row: 1, col: 1 }),
         pushing: Some(Dir::Right),
     };
-    if let Some((w, h, pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
+    if let Some(((w, h), pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
         let mut out = Vec::with_capacity(pixels.len() + 8);
         out.extend_from_slice(&w.to_le_bytes());
         out.extend_from_slice(&h.to_le_bytes());

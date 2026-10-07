@@ -14,6 +14,8 @@ mod install;
 #[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
+mod paint;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod vd;

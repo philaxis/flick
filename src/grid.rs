@@ -33,6 +33,29 @@ pub struct Row {
     pub last: Option<CellId>,
 }
 
+impl Row {
+    /// A new, unnamed row holding one cell.
+    pub fn with_cell(id: CellId) -> Row {
+        Row { name: String::new(), cells: vec![id], last: None }
+    }
+
+    /// The column a vertical move into this row lands on: the cell it was
+    /// last left on, or the first one if it was never visited.
+    pub fn anchor(&self) -> usize {
+        self.last.as_ref().and_then(|id| self.cells.iter().position(|c| c == id)).unwrap_or(0)
+    }
+}
+
+/// What a row is called: its name, or its number while the user has not
+/// given it one.
+pub fn row_title(name: &str, index: usize) -> String {
+    if name.is_empty() {
+        format!("워크스페이스 {}", index + 1)
+    } else {
+        name.to_owned()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     pub rows: Vec<Row>,
@@ -58,8 +81,7 @@ impl Grid {
     }
 
     /// Where a move from `from` lands, or `None` at the edge of the grid.
-    /// Vertical moves go to the column the target row was last left on, and to
-    /// its first column if the row was never visited.
+    /// Vertical moves go to the target row's `anchor`.
     pub fn target(&self, from: Pos, dir: Dir) -> Option<Pos> {
         let row = self.rows.get(from.row)?;
         match dir {
@@ -67,13 +89,7 @@ impl Grid {
             Dir::Right => (from.col + 1 < row.cells.len()).then(|| Pos { row: from.row, col: from.col + 1 }),
             Dir::Up | Dir::Down => {
                 let r = if dir == Dir::Up { from.row.checked_sub(1)? } else { from.row + 1 };
-                let target = self.rows.get(r)?;
-                let col = target
-                    .last
-                    .as_ref()
-                    .and_then(|id| target.cells.iter().position(|c| c == id))
-                    .unwrap_or(0);
-                Some(Pos { row: r, col })
+                Some(Pos { row: r, col: self.rows.get(r)?.anchor() })
             }
         }
     }
@@ -87,12 +103,11 @@ impl Grid {
     /// Inserts a newly created cell next to `from` in direction `dir`:
     /// sideways it joins the same row, vertically it starts a new row.
     pub fn insert_beside(&mut self, from: Pos, dir: Dir, id: CellId) {
-        let row = |id: CellId| Row { name: String::new(), cells: vec![id], last: None };
         match dir {
             Dir::Left => self.rows[from.row].cells.insert(from.col, id),
             Dir::Right => self.rows[from.row].cells.insert(from.col + 1, id),
-            Dir::Up => self.rows.insert(from.row, row(id)),
-            Dir::Down => self.rows.insert(from.row + 1, row(id)),
+            Dir::Up => self.rows.insert(from.row, Row::with_cell(id)),
+            Dir::Down => self.rows.insert(from.row + 1, Row::with_cell(id)),
         }
     }
 
@@ -114,16 +129,15 @@ impl Grid {
         let Some(from) = self.find(id) else { return };
         self.rows[from.row].cells.remove(from.col);
         let at = at.min(self.rows.len());
-        self.rows.insert(at, Row { name: String::new(), cells: vec![id.to_owned()], last: None });
+        self.rows.insert(at, Row::with_cell(id.to_owned()));
         self.rows.retain(|r| !r.cells.is_empty());
     }
 
     /// How far `row` is drawn shifted right, in cells: rows are shifted so
-    /// that the cell each was last left on sits in one common column.
+    /// that their anchors sit in one common column.
     fn shift(&self, row: usize) -> i64 {
-        let anchor = |r: &Row| r.last.as_ref().and_then(|id| r.cells.iter().position(|c| c == id)).unwrap_or(0) as i64;
-        let lead = self.rows.iter().map(anchor).max().unwrap_or(0);
-        self.rows.get(row).map_or(0, |r| lead - anchor(r))
+        let lead = self.rows.iter().map(Row::anchor).max().unwrap_or(0);
+        self.rows.get(row).map_or(0, |r| (lead - r.anchor()) as i64)
     }
 
     /// The cell outside `pos`'s row that is closest to it as the grid is
