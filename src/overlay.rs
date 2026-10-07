@@ -46,8 +46,8 @@ const CELL_H: f32 = 30.0;
 const GAP: f32 = 7.0;
 const PAD: f32 = 20.0;
 /// Time constants (seconds) of the exponential easing.
-const SLIDE_TAU: f32 = 0.045;
-const FADE_TAU: f32 = 0.040;
+const SLIDE_TAU: f32 = 0.018;
+const FADE_TAU: f32 = 0.025;
 
 const ACCENT: (f32, f32, f32) = (0.34, 0.62, 1.0);
 
