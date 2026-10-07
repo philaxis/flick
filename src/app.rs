@@ -5,7 +5,7 @@ use crate::{
     config::{self, Config},
     grid::{Dir, Grid, Pos, Row},
     input::{self, Trigger, WM_CLICK, WM_RELEASE, WM_STEP},
-    overlay::{self, Overlay, View},
+    overlay::{Minimap, Overlay, View},
     tray::{self, Command, PinCommand, PinState},
     vd::{self, Desktops},
 };
@@ -67,7 +67,7 @@ struct App {
     hwnd: HWND,
     config: Config,
     grid: Grid,
-    overlay: Overlay,
+    overlay: Minimap,
     /// Consecutive pushes against the same edge of the grid.
     edge: Option<(Dir, u32)>,
     board: Board,
@@ -819,9 +819,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 with_app(|app| {
                     app.in_gesture = true;
                     app.step(dir, app.carry_held());
-                    // Timer messages wait behind queued steps, so advance the
-                    // minimap's animation here as well.
-                    app.overlay.tick();
+
                 });
             }
         }
@@ -857,14 +855,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     app.settle(LINGER_HOTKEY_MS);
                 });
             }
-        }
-        WM_TIMER if wparam.0 == overlay::TIMER_ID => {
-            with_app(|app| {
-                app.overlay.tick();
-                if !app.overlay.is_visible() {
-                    app.edge = None;
-                }
-            });
         }
         WM_TIMER if wparam.0 == LABEL_TIMER_ID => {
             let _ = KillTimer(hwnd, LABEL_TIMER_ID);
@@ -1003,10 +993,11 @@ pub fn run(first_run: bool) {
         Ok(hwnd) => hwnd,
         Err(e) => return warn(&format!("시작하지 못했습니다: {e}")),
     };
-    let (overlay, board) = match (Overlay::new(wndproc), Board::new(wndproc)) {
-        (Ok(overlay), Ok(board)) => (overlay, board),
-        (Err(e), _) | (_, Err(e)) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
+    let board = match Board::new(wndproc) {
+        Ok(board) => board,
+        Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
     };
+    let overlay = Minimap::spawn();
     BOARD_HWND.set(board.hwnd().0);
     if Desktops::read().is_none() {
         return warn("가상 데스크톱에 접근하지 못했습니다. 이 윈도우 빌드를 지원하지 않는 것일 수 있습니다.");
@@ -1059,7 +1050,7 @@ pub fn run(first_run: bool) {
 /// Renders sample minimaps into `path` (raw: width, height as i32 LE, then
 /// premultiplied BGRA) so the design can be reviewed without touching the desktop.
 pub fn render_sample(path: &str) {
-    let Ok(mut overlay) = Overlay::new(wndproc) else { return };
+    let Ok(mut overlay) = Overlay::new() else { return };
     let view = View {
         rows: vec![vec![false; 4], vec![false, false], vec![false, false, true]],
         anchors: vec![2, 1, 0],
@@ -1081,7 +1072,8 @@ pub fn render_board(path: &str) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    let (Ok(overlay), Ok(board)) = (Overlay::new(wndproc), Board::new(wndproc)) else { return };
+    let Ok(board) = Board::new(wndproc) else { return };
+    let overlay = Minimap::spawn();
     let (_tx, events) = mpsc::channel();
     let mut app = App {
         hwnd: HWND(0),

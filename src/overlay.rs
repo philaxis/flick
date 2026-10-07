@@ -11,6 +11,7 @@ use windows::{
     Win32::{
         Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
+            Dwm::DwmFlush,
             Direct2D::{
                 Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F},
                 D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
@@ -29,15 +30,16 @@ use windows::{
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, KillTimer, RegisterClassW, SetTimer, ShowWindow,
-                UpdateLayeredWindow, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW, SetWindowPos,
+                ShowWindow, HWND_TOPMOST, MSG, PM_REMOVE,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+                UpdateLayeredWindow, SW_HIDE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED,
                 WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
 };
 
-pub const TIMER_ID: usize = 1;
 
 const CELL_W: f32 = 46.0;
 const CELL_H: f32 = 30.0;
@@ -122,7 +124,10 @@ impl View {
 }
 
 impl Overlay {
-    pub fn new(wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) -> Result<Overlay> {
+    pub fn new() -> Result<Overlay> {
+        unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class = w!("flick.overlay");
@@ -196,17 +201,17 @@ impl Overlay {
             self.highlight = (start.col as f32 + view.shift(start.row), start.row as f32);
             self.visible = true;
             self.last_tick = Instant::now();
-            unsafe {
-                SetTimer(self.hwnd, TIMER_ID, 10, None);
-            }
         }
         self.view = view;
         self.hide_at = linger_ms.map(|ms| Instant::now() + std::time::Duration::from_millis(ms));
         self.render();
         unsafe {
-            ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            // Shown and raised: the minimap stays above the sliding picture
+            // of the desktop being left.
+            let raise = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
             for (window, _) in &self.others {
-                ShowWindow(*window, SW_SHOWNOACTIVATE);
+                let _ = SetWindowPos(*window, HWND_TOPMOST, 0, 0, 0, 0, raise);
             }
         }
     }
@@ -250,7 +255,6 @@ impl Overlay {
             self.alpha = 0.0;
             self.visible = false;
             unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_ID);
                 ShowWindow(self.hwnd, SW_HIDE);
                 for (window, _) in &self.others {
                     ShowWindow(*window, SW_HIDE);
@@ -475,5 +479,72 @@ impl Drop for Overlay {
             }
             DeleteDC(self.dc);
         }
+    }
+}
+
+/// What the app asks of the minimap.
+enum Request {
+    Show(View, Option<Pos>, Option<u64>),
+    Update(View),
+    HideAfter(u64),
+}
+
+/// The minimap on a thread of its own. Switching desktops keeps the app's
+/// thread busy for tens of milliseconds at a time; drawn from there the
+/// highlight moved in jerks. Here it is redrawn once per screen refresh no
+/// matter what the app is doing.
+pub struct Minimap {
+    requests: std::sync::mpsc::Sender<Request>,
+}
+
+impl Minimap {
+    pub fn spawn() -> Minimap {
+        let (requests, inbox) = std::sync::mpsc::channel::<Request>();
+        std::thread::spawn(move || {
+            let Ok(mut overlay) = Overlay::new() else { return };
+            let apply = |overlay: &mut Overlay, request: Request| match request {
+                Request::Show(view, from, linger) => overlay.show(view, from, linger),
+                Request::Update(view) => overlay.update(view),
+                Request::HideAfter(ms) => overlay.hide_after(ms),
+            };
+            loop {
+                // Nothing on screen: sleep until asked for something.
+                if !overlay.is_visible() {
+                    match inbox.recv() {
+                        Ok(request) => apply(&mut overlay, request),
+                        Err(_) => return,
+                    }
+                }
+                while let Ok(request) = inbox.try_recv() {
+                    apply(&mut overlay, request);
+                }
+                unsafe {
+                    let mut message = MSG::default();
+                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                        DispatchMessageW(&message);
+                    }
+                    if overlay.is_visible() {
+                        overlay.tick();
+                        // Wait for the next refresh of the screen.
+                        if DwmFlush().is_err() {
+                            std::thread::sleep(std::time::Duration::from_millis(8));
+                        }
+                    }
+                }
+            }
+        });
+        Minimap { requests }
+    }
+
+    pub fn show(&self, view: View, from: Option<Pos>, linger_ms: Option<u64>) {
+        let _ = self.requests.send(Request::Show(view, from, linger_ms));
+    }
+
+    pub fn update(&self, view: View) {
+        let _ = self.requests.send(Request::Update(view));
+    }
+
+    pub fn hide_after(&self, ms: u64) {
+        let _ = self.requests.send(Request::HideAfter(ms));
     }
 }
