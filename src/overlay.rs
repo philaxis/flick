@@ -153,7 +153,7 @@ impl Overlay {
         }
         Ok(Overlay {
             hwnd: create_window()?,
-            target: DcTarget::new(&paint::d2d_factory()?, D2D1_ALPHA_MODE_PREMULTIPLIED, 0.0)?,
+            target: DcTarget::new(&paint::d2d_factory()?, D2D1_ALPHA_MODE_PREMULTIPLIED)?,
             text: None,
             text_scale: 0.0,
             canvas: None,

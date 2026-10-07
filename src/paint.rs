@@ -125,7 +125,8 @@ pub fn dwrite_factory() -> Result<IDWriteFactory> {
     unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }
 }
 
-/// A Direct2D target that draws into the bitmap it was last bound to.
+/// A Direct2D target that draws into the bitmap it was last bound to. One
+/// unit is one pixel; what is drawn is scaled by its own code.
 pub struct DcTarget {
     dc: ID2D1DCRenderTarget,
     /// The same object as the plain render target the drawing calls take.
@@ -133,14 +134,13 @@ pub struct DcTarget {
 }
 
 impl DcTarget {
-    /// `dpi` 0.0 stands for Direct2D's default.
-    pub fn new(factory: &ID2D1Factory, alpha: D2D1_ALPHA_MODE, dpi: f32) -> Result<DcTarget> {
+    pub fn new(factory: &ID2D1Factory, alpha: D2D1_ALPHA_MODE) -> Result<DcTarget> {
         unsafe {
             let dc = factory.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: alpha },
-                dpiX: dpi,
-                dpiY: dpi,
+                dpiX: 96.0,
+                dpiY: 96.0,
                 usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             })?;

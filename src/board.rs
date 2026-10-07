@@ -1357,7 +1357,7 @@ struct Canvas {
 
 impl Canvas {
     fn new(factory: &ID2D1Factory, size: (i32, i32)) -> Result<Canvas> {
-        let target = DcTarget::new(factory, D2D1_ALPHA_MODE_IGNORE, 96.0)?;
+        let target = DcTarget::new(factory, D2D1_ALPHA_MODE_IGNORE)?;
         let dib = Dib::new(size)?;
         target.bind(&dib)?;
         Ok(Canvas { dib, target })
