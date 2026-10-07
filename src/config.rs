@@ -14,9 +14,11 @@ use std::{fs, path::PathBuf};
 
 const DEFAULT_CONFIG: &str = r#"# KanKan 설정. 저장한 뒤 트레이 아이콘 메뉴의 "설정 다시 읽기"를 누르면 적용됩니다.
 
-# 누르고 있는 동안 마우스를 움직이면 칸을 이동하는 버튼.
+# 누르고 있는 동안 마우스를 움직이면 칸을 이동하는 버튼. 쉼표로 여러 개를 함께 쓸 수 있습니다.
 #   마우스: "xbutton1"(뒤로), "xbutton2"(앞으로), "middle"(휠 버튼)
-#   키보드: "capslock", "scrolllock", "pause", "apps", "ralt", "rctrl", "f13" ~ "f24"
+#   키보드: "capslock", "scrolllock", "pause", "apps", "ralt", "rctrl", "f1" ~ "f24"
+#   동시 누르기: "e+r+t"처럼 +로 묶은 키들을 한 번에 누르고 있는 동안 (하나만 쓸 수 있음)
+#   예: trigger = "xbutton2, e+r+t"
 trigger = "xbutton2"
 
 # 한 칸 넘어가는 데 필요한 이동 거리(픽셀). 세로를 더 길게 두면 실수로 행이 바뀌지 않습니다.

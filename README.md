@@ -51,7 +51,7 @@
 
 | 항목 | 기본값 | 설명 |
 |---|---|---|
-| `trigger` | `xbutton2` | `xbutton1`, `xbutton2`, `middle`, `capslock`, `scrolllock`, `pause`, `apps`, `ralt`, `rctrl`, `f13`~`f24` |
+| `trigger` | `xbutton2` | `xbutton1`, `xbutton2`, `middle`, `capslock`, `scrolllock`, `pause`, `apps`, `ralt`, `rctrl`, `f1`~`f24`. 쉼표로 여러 개, `e+r+t`처럼 `+`로 묶으면 동시 누르기 (예: `xbutton2, e+r+t`) |
 | `step_x`, `step_y` | 140, 180 | 한 칸 넘어가는 이동 거리(픽셀) |
 | `edge_create_pushes` | 2 | 가장자리에서 새 칸을 만드는 데 필요한 추가 밀기 횟수 (0 = 끔) |
 | `carry_modifier` | `shift` | 창을 들고 이동하는 보조 키 (`shift`, `ctrl`, `alt`) |

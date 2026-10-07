@@ -553,8 +553,14 @@ impl App {
     }
 
     fn board_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        let started = Instant::now();
         let action = self.board.handle(message, wparam, lparam)?;
+        let handled = started.elapsed();
         self.perform(action);
+        // Kept as a diagnostic: anything this slow is felt as a hitch.
+        if started.elapsed() > Duration::from_millis(250) {
+            log(&format!("slow board message {message:#x}: handle {handled:?}, total {:?}", started.elapsed()));
+        }
         Some(LRESULT(0))
     }
 
@@ -588,11 +594,14 @@ impl App {
         if let Some(error) = error {
             warn(&format!("config.toml을 읽지 못해 기본값을 씁니다.\n\n{error}"));
         }
-        let trigger = Trigger::parse(&config.trigger).unwrap_or_else(|| {
-            warn(&format!("알 수 없는 trigger \"{}\" — xbutton2를 씁니다.", config.trigger));
-            Trigger::XButton2
-        });
-        input::install(self.hwnd, trigger, config.step_x, config.step_y);
+        let (mut triggers, unknown) = Trigger::parse_list(&config.trigger);
+        if !unknown.is_empty() {
+            warn(&format!("config.toml의 trigger에서 알 수 없는 항목: {}", unknown.join(", ")));
+        }
+        if triggers.is_empty() {
+            triggers.push(Trigger::XButton2);
+        }
+        input::install(self.hwnd, triggers, config.step_x, config.step_y);
 
         unsafe {
             for id in 0..=PIN_HOTKEY_ID {

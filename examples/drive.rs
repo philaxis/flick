@@ -87,6 +87,24 @@ fn main() {
                 };
                 SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
             }
+            Some("move") => {
+                // move <dx> <dy>: relative mouse movement, like a real mouse.
+                use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT};
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT { dx: args[2].parse().unwrap(), dy: args[3].parse().unwrap(), dwFlags: MOUSEEVENTF_MOVE, ..Default::default() },
+                    },
+                };
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
+            Some("keys") => {
+                // keys <down|up> <letters>: presses or releases all the letters at once.
+                let up = args[2] == "up";
+                let events: Vec<_> = args[3].chars().map(|c| key(c, up)).collect();
+                windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&events, std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32);
+            }
+            Some("typetest") => typetest(),
             Some("info") => {
                 use windows::Win32::Foundation::RECT;
                 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -104,6 +122,96 @@ fn main() {
             }
             _ => println!("app window: {:?}", app),
         }
+    }
+}
+
+#[cfg(windows)]
+fn key(c: char, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let vk = c.to_ascii_uppercase() as u32;
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk as u16),
+                wScan: unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) } as u16,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                ..Default::default()
+            },
+        },
+    }
+}
+
+/// Types into a text box of its own and prints what arrived, to check that a
+/// key chord used as trigger neither eats nor reorders ordinary typing.
+#[cfg(windows)]
+fn typetest() {
+    use windows::core::w;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, SetFocus, INPUT};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe {
+        let edit = CreateWindowExW(
+            WS_EX_TOPMOST, w!("EDIT"), w!(""), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 420, 120, None, None, None, None,
+        );
+        let other = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let _ = AttachThreadInput(GetCurrentThreadId(), other, true);
+        let _ = SetForegroundWindow(edit);
+        let _ = SetFocus(edit);
+        let _ = AttachThreadInput(GetCurrentThreadId(), other, false);
+        let pump = |ms: u64| {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            let mut message = MSG::default();
+            while std::time::Instant::now() < end {
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let send = |events: &[INPUT]| {
+            SendInput(events, std::mem::size_of::<INPUT>() as i32);
+        };
+        let text = |edit: HWND| {
+            let mut buffer = [0u16; 128];
+            let n = GetWindowTextW(edit, &mut buffer).max(0) as usize;
+            String::from_utf16_lossy(&buffer[..n])
+        };
+        pump(300);
+        // Ordinary typing, one key at a time, with overlap between neighbours.
+        for word in ["ert", "the", "tree"] {
+            let letters: Vec<char> = word.chars().collect();
+            for (i, c) in letters.iter().enumerate() {
+                send(&[key(*c, false)]);
+                pump(35);
+                if i > 0 {
+                    // nothing: previous key was released below
+                }
+                send(&[key(*c, true)]);
+                pump(35);
+            }
+        }
+        pump(200);
+        println!("typed one by one: {:?} (expected \"ertthetree\")", text(edit));
+        // Fast rollover: next key goes down before the previous one is up.
+        send(&[key('r', false)]);
+        pump(20);
+        send(&[key('e', false)]);
+        pump(20);
+        send(&[key('r', true)]);
+        pump(20);
+        send(&[key('e', true)]);
+        pump(200);
+        println!("after rollover re: {:?} (expected \"ertthetreere\")", text(edit));
+        // The chord: all three at once, held, released.
+        send(&[key('e', false), key('r', false), key('t', false)]);
+        pump(400);
+        send(&[key('e', true), key('r', true), key('t', true)]);
+        pump(400);
+        println!("after chord: {:?} (expected unchanged)", text(edit));
+        let _ = DestroyWindow(edit);
     }
 }
 
