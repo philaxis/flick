@@ -1,6 +1,6 @@
 [package]
 name = "flick"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "2D grid navigation on top of Windows 11 virtual desktops"
 license = "MIT"
@@ -19,9 +19,13 @@ serde_json = "1"
 toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
-# 0.0.46 targets Windows 11 23H2 (22631.3085+). 0.0.49 requires 24H2.
-# Vendored (see [patch]) to expose move_desktop, which upstream keeps private.
-winvd = "=0.0.46"
+# The shell's virtual desktop interfaces are undocumented and their layout
+# changed in 24H2, so each winvd release fits one range of Windows builds:
+# 0.0.46 fits 22621.3155+ / 22631.3085+ (23H2), 0.0.49 fits 26100.2605+
+# (24H2, 25H2). Both are linked in and src/vdapi.rs picks one at start-up.
+# Vendored to expose move_desktop, which upstream keeps private.
+winvd_23h2 = { package = "winvd", path = "vendor/winvd" }
+winvd_24h2 = { package = "winvd", path = "vendor/winvd-24h2" }
 windows = { version = "0.52", features = [
     "Foundation_Numerics",
     "Win32_Foundation",
@@ -46,9 +50,6 @@ windows = { version = "0.52", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[patch.crates-io]
-winvd = { path = "vendor/winvd" }
 
 [profile.release]
 opt-level = "s"

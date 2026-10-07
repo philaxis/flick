@@ -28,11 +28,11 @@
 
 ## Good to know
 
-- Windows 11 23H2 only for now. 24H2 is not supported yet.
+- For Windows 11 23H2 (build 22631.3085 or later), 24H2 (build 26100.2605 or later) and 25H2. On any other version it tells you so and does not start.
 - To remove it: Settings → Apps → Installed apps → Flick.
 
 ## Build
 
 `cargo build --release` on Windows, or `scripts/build-wsl.sh build --release` from WSL.
 
-[MIT](LICENSE). `vendor/winvd` comes from [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor) (MIT).
+[MIT](LICENSE). `vendor/winvd` and `vendor/winvd-24h2` come from [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor) (MIT).

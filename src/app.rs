@@ -8,6 +8,7 @@ use crate::{
     overlay::{Minimap, Overlay, View},
     tray::{self, Command, PinCommand, PinState},
     vd::{self, Desktops},
+    vdapi,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -42,7 +43,6 @@ use windows::{
         },
     },
 };
-use winvd::DesktopEvent;
 
 const WM_TRAY: u32 = WM_APP + 10;
 const WM_DESKTOP_EVENT: u32 = WM_APP + 11;
@@ -91,7 +91,7 @@ struct App {
     asleep: HashSet<String>,
     started: Instant,
     events: mpsc::Receiver<(String, String)>,
-    _listener: Option<winvd::DesktopEventThread>,
+    _listener: Option<vdapi::DesktopEventThread>,
     taskbar_created: u32,
 }
 
@@ -180,7 +180,7 @@ impl App {
                 continue;
             }
             let (Some(desktop), Some(from)) = (desktops.get(id), actual.iter().position(|a| a == id)) else { return };
-            if let Err(e) = winvd::move_desktop(desktop, i as u32) {
+            if let Err(e) = vdapi::move_desktop(desktop, i as u32) {
                 return log(&format!("move_desktop failed: {e:?}"));
             }
             let moved = actual.remove(from);
@@ -195,12 +195,12 @@ impl App {
     }
 
     /// Switches to a desktop without Windows' own name label popping up.
-    fn switch(&self, target: winvd::Desktop) -> Result<(), winvd::Error> {
+    fn switch(&self, target: vdapi::Desktop) -> vdapi::Result<()> {
         vd::set_switch_label_hidden(true);
         unsafe {
             SetTimer(self.hwnd, LABEL_TIMER_ID, LABEL_HIDE_MS, None);
         }
-        winvd::switch_desktop(target)
+        vdapi::switch_desktop(target)
     }
 
     /// Brings the windows that follow within a row over to cell `to` from the
@@ -216,7 +216,7 @@ impl App {
         }
         for window in vd::windows(&desktops.current) {
             if window.desktop != to && row.contains(&window.desktop) && self.follows(&window) {
-                let _ = winvd::move_window_to_desktop(target, &window.hwnd);
+                let _ = vdapi::move_window_to_desktop(target, window.hwnd);
             }
         }
     }
@@ -225,8 +225,8 @@ impl App {
         PinState {
             row_window: self.following.contains(&hwnd.0),
             row_app: vd::exe_of_window(hwnd).is_some_and(|exe| self.grid.follow_apps.contains(&exe)),
-            all_window: winvd::is_pinned_window(hwnd).unwrap_or(false),
-            all_app: winvd::is_pinned_app(hwnd).unwrap_or(false),
+            all_window: vdapi::is_pinned_window(hwnd).unwrap_or(false),
+            all_app: vdapi::is_pinned_app(hwnd).unwrap_or(false),
         }
     }
 
@@ -249,10 +249,10 @@ impl App {
                 }
                 Ok(())
             }
-            PinCommand::AllWindow if state.all_window => winvd::unpin_window(hwnd),
-            PinCommand::AllWindow => winvd::pin_window(hwnd),
-            PinCommand::AllApp if state.all_app => winvd::unpin_app(hwnd),
-            PinCommand::AllApp => winvd::pin_app(hwnd),
+            PinCommand::AllWindow if state.all_window => vdapi::unpin_window(hwnd),
+            PinCommand::AllWindow => vdapi::pin_window(hwnd),
+            PinCommand::AllApp if state.all_app => vdapi::unpin_app(hwnd),
+            PinCommand::AllApp => vdapi::pin_app(hwnd),
         };
         if let Err(e) = result {
             log(&format!("pin change failed: {e:?}"));
@@ -353,8 +353,9 @@ impl App {
         let may_create = self.config.edge_create_pushes > 0 && !on_empty_fresh;
         if may_create && pushes >= self.config.edge_create_pushes {
             self.edge = None;
-            match winvd::create_desktop().ok().and_then(|d| Some((vd::id_of(&d)?, d))) {
-                Some((id, _)) => {
+            match vdapi::create_desktop() {
+                Ok(desktop) => {
+                    let id = desktop.id();
                     self.grid.insert_beside(from, dir, id.clone());
                     self.grid.ephemeral.push(id.clone());
                     self.commit();
@@ -363,7 +364,7 @@ impl App {
                     let from = self.grid.find(&current).unwrap_or(from);
                     self.go(&desktops, from, &id, carry);
                 }
-                None => log("create_desktop failed"),
+                Err(_) => log("create_desktop failed"),
             }
         } else {
             self.edge = Some((dir, pushes));
@@ -377,8 +378,8 @@ impl App {
         let window = unsafe { GetForegroundWindow() };
         let carried = carry
             && vd::is_app_window(window)
-            && winvd::is_window_on_current_desktop(window).unwrap_or(false)
-            && winvd::move_window_to_desktop(target, &window).is_ok();
+            && vdapi::is_window_on_current_desktop(window).unwrap_or(false)
+            && vdapi::move_window_to_desktop(target, window).is_ok();
         self.bring_followers(desktops, to);
         if let Err(e) = self.switch(target) {
             log(&format!("switch_desktop failed: {e:?}"));
@@ -521,7 +522,7 @@ impl App {
             Action::MoveWindow { window, cell, monitor } => {
                 if let Some(id) = cell {
                     if let Some(target) = Desktops::read().and_then(|d| d.get(&id)) {
-                        if let Err(e) = winvd::move_window_to_desktop(target, &window) {
+                        if let Err(e) = vdapi::move_window_to_desktop(target, window) {
                             log(&format!("move_window_to_desktop failed: {e:?}"));
                         }
                         self.grid.ephemeral.retain(|cell| *cell != id);
@@ -536,14 +537,14 @@ impl App {
             Action::AddCell { row, front } => {
                 // Placed in the grid before the next sync, which would otherwise
                 // file the unknown desktop under the current row.
-                if let Some(id) = winvd::create_desktop().ok().and_then(|d| vd::id_of(&d)) {
+                if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
                     if let Some(row) = self.grid.rows.get_mut(row) {
                         row.cells.insert(if front { 0 } else { row.cells.len() }, id);
                     }
                 }
             }
             Action::AddRow { top } => {
-                if let Some(id) = winvd::create_desktop().ok().and_then(|d| vd::id_of(&d)) {
+                if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
                     let at = if top { 0 } else { self.grid.rows.len() };
                     self.grid.rows.insert(at, Row { name: String::new(), cells: vec![id], last: None });
                 }
@@ -556,13 +557,13 @@ impl App {
                     self.following.remove(&window.0);
                 }
                 let result = if all {
-                    winvd::pin_window(window)
+                    vdapi::pin_window(window)
                 } else {
                     // Being shown everywhere can also come from its app being pinned.
-                    if winvd::is_pinned_app(window).unwrap_or(false) {
-                        let _ = winvd::unpin_app(window);
+                    if vdapi::is_pinned_app(window).unwrap_or(false) {
+                        let _ = vdapi::unpin_app(window);
                     }
-                    if winvd::is_pinned_window(window).unwrap_or(false) { winvd::unpin_window(window) } else { Ok(()) }
+                    if vdapi::is_pinned_window(window).unwrap_or(false) { vdapi::unpin_window(window) } else { Ok(()) }
                 };
                 if let Err(e) = result {
                     log(&format!("pin change failed: {e:?}"));
@@ -628,7 +629,7 @@ impl App {
         }
         for (id, to) in targets {
             if let (Some(desktop), Some(target)) = (desktops.get(&id), desktops.get(&to)) {
-                match winvd::remove_desktop(desktop, target) {
+                match vdapi::remove_desktop(desktop, target) {
                     Ok(()) => self.grid.remove(&id),
                     Err(e) => log(&format!("remove_desktop failed: {e:?}")),
                 }
@@ -664,7 +665,7 @@ impl App {
         }
         for id in ids {
             if let Some(desktop) = desktops.get(id) {
-                match winvd::remove_desktop(desktop, target) {
+                match vdapi::remove_desktop(desktop, target) {
                     Ok(()) => self.grid.remove(id),
                     Err(e) => log(&format!("remove_desktop failed: {e:?}")),
                 }
@@ -694,7 +695,7 @@ impl App {
             // A cell created by an edge push is kept only if it got a window.
             match (desktops.get(old), desktops.get(new)) {
                 (Some(left), Some(fallback)) if vd::count_on(left) == 0 => {
-                    if winvd::remove_desktop(left, fallback).is_ok() {
+                    if vdapi::remove_desktop(left, fallback).is_ok() {
                         self.grid.remove(old);
                         self.commit();
                     }
@@ -952,21 +953,19 @@ fn run_pending_menu(owner: HWND) {
 
 /// Forwards "current desktop changed" notifications to the UI thread as
 /// (old id, new id) pairs.
-fn listen(hwnd: HWND) -> (mpsc::Receiver<(String, String)>, Option<winvd::DesktopEventThread>) {
-    let (raw_tx, raw_rx) = mpsc::channel::<DesktopEvent>();
+fn listen(hwnd: HWND) -> (mpsc::Receiver<(String, String)>, Option<vdapi::DesktopEventThread>) {
+    let (raw_tx, raw_rx) = mpsc::channel::<vdapi::DesktopEvent>();
     let (tx, rx) = mpsc::channel();
-    let listener = winvd::listen_desktop_events(raw_tx).map_err(|e| log(&format!("listener failed: {e:?}"))).ok();
+    let listener = vdapi::listen_desktop_events(raw_tx).map_err(|e| log(&format!("listener failed: {e:?}"))).ok();
     let target = hwnd.0;
     std::thread::spawn(move || {
         for event in raw_rx {
-            if let DesktopEvent::DesktopChanged { new, old } = event {
-                if let (Some(old), Some(new)) = (vd::id_of(&old), vd::id_of(&new)) {
-                    if tx.send((old, new)).is_err() {
-                        break;
-                    }
-                    unsafe {
-                        let _ = PostMessageW(HWND(target), WM_DESKTOP_EVENT, WPARAM(0), LPARAM(0));
-                    }
+            if let vdapi::DesktopEvent::DesktopChanged { new, old } = event {
+                if tx.send((old.id(), new.id())).is_err() {
+                    break;
+                }
+                unsafe {
+                    let _ = PostMessageW(HWND(target), WM_DESKTOP_EVENT, WPARAM(0), LPARAM(0));
                 }
             }
         }

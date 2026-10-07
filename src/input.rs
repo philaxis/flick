@@ -57,7 +57,10 @@ const WM_RELOAD: u32 = WM_APP + 20;
 /// Marks key events we replay ourselves, so the hook lets them through.
 const OWN_INPUT: usize = 0x4B41_4E4B;
 /// All keys of a chord must go down within this long to count as one press.
+/// Two keys next to each other are also typed in quick succession ("ty" in
+/// "type"), so a two-key chord has to be much more simultaneous than that.
 const CHORD_WINDOW_MS: u32 = 100;
+const PAIR_WINDOW_MS: u32 = 40;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Trigger {
@@ -618,7 +621,8 @@ fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
         SWALLOW.with(|slot| *slot.borrow_mut() = keys);
         press(SRC_CHORD);
     } else if CHORD_TIMER.get() == 0 {
-        CHORD_TIMER.set(unsafe { SetTimer(None, 0, CHORD_WINDOW_MS, Some(chord_timeout)) });
+        let window = if chord.len() <= 2 { PAIR_WINDOW_MS } else { CHORD_WINDOW_MS };
+        CHORD_TIMER.set(unsafe { SetTimer(None, 0, window, Some(chord_timeout)) });
     }
     true
 }

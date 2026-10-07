@@ -28,11 +28,11 @@
 
 ## 须知
 
-- 目前仅支持 Windows 11 23H2,暂不支持 24H2。
+- 支持 Windows 11 23H2(内部版本 22631.3085 及以上)、24H2(内部版本 26100.2605 及以上)和 25H2。在其他版本上只会提示,不会启动。
 - 卸载:设置 → 应用 → 已安装的应用 → Flick。
 
 ## 构建
 
 在 Windows 上运行 `cargo build --release`,在 WSL 中运行 `scripts/build-wsl.sh build --release`。
 
-[MIT](LICENSE)。`vendor/winvd` 来自 [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor)(MIT)。
+[MIT](LICENSE)。`vendor/winvd` 和 `vendor/winvd-24h2` 来自 [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor)(MIT)。

@@ -1,6 +1,12 @@
 //! Test driver: posts the app's own messages to the running instance and
 //! captures the screen, so behaviour can be checked without a person at the mouse.
 //!   drive step <0..3> | click | release | shot <path>
+// The app is a binary only; its door to the virtual desktops is compiled in
+// here as it is, and this driver uses a small part of it.
+#[allow(dead_code)]
+#[path = "../src/vdapi.rs"]
+mod vdapi;
+
 #[cfg(windows)]
 fn main() {
     use windows::{
@@ -172,7 +178,8 @@ fn main() {
                 let fg = GetForegroundWindow();
                 let mut title = [0u16; 128];
                 let n = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(fg, &mut title).max(0) as usize;
-                println!("foreground on current desktop: {:?} title: {}", winvd::is_window_on_current_desktop(fg), String::from_utf16_lossy(&title[..n]).chars().take(30).collect::<String>());
+                vdapi::select(false);
+                println!("foreground on current desktop: {:?} title: {}", vdapi::is_window_on_current_desktop(fg), String::from_utf16_lossy(&title[..n]).chars().take(30).collect::<String>());
                 println!("board {:?} rect {:?} visible {:?} cloaked {} style {:x} ex {:x} fg {:?}", board, r, IsWindowVisible(board), cloaked, GetWindowLongW(board, GWL_STYLE), GetWindowLongW(board, GWL_EXSTYLE), GetForegroundWindow());
             }
             _ => println!("app window: {:?}", app),

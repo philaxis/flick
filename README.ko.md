@@ -28,11 +28,11 @@
 
 ## 알아 둘 것
 
-- 지금은 윈도우 11 23H2 전용입니다. 24H2는 아직 지원하지 않습니다.
+- 윈도우 11 23H2(빌드 22631.3085 이상), 24H2(빌드 26100.2605 이상), 25H2에서 동작합니다. 그 밖의 버전에서는 안내만 띄우고 실행하지 않습니다.
 - 제거: 설정 → 앱 → 설치된 앱 → Flick.
 
 ## 빌드
 
 윈도우에서 `cargo build --release`, WSL에서는 `scripts/build-wsl.sh build --release`.
 
-[MIT](LICENSE). `vendor/winvd`는 [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor)(MIT)에서 가져왔습니다.
+[MIT](LICENSE). `vendor/winvd`와 `vendor/winvd-24h2`는 [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor)(MIT)에서 가져왔습니다.

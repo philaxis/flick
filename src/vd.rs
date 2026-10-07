@@ -1,4 +1,4 @@
-//! Thin layer over `winvd` plus the window bookkeeping the grid needs.
+//! Thin layer over `vdapi` plus the window bookkeeping the grid needs.
 
 use std::collections::{HashMap, HashSet};
 use windows::core::{w, HSTRING, PWSTR};
@@ -27,11 +27,7 @@ use windows::Win32::{
         },
     },
 };
-use winvd::Desktop;
-
-pub fn id_of(desktop: &Desktop) -> Option<String> {
-    desktop.get_id().ok().map(|guid| format!("{guid:?}"))
-}
+use crate::vdapi::{self, Desktop};
 
 /// Snapshot of the desktops that exist right now, in Windows' own order.
 pub struct Desktops {
@@ -41,17 +37,8 @@ pub struct Desktops {
 
 impl Desktops {
     pub fn read() -> Option<Self> {
-        // Keyed by GUID only: a handle that also carries the index goes stale
-        // as soon as a desktop is moved or removed.
-        let list = winvd::get_desktops()
-            .ok()?
-            .into_iter()
-            .filter_map(|d| {
-                let guid = d.get_id().ok()?;
-                Some((format!("{guid:?}"), Desktop::from(guid)))
-            })
-            .collect();
-        let current = id_of(&winvd::get_current_desktop().ok()?)?;
+        let list = vdapi::get_desktops().ok()?.into_iter().map(|d| (d.id(), d)).collect();
+        let current = vdapi::get_current_desktop().ok()?.id();
         Some(Desktops { list, current })
     }
 
@@ -95,7 +82,7 @@ pub fn app_windows() -> Vec<HWND> {
 pub fn count_on(desktop: Desktop) -> usize {
     app_windows()
         .into_iter()
-        .filter(|hwnd| winvd::is_window_on_desktop(desktop, *hwnd).unwrap_or(false))
+        .filter(|hwnd| vdapi::is_window_on_desktop(desktop, *hwnd).unwrap_or(false))
         .count()
 }
 
@@ -122,13 +109,13 @@ pub fn force_foreground(hwnd: HWND) {
 /// or to the shell when that desktop is empty.
 pub fn focus_top_window() {
     let top = app_windows().into_iter().find(|hwnd| unsafe {
-        !IsIconic(*hwnd).as_bool() && winvd::is_window_on_current_desktop(*hwnd).unwrap_or(false)
+        !IsIconic(*hwnd).as_bool() && vdapi::is_window_on_current_desktop(*hwnd).unwrap_or(false)
     });
     force_foreground(top.unwrap_or_else(|| unsafe { GetShellWindow() }));
 }
 
 fn pinned_everywhere(hwnd: HWND) -> bool {
-    winvd::is_pinned_window(hwnd).unwrap_or(false) || winvd::is_pinned_app(hwnd).unwrap_or(false)
+    vdapi::is_pinned_window(hwnd).unwrap_or(false) || vdapi::is_pinned_app(hwnd).unwrap_or(false)
 }
 
 fn describe(hwnd: HWND, desktop: String) -> WindowInfo {
@@ -262,7 +249,7 @@ pub fn windows(current: &str) -> Vec<WindowInfo> {
             if pinned_everywhere(hwnd) {
                 return None;
             }
-            let desktop = id_of(&winvd::get_desktop_by_window(hwnd).ok()?)?;
+            let desktop = vdapi::get_desktop_by_window(hwnd).ok()?.id();
             // On the desktop being shown nothing is hidden by the shell, so a
             // cloaked window there is a suspended store app, not a real window.
             if desktop == current && dwm_attribute::<u32>(hwnd, DWMWA_CLOAKED).unwrap_or(0) != 0 {
