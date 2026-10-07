@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flick — 윈도우 11 가상 데스크톱을 2D 격자로</title>
+<meta name="description" content="Flick은 윈도우 11 가상 데스크톱을 2D 격자로 쓰게 해 주는 무료 오픈 소스 프로그램입니다. 버튼을 누른 채 마우스를 밀면 그 방향의 데스크톱으로 넘어갑니다. Flick turns Windows 11 virtual desktops into a 2D grid: hold a button, flick the mouse, move one desktop in that direction.">
+<link rel="canonical" href="https://philaxis.github.io/flick/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Flick">
+<meta property="og:title" content="Flick — 윈도우 11 가상 데스크톱을 2D 격자로">
+<meta property="og:description" content="버튼을 누른 채 마우스를 밀면 그 방향의 데스크톱으로 넘어갑니다. 행은 워크스페이스, 칸은 그 작업의 화면. 무료, 오픈 소스. / Hold a button, flick the mouse, move one desktop in that direction. Free and open source.">
+<meta property="og:url" content="https://philaxis.github.io/flick/">
+<meta property="og:locale" content="ko_KR">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:image" content="https://philaxis.github.io/flick/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Flick: 길이가 다른 세 행의 격자. 각 행이 좌우로 밀려 한 열에 맞춰져 있다. A ragged three-row grid with each row slid sideways to line up on one column.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Flick — 윈도우 11 가상 데스크톱을 2D 격자로">
+<meta name="twitter:description" content="버튼을 누른 채 마우스를 밀면 그 방향의 데스크톱으로 넘어갑니다. Hold a button, flick the mouse, move one desktop in that direction.">
+<meta name="twitter:image" content="https://philaxis.github.io/flick/og.png">
+<meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e1014" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="icon.png" type="image/png">
+<link rel="apple-touch-icon" href="icon.png">
+<script>(function(){var l=null,q=/[?&]lang=(ko|en)\b/.exec(location.search);try{l=localStorage.getItem('flick-lang')}catch(e){}if(q)l=q[1];if(l!=='ko'&&l!=='en')l=/^ko\b/i.test(navigator.language||'')?'ko':'en';document.documentElement.lang=l})();</script>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Flick","applicationCategory":"UtilitiesApplication","operatingSystem":"Windows 11 23H2 (build 22631.3085 or later)","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"isAccessibleForFree":true,"license":"https://opensource.org/license/mit","description":"Flick turns Windows 11 virtual desktops into a 2D grid. Hold a button and flick the mouse to move one desktop in that direction.","url":"https://philaxis.github.io/flick/","downloadUrl":"https://github.com/philaxis/flick/releases/latest/download/Flick.exe","codeRepository":"https://github.com/philaxis/flick","inLanguage":["ko","en"],"author":{"@type":"Person","name":"philaxis","url":"https://philaxis.github.io"}}</script>
+<style>
+:root{
+  --bg:#f4f5f7;--surface:#ffffff;--ink:#11141a;--ink-2:#4d5766;--line:#d8dce3;
+  --accent:#0f62b8;--accent-soft:#dbe9f8;
+  --btn:#11141a;--btn-ink:#ffffff;
+  --tile:#e7eaef;--t-cell:#bfc6d2;--t-rem:#ffffff;--t-cur:#2f8fd0;--t-spine:#d3d9e2;--t-ink:#4d5766;
+  --stage:#12151b;--stage-line:#12151b;
+  --s-cell:#3a414e;--s-rem:#dfe4ec;--s-cur:#7ccbee;--s-spine:#232831;--s-ink:#e8ebf0;--s-ink-2:#8d96a5;--s-line:#2b313c;--s-panel:#1a1e26;
+  --sans:"Segoe UI Variable Text","Segoe UI",-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR","Noto Sans CJK KR",system-ui,sans-serif;
+  --display:"Segoe UI Variable Display","Segoe UI",-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR","Noto Sans CJK KR",system-ui,sans-serif;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Consolas,"Liberation Mono","Malgun Gothic","Apple SD Gothic Neo","Noto Sans KR",monospace;
+  --fs-display:clamp(2.125rem,1.1rem + 4.2vw,3.625rem);
+  --fs-h2:clamp(1.5rem,1.25rem + 1vw,2rem);
+  --fs-lead:clamp(1.0625rem,1rem + .4vw,1.25rem);
+  --fs-small:.875rem;
+  --gutter:clamp(20px,5vw,48px);
+  --section:clamp(72px,11vw,136px);
+  color-scheme:light dark;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0e1014;--surface:#191c23;--ink:#e9ecf0;--ink-2:#9aa4b2;--line:#2a2f39;
+  --accent:#84cdf0;--accent-soft:#15303f;
+  --btn:#e9ecf0;--btn-ink:#0e1014;
+  --tile:#171a20;--t-cell:#3a414e;--t-rem:#dfe4ec;--t-cur:#7ccbee;--t-spine:#232831;--t-ink:#9aa4b2;
+  --stage:#08090c;--stage-line:#262b34;
+}}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%;scroll-behavior:smooth}
+html[lang="ko"] [lang="en"],html[lang="en"] [lang="ko"]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:1.0625rem/1.65 var(--sans);overflow-wrap:break-word}
+html[lang="ko"] body{line-height:1.75;word-break:keep-all}
+h1,h2,h3,p,ol,ul,dl,dd,figure{margin:0}
+ol,ul{padding:0;list-style:none}
+h1,h2,h3{font-family:var(--display);text-wrap:balance}
+p,dd,li{text-wrap:pretty}
+a{color:var(--accent);text-underline-offset:.18em;text-decoration-thickness:1px}
+a:hover{text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+button{font:inherit;color:inherit}
+kbd{display:inline-block;min-width:1.55em;padding:0 .4em;border:1px solid var(--line);border-bottom-width:2px;border-radius:6px;background:var(--surface);color:var(--ink);font:600 .82em/1.5 var(--mono);text-align:center;vertical-align:.08em;white-space:nowrap}
+code{font:.86em var(--mono);padding:.1em .35em;border-radius:5px;background:var(--tile);overflow-wrap:anywhere}
+.wrap{max-width:1168px;margin-inline:auto;padding-inline:var(--gutter)}
+.nb{white-space:nowrap}
+.tag{color:var(--ink-2);font:500 .75rem/1.4 var(--mono);letter-spacing:.06em;text-transform:uppercase}
+html[lang="ko"] .tag:not(.num){font-family:var(--sans);font-weight:600;letter-spacing:0}
+
+/* header */
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-block:20px}
+.brand{display:inline-flex;align-items:center;gap:10px;color:var(--ink);font:650 1.0625rem/1 var(--display);letter-spacing:-.01em;text-decoration:none}
+.brand img{display:block;width:32px;height:32px}
+.top-r{display:flex;align-items:center;gap:6px 14px;font-size:var(--fs-small)}
+.top-r>a{color:var(--ink-2);text-decoration:none}
+.top-r>a:hover{color:var(--ink)}
+.lang{display:flex;padding:3px;border:1px solid var(--line);border-radius:10px}
+.lang button{padding:3px 10px;border:0;border-radius:7px;background:none;color:var(--ink-2);font-size:var(--fs-small);cursor:pointer;white-space:nowrap}
+.lang button:hover{color:var(--ink)}
+.lang button[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:600;box-shadow:0 0 0 1px var(--line)}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 22px;border-radius:12px;background:var(--btn);color:var(--btn-ink);font-weight:600;line-height:1.3;text-decoration:none;transition:transform .15s ease,opacity .15s ease}
+.btn:hover{opacity:.86}
+.btn:active{transform:translateY(1px)}
+.btn svg{flex:none}
+.cta{display:grid;gap:12px;justify-items:start}
+.cta-sub{color:var(--ink-2);font-size:.9375rem;max-width:30em}
+.cta-sub b{color:var(--ink);font-weight:600}
+.cta-more{font-size:.9375rem}
+
+/* hero */
+.hero{display:grid;gap:clamp(36px,6vw,64px);align-items:center;padding-block:clamp(28px,5vw,64px) 0}
+.hero-copy{display:grid;gap:clamp(18px,2.4vw,26px);min-width:0}
+h1{font-size:var(--fs-display);font-weight:700;line-height:1.08;letter-spacing:-.028em}
+html[lang="ko"] h1{line-height:1.22;letter-spacing:-.02em}
+h1 em{font-style:normal;color:var(--accent)}
+.lead{max-width:31em;font-size:var(--fs-lead);line-height:1.55;color:var(--ink-2)}
+html[lang="ko"] .lead{line-height:1.7}
+@media (min-width:980px){.hero{grid-template-columns:minmax(0,5fr) minmax(0,6fr)}}
+
+/* demo */
+.demo{min-width:0}
+.stage{position:relative;padding:clamp(14px,2.6vw,26px);border:1px solid var(--stage-line);border-radius:22px;background:var(--stage);color:var(--s-ink);user-select:none;-webkit-user-select:none;touch-action:none;cursor:grab;outline-offset:4px}
+.stage.held{cursor:grabbing}
+.stage-top{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:clamp(12px,2.4vw,22px);font:500 .75rem/1.4 var(--mono);color:var(--s-ink-2)}
+.st{color:var(--s-ink);font-variant-numeric:tabular-nums}
+.st b{font-weight:600;color:var(--s-cur)}
+.map{container-type:inline-size}
+.map-in{--g:clamp(5px,1.7cqw,10px);--c:calc((100cqw - 6*var(--g))/7);--h:calc(var(--c)*.74);--lh:22px;--rg:6px;--pitch:calc(var(--lh) + var(--h) + var(--rg));position:relative}
+.spine{position:absolute;left:calc(3*(var(--c) + var(--g)) - var(--g)*.5);width:calc(var(--c) + var(--g));top:calc(var(--lh) - var(--g)*.5);bottom:calc(var(--g)*-.5);border-radius:calc(var(--c)*.2);background:var(--s-spine)}
+.row{position:relative;height:calc(var(--lh) + var(--h))}
+.row+.row{margin-top:var(--rg)}
+.row-name{display:block;height:var(--lh);font:500 .6875rem/var(--lh) var(--mono);color:var(--s-ink-2);opacity:.7;transition:color .3s,opacity .3s}
+.row.on .row-name{color:var(--s-ink);opacity:1}
+.cells{display:flex;gap:var(--g);width:max-content;transform:translateX(calc((3 - var(--m,0))*(var(--c) + var(--g))));transition:transform .55s cubic-bezier(.22,.9,.24,1)}
+.cell{--win:rgb(255 255 255/.2);position:relative;flex:none;width:var(--c);height:var(--h);border-radius:calc(var(--c)*.15);background:var(--s-cell);transition:background-color .35s ease}
+.cell.rem{background:var(--s-rem);--win:rgb(18 24 32/.26)}
+.cell.cur{background:var(--s-cur);--win:rgb(6 30 46/.42)}
+.cell::before,.cell::after{content:"";position:absolute;border-radius:2px;background:var(--win);transition:background-color .35s ease}
+.k1::before{inset:20% 16%}.k1::after{display:none}
+.k2::before{left:13%;top:20%;width:33%;bottom:20%}.k2::after{right:13%;top:20%;width:33%;bottom:20%}
+.k3::before{left:13%;top:17%;width:50%;height:48%}.k3::after{right:13%;bottom:17%;width:40%;height:40%}
+.k4::before{left:13%;top:20%;right:44%;bottom:20%}.k4::after{right:13%;top:20%;width:24%;height:27%}
+.ring{position:absolute;left:calc(3*(var(--c) + var(--g)));top:var(--lh);width:var(--c);height:var(--h);border-radius:calc(var(--c)*.15);outline:2px solid var(--s-cur);outline-offset:2px;translate:0 calc(var(--r,0)*var(--pitch));transition:translate .42s cubic-bezier(.22,.9,.24,1);pointer-events:none}
+.ring.bL{animation:bl .28s ease}.ring.bR{animation:br .28s ease}.ring.bU{animation:bu .28s ease}.ring.bD{animation:bd .28s ease}
+@keyframes bl{40%{transform:translateX(-7px)}}@keyframes br{40%{transform:translateX(7px)}}
+@keyframes bu{40%{transform:translateY(-7px)}}@keyframes bd{40%{transform:translateY(7px)}}
+.demo-cap{display:grid;gap:10px;margin-top:14px;padding-inline:4px}
+.ctl{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px}
+.mouse{flex:none;display:block;width:30px;height:auto;overflow:visible;transition:transform .22s cubic-bezier(.2,.9,.3,1.4)}
+.m-body,.m-side{fill:var(--surface);stroke:var(--ink-2);stroke-width:2.2}
+.m-line{fill:none;stroke:var(--ink-2);stroke-width:2.2;stroke-linecap:round}
+.m-side{transition:fill .12s,stroke .12s}
+.demo.held .m-side{fill:var(--accent);stroke:var(--accent)}
+.demo[data-dir=L] .mouse{transform:translateX(-6px)}.demo[data-dir=R] .mouse{transform:translateX(6px)}
+.demo[data-dir=U] .mouse{transform:translateY(-6px)}.demo[data-dir=D] .mouse{transform:translateY(6px)}
+.ctl-say{flex:1;min-width:9em;color:var(--ink);font-size:.9375rem}
+.pad{display:flex;gap:6px}
+.pad button,.toggle{display:inline-grid;place-items:center;min-width:40px;height:40px;border:1px solid var(--line);border-radius:11px;background:var(--surface);color:var(--ink);cursor:pointer;transition:transform .1s,border-color .15s}
+.pad button:hover,.toggle:hover{border-color:var(--ink-2)}
+.pad button:active{transform:scale(.94)}
+.toggle{grid-auto-flow:column;gap:7px;padding-inline:13px;font-size:var(--fs-small);color:var(--ink-2)}
+.toggle i{display:block;width:8px;height:10px;border-inline:2.5px solid currentColor}
+.toggle.is-play i{width:0;height:0;border:5px solid transparent;border-left:8px solid currentColor;border-right:0}
+.cap-note{max-width:40em;color:var(--ink-2);font-size:var(--fs-small)}
+
+/* sections */
+.section{margin-top:var(--section)}
+h2{font-size:var(--fs-h2);font-weight:650;line-height:1.2;letter-spacing:-.018em}
+html[lang="ko"] h2{line-height:1.35;letter-spacing:-.01em}
+h3{font-size:1.1875rem;font-weight:650;line-height:1.35}
+.sec-head{display:grid;gap:10px;max-width:40em}
+.sec-head p{color:var(--ink-2)}
+.split{display:grid;gap:clamp(20px,3vw,32px)}
+@media (min-width:900px){.split{grid-template-columns:minmax(0,4fr) minmax(0,8fr);gap:40px}}
+
+/* gestures */
+.moves{margin-top:clamp(28px,4vw,44px);border-top:1px solid var(--line)}
+.move{display:grid;gap:18px 40px;padding-block:clamp(22px,3vw,32px);border-bottom:1px solid var(--line)}
+.move-vis{display:block;width:100%;max-width:300px;height:auto;border-radius:16px;background:var(--tile)}
+.move-txt{display:grid;gap:8px;align-content:center;min-width:0}
+.move-txt .tag{color:var(--accent)}
+.move-txt p{color:var(--ink-2);max-width:36em}
+@media (min-width:720px){.move{grid-template-columns:minmax(0,300px) minmax(0,1fr);align-items:center}}
+.v-cell{fill:var(--t-cell)}.v-rem{fill:var(--t-rem)}.v-cur{fill:var(--t-cur)}.v-spine{fill:var(--t-spine)}
+.v-ln{fill:none;stroke:var(--t-ink);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.v-ac{fill:none;stroke:var(--t-cur);stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.v-body{fill:var(--tile);stroke:var(--t-ink);stroke-width:2}
+.v-dark{fill:var(--stage)}.v-pan{fill:var(--s-panel)}.v-dim{fill:var(--s-cell)}.v-sky{fill:var(--s-cur)}
+.more{display:grid;gap:10px 40px;margin-top:22px;color:var(--ink-2);font-size:.9375rem}
+.more li{padding-left:16px;position:relative;max-width:36em}
+.more li::before{content:"";position:absolute;left:0;top:.72em;width:6px;height:6px;border-radius:2px;background:var(--t-cell)}
+html[lang="ko"] .more li::before{top:.8em}
+@media (min-width:720px){.more{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+/* board */
+.board-grid{display:grid;gap:clamp(24px,4vw,48px);margin-top:clamp(28px,4vw,44px);align-items:start}
+@media (min-width:1000px){.board-grid{grid-template-columns:minmax(0,7fr) minmax(0,4fr)}}
+.board-fig{min-width:0}
+.board{padding:clamp(12px,2.4vw,24px);border:1px solid var(--stage-line);border-radius:20px;background:var(--stage);color:var(--s-ink);font-size:.75rem;line-height:1.4;user-select:none}
+.b-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;color:var(--s-ink-2);font-family:var(--mono)}
+.b-head b{color:var(--s-ink);font:650 .9375rem/1.3 var(--display);margin-right:8px}
+.pvs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.pv{display:flex;flex-direction:column;min-width:0;border:1px solid var(--s-line);border-radius:10px;background:var(--s-panel);overflow:hidden}
+.pv-big{grid-column:1/-1}
+@media (min-width:620px){.pvs{grid-template-columns:minmax(0,1.55fr) minmax(0,1fr)}.pv-big{grid-column:1;grid-row:1/3}}
+.pv-bar{display:flex;align-items:center;gap:7px;min-width:0;padding:6px 7px 6px 9px;border-bottom:1px solid var(--s-line)}
+.ico{flex:none;display:block;width:13px;height:13px;border-radius:4px;background:var(--i,#7ccbee)}
+.i-a{--i:#7ccbee}.i-b{--i:#f0b35a}.i-c{--i:#8fd49a}.i-d{--i:#e58a8a}.i-e{--i:#c4cad4}
+.pv-name{flex:none;font-weight:650}
+.pv-title{flex:1;min-width:0;color:var(--s-ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv-btn{flex:none;display:grid;place-items:center;width:20px;height:20px;border-radius:6px;background:#262c37;color:var(--s-ink-2)}
+.pv-btn svg{display:block}
+.pv-btn.p-row,.pv-btn.p-all{color:var(--s-cur);background:#1c3340}
+.pv-body{flex:1;display:grid;gap:7px;align-content:start;min-height:74px;padding:11px}
+.pv-big .pv-body{max-height:clamp(120px,24vw,236px);overflow:hidden}
+.pv-body i{display:block;height:6px;border-radius:3px;background:#2e3541}
+.pv-body i.s{background:#3f6f88}.pv-body i.o{background:#7a6238}
+.pv-body .blk{height:auto;aspect-ratio:16/7;border-radius:6px}
+.n{flex:none;display:inline-grid;place-items:center;width:17px;height:17px;border-radius:50%;background:var(--s-cur);color:#06202e;font:700 .6875rem/1 var(--mono)}
+.list-n{background:var(--ink);color:var(--bg)}
+.b-map{display:grid;gap:6px;margin-top:16px;padding-top:14px;border-top:1px solid var(--s-line);--q:clamp(30px,8.6vw,38px)}
+.bm-row{display:flex;align-items:center;gap:6px;min-width:0}
+.bm-name{flex:none;width:clamp(44px,13vw,72px);color:var(--s-ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bm-row.on .bm-name{color:var(--s-ink);font-weight:650}
+.bm-pad{flex:none;width:var(--q)}
+.bm{position:relative;flex:none;display:grid;grid-template-columns:repeat(2,9px);gap:3px;place-content:center;width:var(--q);height:var(--q);border-radius:9px;background:#232832}
+.bm .ico{width:9px;height:9px;border-radius:3px}
+.bm small{grid-column:1/-1;text-align:center;color:var(--s-ink-2);font:600 .5625rem/1 var(--mono)}
+.bm.sp{background:#2f3541}
+.bm.cur{background:#1c3340;box-shadow:0 0 0 2px var(--s-cur)}
+.bm.cur small{color:var(--s-cur)}
+.bm.drop{box-shadow:0 0 0 2px var(--s-cur);background:#1c3340}
+.bm.add{background:none;border:1.5px dashed #3a414e;color:var(--s-ink-2);font:500 .9375rem/1 var(--mono);display:grid;place-items:center}
+.ghost{position:absolute;left:38%;top:-64%;display:flex;align-items:center;gap:5px;padding:4px 7px 4px 5px;border:1px solid #47505f;border-radius:7px;background:#2b323e;box-shadow:0 8px 18px -6px rgb(0 0 0/.7);white-space:nowrap;transform:rotate(-4deg);z-index:1}
+.ghost .ico{width:11px;height:11px}
+.bm-new{margin-left:calc(clamp(44px,13vw,72px) + 6px);padding:5px 11px;border:1.5px dashed #3a414e;border-radius:9px;color:var(--s-ink-2);width:max-content}
+.fig-note{margin-top:10px;padding-inline:4px;color:var(--ink-2);font-size:var(--fs-small)}
+.notes{border-top:1px solid var(--line)}
+.notes li{display:grid;grid-template-columns:28px minmax(0,1fr);gap:4px;padding-block:16px;border-bottom:1px solid var(--line)}
+.notes .n{margin-top:.38em}
+html[lang="ko"] .notes .n{margin-top:.5em}
+.notes h3{font-size:1.0625rem}
+.notes p{grid-column:2;color:var(--ink-2);font-size:.9375rem}
+.pins{display:flex;flex-wrap:wrap;align-items:center;gap:6px;grid-column:2;margin-top:8px;font-size:var(--fs-small)}
+.pin{display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 7px;border:1px solid var(--line);border-radius:999px;background:var(--surface);white-space:nowrap}
+.pin svg{color:var(--ink-2)}
+.pin.on svg{color:var(--accent)}
+.pins .arr{color:var(--ink-2)}
+
+/* install */
+.how{counter-reset:s;border-top:1px solid var(--line)}
+.how>li{counter-increment:s;display:grid;grid-template-columns:2.4rem minmax(0,1fr);gap:8px;padding-block:16px;border-bottom:1px solid var(--line)}
+.how>li::before{content:counter(s);color:var(--accent);font:650 1.0625rem/1.65 var(--display);font-variant-numeric:tabular-nums}
+html[lang="ko"] .how>li::before{line-height:1.75}
+.how div{max-width:38em;min-width:0}
+.how small{display:block;margin-top:2px;color:var(--ink-2);font-size:.9375rem}
+.req{margin-top:28px;border:1px solid var(--line);border-radius:16px;background:var(--surface);overflow:hidden}
+.req-h{padding:14px 18px 0}
+.req dl{padding:4px 18px 6px}
+.req dl>div{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 12px;padding-block:12px}
+.req dl>div+div{border-top:1px solid var(--line)}
+.req dt{grid-column:2;font-weight:650}
+.req dd{grid-column:2;color:var(--ink-2);font-size:.9375rem;max-width:36em}
+.mark{grid-row:1/3;display:grid;place-items:center;width:22px;height:22px;margin-top:.22em;border-radius:50%}
+html[lang="ko"] .mark{margin-top:.3em}
+.mark.ok{background:var(--accent-soft);color:var(--accent)}
+.mark.no{background:var(--tile);color:var(--ink-2)}
+.req-foot{padding:12px 18px 14px;border-top:1px solid var(--line);color:var(--ink-2);font-size:var(--fs-small)}
+
+/* open */
+.facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--line)}
+.facts>div{padding:20px 16px 20px 0;border-bottom:1px solid var(--line);min-width:0}
+.facts dt{font:650 clamp(1.25rem,1.05rem + .9vw,1.625rem)/1.25 var(--display);letter-spacing:-.015em}
+.facts dd{margin-top:2px;color:var(--ink-2);font-size:.9375rem}
+@media (min-width:820px){.facts{grid-template-columns:repeat(4,minmax(0,1fr))}.facts>div+div{padding-left:clamp(16px,2.4vw,28px);border-left:1px solid var(--line)}}
+@media (max-width:819px){.facts>div:nth-child(even){padding-left:16px;border-left:1px solid var(--line)}}
+.open-p{display:grid;gap:12px;margin-top:22px;max-width:44em;color:var(--ink-2)}
+
+/* end + footer */
+.end{display:grid;gap:22px;justify-items:start;padding:clamp(24px,5vw,56px);border-radius:22px;background:var(--tile)}
+.end .cta-sub{max-width:36em}
+.end h2{font-size:clamp(1.625rem,1.2rem + 2vw,2.5rem)}
+.foot{margin-top:var(--section);padding-block:28px 44px;border-top:1px solid var(--line);color:var(--ink-2);font-size:var(--fs-small)}
+.foot-in{display:flex;flex-wrap:wrap;justify-content:space-between;gap:10px 32px}
+.foot ul{display:flex;flex-wrap:wrap;gap:4px 20px}
+.foot a{color:var(--ink-2)}
+.foot a:hover{color:var(--ink)}
+
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  .cells,.ring,.mouse,.btn,.pad button{transition:none}
+  .ring.bL,.ring.bR,.ring.bU,.ring.bD{animation:none}
+  .demo[data-dir] .mouse{transform:none}
+}
+</style>
+</head>
+<body>
+<header class="wrap top">
+<a class="brand" href="./"><img src="icon.png" alt="" width="32" height="32">Flick</a>
+<div class="top-r">
+<a href="https://github.com/philaxis/flick">GitHub</a>
+<div class="lang" role="group" aria-label="언어 / Language"><button type="button" data-lang="ko" aria-pressed="true">한국어</button><button type="button" data-lang="en" aria-pressed="false">English</button></div>
+</div>
+</header>
+
+<main class="wrap">
+<section class="hero">
+<div class="hero-copy">
+<h1><span lang="ko">가상 데스크톱을 <em class="nb">2D 격자</em>로</span><span lang="en">Virtual desktops, as a <em class="nb">2D grid</em></span></h1>
+<p class="lead" lang="ko">버튼을 누른 채 마우스를 툭 밀면 그 방향의 데스크톱으로 넘어갑니다. 행은 워크스페이스, 그 안의 칸은 그 작업의 화면입니다.</p>
+<p class="lead" lang="en">Hold a button, flick the mouse, and you are on the desktop in that direction. Rows are workspaces; the cells in a row are that workspace’s desktops.</p>
+<div class="cta">
+<a class="btn" href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2.5v9M5 8l4 4 4-4M3 15.5h12"/></svg><span lang="ko">Flick.exe 받기 — 무료</span><span lang="en">Download Flick.exe — free</span></a>
+<p class="cta-sub" lang="ko">파일 하나, 약 0.7 MB. <b>윈도우 11 23H2</b>(빌드 22631.3085 이상)에서 동작합니다. <b>24H2는 아직 지원하지 않습니다.</b></p>
+<p class="cta-sub" lang="en">One file, about 0.7 MB. Runs on <b>Windows 11 23H2</b> (build 22631.3085 or later). <b>24H2 is not supported yet.</b></p>
+<p class="cta-more"><a href="#install"><span lang="ko">설치와 요구 사항</span><span lang="en">Install and requirements</span></a></p>
+</div>
+</div>
+
+<figure class="demo" data-demo>
+<div class="stage" tabindex="0" role="application" aria-label="Flick 격자 데모 / Flick grid demo">
+<div class="stage-top"><p class="st" aria-live="polite"><b data-ws>개발</b> · <span data-pos>3 / 4</span></p><span aria-hidden="true"><span lang="ko">끌어서 넘기기</span><span lang="en">drag to flick</span></span></div>
+<div class="map"><div class="map-in" aria-hidden="true">
+<div class="spine"></div>
+<div class="row on" style="--m:2"><span class="row-name"><span lang="ko">개발</span><span lang="en">Dev</span></span><div class="cells"><i class="cell k3"></i><i class="cell k2"></i><i class="cell k1 rem cur"></i><i class="cell k4"></i></div></div>
+<div class="row" style="--m:1"><span class="row-name"><span lang="ko">글쓰기</span><span lang="en">Writing</span></span><div class="cells"><i class="cell k1"></i><i class="cell k2 rem"></i></div></div>
+<div class="row" style="--m:1"><span class="row-name"><span lang="ko">개인</span><span lang="en">Personal</span></span><div class="cells"><i class="cell k4"></i><i class="cell k3 rem"></i><i class="cell k1"></i></div></div>
+<div class="ring"></div>
+</div></div>
+</div>
+<figcaption class="demo-cap">
+<div class="ctl">
+<svg class="mouse" viewBox="-6 0 66 88" width="30" height="40" aria-hidden="true"><rect class="m-side" x="-3" y="30" width="16" height="26" rx="6"/><rect class="m-body" x="6" y="2" width="50" height="84" rx="25"/><path class="m-line" d="M31 2v30M6 32.5h50"/><rect class="m-body" x="27.5" y="10" width="7" height="14" rx="3.5"/></svg>
+<p class="ctl-say"><span lang="ko">누른 채 밀면 한 칸.</span><span lang="en">Hold, flick, one cell.</span></p>
+<div class="pad">
+<button type="button" data-move="L" aria-label="왼쪽 / Left"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 8H3M7 4L3 8l4 4"/></svg></button>
+<button type="button" data-move="U" aria-label="위 / Up"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3M4 7l4-4 4 4"/></svg></button>
+<button type="button" data-move="D" aria-label="아래 / Down"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v10M4 9l4 4 4-4"/></svg></button>
+<button type="button" data-move="R" aria-label="오른쪽 / Right"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4"/></svg></button>
+</div>
+<button class="toggle is-play" type="button" data-toggle hidden><i></i><span lang="ko" data-t-ko>재생</span><span lang="en" data-t-en>Play</span></button>
+</div>
+<p class="cap-note" lang="ko">지도 위에서 끌거나, 화살표 버튼을 누르거나, 데모를 한 번 누른 뒤 방향키를 써 보세요. 위아래로 가면 그 행에서 마지막에 있던 칸에 도착하고, 각 행은 그 칸이 한 열에 오도록 좌우로 밀립니다.</p>
+<p class="cap-note" lang="en">Drag on the map, use the arrow buttons, or click the demo once and use the arrow keys. Going up or down lands on the cell that row was last left on, and each row slides sideways so those cells sit in one column.</p>
+</figcaption>
+</figure>
+</section>
+
+<section class="section" aria-labelledby="how">
+<div class="sec-head">
+<h2 id="how"><span lang="ko">동작은 세 가지입니다</span><span lang="en">Three gestures</span></h2>
+<p lang="ko">기본 트리거는 마우스 옆면의 “앞으로” 버튼입니다.</p>
+<p lang="en">The default trigger is the “forward” button on the side of the mouse.</p>
+</div>
+<ol class="moves">
+<li class="move">
+<svg class="move-vis" viewBox="0 0 240 132" aria-hidden="true"><rect class="v-cell" x="20" y="22" width="44" height="32" rx="7"/><rect class="v-cell" x="72" y="22" width="44" height="32" rx="7"/><rect class="v-cur" x="124" y="22" width="44" height="32" rx="7"/><rect class="v-cell" x="176" y="22" width="44" height="32" rx="7"/><path class="v-ac" d="M94 68h50M136 61l8 7-8 7"/><rect class="v-cur" x="100" y="94" width="9" height="13" rx="3.5"/><rect class="v-body" x="105" y="84" width="24" height="38" rx="12"/><path class="v-ln" d="M117 84v13M105 97.5h24"/><path class="v-ln" d="M138 97l6 6-6 6M148 97l6 6-6 6" opacity=".55"/></svg>
+<div class="move-txt"><span class="tag num">01</span>
+<h3><span lang="ko">누른 채 밀기 — 한 칸 이동</span><span lang="en">Hold and flick — move one cell</span></h3>
+<p lang="ko">트리거를 누른 채 마우스를 밀면 그 방향으로 한 칸 넘어갑니다. 누르고 있는 동안 커서는 제자리에 멈춰 있고, 작은 미니맵이 지금 위치를 보여 줍니다.</p>
+<p lang="en">Hold the trigger and flick the mouse: you move one cell in that direction. The cursor stays frozen while you hold, and a small minimap shows where you are.</p></div>
+</li>
+<li class="move">
+<svg class="move-vis" viewBox="0 0 240 132" aria-hidden="true"><rect class="v-spine" x="95" y="8" width="50" height="116" rx="12"/><rect class="v-cell" x="4" y="14" width="40" height="26" rx="6"/><rect class="v-cell" x="52" y="14" width="40" height="26" rx="6"/><rect class="v-rem" x="100" y="14" width="40" height="26" rx="6"/><rect class="v-cell" x="148" y="14" width="40" height="26" rx="6"/><rect class="v-cur" x="100" y="53" width="40" height="26" rx="6"/><rect class="v-cell" x="148" y="53" width="40" height="26" rx="6"/><rect class="v-cell" x="52" y="92" width="40" height="26" rx="6"/><rect class="v-rem" x="100" y="92" width="40" height="26" rx="6"/><rect class="v-cell" x="148" y="92" width="40" height="26" rx="6"/><path class="v-ac" d="M216 40v52M209 47l7-8 7 8M209 85l7 8 7-8"/></svg>
+<div class="move-txt"><span class="tag num">02</span>
+<h3><span lang="ko">위아래 — 워크스페이스 전환</span><span lang="en">Up and down — switch workspace</span></h3>
+<p lang="ko">위아래로 밀면 다른 행으로 가고, 그 행에서 마지막에 있던 칸에 도착합니다. 처음 가는 행은 첫 칸입니다. 지도는 각 행을 좌우로 밀어서, 도착할 칸들이 지금 칸의 바로 위아래 한 열에 오도록 보여 줍니다.</p>
+<p lang="en">Flick up or down to change rows. You land on the cell that row was last left on, or its first cell if you have not been there. The map slides each row sideways so the landing cells line up in one column, directly above and below where you are.</p></div>
+</li>
+<li class="move">
+<svg class="move-vis" viewBox="0 0 240 132" aria-hidden="true"><rect class="v-dark" x="34" y="12" width="172" height="108" rx="10"/><rect class="v-pan" x="46" y="24" width="88" height="52" rx="5"/><rect class="v-pan" x="140" y="24" width="54" height="23" rx="5"/><rect class="v-pan" x="140" y="53" width="54" height="23" rx="5"/><rect class="v-dim" x="52" y="30" width="30" height="4" rx="2"/><rect class="v-dim" x="146" y="30" width="20" height="4" rx="2"/><rect class="v-dim" x="146" y="59" width="24" height="4" rx="2"/><rect class="v-dim" x="80" y="88" width="14" height="11" rx="3"/><rect class="v-sky" x="98" y="88" width="14" height="11" rx="3"/><rect class="v-dim" x="116" y="88" width="14" height="11" rx="3"/><rect class="v-dim" x="134" y="88" width="14" height="11" rx="3"/><rect class="v-dim" x="98" y="103" width="14" height="11" rx="3"/><rect class="v-dim" x="116" y="103" width="14" height="11" rx="3"/></svg>
+<div class="move-txt"><span class="tag num">03</span>
+<h3><span lang="ko">딸깍 — 전체 뷰 열기</span><span lang="en">Click — open the board</span></h3>
+<p lang="ko">밀지 않고 트리거를 딸깍 누르면 화면 전체에 뷰가 열립니다. 선택한 칸의 창들이 크게 보이고 아래에 작은 지도가 있습니다. 다시 딸깍하거나 <kbd>Enter</kbd>를 누르면 그 칸으로 가고, <kbd>Esc</kbd>는 취소입니다.</p>
+<p lang="en">Click the trigger without moving and a full-screen board opens: the selected cell’s windows at large size, with a small map below. Click again or press <kbd>Enter</kbd> to go to that cell; <kbd>Esc</kbd> cancels.</p></div>
+</li>
+</ol>
+<ul class="more">
+<li lang="ko">트리거는 다른 마우스 버튼이나 키로 바꿀 수 있고, <kbd>W</kbd>+<kbd>E</kbd>+<kbd>R</kbd>처럼 여러 키를 함께 누르는 방식도 됩니다.</li>
+<li lang="en">The trigger can be another mouse button or a key, or a chord such as <kbd>W</kbd>+<kbd>E</kbd>+<kbd>R</kbd>.</li>
+<li lang="ko"><kbd>Shift</kbd>를 함께 누른 채 밀면 지금 쓰는 창을 들고 이동합니다.</li>
+<li lang="en">Hold <kbd>Shift</kbd> as well and the active window comes with you.</li>
+<li lang="ko">키보드로는 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Win</kbd>+<span class="nb">방향키</span>로 이동합니다.</li>
+<li lang="en">On the keyboard, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Win</kbd>+<span class="nb">arrow keys</span> does the same.</li>
+<li lang="ko">모니터가 여러 대면 모든 모니터가 함께 전환됩니다. 윈도우 가상 데스크톱이 원래 그렇게 동작합니다.</li>
+<li lang="en">With several monitors, all of them switch together. That is how Windows virtual desktops work.</li>
+</ul>
+</section>
+
+<section class="section" aria-labelledby="board">
+<div class="sec-head">
+<h2 id="board"><span lang="ko">전체 뷰: 창은 크게, 지도는 작게</span><span lang="en">The board: large windows, small map</span></h2>
+<p lang="ko">윈도우의 작업 보기와 비슷한 화면입니다. 선택한 칸의 창이 실시간 미리보기로 크게 보이고, 격자 전체는 아래에 작은 지도로 들어갑니다.</p>
+<p lang="en">It works like Task View. The selected cell’s windows appear as large live previews, and the whole grid sits below as a small map.</p>
+</div>
+<div class="board-grid">
+<figure class="board-fig">
+<div class="board" role="img" aria-label="전체 뷰를 단순하게 그린 그림 / A simplified drawing of the board">
+<div class="b-head"><span><b><span lang="ko">개발</span><span lang="en">Dev</span></b>2 / 4</span><span class="n">1</span></div>
+<div class="pvs">
+<div class="pv pv-big"><div class="pv-bar"><i class="ico i-a"></i><span class="pv-name"><span lang="ko">편집기</span><span lang="en">Editor</span></span><span class="pv-title">grid.rs</span><span class="n">2</span><span class="pv-btn p-row"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="5.5" r="3.2"/><path d="M8 8.7V12M3.5 14.2h9"/></svg></span><span class="pv-btn"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 2l6 6M8 2L2 8"/></svg></span></div>
+<div class="pv-body"><i class="s" style="width:34%"></i><i style="width:62%"></i><i style="width:48%;margin-left:6%"></i><i class="o" style="width:30%;margin-left:6%"></i><i style="width:56%;margin-left:6%"></i><i style="width:22%"></i><i class="s" style="width:40%"></i><i style="width:68%;margin-left:6%"></i><i style="width:44%;margin-left:12%"></i><i class="o" style="width:26%;margin-left:12%"></i><i style="width:52%;margin-left:6%"></i><i style="width:18%"></i><i class="s" style="width:30%"></i><i style="width:58%;margin-left:6%"></i></div></div>
+<div class="pv"><div class="pv-bar"><i class="ico i-b"></i><span class="pv-name"><span lang="ko">브라우저</span><span lang="en">Browser</span></span><span class="pv-title"><span lang="ko">문서</span><span lang="en">Docs</span></span><span class="pv-btn"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="5.5" r="3.2"/><path d="M8 8.7V14"/></svg></span><span class="pv-btn"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 2l6 6M8 2L2 8"/></svg></span></div>
+<div class="pv-body"><i style="width:80%"></i><i class="blk"></i></div></div>
+<div class="pv"><div class="pv-bar"><i class="ico i-c"></i><span class="pv-name"><span lang="ko">터미널</span><span lang="en">Terminal</span></span><span class="pv-title">cargo test</span><span class="pv-btn p-all"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="5.5" r="3.2"/><path d="M8 8.7V14"/></svg></span><span class="pv-btn"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 2l6 6M8 2L2 8"/></svg></span></div>
+<div class="pv-body"><i style="width:44%"></i><i class="s" style="width:66%"></i><i style="width:30%"></i><i style="width:52%"></i></div></div>
+</div>
+<div class="b-map">
+<div class="bm-row on"><span class="bm-name"><span lang="ko">개발</span><span lang="en">Dev</span></span><span class="bm"><i class="ico i-e"></i><small>1</small></span><span class="bm sp cur"><i class="ico i-a"></i><i class="ico i-b"></i><small>3</small></span><span class="bm"><i class="ico i-b"></i><small>2</small></span><span class="bm drop"><span class="ghost"><i class="ico i-b"></i><span lang="ko">브라우저</span><span lang="en">Browser</span><span class="n">3</span></span><i class="ico i-c"></i><small>1</small></span><span class="bm add">+</span></div>
+<div class="bm-row"><span class="bm-name"><span lang="ko">글쓰기</span><span lang="en">Writing</span></span><span class="bm-pad"></span><span class="bm sp"><i class="ico i-d"></i><i class="ico i-b"></i><small>2</small></span><span class="bm"><i class="ico i-e"></i><small>1</small></span><span class="bm add">+</span></div>
+<div class="bm-row"><span class="bm-name"><span lang="ko">개인</span><span lang="en">Personal</span></span><span class="bm"><i class="ico i-b"></i><small>4</small></span><span class="bm sp"><i class="ico i-d"></i><small>1</small></span><span class="bm"><i class="ico i-c"></i><i class="ico i-e"></i><small>2</small></span><span class="bm add">+</span></div>
+<div class="bm-new"><span class="n" style="margin-right:7px">4</span><span lang="ko">+ 새 워크스페이스</span><span lang="en">+ New workspace</span></div>
+</div>
+</div>
+<figcaption class="fig-note"><span lang="ko">실제 화면을 찍은 것이 아니라 구성을 설명하려고 그린 그림입니다.</span><span lang="en">This is a drawing of the layout, not a screenshot.</span></figcaption>
+</figure>
+<ol class="notes">
+<li><span class="n list-n">1</span><h3><span lang="ko">선택한 칸의 창</span><span lang="en">The selected cell’s windows</span></h3>
+<p lang="ko">창마다 앱 이름과 제목, 닫기 버튼이 붙습니다. 뷰가 열린 채 밀거나 방향키를 누르면 선택한 칸만 바뀌어서, 가지 않고도 다른 칸을 들여다볼 수 있습니다.</p>
+<p lang="en">Each window shows its app name, title and a close button. Flick or press the arrow keys while the board is open and only the selection moves, so you can look into other cells without going there.</p></li>
+<li><span class="n list-n">2</span><h3><span lang="ko">고정 버튼 하나</span><span lang="en">One pin button</span></h3>
+<p lang="ko">창마다 있는 버튼을 누를 때마다 다음 상태로 넘어갑니다.</p>
+<p lang="en">Each window has one button that steps through three states.</p>
+<div class="pins"><span class="pin"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.5" r="3.2"/><path d="M8 8.7V14"/></svg><span lang="ko">꺼짐</span><span lang="en">Off</span></span><span class="arr" aria-hidden="true">→</span><span class="pin on"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.5" r="3.2"/><path d="M8 8.7V12M3.5 14.2h9"/></svg><span lang="ko">워크스페이스 안에서 따라옴</span><span lang="en">Follows you in its workspace</span></span><span class="arr" aria-hidden="true">→</span><span class="pin on"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="5.5" r="3.2"/><path d="M8 8.7V14"/></svg><span lang="ko">모든 데스크톱에 표시</span><span lang="en">Shown on every desktop</span></span></div></li>
+<li><span class="n list-n">3</span><h3><span lang="ko">창을 끌어 옮기기</span><span lang="en">Drag a window to move it</span></h3>
+<p lang="ko">미리보기를 지도의 칸 위로 끌어다 놓으면 그 창이 그 칸으로 옮겨집니다. 지도의 칸에는 그 안에 있는 앱 아이콘과 창 개수가 보입니다.</p>
+<p lang="en">Drop a preview onto a map cell and the window moves to that cell. Each map cell shows the icons of the apps in it and how many windows it holds.</p></li>
+<li><span class="n list-n">4</span><h3><span lang="ko">격자 고치기</span><span lang="en">Edit the grid</span></h3>
+<p lang="ko">칸을 끌어 순서를 바꾸거나 다른 행으로 옮기고, 칸과 행을 더하거나 지웁니다. 행의 길이는 서로 달라도 됩니다.</p>
+<p lang="en">Drag cells to reorder them or move them to another row, and add or remove cells and rows. Rows do not have to be the same length.</p></li>
+</ol>
+</div>
+</section>
+
+<section class="section split" id="install" aria-labelledby="inst">
+<h2 id="inst"><span lang="ko">설치와 요구 사항</span><span lang="en">Install and requirements</span></h2>
+<div>
+<ol class="how">
+<li><div><span lang="ko"><a href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe">Flick.exe</a>를 받아 한 번 실행합니다.</span><span lang="en">Download <a href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe">Flick.exe</a> and run it once.</span>
+<small lang="ko">스스로 <code>%LOCALAPPDATA%\Flick</code>에 설치하고, 시작 메뉴와 윈도우 시작 시 자동 실행에 등록한 뒤 바로 실행됩니다. 따로 깔아야 하는 런타임은 없습니다.</small>
+<small lang="en">It installs itself to <code>%LOCALAPPDATA%\Flick</code>, adds a Start menu shortcut, registers to start with Windows, and starts running. There is no runtime to install.</small></div></li>
+<li><div><span lang="ko">마우스의 “앞으로” 버튼을 누른 채 밀어 봅니다.</span><span lang="en">Hold the mouse “forward” button and flick.</span>
+<small lang="ko">트리거 같은 설정은 트레이 아이콘을 우클릭해 여는 설정 파일에서 바꿉니다.</small>
+<small lang="en">Settings such as the trigger live in a config file you open from the tray icon’s right-click menu.</small></div></li>
+<li><div><span lang="ko">지울 때는 설정 → 앱 → 설치된 앱 → Flick → 제거.</span><span lang="en">To remove it: Settings → Apps → Installed apps → Flick → Uninstall.</span>
+<small lang="ko">설치하지 않고 그 자리에서만 실행하려면 <code>Flick.exe --portable</code>.</small>
+<small lang="en">To run it in place without installing: <code>Flick.exe --portable</code>.</small></div></li>
+</ol>
+<div class="req">
+<p class="req-h tag"><span lang="ko">지원하는 윈도우</span><span lang="en">Supported Windows</span></p>
+<dl>
+<div><span class="mark ok" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5l2.5 2.5 4.5-5.5"/></svg></span>
+<dt><span lang="ko">윈도우 11 23H2 — 지원</span><span lang="en">Windows 11 23H2 — supported</span></dt>
+<dd lang="ko">빌드 22631.3085 이상이어야 합니다.</dd><dd lang="en">Build 22631.3085 or later.</dd></div>
+<div><span class="mark no" aria-hidden="true"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l6 6M9 3L3 9"/></svg></span>
+<dt><span lang="ko">윈도우 11 24H2 — 아직 지원하지 않음</span><span lang="en">Windows 11 24H2 — not supported yet</span></dt>
+<dd lang="ko">Flick은 문서화되지 않은 윈도우 인터페이스로 가상 데스크톱을 전환하는데, 이 인터페이스가 윈도우 빌드마다 다릅니다. 24H2용은 아직 맞추지 못했습니다.</dd>
+<dd lang="en">Flick switches desktops through an undocumented Windows interface that differs from build to build. It has not been adapted to 24H2 yet.</dd></div>
+</dl>
+<p class="req-foot" lang="ko">내 버전 확인: <kbd>Win</kbd>+<kbd>R</kbd>을 누르고 <code>winver</code>를 입력합니다.</p>
+<p class="req-foot" lang="en">To check your version: press <kbd>Win</kbd>+<kbd>R</kbd> and type <code>winver</code>.</p>
+</div>
+</div>
+</section>
+
+<section class="section" aria-labelledby="open">
+<div class="sec-head"><h2 id="open"><span lang="ko">무료, 오픈 소스</span><span lang="en">Free and open source</span></h2></div>
+<dl class="facts" style="margin-top:clamp(24px,3vw,36px)">
+<div><dt><span lang="ko">약 0.7 MB</span><span lang="en">About 0.7 MB</span></dt><dd><span lang="ko">실행 파일 하나</span><span lang="en">A single exe</span></dd></div>
+<div><dt>Rust</dt><dd><span lang="ko">별도 런타임 없음</span><span lang="en">No runtime needed</span></dd></div>
+<div><dt>MIT</dt><dd><span lang="ko">소스 전체 공개</span><span lang="en">All source is public</span></dd></div>
+<div><dt><span lang="ko">무료</span><span lang="en">Free</span></dt><dd><span lang="ko">받아서 실행하면 끝</span><span lang="en">Download and run</span></dd></div>
+</dl>
+<div class="open-p">
+<p lang="ko">소스는 <a href="https://github.com/philaxis/flick">github.com/philaxis/flick</a>에 있습니다. 가상 데스크톱 전환에 윈도우의 문서화되지 않은 인터페이스를 쓰기 때문에, 윈도우 대규모 업데이트 뒤에는 Flick도 새 버전이 필요할 수 있습니다.</p>
+<p lang="en">The source is at <a href="https://github.com/philaxis/flick">github.com/philaxis/flick</a>. Because switching desktops relies on an undocumented Windows interface, Flick may need a new version after a major Windows update.</p>
+</div>
+</section>
+
+<section class="section end" aria-labelledby="end">
+<h2 id="end"><span lang="ko">누르고, 밀면, 거기입니다.</span><span lang="en">Hold, flick, there.</span></h2>
+<div class="cta">
+<a class="btn" href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe"><svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2.5v9M5 8l4 4 4-4M3 15.5h12"/></svg><span lang="ko">Flick.exe 받기 — 무료</span><span lang="en">Download Flick.exe — free</span></a>
+<p class="cta-sub" lang="ko"><b>윈도우 11 23H2</b>(빌드 22631.3085 이상) 전용. <b>24H2는 아직 지원하지 않습니다.</b></p>
+<p class="cta-sub" lang="en"><b>Windows 11 23H2</b> only (build 22631.3085 or later). <b>24H2 is not supported yet.</b></p>
+</div>
+</section>
+</main>
+
+<footer class="wrap"><div class="foot"><div class="foot-in">
+<p><span lang="ko">MIT 라이선스 · 만든 사람 </span><span lang="en">MIT License · made by </span><a href="https://philaxis.github.io">philaxis</a></p>
+<ul><li><a href="https://github.com/philaxis/flick">GitHub</a></li><li><a href="https://github.com/philaxis/flick/releases"><span lang="ko">모든 릴리스</span><span lang="en">All releases</span></a></li><li><a href="https://philaxis.github.io">philaxis.github.io</a></li></ul>
+</div></div></footer>
+
+<script>(function(){
+var root=document.documentElement,
+T={ko:'Flick — 윈도우 11 가상 데스크톱을 2D 격자로',en:'Flick — Windows 11 virtual desktops as a 2D grid'},
+WS={ko:['개발','글쓰기','개인'],en:['Dev','Writing','Personal']},
+lb=document.querySelectorAll('.lang button');
+function lang(){return root.lang==='en'?'en':'ko'}
+function setLang(l,save){root.lang=l;document.title=T[l];for(var i=0;i<lb.length;i++)lb[i].setAttribute('aria-pressed',String(lb[i].getAttribute('data-lang')===l));if(save)try{localStorage.setItem('flick-lang',l)}catch(e){}say()}
+for(var i=0;i<lb.length;i++)lb[i].addEventListener('click',function(){setLang(this.getAttribute('data-lang'),true)});
+
+/* demo: the grid rules. rows[i] = cells in row i, mem[i] = the cell row i was last left on, r = current row. */
+var d=document.querySelector('[data-demo]'),stage=d.querySelector('.stage'),
+rowEls=d.querySelectorAll('.row'),ring=d.querySelector('.ring'),
+ws=d.querySelector('[data-ws]'),pos=d.querySelector('[data-pos]'),tg=d.querySelector('[data-toggle]'),
+rows=[4,2,3],START=[2,1,1],mem=START.slice(),r=0,
+SCRIPT='RDLDRUULLDRDLUUR',si=0,timer=0,playing=false,away=false,dirT=0,
+calm=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+function say(){if(!ws)return;ws.textContent=WS[lang()][r];pos.textContent=(mem[r]+1)+' / '+rows[r]}
+function draw(){for(var i=0;i<rowEls.length;i++){var e=rowEls[i],c=e.querySelectorAll('.cell');e.style.setProperty('--m',mem[i]);e.classList.toggle('on',i===r);for(var j=0;j<c.length;j++){c[j].classList.toggle('rem',j===mem[i]);c[j].classList.toggle('cur',i===r&&j===mem[i])}}ring.style.setProperty('--r',r);say()}
+function move(k){var ok=false;
+if(k==='L'){if(mem[r]>0){mem[r]--;ok=true}}
+else if(k==='R'){if(mem[r]<rows[r]-1){mem[r]++;ok=true}}
+else if(k==='U'){if(r>0){r--;ok=true}}
+else if(k==='D'){if(r<rows.length-1){r++;ok=true}}
+if(ok)draw();else{ring.classList.remove('bL','bR','bU','bD');void ring.offsetWidth;ring.classList.add('b'+k)}
+d.setAttribute('data-dir',k);clearTimeout(dirT);dirT=setTimeout(function(){d.removeAttribute('data-dir')},240);return ok}
+function label(){tg.classList.toggle('is-play',!playing);tg.querySelector('[data-t-ko]').textContent=playing?'멈춤':'재생';tg.querySelector('[data-t-en]').textContent=playing?'Pause':'Play';tg.setAttribute('aria-pressed',String(playing))}
+function step(){d.classList.add('held');timer=setTimeout(function(){move(SCRIPT.charAt(si));si=(si+1)%SCRIPT.length;timer=setTimeout(function(){d.classList.remove('held');timer=setTimeout(step,900)},420)},260)}
+function sync(){clearTimeout(timer);timer=0;if(playing&&!away)timer=setTimeout(step,900);else if(!drag)d.classList.remove('held')}
+function play(on){playing=on;if(on){mem=START.slice();r=0;si=0;draw()}label();sync()}
+function touch(){if(playing)play(false)}
+var drag=null,STEP=34;
+stage.addEventListener('pointerdown',function(e){if(e.button)return;touch();drag={x:e.clientX,y:e.clientY};d.classList.add('held');stage.classList.add('held');try{stage.setPointerCapture(e.pointerId)}catch(_){}stage.focus({preventScroll:true})});
+stage.addEventListener('pointermove',function(e){if(!drag)return;var dx=e.clientX-drag.x,dy=e.clientY-drag.y,k='';
+if(Math.abs(dx)>=STEP&&Math.abs(dx)>=Math.abs(dy))k=dx>0?'R':'L';else if(Math.abs(dy)>=STEP&&Math.abs(dy)>Math.abs(dx))k=dy>0?'D':'U';
+if(k){move(k);drag.x=e.clientX;drag.y=e.clientY}});
+function up(){if(!drag)return;drag=null;d.classList.remove('held');stage.classList.remove('held')}
+stage.addEventListener('pointerup',up);stage.addEventListener('pointercancel',up);
+d.addEventListener('keydown',function(e){var k={ArrowLeft:'L',ArrowRight:'R',ArrowUp:'U',ArrowDown:'D'}[e.key];if(!k||e.altKey||e.ctrlKey||e.metaKey)return;e.preventDefault();touch();move(k)});
+var pb=d.querySelectorAll('[data-move]');for(i=0;i<pb.length;i++)pb[i].addEventListener('click',function(){touch();move(this.getAttribute('data-move'))});
+tg.addEventListener('click',function(){play(!playing)});tg.hidden=false;
+function seen(v){if(away===!v)return;away=!v;sync()}
+if('IntersectionObserver' in window)new IntersectionObserver(function(e){seen(e[e.length-1].isIntersecting&&!document.hidden)},{threshold:.2}).observe(d);
+document.addEventListener('visibilitychange',function(){if(document.hidden)seen(false);else{var b=d.getBoundingClientRect();seen(b.bottom>0&&b.top<innerHeight)}});
+setLang(lang(),false);draw();play(!calm);
+})();</script>
+</body>
+</html>
