@@ -1,0 +1,173 @@
+//! Notification-area icon, its menu, and the "run at startup" registry entry.
+
+use windows::{
+    core::{w, HSTRING, PCWSTR},
+    Win32::{
+        Foundation::{HWND, POINT},
+        System::LibraryLoader::GetModuleHandleW,
+        System::Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ},
+        UI::{
+            Shell::{
+                Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NOTIFYICONDATAW,
+            },
+            WindowsAndMessaging::{
+                AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, LoadIconW, LoadImageW,
+                SetForegroundWindow, TrackPopupMenu, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED,
+                MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            },
+        },
+    },
+};
+
+const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_VALUE: PCWSTR = w!("KanKan");
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Command {
+    Peek = 1,
+    OpenConfig,
+    ReloadConfig,
+    ToggleAutostart,
+    Exit,
+}
+
+/// The app icon embedded in the exe (resource id 1), at tray size.
+fn app_icon() -> HICON {
+    unsafe {
+        let size = GetSystemMetrics(SM_CXSMICON);
+        GetModuleHandleW(None)
+            .and_then(|module| LoadImageW(module, PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR))
+            .map(|handle| HICON(handle.0))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default()
+    }
+}
+
+fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
+}
+
+pub fn add(hwnd: HWND, callback_message: u32) {
+    let mut data = icon_data(hwnd);
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    data.uCallbackMessage = callback_message;
+    data.hIcon = app_icon();
+    for (slot, unit) in data.szTip.iter_mut().zip(crate::config::APP_NAME.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe {
+        Shell_NotifyIconW(NIM_ADD, &data);
+    }
+}
+
+/// Shows a balloon notification from the tray icon.
+pub fn notify(hwnd: HWND, title: &str, text: &str) {
+    let mut data = icon_data(hwnd);
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO;
+    for (slot, unit) in data.szInfoTitle.iter_mut().zip(title.encode_utf16().take(63)) {
+        *slot = unit;
+    }
+    for (slot, unit) in data.szInfo.iter_mut().zip(text.encode_utf16().take(255)) {
+        *slot = unit;
+    }
+    unsafe {
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+}
+
+pub fn remove(hwnd: HWND) {
+    unsafe {
+        Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
+    }
+}
+
+/// Shows the context menu at the cursor and returns what was picked.
+pub fn menu(hwnd: HWND) -> Option<Command> {
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        let item = |command: Command, text: PCWSTR, checked: bool| {
+            let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, command as usize, text);
+        };
+        item(Command::Peek, w!("격자 보기"), false);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        item(Command::OpenConfig, w!("설정 파일 열기"), false);
+        item(Command::ReloadConfig, w!("설정 다시 읽기"), false);
+        item(Command::ToggleAutostart, w!("윈도우 시작 시 실행"), autostart_enabled());
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        item(Command::Exit, w!("종료"), false);
+
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        // Required so the menu closes when the user clicks elsewhere.
+        let _ = SetForegroundWindow(hwnd);
+        let picked =
+            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd, None);
+        let _ = DestroyMenu(menu);
+        [Command::Peek, Command::OpenConfig, Command::ReloadConfig, Command::ToggleAutostart, Command::Exit]
+            .into_iter()
+            .find(|c| *c as i32 == picked.0)
+    }
+}
+
+pub fn autostart_enabled() -> bool {
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None).is_ok() }
+}
+
+pub fn set_autostart(enabled: bool) {
+    unsafe {
+        if !enabled {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let command = HSTRING::from(format!("\"{}\"", exe.display()));
+        let bytes = (command.len() + 1) * 2;
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ.0, Some(command.as_ptr().cast()), bytes as u32);
+    }
+}
+
+/// Which kinds of pinning a window currently has.
+#[derive(Clone, Copy, Default)]
+pub struct PinState {
+    pub row_window: bool,
+    pub row_app: bool,
+    pub all_window: bool,
+    pub all_app: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum PinCommand {
+    RowWindow = 1,
+    RowApp,
+    AllWindow,
+    AllApp,
+}
+
+/// Shows the pin menu for one window at the cursor. The caller must make
+/// `owner` the foreground window first so the menu closes on an outside click.
+pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        let item = |command: PinCommand, text: PCWSTR, checked: bool| {
+            let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, command as usize, text);
+        };
+        item(PinCommand::RowWindow, w!("이 창을 행 안에서 따라오게"), state.row_window);
+        item(PinCommand::RowApp, w!("이 앱의 창을 행 안에서 따라오게"), state.row_app);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        item(PinCommand::AllWindow, w!("이 창을 모든 칸에 고정"), state.all_window);
+        item(PinCommand::AllApp, w!("이 앱을 모든 칸에 고정"), state.all_app);
+
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let picked =
+            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, owner, None);
+        let _ = DestroyMenu(menu);
+        [PinCommand::RowWindow, PinCommand::RowApp, PinCommand::AllWindow, PinCommand::AllApp]
+            .into_iter()
+            .find(|c| *c as i32 == picked.0)
+    }
+}
