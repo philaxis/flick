@@ -1078,6 +1078,10 @@ pub fn render_sample(path: &str) {
 /// Renders the board for the real desktops and windows into `path` (same raw
 /// format as `render_sample`), without live thumbnails and without showing it.
 pub fn render_board(path: &str) {
+    // Reading the desktops needs a backend, and only a known Windows gets one.
+    if vdapi::select(false).is_none() {
+        return;
+    }
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
