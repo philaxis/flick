@@ -37,15 +37,23 @@ use windows::{
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Input::KeyboardAndMouse::{
-                ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+            Input::{
+                Ime::{
+                    ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME, ImmReleaseContext, CPS_CANCEL, GCS_COMPSTR,
+                    GCS_RESULTSTR, IME_COMPOSITION_STRING, NI_COMPOSITIONSTR,
+                },
+                KeyboardAndMouse::{
+                    ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+                    VK_UP,
+                },
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG, IDC_ARROW,
-                SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON, WM_KEYDOWN,
-                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON,
+                WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_POPUP,
             },
         },
     },
@@ -131,8 +139,11 @@ pub enum Action {
     Rename(usize, String),
 }
 
-/// Height of the hint line at the bottom, in unscaled units.
+/// Height of the line at the bottom that says what the thing under the
+/// cursor is or does, in unscaled units.
 const FOOTER: f32 = 44.0;
+/// The longest name a workspace can be given, in characters.
+const NAME_LENGTH: usize = 24;
 
 fn contains(r: &Rect, x: f32, y: f32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
@@ -217,8 +228,10 @@ struct CellLayout {
     body: Rect,
     close: Rect,
     apps: Vec<AppBadge>,
-    /// Apps that did not fit.
+    /// How many apps did not fit, and where that is written: in the bottom
+    /// right corner, clear of the icons.
     more: usize,
+    more_label: Rect,
 }
 
 struct RowLayout {
@@ -239,6 +252,8 @@ struct TileLayout {
     hwnd: HWND,
     frame: Rect,
     icon: Rect,
+    /// The title bar from the icon to the close button. The pin button
+    /// takes its place at the right end of this while it is shown.
     title: Rect,
     thumb: Rect,
     /// The pin button and the close button at the right of the title bar.
@@ -350,6 +365,9 @@ pub struct Board {
     origin: (i32, i32),
     /// The row being renamed and the text typed so far.
     editing: Option<(usize, String)>,
+    /// What the input method is still putting together (a Korean syllable
+    /// in the making), shown after the typed text.
+    composing: String,
 }
 
 impl Board {
@@ -410,6 +428,7 @@ impl Board {
                 home: Rect::default(),
                 origin: (0, 0),
                 editing: None,
+                composing: String::new(),
             })
         }
     }
@@ -422,13 +441,14 @@ impl Board {
         self.open
     }
 
-    /// A workspace's label for its menu: name, then window count and memory
-    /// estimate.
-    pub fn row_summary(&self, row: usize) -> Option<(String, String)> {
+    /// What a workspace's menu is headed with: its name, how many windows
+    /// it has and an estimate of the memory they take.
+    pub fn row_summary(&self, row: usize) -> Option<String> {
         let model = self.model.rows.get(row)?;
         let windows: usize = model.cells.iter().map(|c| c.windows.len()).sum();
-        let asleep = if model.asleep { ", 재움" } else { "" };
-        Some((grid::row_title(&model.name, row), format!("창 {windows}개, {}{asleep}", format_memory(model.memory))))
+        let asleep = if model.asleep { "  ·  재움" } else { "" };
+        let name = grid::row_title(&model.name, row);
+        Some(format!("{name}  ·  창 {windows}개  ·  {}{asleep}", format_memory(model.memory)))
     }
 
     pub fn set_modal(&mut self, modal: bool) {
@@ -467,7 +487,7 @@ impl Board {
         self.selected = model.current.clone();
         self.hover = Hit::Nothing;
         self.press = None;
-        self.editing = None;
+        self.stop_editing();
         self.open = true;
         unsafe {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_SHOWWINDOW);
@@ -859,11 +879,19 @@ impl Board {
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_CHAR => {
                 if let (Some((_, text)), Some(c)) = (&mut self.editing, char::from_u32(wparam.0 as u32)) {
-                    if !c.is_control() && text.chars().count() < 24 {
+                    if !c.is_control() && text.chars().count() < NAME_LENGTH {
                         text.push(c);
                         self.invalidate();
                     }
                 }
+                Action::None
+            }
+            // While a name is typed the board shows the text being put
+            // together itself, so the input method's own little window is
+            // not opened and its results are taken here.
+            WM_IME_STARTCOMPOSITION if self.editing.is_some() => Action::None,
+            WM_IME_COMPOSITION if self.editing.is_some() => {
+                self.composition_changed(lparam.0 as u32);
                 Action::None
             }
             _ => return None,
@@ -873,20 +901,52 @@ impl Board {
     fn start_rename(&mut self, row: usize) {
         if let Some(model) = self.model.rows.get(row) {
             self.editing = Some((row, model.name.clone()));
+            self.composing.clear();
             self.invalidate();
         }
     }
 
+    /// The input method has new text: finished text (`GCS_RESULTSTR` in
+    /// `flags`) joins the name, text still being put together is shown.
+    fn composition_changed(&mut self, flags: u32) {
+        let read = |kind: IME_COMPOSITION_STRING| unsafe {
+            let context = ImmGetContext(self.hwnd);
+            let mut text = vec![0u16; 64];
+            let bytes = ImmGetCompositionStringW(context, kind, Some(text.as_mut_ptr().cast()), (text.len() * 2) as u32);
+            let _ = ImmReleaseContext(self.hwnd, context);
+            String::from_utf16_lossy(&text[..(bytes.max(0) as usize / 2).min(text.len())])
+        };
+        let finished = if flags & GCS_RESULTSTR.0 != 0 { read(GCS_RESULTSTR) } else { String::new() };
+        self.composing = if flags & GCS_COMPSTR.0 != 0 { read(GCS_COMPSTR) } else { String::new() };
+        if let Some((_, text)) = &mut self.editing {
+            let room = NAME_LENGTH.saturating_sub(text.chars().count());
+            text.extend(finished.chars().filter(|c| !c.is_control()).take(room));
+        }
+        self.invalidate();
+    }
+
+    /// Ends renaming and returns the row and its name as typed, including
+    /// what the input method had not finished.
+    fn stop_editing(&mut self) -> Option<(usize, String)> {
+        let (row, text) = self.editing.take()?;
+        let name = format!("{text}{}", std::mem::take(&mut self.composing));
+        unsafe {
+            // Or the unfinished text would turn up in the next thing typed.
+            let context = ImmGetContext(self.hwnd);
+            let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+            let _ = ImmReleaseContext(self.hwnd, context);
+        }
+        self.invalidate();
+        Some((row, name.trim().to_owned()))
+    }
+
     fn key_down(&mut self, key: u16) -> Action {
-        if let Some((row, text)) = &mut self.editing {
-            let row = *row;
+        if let Some((_, text)) = &mut self.editing {
             if key == VK_RETURN.0 {
-                let name = text.trim().to_owned();
-                self.editing = None;
-                return Action::Rename(row, name);
+                return self.stop_editing().map_or(Action::None, |(row, name)| Action::Rename(row, name));
             }
             if key == VK_ESCAPE.0 {
-                self.editing = None;
+                self.stop_editing();
             } else if key == VK_BACK.0 {
                 text.pop();
             }
@@ -919,10 +979,7 @@ impl Board {
         }
         self.invalidate();
         // A click anywhere finishes a rename in progress.
-        match self.editing.take() {
-            Some((row, text)) => Action::Rename(row, text.trim().to_owned()),
-            None => Action::None,
-        }
+        self.stop_editing().map_or(Action::None, |(row, name)| Action::Rename(row, name))
     }
 
     fn mouse_move(&mut self, x: f32, y: f32) {
@@ -1118,7 +1175,43 @@ impl Board {
         Ok(())
     }
 
-    /// The cell label at the top and the hint line at the bottom of the home monitor.
+    /// What the line at the bottom says: the full title of the tile under
+    /// the cursor (it may be shortened there), or what can be done with the
+    /// thing under the cursor. Nothing when the cursor is on nothing.
+    fn footer(&self) -> Option<(String, f32)> {
+        let hint = |text: &str| Some((text.to_owned(), 0.50));
+        if self.editing.is_some() {
+            return hint("Enter: 저장   ·   Esc: 취소");
+        }
+        if self.dragged_window().is_some() {
+            return hint(if self.monitors.len() > 1 {
+                "칸에 놓으면 그 칸으로, 다른 모니터에 놓으면 그 모니터로 옮겨집니다"
+            } else {
+                "칸에 놓으면 그 칸으로 옮겨집니다"
+            });
+        }
+        if self.press.is_some() {
+            return None;
+        }
+        match &self.hover {
+            Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => {
+                let windows = self.tile_windows();
+                let (window, _) = windows.iter().find(|(w, _)| w.hwnd.0 == *hwnd)?;
+                let title = match window.app_name.is_empty() {
+                    true => window.title.clone(),
+                    false => format!("{}  —  {}", window.app_name, window.title),
+                };
+                Some((title, 0.85))
+            }
+            Hit::Cell(_) | Hit::CellClose(_) => hint("클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조"),
+            Hit::RowName(_) => hint("더블클릭: 이름 바꾸기   ·   우클릭: 창 닫기, 없애기"),
+            Hit::Plus(_) | Hit::PlusLeft(_) => hint("칸 추가"),
+            Hit::AddRow | Hit::AddRowTop => hint("워크스페이스 추가"),
+            Hit::Nothing => None,
+        }
+    }
+
+    /// The cell label at the top and the line at the bottom of the home monitor.
     fn draw_captions(&self, p: &Painter, fonts: &Fonts) {
         let s = self.scale;
         let (w, h) = size(&self.home);
@@ -1127,20 +1220,9 @@ impl Board {
             let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
             p.text(&format!("{row}  ·  {}번 칸{here}", pos.col + 1), &fonts.label, &self.label, white(0.80));
         }
-        let pointed = match &self.hover {
-            Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
-            _ => None,
-        };
-        // The full title of the tile under the cursor, in case it was shortened.
-        let windows = self.tile_windows();
-        let hovered = windows.iter().find(|(w, _)| Some(w.hwnd.0) == pointed).map(|(window, _)| {
-            if window.app_name.is_empty() { window.title.clone() } else { format!("{}  —  {}", window.app_name, window.title) }
-        });
-        let (line, alpha) = match &hovered {
-            Some(title) => (title.as_str(), 0.85),
-            None => ("창을 아래 칸으로 끌면 옮겨집니다   ·   칸을 끌면 재배치됩니다", 0.22),
-        };
-        p.text(line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
+        if let Some((line, alpha)) = self.footer() {
+            p.text(&line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
+        }
     }
 
     /// The selected cell's windows as large titled previews.
@@ -1159,6 +1241,12 @@ impl Board {
     fn draw_tile(&self, p: &Painter, fonts: &Fonts, tile: &TileLayout, window: &WindowModel, pin: Pin) {
         let s = self.scale;
         let hot = self.hover == self.tile_hit(tile.hwnd);
+        // The cursor is on the tile or on one of its buttons.
+        let pointed = hot || matches!(&self.hover, Hit::Pin(hwnd) | Hit::TileClose(hwnd) if *hwnd == tile.hwnd.0);
+        // A window that is not pinned shows the button for it only then, so
+        // that a narrow tile has room for its title.
+        let show_pin = pin != Pin::Off || pointed;
+        let title_bar = Rect { right: if show_pin { tile.pin.left - 8.0 * s } else { tile.title.right }, ..tile.title };
         let dim = if self.dragged_window() == Some(tile.hwnd.0) { 0.35 } else { 1.0 };
         p.fill(&tile.frame, 9.0 * s, rgba(0.125, 0.135, 0.165, dim));
         // Stand-in under the live thumbnail (and all there is for a minimized window).
@@ -1174,15 +1262,15 @@ impl Board {
         }
 
         // Two lines: the app, then what this window of it is about.
-        let title = display_title(&window.title, &window.app_name, (size(&tile.title).0 / (7.4 * s)) as usize);
+        let title = display_title(&window.title, &window.app_name, (size(&title_bar).0 / (7.4 * s)) as usize);
         let bright = white(if hot { 1.0 } else { 0.88 } * dim);
         if window.app_name.is_empty() || title.is_empty() || title.eq_ignore_ascii_case(&window.app_name) {
             let only = if title.is_empty() { &window.app_name } else { &title };
-            p.text(only, &fonts.title, &tile.title, bright);
+            p.text(only, &fonts.title, &title_bar, bright);
         } else {
-            let middle = centre(&tile.title).1;
-            let upper = Rect { top: tile.title.top + 5.0 * s, bottom: middle, ..tile.title };
-            let lower = Rect { top: middle - 2.0 * s, bottom: tile.title.bottom - 4.0 * s, ..tile.title };
+            let middle = centre(&title_bar).1;
+            let upper = Rect { top: title_bar.top + 5.0 * s, bottom: middle, ..title_bar };
+            let lower = Rect { top: middle - 2.0 * s, bottom: title_bar.bottom - 4.0 * s, ..title_bar };
             p.text(&window.app_name, &fonts.sub, &upper, white(0.50 * dim));
             p.text(&title, &fonts.title, &lower, bright);
         }
@@ -1193,8 +1281,10 @@ impl Board {
             Pin::Row => accent(dim),
             Pin::Off => white(if over { 0.20 } else { 0.07 } * dim),
         };
-        p.fill(&tile.pin, 5.0 * s, colour);
-        p.text(pin.label(), &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
+        if show_pin {
+            p.fill(&tile.pin, 5.0 * s, colour);
+            p.text(pin.label(), &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
+        }
 
         let over = self.hover == Hit::TileClose(tile.hwnd.0);
         if over {
@@ -1240,7 +1330,7 @@ impl Board {
         let s = self.scale;
         let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
         let name = match editing {
-            Some((_, typed)) => format!("{typed}▏"),
+            Some((_, typed)) => format!("{typed}{}▏", self.composing),
             None => grid::row_title(name, r),
         };
         let hot = self.hover == Hit::RowName(r) && self.press.is_none();
@@ -1293,8 +1383,7 @@ impl Board {
             }
         }
         if cell.more > 0 {
-            let area = Rect { top: cell.body.bottom - 18.0 * s, ..cell.body };
-            p.text(&format!("+{}", cell.more), &fonts.centered, &area, white(0.45 * dim));
+            p.text(&format!("+{}", cell.more), &fonts.centered, &cell.more_label, white(0.50 * dim));
         }
         if hovering && self.model.cell_count() > 1 && self.press.is_none() {
             let hot = self.hover == Hit::CellClose(cell.id.clone());
@@ -1511,7 +1600,7 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
                 hwnd: window.hwnd,
                 frame: rect(x, y, w, title_h + height),
                 icon: rect(x + 10.0 * s, y + (title_h - icon) / 2.0, icon, icon),
-                title: rect(x + 18.0 * s + icon, y, (pin.left - 8.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
+                title: rect(x + 18.0 * s + icon, y, (close.left - 6.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
                 thumb: rect(x, y + title_h, w, height),
                 pin,
                 close,
@@ -1611,6 +1700,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
                 close: rect(body.right - 15.0 * s, body.top - 5.0 * s, 20.0 * s, 20.0 * s),
                 apps,
                 more,
+                more_label: rect(body.right - 28.0 * s, body.bottom - 18.0 * s, 24.0 * s, 16.0 * s),
             });
             x += pitch;
         }

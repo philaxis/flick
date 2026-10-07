@@ -155,7 +155,7 @@ pub fn uninstall() {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &uninstall_key(APP_NAME));
     }
     let _ = fs::remove_file(shortcut(APP_NAME));
-    let text = format!("{APP_NAME}을(를) 제거했습니다.\n설정과 격자 배치는 %APPDATA%\\{APP_NAME} 에 남아 있습니다.");
+    let text = format!("제거했습니다.\n설정과 칸 배치는 %APPDATA%\\{APP_NAME} 폴더에 남아 있습니다.");
     unsafe {
         MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(APP_NAME), MB_OK | MB_ICONINFORMATION);
     }

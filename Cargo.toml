@@ -29,6 +29,7 @@ winvd_24h2 = { package = "winvd", path = "vendor/winvd-24h2" }
 windows = { version = "0.52", features = [
     "Foundation_Numerics",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",
@@ -46,6 +47,7 @@ windows = { version = "0.52", features = [
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
     "Win32_UI_Input",
+    "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

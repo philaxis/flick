@@ -1111,8 +1111,7 @@ fn run_cell_menu(owner: HWND) {
 fn run_row_menu(owner: HWND) {
     let pending = with_app(|app| {
         let row = app.pending_row_menu.take()?;
-        let (name, summary) = app.board.row_summary(row)?;
-        Some((row, format!("{name}: {summary}"), app.grid.rows.len() > 1))
+        Some((row, app.board.row_summary(row)?, app.grid.rows.len() > 1))
     })
     .flatten();
     let Some((row, summary, removable)) = pending else { return };
@@ -1121,11 +1120,11 @@ fn run_row_menu(owner: HWND) {
             // Closing windows can lose work, so it is asked about in earnest,
             // with "No" as the default answer.
             let text = format!(
-                "{summary}\n\n이 워크스페이스의 창을 전부 닫습니다.\n저장하지 않은 작업은 잃을 수 있고, 되돌릴 수 없습니다.\n\n정말 닫을까요?"
+                "{summary}\n\n이 워크스페이스의 창을 모두 닫습니다.\n저장하지 않은 작업은 잃을 수 있고, 되돌릴 수 없습니다.\n\n정말 닫을까요?"
             );
             with_app(|app| app.board.set_modal(true));
             let answer = unsafe {
-                MessageBoxW(owner, &HSTRING::from(text), w!("창을 모두 닫습니다"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
+                MessageBoxW(owner, &HSTRING::from(text), w!("창 모두 닫기"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
             };
             with_app(|app| app.board.set_modal(false));
             if answer == IDYES {
