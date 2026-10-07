@@ -187,7 +187,7 @@ struct Settings {
     step_x: i32,
     step_y: i32,
     /// Rows change on a quick flick rather than by distance (see `travel`).
-    sticky_vertical: bool,
+    vertical_sticky: bool,
 }
 
 impl Settings {
@@ -286,9 +286,9 @@ thread_local! {
 }
 
 /// Starts the hook thread (once) and gives it these settings.
-pub fn install(target: HWND, triggers: Vec<Trigger>, step_x: i32, step_y: i32, sticky_vertical: bool) {
+pub fn install(target: HWND, triggers: Vec<Trigger>, step_x: i32, step_y: i32, vertical_sticky: bool) {
     *SHARED.lock().unwrap() =
-        Some(Settings { target: target.0, triggers, step_x: step_x.max(20), step_y: step_y.max(20), sticky_vertical });
+        Some(Settings { target: target.0, triggers, step_x: step_x.max(20), step_y: step_y.max(20), vertical_sticky });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
             std::thread::spawn(hook_thread);
@@ -475,7 +475,7 @@ const FLICK_PAUSE_MS: u128 = 70;
 /// hand back for the next flick is too slow to count, so flick, flick is two
 /// rows.
 fn travel(s: &Settings, dx: i32, dy: i32) {
-    if !s.sticky_vertical {
+    if !s.vertical_sticky {
         return travel_linear(s, dx, dy);
     }
     let now = std::time::Instant::now();

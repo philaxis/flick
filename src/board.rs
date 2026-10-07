@@ -1,5 +1,6 @@
-//! The full-screen grid view: every workspace row with a live miniature of
-//! each desktop, where windows and cells can be dragged around.
+//! The full-screen view: the selected cell's windows as large live previews
+//! and, at the bottom of every monitor, a small map of all rows and cells.
+//! Windows can be dragged onto cells and monitors, cells around the map.
 //!
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
 //! not touch desktops itself; input is turned into an `Action` for the app.
@@ -128,8 +129,6 @@ pub enum Action {
 
 type Rect = D2D_RECT_F;
 
-/// The map is drawn at this fraction of the board's scale.
-const MAP_SCALE: f32 = 1.0;
 /// Height of the hint line at the bottom, in unscaled units.
 const FOOTER: f32 = 44.0;
 
@@ -194,7 +193,8 @@ struct CellLayout {
 }
 
 struct RowLayout {
-    /// The whole label area left of the row; its extras show on hover.
+    /// The whole label area left of the row; a right-click in it opens the
+    /// row's menu.
     header: Rect,
     name: Rect,
     top: f32,
@@ -283,8 +283,6 @@ pub struct Board {
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
-    /// The same fonts at the map's smaller scale.
-    map_fonts: Option<Fonts>,
     open: bool,
     model: Model,
     /// Copy of the grid used to move the selection, so that looking around
@@ -296,22 +294,22 @@ pub struct Board {
     other_maps: Vec<(usize, Layout)>,
     size: (i32, i32),
     scale: f32,
-    /// (source window, thumbnail handle, is a tile rather than part of the
-    /// map), in drawing order.
-    thumbs: Vec<(isize, isize, bool)>,
+    /// (source window, thumbnail handle) of every tile, in stacking order.
+    thumbs: Vec<(isize, isize)>,
     icons: HashMap<isize, ID2D1Bitmap>,
     hover: Hit,
     press: Option<Press>,
     cursor: (f32, f32),
-    cursor_before: (f32, f32),
     /// A confirmation box owned by the board is up.
     modal: bool,
     /// Every monitor, in the board window's coordinates. The board spans
-    /// them all; `home` (the one the cursor was on) also holds the map.
+    /// them all, each with a map of its own; `home` (the primary one) also
+    /// carries the cell label and the hint line, and sets the scale.
     monitors: Vec<Rect>,
     home: Rect,
     /// Screen position of the board window's top-left corner.
     origin: (i32, i32),
+    /// The row being renamed and the text typed so far.
     editing: Option<(usize, String)>,
 }
 
@@ -350,7 +348,6 @@ impl Board {
                 factory: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
                 canvas: None,
                 fonts: None,
-                map_fonts: None,
                 open: false,
                 model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new() },
                 nav: Grid::default(),
@@ -364,7 +361,6 @@ impl Board {
                 hover: Hit::Nothing,
                 press: None,
                 cursor: (0.0, 0.0),
-                cursor_before: (0.0, 0.0),
                 modal: false,
                 monitors: Vec::new(),
                 home: Rect::default(),
@@ -399,15 +395,15 @@ impl Board {
         self.selected.clone()
     }
 
-    /// Covers the monitor under the cursor and shows `model`.
+    /// Covers every monitor and shows `model`.
     pub fn open(&mut self, model: Model, grid: Grid) {
         unsafe extern "system" fn collect(_: HMONITOR, _: HDC, area: *mut RECT, out: LPARAM) -> BOOL {
             (*(out.0 as *mut Vec<RECT>)).push(*area);
             true.into()
         }
         unsafe {
-            // The primary monitor is "home" (it carries the label and sets the
-            // scale), so the board looks the same wherever the cursor is.
+            // Home is the primary monitor rather than the one under the
+            // cursor, so the board looks the same wherever the cursor is.
             let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
             let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             if !GetMonitorInfoW(monitor, &mut info).as_bool() {
@@ -437,7 +433,6 @@ impl Board {
             let size = (right - left, bottom - top);
             if self.scale != dpi as f32 / 96.0 {
                 self.fonts = None;
-                self.map_fonts = None;
             }
             self.scale = dpi as f32 / 96.0;
             self.size = size;
@@ -510,8 +505,6 @@ impl Board {
         self.model.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected)
     }
 
-    /// The windows shown as tiles: those of the selected cell, then the ones
-    /// pinned to every desktop (flagged), which are visible there as well.
     /// The windows shown as tiles: those of the selected cell and the ones
     /// pinned to every desktop (flagged), which are visible there as well.
     /// Their order depends only on what the windows are (app, then the
@@ -552,7 +545,7 @@ impl Board {
         // The map and the label are laid out inside the home monitor (and
         // drawn shifted to it); the tiles are placed in window coordinates,
         // each on the monitor its window is on.
-        let mut layout = compute_layout(&self.model, &anchors, (w, h - FOOTER * s), s * MAP_SCALE);
+        let mut layout = compute_layout(&self.model, &anchors, (w, h - FOOTER * s), s);
         let margin = 40.0 * s;
         layout.tiles_label = rect(margin, 22.0 * s, w - 2.0 * margin, 30.0 * s);
         let windows = self.tile_windows();
@@ -566,7 +559,7 @@ impl Board {
                 layout.map_top
             } else {
                 let size = (monitor.right - monitor.left, monitor.bottom - monitor.top - FOOTER * s);
-                let map = compute_layout(&self.model, &anchors, size, s * MAP_SCALE);
+                let map = compute_layout(&self.model, &anchors, size, s);
                 let top = map.map_top;
                 other_maps.push((m, map));
                 top
@@ -697,7 +690,7 @@ impl Board {
     // ---- thumbnails -------------------------------------------------------
 
     fn clear_thumbnails(&mut self) {
-        for (_, thumb, _) in self.thumbs.drain(..) {
+        for (_, thumb) in self.thumbs.drain(..) {
             unsafe {
                 let _ = DwmUnregisterThumbnail(thumb);
             }
@@ -710,7 +703,7 @@ impl Board {
         let wanted: Vec<HWND> = self.tile_windows().into_iter().map(|(w, _)| w.hwnd).collect();
         for hwnd in wanted {
             if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
-                self.thumbs.push((hwnd.0, thumb, true));
+                self.thumbs.push((hwnd.0, thumb));
             }
         }
         self.update_thumbnails();
@@ -731,7 +724,7 @@ impl Board {
             right: r.right.round() as i32,
             bottom: r.bottom.round() as i32,
         };
-        for &(hwnd, thumb, _) in &self.thumbs {
+        for &(hwnd, thumb) in &self.thumbs {
             let mut props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
                 opacity: 255,
@@ -786,17 +779,12 @@ impl Board {
     /// Thumbnails stack in registration order; re-register the one that will
     /// follow the cursor to lift it above the rest.
     fn raise_thumbnail(&mut self, hwnd: isize) {
-        let index = self
-            .thumbs
-            .iter()
-            .position(|&(h, _, tile)| h == hwnd && tile)
-            .or_else(|| self.thumbs.iter().position(|&(h, _, _)| h == hwnd));
-        if let Some(i) = index {
-            let (_, old, tile) = self.thumbs.remove(i);
+        if let Some(i) = self.thumbs.iter().position(|&(h, _)| h == hwnd) {
+            let (_, old) = self.thumbs.remove(i);
             unsafe {
                 let _ = DwmUnregisterThumbnail(old);
                 if let Ok(thumb) = DwmRegisterThumbnail(self.hwnd, HWND(hwnd)) {
-                    self.thumbs.push((hwnd, thumb, tile));
+                    self.thumbs.push((hwnd, thumb));
                 }
             }
         }
@@ -944,15 +932,10 @@ impl Board {
             return;
         }
         let hover = self.hit_test(x, y);
-        let over_header = |px: f32, py: f32| {
-            let (m, map, px, py) = self.map_at(px, py);
-            map.rows.iter().position(|row| contains(&row.header, px, py)).map(|row| (m, row))
-        };
-        if hover != self.hover || over_header(x, y) != over_header(self.cursor_before.0, self.cursor_before.1) {
+        if hover != self.hover {
             self.hover = hover;
             self.invalidate();
         }
-        self.cursor_before = (x, y);
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Action {
@@ -1041,10 +1024,8 @@ impl Board {
 
     fn paint(&mut self) {
         let Some(target) = self.ensure_canvas() else { return };
-        if self.fonts.is_none() || self.map_fonts.is_none() {
-            let log = |e| crate::app::log(&format!("board fonts failed: {e}"));
-            self.fonts = make_fonts(self.scale).map_err(log).ok();
-            self.map_fonts = make_fonts(self.scale * MAP_SCALE).map_err(log).ok();
+        if self.fonts.is_none() {
+            self.fonts = make_fonts(self.scale).map_err(|e| crate::app::log(&format!("board fonts failed: {e}"))).ok();
         }
         self.load_icons(&target);
         unsafe {
@@ -1078,35 +1059,33 @@ impl Board {
 
     fn draw(&self, t: &ID2D1RenderTarget) -> Result<()> {
         let s = self.scale;
-        let (Some(fonts), Some(map_fonts)) = (&self.fonts, &self.map_fonts) else { return Ok(()) };
+        let Some(fonts) = &self.fonts else { return Ok(()) };
         unsafe {
             t.Clear(Some(&rgba(0.050, 0.055, 0.068, 1.0)));
         }
         self.draw_tiles(t, fonts, s)?;
-        // Everything from here on belongs to the home monitor.
-        let mut hovered = Ok(None);
+        // Each map is laid out in its own monitor's coordinates.
+        let mut maps = Ok(());
         for (_, monitor, map) in self.maps() {
             unsafe {
                 t.SetTransform(&Matrix3x2::translation(monitor.left, monitor.top));
             }
-            let drawn = self.draw_map(t, map_fonts, s * MAP_SCALE, map, &monitor);
-            if hovered.is_ok() {
-                hovered = drawn;
-            }
+            let drawn = self.draw_map(t, fonts, s, map, &monitor);
+            maps = maps.and(drawn);
         }
-        // The label and the hint belong to the home monitor.
+        // So are the label and the hint, which belong to the home monitor.
         unsafe {
             t.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
         }
-        let footer = self.draw_footer(t, fonts, s, hovered.as_ref().ok().cloned().flatten());
+        let captions = self.draw_captions(t, fonts, s);
         unsafe {
             t.SetTransform(&Matrix3x2::identity());
         }
-        hovered.and(footer)
+        maps.and(captions)
     }
 
     /// The cell label at the top and the hint line at the bottom of the home monitor.
-    fn draw_footer(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32, hovered: Option<String>) -> Result<()> {
+    fn draw_captions(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32) -> Result<()> {
         unsafe {
             let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
             let (w, h) = (self.home.right - self.home.left, self.home.bottom - self.home.top);
@@ -1125,10 +1104,9 @@ impl Board {
                 _ => None,
             };
             // The full title of the tile under the cursor, in case it was shortened.
-            let hovered = hovered.or_else(|| {
-                let windows = self.tile_windows();
-                let (window, _) = windows.iter().find(|(w, _)| Some(w.hwnd.0) == pointed)?;
-                Some(if window.app_name.is_empty() { window.title.clone() } else { format!("{}  —  {}", window.app_name, window.title) })
+            let windows = self.tile_windows();
+            let hovered = windows.iter().find(|(w, _)| Some(w.hwnd.0) == pointed).map(|(window, _)| {
+                if window.app_name.is_empty() { window.title.clone() } else { format!("{}  —  {}", window.app_name, window.title) }
             });
             let (line, alpha) = match &hovered {
                 Some(title) => (title.as_str(), 0.85),
@@ -1217,7 +1195,7 @@ impl Board {
 
     /// The map of all rows and cells: plain squares holding each cell's apps
     /// (icon and count), with the controls appearing on hover.
-    fn draw_map(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32, map: &Layout, monitor: &Rect) -> Result<Option<String>> {
+    fn draw_map(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32, map: &Layout, monitor: &Rect) -> Result<()> {
         unsafe {
             let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
             let text = |string: &str, font: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F| {
@@ -1345,7 +1323,7 @@ impl Board {
             }
             if let Some(hwnd) = self.dragged_window().filter(|_| here) {
                 // A minimized window has no thumbnail to follow the cursor.
-                if !self.thumbs.iter().any(|&(h, _, _)| h == hwnd) {
+                if !self.thumbs.iter().any(|&(h, _)| h == hwnd) {
                     let (cx, cy) = cursor;
                     let area = rect(cx - 16.0 * s, cy - 16.0 * s, 32.0 * s, 32.0 * s);
                     if let Some(bitmap) = self.icons.get(&hwnd) {
@@ -1353,7 +1331,7 @@ impl Board {
                     }
                 }
             }
-            Ok(None)
+            Ok(())
         }
     }
 
@@ -1371,7 +1349,6 @@ impl Board {
         self.nav.visit(&selected);
         self.relayout();
         self.fonts = make_fonts(scale).ok();
-        self.map_fonts = make_fonts(scale * MAP_SCALE).ok();
         let target = self.ensure_canvas()?;
         self.load_icons(&target);
         unsafe {

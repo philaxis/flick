@@ -46,7 +46,6 @@ use windows::{
     },
 };
 
-
 const CELL_W: f32 = 46.0;
 const CELL_H: f32 = 30.0;
 const GAP: f32 = 7.0;
@@ -93,9 +92,11 @@ pub struct Overlay {
     shifts: Vec<f32>,
     alpha: f32,
     visible: bool,
+    /// When to start fading out; `None` keeps the minimap up.
     hide_at: Option<Instant>,
     last_tick: Instant,
     scale: f32,
+    /// Work area of the primary monitor, which `hwnd` is centred on.
     monitor: RECT,
     /// The same picture is shown on every other monitor through one more
     /// window each: (window, that monitor's work area).
@@ -204,13 +205,12 @@ impl Overlay {
         self.visible
     }
 
-    /// Shows `view`. When the overlay was hidden the highlight starts at
-    /// `from` (the cell just left) so the first move is animated too.
-    /// `linger_ms` hides it again after that long; `None` keeps it up until
-    /// `hide_after` is called.
-    pub fn show(&mut self, view: View, from: Option<Pos>, linger_ms: Option<u64>) {
+    /// Shows `view` until `hide_after` is called. When the overlay was hidden
+    /// the highlight starts at `from` (the cell just left) so the first move
+    /// is animated too.
+    pub fn show(&mut self, view: View, from: Option<Pos>) {
         if !self.visible {
-            self.place_on_cursor_monitor();
+            self.place_on_monitors();
             let start = from.or(view.cur).unwrap_or(Pos { row: 0, col: 0 });
             self.shifts = (0..view.rows.len()).map(|r| view.shift(r)).collect();
             self.highlight = (start.col as f32 + view.shift(start.row), start.row as f32);
@@ -218,7 +218,7 @@ impl Overlay {
             self.last_tick = Instant::now();
         }
         self.view = view;
-        self.hide_at = linger_ms.map(|ms| Instant::now() + std::time::Duration::from_millis(ms));
+        self.hide_at = None;
         self.render();
         unsafe {
             // Shown and raised: the minimap stays above the sliding picture
@@ -280,16 +280,16 @@ impl Overlay {
         self.render();
     }
 
-    /// Finds the monitors: the one under the cursor sets the scale, and each
-    /// of the others gets a window of its own to show the minimap too.
-    fn place_on_cursor_monitor(&mut self) {
+    /// Finds the monitors: the primary one sets the scale, and each of the
+    /// others gets a window of its own to show the minimap too.
+    fn place_on_monitors(&mut self) {
         unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> BOOL {
             (*(out.0 as *mut Vec<HMONITOR>)).push(monitor);
             true.into()
         }
         unsafe {
-            // Scale by the primary monitor: the minimap is the same on every
-            // screen, wherever the cursor happens to be.
+            // The primary monitor rather than the one under the cursor: the
+            // minimap is the same on every screen, wherever the cursor is.
             let monitor = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
             let work_area = |monitor: HMONITOR| {
                 let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -531,7 +531,7 @@ fn make_text_format(scale: f32) -> Result<IDWriteTextFormat> {
 
 /// What the app asks of the minimap.
 enum Request {
-    Show(View, Option<Pos>, Option<u64>),
+    Show(View, Option<Pos>),
     Update(View),
     HideAfter(u64),
 }
@@ -550,7 +550,7 @@ impl Minimap {
         std::thread::spawn(move || {
             let Ok(mut overlay) = Overlay::new() else { return };
             let apply = |overlay: &mut Overlay, request: Request| match request {
-                Request::Show(view, from, linger) => overlay.show(view, from, linger),
+                Request::Show(view, from) => overlay.show(view, from),
                 Request::Update(view) => overlay.update(view),
                 Request::HideAfter(ms) => overlay.hide_after(ms),
             };
@@ -583,8 +583,8 @@ impl Minimap {
         Minimap { requests }
     }
 
-    pub fn show(&self, view: View, from: Option<Pos>, linger_ms: Option<u64>) {
-        let _ = self.requests.send(Request::Show(view, from, linger_ms));
+    pub fn show(&self, view: View, from: Option<Pos>) {
+        let _ = self.requests.send(Request::Show(view, from));
     }
 
     pub fn update(&self, view: View) {

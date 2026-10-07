@@ -1,10 +1,11 @@
-//! Wires input, the grid model, the virtual desktops and the overlay together.
+//! Wires input, the grid model, the virtual desktops, the minimap and the
+//! board together.
 
 use crate::{
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
     grid::{Dir, Grid, Pos, Row},
-    input::{self, Trigger, WM_CLICK, WM_RELEASE, WM_STEP},
+    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_RELEASE, WM_STEP},
     overlay::{Minimap, Overlay, View},
     tray::{self, Command, PinCommand, PinState},
     vd::{self, Desktops},
@@ -28,17 +29,17 @@ use windows::{
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
-                MOD_SHIFT, MOD_WIN, VK_DOWN, VK_LEFT, VK_RIGHT, VK_UP,
+                MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_UP,
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetSystemMetrics,
-                SM_CXSCREEN, SM_CYSCREEN, WINDOW_STYLE, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-                WS_VISIBLE,
-                GetMessageW, IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
-                RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
-                MB_OK, MSG, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-                WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
+                GetSystemMetrics, IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
+                RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2,
+                MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP,
+                WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
             },
         },
     },
@@ -49,26 +50,29 @@ const WM_DESKTOP_EVENT: u32 = WM_APP + 11;
 /// Starts choosing a new trigger; what the tray menu item sends.
 const WM_CHANGE_TRIGGER: u32 = WM_APP + 12;
 
-/// How long the minimap stays after the trigger is released, after a hotkey,
-/// and after a plain click.
+/// How long the minimap stays after the trigger is released and after a
+/// hotkey (which has no release to wait for).
 const LINGER_RELEASE_MS: u64 = 350;
 const LINGER_HOTKEY_MS: u64 = 900;
 /// One-shot timer that refreshes the board after windows were asked to close.
 const REFRESH_TIMER_ID: usize = 2;
+/// Periodic check for rows idle long enough to be put to sleep.
+const SLEEP_TIMER_ID: usize = 3;
 /// Puts Windows' own "desktop name" label back after a switch.
 const LABEL_TIMER_ID: usize = 4;
 /// How long that label would have stayed up.
 const LABEL_HIDE_MS: u32 = 1600;
-/// Periodic check for rows idle long enough to be put to sleep.
-const SLEEP_TIMER_ID: usize = 3;
+/// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
+/// do the same carrying the active window, and this one opens the pin menu.
 const PIN_HOTKEY_ID: i32 = 8;
 
 struct App {
     hwnd: HWND,
     config: Config,
     grid: Grid,
-    overlay: Minimap,
-    /// Consecutive pushes against the same edge of the grid.
+    minimap: Minimap,
+    /// Consecutive pushes against the same edge of the grid, counted towards
+    /// `edge_create_pushes`.
     edge: Option<(Dir, u32)>,
     board: Board,
     /// The window that had focus when the board opened, to give it back on cancel.
@@ -86,10 +90,13 @@ struct App {
     pending_menu: Option<(HWND, PinState)>,
     /// Likewise the menu of a workspace in the board.
     pending_row_menu: Option<usize>,
-    /// When each cell was last shown, and the cells of rows put to sleep.
+    /// When each cell was last shown (cells not in here count from
+    /// `started`), and the cells of rows put to sleep. Both only matter with
+    /// `sleep_after_minutes` set.
     seen: HashMap<String, Instant>,
     asleep: HashSet<String>,
     started: Instant,
+    /// (old id, new id) of each change of the current desktop, from `listen`.
     events: mpsc::Receiver<(String, String)>,
     _listener: Option<vdapi::DesktopEventThread>,
     taskbar_created: u32,
@@ -117,12 +124,9 @@ pub fn log(message: &str) {
     }
 }
 
-/// A message box for something the user must know before the app exits.
-pub fn notice(text: &str) {
-    warn(text);
-}
-
-fn warn(text: &str) {
+/// Logs `text` and shows it in a message box: for what the user must know
+/// about, such as why the app will not start.
+pub fn warn(text: &str) {
     log(text);
     unsafe {
         MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(config::APP_NAME), MB_OK | MB_ICONWARNING);
@@ -314,12 +318,12 @@ impl App {
     }
 
     fn carry_held(&self) -> bool {
-        let vk = match self.config.carry_modifier.trim().to_ascii_lowercase().as_str() {
-            "ctrl" => 0x11,
-            "alt" => 0x12,
-            _ => 0x10,
+        let key = match self.config.carry_modifier.trim().to_ascii_lowercase().as_str() {
+            "ctrl" => VK_CONTROL,
+            "alt" => VK_MENU,
+            _ => VK_SHIFT,
         };
-        unsafe { GetAsyncKeyState(vk) < 0 }
+        unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
     }
 
     /// Moves one cell in `dir`, creating a cell when the edge has been pushed
@@ -369,7 +373,7 @@ impl App {
         } else {
             self.edge = Some((dir, pushes));
             let view = self.view(&current, may_create.then_some(dir));
-            self.overlay.show(view, None, None);
+            self.minimap.show(view, None);
         }
     }
 
@@ -399,7 +403,7 @@ impl App {
             config::save_grid(&self.grid);
         }
         let view = self.view(to, None);
-        self.overlay.show(view, Some(from), None);
+        self.minimap.show(view, Some(from));
     }
 
     /// The trigger was released: do what the steps of the gesture put off.
@@ -410,10 +414,6 @@ impl App {
             }
             config::save_grid(&self.grid);
         }
-    }
-
-    fn settle(&mut self, linger_ms: u64) {
-        self.overlay.hide_after(linger_ms);
     }
 
     fn model(&self, desktops: &Desktops) -> Model {
@@ -457,7 +457,7 @@ impl App {
     fn open_board(&mut self) {
         let Some(desktops) = self.sync() else { return };
         self.following.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
-        self.overlay.hide_after(0);
+        self.minimap.hide_after(0);
         self.focus_before_board = unsafe { GetForegroundWindow() };
         let model = self.model(&desktops);
         self.board.open(model, self.grid.clone());
@@ -549,7 +549,7 @@ impl App {
                     self.grid.rows.insert(at, Row { name: String::new(), cells: vec![id], last: None });
                 }
             }
-            Action::RemoveCell(id) => self.remove_cells(&[id]),
+            Action::RemoveCell(id) => self.remove_cell(&id),
             Action::SetPin { window, row, all } => {
                 if row {
                     self.following.insert(window.0);
@@ -639,37 +639,33 @@ impl App {
         self.refresh_board();
     }
 
-    /// Deletes desktops, moving their windows to a cell that stays: the left
-    /// or right neighbour in the row when there is one, else the current cell
-    /// or the nearest other row.
-    fn remove_cells(&mut self, ids: &[String]) {
+    /// Deletes a desktop, moving its windows to a cell that stays: the left
+    /// (else the right) neighbour in its row when there is one, else the
+    /// current cell, else the landing cell of the row above or below.
+    fn remove_cell(&mut self, id: &str) {
         let Some(desktops) = self.sync() else { return };
-        let Some(first) = ids.first().and_then(|id| self.grid.find(id)) else { return };
-        let survivors = |row: &Row| row.cells.iter().filter(|c| !ids.contains(c)).cloned().collect::<Vec<_>>();
-        let same_row = survivors(&self.grid.rows[first.row]);
-        let fallback = if !same_row.is_empty() {
-            same_row[first.col.saturating_sub(1).min(same_row.len() - 1)].clone()
-        } else if !ids.contains(&desktops.current) {
+        let Some(pos) = self.grid.find(id) else { return };
+        let is_current = desktops.current == id;
+        let neighbours: Vec<&String> = self.grid.rows[pos.row].cells.iter().filter(|c| *c != id).collect();
+        let fallback = if !neighbours.is_empty() {
+            neighbours[pos.col.saturating_sub(1).min(neighbours.len() - 1)].clone()
+        } else if !is_current {
             desktops.current.clone()
         } else {
-            let other = if first.row > 0 { first.row - 1 } else { first.row + 1 };
+            let other = if pos.row > 0 { pos.row - 1 } else { pos.row + 1 };
             let Some(row) = self.grid.rows.get(other) else { return };
             row.last.clone().filter(|id| row.cells.contains(id)).unwrap_or_else(|| row.cells[0].clone())
         };
-        let Some(target) = desktops.get(&fallback) else { return };
-        if ids.contains(&desktops.current) {
+        let (Some(desktop), Some(target)) = (desktops.get(id), desktops.get(&fallback)) else { return };
+        if is_current {
             if self.switch(target).is_err() {
                 return;
             }
             self.visit(&fallback);
         }
-        for id in ids {
-            if let Some(desktop) = desktops.get(id) {
-                match vdapi::remove_desktop(desktop, target) {
-                    Ok(()) => self.grid.remove(id),
-                    Err(e) => log(&format!("remove_desktop failed: {e:?}")),
-                }
-            }
+        match vdapi::remove_desktop(desktop, target) {
+            Ok(()) => self.grid.remove(id),
+            Err(e) => log(&format!("remove_desktop failed: {e:?}")),
         }
     }
 
@@ -705,7 +701,7 @@ impl App {
         }
         config::save_grid(&self.grid);
         let view = self.view(&desktops.current, None);
-        self.overlay.update(view);
+        self.minimap.update(view);
         self.refresh_board();
     }
 
@@ -829,7 +825,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 with_app(|app| {
                     app.in_gesture = true;
                     app.step(dir, app.carry_held());
-
                 });
             }
         }
@@ -839,14 +834,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_CHANGE_TRIGGER => {
             with_app(App::begin_trigger_change);
         }
-        input::WM_CAPTURED => {
+        WM_CAPTURED => {
             with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.end_trigger_prompt() });
         }
         WM_RELEASE => {
             with_app(|app| {
                 app.edge = None;
                 app.finish_gesture();
-                app.settle(LINGER_RELEASE_MS);
+                app.minimap.hide_after(LINGER_RELEASE_MS);
             });
         }
         WM_HOTKEY if wparam.0 as i32 == PIN_HOTKEY_ID => {
@@ -862,7 +857,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             if let Some(dir) = input::dir_from_index(wparam.0 % 4) {
                 with_app(|app| {
                     app.step(dir, wparam.0 >= 4);
-                    app.settle(LINGER_HOTKEY_MS);
+                    app.minimap.hide_after(LINGER_HOTKEY_MS);
                 });
             }
         }
@@ -912,8 +907,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     LRESULT(0)
 }
 
-/// Shows the pin menu a handler asked for. It runs after the handler returned
-/// because a menu pumps messages, which must be able to reach the app.
+/// Shows the workspace menu or the pin menu a handler asked for. It runs after
+/// the handler returned because a menu pumps messages, which must be able to
+/// reach the app.
 fn run_pending_menu(owner: HWND) {
     let row = with_app(|app| {
         let row = app.pending_row_menu.take()?;
@@ -1005,7 +1001,7 @@ pub fn run(first_run: bool) {
         Ok(board) => board,
         Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
     };
-    let overlay = Minimap::spawn();
+    let minimap = Minimap::spawn();
     BOARD_HWND.set(board.hwnd().0);
     if Desktops::read().is_none() {
         return warn("가상 데스크톱에 접근하지 못했습니다. 이 윈도우 빌드를 지원하지 않는 것일 수 있습니다.");
@@ -1016,7 +1012,7 @@ pub fn run(first_run: bool) {
         hwnd,
         config: Config::default(),
         grid: config::load_grid(),
-        overlay,
+        minimap,
         edge: None,
         board,
         focus_before_board: HWND(0),
@@ -1086,13 +1082,13 @@ pub fn render_board(path: &str) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let Ok(board) = Board::new(wndproc) else { return };
-    let overlay = Minimap::spawn();
+    let minimap = Minimap::spawn();
     let (_tx, events) = mpsc::channel();
     let mut app = App {
         hwnd: HWND(0),
         config: Config::default(),
         grid: config::load_grid(),
-        overlay,
+        minimap,
         edge: None,
         board,
         focus_before_board: HWND(0),

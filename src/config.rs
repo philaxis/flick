@@ -2,6 +2,8 @@
 //! `%APPDATA%\Flick`.
 
 use crate::grid::Grid;
+use serde::Deserialize;
+use std::{fs, path::PathBuf};
 
 /// The app's display name. Also used for the install folder, the settings
 /// folder, the Start menu shortcut and the registry entries; the exe name in
@@ -9,8 +11,6 @@ use crate::grid::Grid;
 pub const APP_NAME: &str = "Flick";
 /// Settings folders of versions under earlier names, newest first.
 const OLD_DIRS: [&str; 2] = ["KanKan", "desk2d"];
-use serde::Deserialize;
-use std::{fs, path::PathBuf};
 
 const DEFAULT_CONFIG: &str = r#"# Flick 설정. 저장한 뒤 트레이 아이콘 메뉴의 "설정 다시 읽기"를 누르면 적용됩니다.
 
@@ -72,6 +72,8 @@ impl Default for Config {
     }
 }
 
+/// The settings folder. One left by a version under an earlier name is taken
+/// over the first time this is asked for.
 fn dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
     let dir = base.join(APP_NAME);

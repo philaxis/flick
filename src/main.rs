@@ -47,7 +47,7 @@ fn main() {
     // installing or touching anything.
     if vdapi::select(flag == Some("--force")).is_none() {
         let build = vdapi::windows_build().map_or("알 수 없음".to_owned(), |(b, r)| format!("{b}.{r}"));
-        return app::notice(&format!(
+        return app::warn(&format!(
             "이 윈도우에서는 Flick을 실행하지 않습니다.\n\n윈도우 11 23H2(빌드 22631.3085 이상), 24H2(빌드 26100.2605 이상), 25H2를 지원합니다.\n이 PC의 빌드: {build}\n\nFlick does not run on this version of Windows. It supports Windows 11 23H2 (build 22631.3085 or later), 24H2 (build 26100.2605 or later) and 25H2."
         ));
     }

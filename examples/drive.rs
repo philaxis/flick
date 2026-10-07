@@ -1,6 +1,12 @@
-//! Test driver: posts the app's own messages to the running instance and
-//! captures the screen, so behaviour can be checked without a person at the mouse.
-//!   drive step <0..3> | click | release | shot <path>
+//! Test driver: posts the app's own messages to the running instance, sends
+//! input and captures the screen, so behaviour can be checked without a person
+//! at the mouse.
+//!   drive step <0..3> | click | release | change-trigger
+//!   drive xbutton <down|up> | mouse <x> <y> [down|up|rdown|rup] | move <dx> <dy>
+//!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
+//!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
+//! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
+//! (src/input.rs) and `WM_CHANGE_TRIGGER` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
 // here as it is, and this driver uses a small part of it.
 #[allow(dead_code)]
@@ -261,18 +267,12 @@ fn typetest() {
             String::from_utf16_lossy(&buffer[..n])
         };
         pump(300);
-        // Ordinary typing, one key at a time, with overlap between neighbours.
-        for word in ["wer", "the", "were"] {
-            let letters: Vec<char> = word.chars().collect();
-            for (i, c) in letters.iter().enumerate() {
-                send(&[key(*c, false)]);
-                pump(35);
-                if i > 0 {
-                    // nothing: previous key was released below
-                }
-                send(&[key(*c, true)]);
-                pump(35);
-            }
+        // Ordinary typing, one key at a time.
+        for c in "werthewere".chars() {
+            send(&[key(c, false)]);
+            pump(35);
+            send(&[key(c, true)]);
+            pump(35);
         }
         pump(200);
         println!("typed one by one: {:?} (expected \"werthewere\")", text(edit));
