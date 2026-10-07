@@ -183,6 +183,8 @@ struct Settings {
     triggers: Vec<Trigger>,
     step_x: i32,
     step_y: i32,
+    /// Vertical moves take one deliberate stroke per row (see `travel`).
+    sticky_vertical: bool,
 }
 
 impl Settings {
@@ -260,6 +262,9 @@ thread_local! {
     static STEPPED: Cell<bool> = const { Cell::new(false) };
     /// Mouse travel not yet converted into steps.
     static ACCUM: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    /// A vertical step was taken in the stroke still under way.
+    static LATCHED: Cell<bool> = const { Cell::new(false) };
+    static LAST_MOVE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     /// The hook thread's hidden window, which receives raw mouse input.
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
@@ -274,8 +279,9 @@ thread_local! {
 }
 
 /// Starts the hook thread (once) and gives it these settings.
-pub fn install(target: HWND, triggers: Vec<Trigger>, step_x: i32, step_y: i32) {
-    *SHARED.lock().unwrap() = Some(Settings { target: target.0, triggers, step_x: step_x.max(20), step_y: step_y.max(20) });
+pub fn install(target: HWND, triggers: Vec<Trigger>, step_x: i32, step_y: i32, sticky_vertical: bool) {
+    *SHARED.lock().unwrap() =
+        Some(Settings { target: target.0, triggers, step_x: step_x.max(20), step_y: step_y.max(20), sticky_vertical });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
             std::thread::spawn(hook_thread);
@@ -376,6 +382,8 @@ fn press(source: u8) {
     if before == 0 {
         STEPPED.set(false);
         ACCUM.set((0, 0));
+        LATCHED.set(false);
+        LAST_MOVE.set(None);
         LAST_ABSOLUTE.set(None);
         listen_raw(true);
     }
@@ -444,23 +452,44 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
 /// down). Everything else is sideways, the far more common move.
 const VERTICAL_BIAS: f32 = 2.0;
 
-/// Adds mouse travel and emits one step per threshold crossed. The other
-/// axis is cleared on a step so that drift does not leak into the next one.
+/// A pause this long ends a stroke.
+const STROKE_PAUSE_MS: u128 = 110;
+
+/// Adds mouse travel and emits steps. Sideways it is linear: one step per
+/// threshold of travel, as far as the hand goes. Vertically (unless the user
+/// asked for linear there too) it is one step per stroke: after a row change
+/// further vertical travel is ignored until the hand pauses or goes sideways,
+/// so changing workspace takes a deliberate pull each time.
 fn travel(s: &Settings, dx: i32, dy: i32) {
+    let now = std::time::Instant::now();
+    if LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > STROKE_PAUSE_MS) {
+        LATCHED.set(false);
+    }
     let (mut ax, mut ay) = ACCUM.get();
     ax += dx;
     ay += dy;
     loop {
         let vertical = ay.abs() as f32 >= VERTICAL_BIAS * ax.abs() as f32;
+        if vertical && LATCHED.get() {
+            // Still the stroke that already changed row.
+            ay = 0;
+            ax = 0;
+            break;
+        }
         let dir = if vertical && ay.abs() >= s.step_y {
             let dir = if ay > 0 { Dir::Down } else { Dir::Up };
             ay -= ay.signum() * s.step_y;
             ax = 0;
+            if s.sticky_vertical {
+                ay = 0;
+                LATCHED.set(true);
+            }
             dir
         } else if !vertical && ax.abs() >= s.step_x {
             let dir = if ax > 0 { Dir::Right } else { Dir::Left };
             ax -= ax.signum() * s.step_x;
             ay = 0;
+            LATCHED.set(false);
             dir
         } else {
             break;

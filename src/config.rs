@@ -25,6 +25,10 @@ trigger = "xbutton2"
 step_x = 260
 step_y = 320
 
+# 위아래 이동을 "쫀득하게": 한 번 확실히 밀 때마다 한 행만 넘어갑니다.
+# false로 하면 좌우처럼 민 만큼 계속 넘어갑니다.
+vertical_sticky = true
+
 # 새 칸/새 행은 전체 격자 뷰(딸깍)에서 마우스로 만듭니다.
 # 여기에 1 이상을 넣으면 격자 가장자리에서 그 횟수만큼 더 밀 때도 만들어집니다. 0이면 만들지 않습니다.
 edge_create_pushes = 0
@@ -46,6 +50,7 @@ pub struct Config {
     pub trigger: String,
     pub step_x: i32,
     pub step_y: i32,
+    pub vertical_sticky: bool,
     pub edge_create_pushes: u32,
     pub carry_modifier: String,
     pub hotkeys: bool,
@@ -58,6 +63,7 @@ impl Default for Config {
             trigger: "xbutton2".into(),
             step_x: 260,
             step_y: 320,
+            vertical_sticky: true,
             edge_create_pushes: 0,
             carry_modifier: "shift".into(),
             hotkeys: true,

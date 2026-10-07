@@ -763,7 +763,7 @@ impl App {
         if triggers.is_empty() {
             triggers.push(Trigger::XButton2);
         }
-        input::install(self.hwnd, triggers, config.step_x, config.step_y);
+        input::install(self.hwnd, triggers, config.step_x, config.step_y, config.vertical_sticky);
 
         unsafe {
             for id in 0..=PIN_HOTKEY_ID {
