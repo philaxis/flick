@@ -112,6 +112,25 @@ fn main() {
                 };
                 SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
             }
+            Some("stroke") => {
+                // stroke <dx> <dy> <ms>: one continuous movement, as a stream of small reports.
+                use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT};
+                let (dx, dy, ms): (i32, i32, u64) = (args[2].parse().unwrap(), args[3].parse().unwrap(), args[4].parse().unwrap());
+                let reports = (ms / 5).max(1) as i32;
+                let started = std::time::Instant::now();
+                for i in 1..=reports {
+                    let part = |total: i32| total * i / reports - total * (i - 1) / reports;
+                    let input = INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: part(dx), dy: part(dy), dwFlags: MOUSEEVENTF_MOVE, ..Default::default() } },
+                    };
+                    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                    let due = std::time::Duration::from_millis(ms * i as u64 / reports as u64);
+                    if let Some(wait) = due.checked_sub(started.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+            }
             Some("keys") => {
                 // keys <down|up> <letters>: presses or releases all the letters at once.
                 let up = args[2] == "up";

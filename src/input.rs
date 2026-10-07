@@ -186,7 +186,7 @@ struct Settings {
     triggers: Vec<Trigger>,
     step_x: i32,
     step_y: i32,
-    /// Vertical moves take one deliberate stroke per row (see `travel`).
+    /// Rows change on a quick flick rather than by distance (see `travel`).
     sticky_vertical: bool,
 }
 
@@ -265,9 +265,13 @@ thread_local! {
     static STEPPED: Cell<bool> = const { Cell::new(false) };
     /// Mouse travel not yet converted into steps.
     static ACCUM: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
-    /// A vertical step was taken in the stroke still under way.
-    static LATCHED: Cell<bool> = const { Cell::new(false) };
+    /// Direction (-1 up, 1 down) of the flick the hand is still carrying
+    /// through, 0 when a new flick may be taken.
+    static FLICKED: Cell<i32> = const { Cell::new(0) };
     static LAST_MOVE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// The last moments of travel: (when, dx, dy).
+    static RECENT: RefCell<std::collections::VecDeque<(std::time::Instant, i32, i32)>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
     /// The hook thread's hidden window, which receives raw mouse input.
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
@@ -385,8 +389,9 @@ fn press(source: u8) {
     if before == 0 {
         STEPPED.set(false);
         ACCUM.set((0, 0));
-        LATCHED.set(false);
+        FLICKED.set(0);
         LAST_MOVE.set(None);
+        RECENT.with(|recent| recent.borrow_mut().clear());
         LAST_ABSOLUTE.set(None);
         listen_raw(true);
     }
@@ -455,44 +460,80 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
 /// down). Everything else is sideways, the far more common move.
 const VERTICAL_BIAS: f32 = 2.0;
 
-/// A pause this long ends a stroke.
-const STROKE_PAUSE_MS: u128 = 110;
+/// Vertical flicks are judged over the last this-many milliseconds of travel.
+const FLICK_WINDOW_MS: u128 = 150;
+/// With no movement for this long the hand has stopped.
+const FLICK_PAUSE_MS: u128 = 70;
 
-/// Adds mouse travel and emits steps. Sideways it is linear: one step per
-/// threshold of travel, as far as the hand goes. Vertically (unless the user
-/// asked for linear there too) it is one step per stroke: after a row change
-/// further vertical travel is ignored until the hand pauses or goes sideways,
-/// so changing workspace takes a deliberate pull each time.
+/// Adds mouse travel and emits steps.
+///
+/// Sideways it is linear: one step per threshold of travel, as far as the
+/// hand goes. Vertically (unless the user asked for linear there too) a row
+/// changes only on a flick: half the vertical threshold covered within
+/// `FLICK_WINDOW_MS`. One flick is one row however far it carries on; a flick
+/// the other way goes back at once; and the slow movement of bringing the
+/// hand back for the next flick is too slow to count, so flick, flick is two
+/// rows.
 fn travel(s: &Settings, dx: i32, dy: i32) {
-    let now = std::time::Instant::now();
-    if LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > STROKE_PAUSE_MS) {
-        LATCHED.set(false);
+    if !s.sticky_vertical {
+        return travel_linear(s, dx, dy);
     }
+    let now = std::time::Instant::now();
+    let paused = LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > FLICK_PAUSE_MS);
+    let (wx, wy) = RECENT.with(|recent| {
+        let mut recent = recent.borrow_mut();
+        // A stop, or turning round after a flick, starts a fresh stroke.
+        let turned = FLICKED.get() != 0 && dy != 0 && dy.signum() != FLICKED.get();
+        if paused || turned {
+            recent.clear();
+            FLICKED.set(0);
+        }
+        recent.push_back((now, dx, dy));
+        while recent.front().is_some_and(|(at, _, _)| now.duration_since(*at).as_millis() > FLICK_WINDOW_MS) {
+            recent.pop_front();
+        }
+        recent.iter().fold((0, 0), |(x, y), (_, dx, dy)| (x + dx, y + dy))
+    });
+    let (mut ax, _) = ACCUM.get();
+    if wy.abs() as f32 >= VERTICAL_BIAS * wx.abs() as f32 {
+        // Moving up or down: nothing of it counts sideways.
+        ax = 0;
+        if FLICKED.get() == 0 && wy.abs() >= (s.step_y / 2).max(40) {
+            FLICKED.set(wy.signum());
+            RECENT.with(|recent| recent.borrow_mut().clear());
+            STEPPED.set(true);
+            post(s, WM_STEP, dir_index(if wy > 0 { Dir::Down } else { Dir::Up }));
+        }
+    } else {
+        ax += dx;
+        while ax.abs() >= s.step_x {
+            let dir = if ax > 0 { Dir::Right } else { Dir::Left };
+            ax -= ax.signum() * s.step_x;
+            FLICKED.set(0);
+            STEPPED.set(true);
+            post(s, WM_STEP, dir_index(dir));
+        }
+    }
+    ACCUM.set((ax, 0));
+}
+
+/// Both axes by distance alone: one step per threshold of travel. The other
+/// axis is cleared on a step so that drift does not leak into the next one.
+fn travel_linear(s: &Settings, dx: i32, dy: i32) {
     let (mut ax, mut ay) = ACCUM.get();
     ax += dx;
     ay += dy;
     loop {
         let vertical = ay.abs() as f32 >= VERTICAL_BIAS * ax.abs() as f32;
-        if vertical && LATCHED.get() {
-            // Still the stroke that already changed row.
-            ay = 0;
-            ax = 0;
-            break;
-        }
         let dir = if vertical && ay.abs() >= s.step_y {
             let dir = if ay > 0 { Dir::Down } else { Dir::Up };
             ay -= ay.signum() * s.step_y;
             ax = 0;
-            if s.sticky_vertical {
-                ay = 0;
-                LATCHED.set(true);
-            }
             dir
         } else if !vertical && ax.abs() >= s.step_x {
             let dir = if ax > 0 { Dir::Right } else { Dir::Left };
             ax -= ax.signum() * s.step_x;
             ay = 0;
-            LATCHED.set(false);
             dir
         } else {
             break;
