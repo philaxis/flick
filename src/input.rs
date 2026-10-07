@@ -439,29 +439,31 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-/// Adds mouse travel and emits one step per threshold crossed. A step is taken
-/// along whichever axis is further through its own threshold, and the other
-/// axis is cleared so a diagonal drift does not leak into the next step.
+/// A movement counts as vertical only when it is this many times more
+/// vertical than horizontal (about 27 degrees either side of straight up or
+/// down). Everything else is sideways, the far more common move.
+const VERTICAL_BIAS: f32 = 2.0;
+
+/// Adds mouse travel and emits one step per threshold crossed. The other
+/// axis is cleared on a step so that drift does not leak into the next one.
 fn travel(s: &Settings, dx: i32, dy: i32) {
     let (mut ax, mut ay) = ACCUM.get();
     ax += dx;
     ay += dy;
     loop {
-        let nx = ax.abs() as f32 / s.step_x as f32;
-        let ny = ay.abs() as f32 / s.step_y as f32;
-        if nx < 1.0 && ny < 1.0 {
-            break;
-        }
-        let dir = if nx >= ny {
+        let vertical = ay.abs() as f32 >= VERTICAL_BIAS * ax.abs() as f32;
+        let dir = if vertical && ay.abs() >= s.step_y {
+            let dir = if ay > 0 { Dir::Down } else { Dir::Up };
+            ay -= ay.signum() * s.step_y;
+            ax = 0;
+            dir
+        } else if !vertical && ax.abs() >= s.step_x {
             let dir = if ax > 0 { Dir::Right } else { Dir::Left };
             ax -= ax.signum() * s.step_x;
             ay = 0;
             dir
         } else {
-            let dir = if ay > 0 { Dir::Down } else { Dir::Up };
-            ay -= ay.signum() * s.step_y;
-            ax = 0;
-            dir
+            break;
         };
         STEPPED.set(true);
         post(s, WM_STEP, dir_index(dir));

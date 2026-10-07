@@ -21,7 +21,7 @@ use windows::Win32::{
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
             EnumWindows, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowPlacement, SetWindowPlacement,
-            ShowWindow, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, GetWindowLongW,
+            FindWindowExW, ShowWindow, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, GetWindowLongW,
             GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
             IsWindowVisible, SetForegroundWindow, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
         },
@@ -367,5 +367,30 @@ pub fn move_to_monitor(hwnd: HWND, to: RECT) {
             placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
         }
         let _ = SetWindowPlacement(hwnd, &placement);
+    }
+}
+
+/// Windows 11 shows the desktop's name above the taskbar on every switch.
+/// There is no setting for it; it is drawn by the same shell window as the
+/// volume indicator, and that window stops showing while minimized (the
+/// approach of the HideVolumeOSD tool). `hidden = false` puts it back.
+pub fn set_switch_label_hidden(hidden: bool) {
+    unsafe {
+        let mut host = HWND(0);
+        loop {
+            host = FindWindowExW(None, host, w!("XamlExplorerHostIslandWindow"), w!(""));
+            if host.0 == 0 {
+                break;
+            }
+            let bridge = FindWindowExW(
+                host,
+                None,
+                w!("Windows.UI.Composition.DesktopWindowContentBridge"),
+                w!("DesktopWindowXamlSource"),
+            );
+            if bridge.0 != 0 {
+                ShowWindow(host, if hidden { SW_MINIMIZE } else { SW_RESTORE });
+            }
+        }
     }
 }

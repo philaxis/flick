@@ -173,3 +173,28 @@ pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
             .find(|c| *c as i32 == picked.0)
     }
 }
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum RowCommand {
+    CloseWindows = 1,
+    Remove,
+}
+
+/// The menu of a workspace in the board, at the cursor. `summary` says what
+/// closing would close; `removable` is false for the only workspace.
+pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowCommand> {
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        let close = HSTRING::from(format!("열린 창 닫기  ({summary})"));
+        let _ = AppendMenuW(menu, MF_STRING, RowCommand::CloseWindows as usize, &close);
+        if removable {
+            let _ = AppendMenuW(menu, MF_STRING, RowCommand::Remove as usize, w!("워크스페이스 없애기  (창은 가장 가까운 칸으로)"));
+        }
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let picked =
+            TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, owner, None);
+        let _ = DestroyMenu(menu);
+        [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as i32 == picked.0)
+    }
+}

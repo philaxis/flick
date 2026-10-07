@@ -35,7 +35,7 @@ use windows::{
                 SM_CXSCREEN, SM_CYSCREEN, WINDOW_STYLE, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
                 WS_VISIBLE,
                 GetMessageW, IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
-                RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, MB_ICONWARNING,
+                RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
                 MB_OK, MSG, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
                 WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
             },
@@ -55,6 +55,10 @@ const LINGER_RELEASE_MS: u64 = 350;
 const LINGER_HOTKEY_MS: u64 = 900;
 /// One-shot timer that refreshes the board after windows were asked to close.
 const REFRESH_TIMER_ID: usize = 2;
+/// Puts Windows' own "desktop name" label back after a switch.
+const LABEL_TIMER_ID: usize = 4;
+/// How long that label would have stayed up.
+const LABEL_HIDE_MS: u32 = 1600;
 /// Periodic check for rows idle long enough to be put to sleep.
 const SLEEP_TIMER_ID: usize = 3;
 const PIN_HOTKEY_ID: i32 = 8;
@@ -80,6 +84,8 @@ struct App {
     following: HashSet<isize>,
     /// A pin menu to show once the current handler has returned.
     pending_menu: Option<(HWND, PinState)>,
+    /// Likewise the menu of a workspace in the board.
+    pending_row_menu: Option<usize>,
     /// When each cell was last shown, and the cells of rows put to sleep.
     seen: HashMap<String, Instant>,
     asleep: HashSet<String>,
@@ -177,6 +183,15 @@ impl App {
         self.following.contains(&window.hwnd.0)
             || (!self.grid.follow_apps.is_empty()
                 && vd::exe_name(window.pid).is_some_and(|exe| self.grid.follow_apps.contains(&exe)))
+    }
+
+    /// Switches to a desktop without Windows' own name label popping up.
+    fn switch(&self, target: winvd::Desktop) -> Result<(), winvd::Error> {
+        vd::set_switch_label_hidden(true);
+        unsafe {
+            SetTimer(self.hwnd, LABEL_TIMER_ID, LABEL_HIDE_MS, None);
+        }
+        winvd::switch_desktop(target)
     }
 
     /// Brings the windows that follow within a row over to cell `to` from the
@@ -356,7 +371,7 @@ impl App {
             && winvd::is_window_on_current_desktop(window).unwrap_or(false)
             && winvd::move_window_to_desktop(target, &window).is_ok();
         self.bring_followers(desktops, to);
-        if let Err(e) = winvd::switch_desktop(target) {
+        if let Err(e) = self.switch(target) {
             log(&format!("switch_desktop failed: {e:?}"));
             return;
         }
@@ -477,7 +492,7 @@ impl App {
                 if !id.is_empty() && id != desktops.current {
                     let Some(target) = desktops.get(&id) else { return };
                     self.bring_followers(&desktops, &id);
-                    if let Err(e) = winvd::switch_desktop(target) {
+                    if let Err(e) = self.switch(target) {
                         return log(&format!("switch_desktop failed: {e:?}"));
                     }
                     self.visit(&id);
@@ -552,26 +567,61 @@ impl App {
                 }
                 return;
             }
-            Action::CloseRow(row) => {
-                let Some(desktops) = self.sync() else { return };
-                let Some(ids) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
-                for window in vd::windows(&desktops.current).iter().filter(|w| ids.contains(&w.desktop)) {
-                    unsafe {
-                        let _ = PostMessageW(window.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-                    }
-                }
-                // The only row keeps its cells; otherwise the row goes away and
-                // any window that refuses to close lands on a neighbouring row.
-                if self.grid.rows.len() > 1 {
-                    self.remove_cells(&ids);
-                }
-                unsafe {
-                    SetTimer(self.hwnd, REFRESH_TIMER_ID, 600, None);
-                }
+            Action::RowMenu(row) => {
+                // Shown once this handler has returned (`run_pending_menu`).
+                self.pending_row_menu = Some(row);
+                return;
             }
             Action::Rename(row, name) => {
                 if let Some(row) = self.grid.rows.get_mut(row) {
                     row.name = name;
+                }
+            }
+        }
+        self.commit();
+        self.refresh_board();
+    }
+
+    /// Asks every window of a workspace to close; the workspace stays.
+    fn close_row_windows(&mut self, row: usize) {
+        let Some(desktops) = self.sync() else { return };
+        let Some(ids) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
+        for window in vd::windows(&desktops.current).iter().filter(|w| ids.contains(&w.desktop)) {
+            unsafe {
+                let _ = PostMessageW(window.hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+        unsafe {
+            SetTimer(self.hwnd, REFRESH_TIMER_ID, 600, None);
+        }
+    }
+
+    /// Removes a workspace. Each of its desktops hands its windows to the
+    /// cell drawn nearest to it in the other rows.
+    fn remove_row(&mut self, row: usize) {
+        let Some(desktops) = self.sync() else { return };
+        if self.grid.rows.len() < 2 {
+            return;
+        }
+        let Some(ids) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
+        let targets: Vec<(String, String)> = ids
+            .iter()
+            .filter_map(|id| Some((id.clone(), self.grid.nearest_in_other_rows(self.grid.find(id)?)?.clone())))
+            .collect();
+        // Leave the workspace first if we are standing in it.
+        if let Some((_, to)) = targets.iter().find(|(id, _)| *id == desktops.current) {
+            let Some(target) = desktops.get(to) else { return };
+            if self.switch(target).is_err() {
+                return;
+            }
+            let to = to.clone();
+            self.visit(&to);
+        }
+        for (id, to) in targets {
+            if let (Some(desktop), Some(target)) = (desktops.get(&id), desktops.get(&to)) {
+                match winvd::remove_desktop(desktop, target) {
+                    Ok(()) => self.grid.remove(&id),
+                    Err(e) => log(&format!("remove_desktop failed: {e:?}")),
                 }
             }
         }
@@ -598,7 +648,7 @@ impl App {
         };
         let Some(target) = desktops.get(&fallback) else { return };
         if ids.contains(&desktops.current) {
-            if winvd::switch_desktop(target).is_err() {
+            if self.switch(target).is_err() {
                 return;
             }
             self.visit(&fallback);
@@ -816,6 +866,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 }
             });
         }
+        WM_TIMER if wparam.0 == LABEL_TIMER_ID => {
+            let _ = KillTimer(hwnd, LABEL_TIMER_ID);
+            vd::set_switch_label_hidden(false);
+        }
         WM_TIMER if wparam.0 == REFRESH_TIMER_ID => {
             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
             with_app(App::refresh_board);
@@ -842,6 +896,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             }
         }
         WM_DESTROY => {
+            vd::set_switch_label_hidden(false);
             input::uninstall();
             tray::remove(hwnd);
             PostQuitMessage(0);
@@ -860,6 +915,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
 /// Shows the pin menu a handler asked for. It runs after the handler returned
 /// because a menu pumps messages, which must be able to reach the app.
 fn run_pending_menu(owner: HWND) {
+    let row = with_app(|app| {
+        let row = app.pending_row_menu.take()?;
+        let (name, summary) = app.board.row_summary(row)?;
+        Some((row, format!("{name}: {summary}"), app.grid.rows.len() > 1))
+    })
+    .flatten();
+    if let Some((row, summary, removable)) = row {
+        match tray::row_menu(owner, &summary, removable) {
+            Some(tray::RowCommand::CloseWindows) => {
+                // Closing windows can lose work, so it is asked about in earnest,
+                // with "No" as the default answer.
+                let text = format!(
+                    "{summary}\n\n이 워크스페이스의 창을 전부 닫습니다.\n저장하지 않은 작업은 잃을 수 있고, 되돌릴 수 없습니다.\n\n정말 닫을까요?"
+                );
+                with_app(|app| app.board.set_modal(true));
+                let answer = unsafe {
+                    MessageBoxW(owner, &HSTRING::from(text), w!("창을 모두 닫습니다"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
+                };
+                with_app(|app| app.board.set_modal(false));
+                if answer == IDYES {
+                    with_app(|app| app.close_row_windows(row));
+                }
+            }
+            Some(tray::RowCommand::Remove) => {
+                with_app(|app| app.remove_row(row));
+            }
+            None => {}
+        }
+    }
     if let Some((window, state)) = with_app(|app| app.pending_menu.take()).flatten() {
         if let Some(command) = tray::pin_menu(owner, state) {
             with_app(|app| app.apply_pin(window, command));
@@ -942,6 +1026,7 @@ pub fn run(first_run: bool) {
         unsettled: false,
         following: HashSet::new(),
         pending_menu: None,
+        pending_row_menu: None,
         seen: HashMap::new(),
         asleep: HashSet::new(),
         started: Instant::now(),
@@ -1011,6 +1096,7 @@ pub fn render_board(path: &str) {
         unsettled: false,
         following: HashSet::new(),
         pending_menu: None,
+        pending_row_menu: None,
         seen: HashMap::new(),
         asleep: HashSet::new(),
         started: Instant::now(),

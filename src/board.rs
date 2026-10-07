@@ -54,7 +54,7 @@ use windows::{
                 CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, IDC_ARROW, SendMessageTimeoutW,
                 SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG,
                 SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON, WM_KEYDOWN,
-                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
+                WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
@@ -121,7 +121,8 @@ pub enum Action {
     /// Set how one window is pinned: following within its row, shown on
     /// every desktop, or neither (never both).
     SetPin { window: HWND, row: bool, all: bool },
-    CloseRow(usize),
+    /// Show the menu of a workspace (close its windows, remove it).
+    RowMenu(usize),
     Rename(usize, String),
 }
 
@@ -196,7 +197,6 @@ struct RowLayout {
     /// The whole label area left of the row; its extras show on hover.
     header: Rect,
     name: Rect,
-    close: Rect,
     top: f32,
     bottom: f32,
     cells: Vec<CellLayout>,
@@ -250,7 +250,6 @@ enum Hit {
     PlusLeft(usize),
     AddRow,
     AddRowTop,
-    RowClose(usize),
     RowName(usize),
 }
 
@@ -305,14 +304,14 @@ pub struct Board {
     press: Option<Press>,
     cursor: (f32, f32),
     cursor_before: (f32, f32),
+    /// A confirmation box owned by the board is up.
+    modal: bool,
     /// Every monitor, in the board window's coordinates. The board spans
     /// them all; `home` (the one the cursor was on) also holds the map.
     monitors: Vec<Rect>,
     home: Rect,
     /// Screen position of the board window's top-left corner.
     origin: (i32, i32),
-    /// Row whose close button was clicked once and waits for confirmation.
-    armed_row: Option<usize>,
     editing: Option<(usize, String)>,
 }
 
@@ -366,10 +365,10 @@ impl Board {
                 press: None,
                 cursor: (0.0, 0.0),
                 cursor_before: (0.0, 0.0),
+                modal: false,
                 monitors: Vec::new(),
                 home: Rect::default(),
                 origin: (0, 0),
-                armed_row: None,
                 editing: None,
             })
         }
@@ -381,6 +380,19 @@ impl Board {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// A workspace's label for its menu: name, memory estimate, window count.
+    pub fn row_summary(&self, row: usize) -> Option<(String, String)> {
+        let model = self.model.rows.get(row)?;
+        let name = if model.name.is_empty() { format!("워크스페이스 {}", row + 1) } else { model.name.clone() };
+        let windows: usize = model.cells.iter().map(|c| c.windows.len()).sum();
+        let asleep = if model.asleep { ", 재움" } else { "" };
+        Some((name, format!("창 {windows}개, {}{asleep}", format_memory(model.memory))))
+    }
+
+    pub fn set_modal(&mut self, modal: bool) {
+        self.modal = modal;
     }
 
     pub fn selected(&self) -> CellId {
@@ -433,7 +445,6 @@ impl Board {
             self.selected = model.current.clone();
             self.hover = Hit::Nothing;
             self.press = None;
-            self.armed_row = None;
             self.editing = None;
             self.open = true;
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, size.0, size.1, SWP_SHOWWINDOW);
@@ -622,9 +633,6 @@ impl Board {
             if contains(&row.plus_left, x, y) {
                 return Hit::PlusLeft(r);
             }
-            if contains(&row.close, x, y) {
-                return Hit::RowClose(r);
-            }
             if contains(&row.name, x, y) {
                 return Hit::RowName(r);
             }
@@ -811,7 +819,8 @@ impl Board {
                 Action::None
             }
             WM_ERASEBKGND => return None,
-            WM_ACTIVATE if wparam.0 & 0xFFFF == 0 => Action::Dismiss,
+            // Losing focus closes the board, except to its own confirmation box.
+            WM_ACTIVATE if wparam.0 & 0xFFFF == 0 && !self.modal => Action::Dismiss,
             WM_LBUTTONDOWN => {
                 let (x, y) = point();
                 self.mouse_down(x, y)
@@ -831,6 +840,14 @@ impl Board {
             WM_LBUTTONUP => {
                 let (x, y) = point();
                 self.mouse_up(x, y)
+            }
+            WM_RBUTTONUP => {
+                let (x, y) = point();
+                let (_, map, lx, ly) = self.map_at(x, y);
+                match map.rows.iter().position(|row| contains(&row.header, lx, ly)) {
+                    Some(row) => Action::RowMenu(row),
+                    None => Action::None,
+                }
             }
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_CHAR => {
@@ -888,9 +905,6 @@ impl Board {
 
     fn mouse_down(&mut self, x: f32, y: f32) -> Action {
         let hit = self.hit_test(x, y);
-        if !matches!(hit, Hit::RowClose(r) if self.armed_row == Some(r)) {
-            self.armed_row = None;
-        }
         self.cursor = (x, y);
         self.press = Some(Press { hit, x, y, dragging: false });
         unsafe {
@@ -1004,14 +1018,6 @@ impl Board {
             Hit::PlusLeft(row) => Action::AddCell { row, front: true },
             Hit::AddRow => Action::AddRow { top: false },
             Hit::AddRowTop => Action::AddRow { top: true },
-            Hit::RowClose(row) if self.armed_row == Some(row) => {
-                self.armed_row = None;
-                Action::CloseRow(row)
-            }
-            Hit::RowClose(row) => {
-                self.armed_row = Some(row);
-                Action::None
-            }
             Hit::RowName(_) => Action::None,
             // A click on nothing dismisses the board, like Task View.
             Hit::Nothing => Action::Cancel,
@@ -1244,27 +1250,22 @@ impl Board {
             fill(&map.spine, 10.0 * s, white(0.035));
 
             for (r, (row, model)) in map.rows.iter().zip(&self.model.rows).enumerate() {
-                // Row label; memory and the close button only while pointed at.
+                // Row label, in a box as wide as its text (right-click: menu).
                 let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
-                let pointed = contains(&row.header, cursor.0, cursor.1) && self.press.is_none();
                 let name = match editing {
                     Some((_, typed)) => format!("{typed}▏"),
                     None if model.name.is_empty() => format!("워크스페이스 {}", r + 1),
                     None => model.name.clone(),
                 };
-                if editing.is_some() {
-                    fill(&grow(&row.name, 3.0 * s), 5.0 * s, white(0.10));
+                let hot = self.hover == Hit::RowName(r) && self.press.is_none();
+                if editing.is_some() || hot {
+                    // While typing the box follows the text being typed.
+                    let width = text_width(&name, 12.0 * s) + 4.0 * s;
+                    let area = Rect { right: row.name.left + width.max(row.name.right - row.name.left), ..row.name };
+                    fill(&grow(&area, 4.0 * s), 5.0 * s, white(if editing.is_some() { 0.12 } else { 0.06 }));
                 }
-                text(&name, &fonts.small, &row.name, white(if selected_row == Some(r) { 0.90 } else { 0.45 }));
-                if self.armed_row == Some(r) {
-                    fill(&row.close, 5.0 * s, danger(0.90));
-                    text("한 번 더: 닫기", &fonts.centered, &row.close, white(1.0));
-                } else if pointed {
-                    let hot = self.hover == Hit::RowClose(r);
-                    fill(&row.close, 5.0 * s, white(if hot { 0.18 } else { 0.08 }));
-                    let asleep = if model.asleep { " · 재움" } else { "" };
-                    text(&format!("닫기 · {}{asleep}", format_memory(model.memory)), &fonts.centered, &row.close, white(if hot { 0.95 } else { 0.60 }));
-                }
+                let wide = Rect { right: row.header.right, ..row.name };
+                text(&name, &fonts.small, &wide, white(if selected_row == Some(r) || hot { 0.90 } else { 0.45 }));
 
                 for cell in &row.cells {
                     let dim = if dragged_cell == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
@@ -1539,6 +1540,12 @@ fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D
     }
 }
 
+/// Rough width of a line of text at `size` pixels: enough to size a box
+/// around a short label without laying the text out.
+fn text_width(text: &str, size: f32) -> f32 {
+    text.chars().map(|c| if c.is_ascii() { 0.56 } else { 1.0 }).sum::<f32>() * size
+}
+
 /// What to show as a window's title next to its app's name: the part that
 /// tells this window from the app's others, shortened where it is long.
 fn display_title(title: &str, app: &str, max_chars: usize) -> String {
@@ -1728,8 +1735,12 @@ fn compute_layout(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) ->
         let first_x = spine_x - anchor(r) as f32 * pitch;
         layout.rows.push(RowLayout {
             header: rect(x0, y, header_w, cell_h),
-            name: rect(x0, y + cell_h / 2.0 - 20.0 * s, header_w - 12.0 * s, 20.0 * s),
-            close: rect(x0, y + cell_h / 2.0 + 2.0 * s, 140.0 * s, 20.0 * s),
+            name: {
+                // As wide as the name itself, so the clickable box matches what is read.
+                let name = if row.name.is_empty() { format!("워크스페이스 {}", r + 1) } else { row.name.clone() };
+                let width = (text_width(&name, 12.0 * s) + 4.0 * s).min(header_w - 12.0 * s);
+                rect(x0, y + (cell_h - 20.0 * s) / 2.0, width, 20.0 * s)
+            },
             top: y - gap / 2.0,
             bottom: y + cell_h + gap / 2.0,
             cells,

@@ -118,6 +118,35 @@ impl Grid {
         self.rows.retain(|r| !r.cells.is_empty());
     }
 
+    /// How far `row` is drawn shifted right, in cells: rows are shifted so
+    /// that the cell each was last left on sits in one common column.
+    fn shift(&self, row: usize) -> i64 {
+        let anchor = |r: &Row| r.last.as_ref().and_then(|id| r.cells.iter().position(|c| c == id)).unwrap_or(0) as i64;
+        let lead = self.rows.iter().map(anchor).max().unwrap_or(0);
+        self.rows.get(row).map_or(0, |r| lead - anchor(r))
+    }
+
+    /// The cell outside `pos`'s row that is closest to it as the grid is
+    /// drawn: a neighbouring row before a farther one, then the smallest
+    /// sideways distance, the row above before the row below, the left cell
+    /// before the right. This is where a row's windows go when it is removed.
+    pub fn nearest_in_other_rows(&self, pos: Pos) -> Option<&CellId> {
+        let x = pos.col as i64 + self.shift(pos.row);
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(r, _)| *r != pos.row)
+            .flat_map(|(r, row)| {
+                let shift = self.shift(r);
+                row.cells.iter().enumerate().map(move |(c, id)| {
+                    let (rows_apart, cells_apart) = ((r as i64 - pos.row as i64).abs(), (c as i64 + shift - x).abs());
+                    ((rows_apart, cells_apart, r > pos.row, c), id)
+                })
+            })
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, id)| id)
+    }
+
     pub fn remove(&mut self, id: &str) {
         for r in &mut self.rows {
             r.cells.retain(|c| c != id);
@@ -216,5 +245,21 @@ mod tests {
         g.move_cell_to_new_row("a", 0);
         assert_eq!(g.rows[0].cells, ["a"]);
         assert_eq!(g.rows[1].cells, ["b", "c", "d"]);
+    }
+
+    /// Removing a workspace: each of its cells sends its windows to the cell
+    /// drawn closest to it, a neighbouring row winning over a nearer cell
+    /// two rows away and the row above winning a tie.
+    #[test]
+    fn a_removed_rows_cells_go_to_the_nearest_cell() {
+        let mut g = grid(&[&["a1", "a2", "a3"], &["b1", "b2"], &["c1"]]);
+        // Rows are drawn lined up on their last-visited cells: a3, b1 and c1 share a column.
+        g.visit("a3");
+        g.visit("b1");
+        let nearest = |g: &Grid, id: &str| g.nearest_in_other_rows(g.find(id).unwrap()).cloned();
+        assert_eq!(nearest(&g, "b1").as_deref(), Some("a3"));
+        assert_eq!(nearest(&g, "b2").as_deref(), Some("a3"));
+        assert_eq!(nearest(&g, "c1").as_deref(), Some("b1"));
+        assert_eq!(nearest(&g, "a1").as_deref(), Some("b1"));
     }
 }

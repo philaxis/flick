@@ -131,6 +131,30 @@ fn main() {
                 ReleaseDC(board, window);
                 ReleaseDC(None, screen);
             }
+            Some("wins") => {
+                // Lists every visible top-level window: handle, class, title, rectangle, ex-style.
+                use windows::Win32::Foundation::{BOOL, HWND, RECT};
+                use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW, IsWindowVisible, GWL_EXSTYLE};
+                unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> BOOL {
+                    let all = std::env::args().nth(2).as_deref() == Some("all");
+                    if all || IsWindowVisible(hwnd).as_bool() {
+                        let mut cloaked = 0u32;
+                        let _ = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(hwnd, windows::Win32::Graphics::Dwm::DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
+                        if all {
+                            print!("v{}c{}|", IsWindowVisible(hwnd).as_bool() as u8, cloaked);
+                        }
+                        let mut class = [0u16; 128];
+                        let n = GetClassNameW(hwnd, &mut class).max(0) as usize;
+                        let mut title = [0u16; 128];
+                        let t = GetWindowTextW(hwnd, &mut title).max(0) as usize;
+                        let mut r = RECT::default();
+                        let _ = GetWindowRect(hwnd, &mut r);
+                        println!("{:x}|{}|{}|{},{},{},{}|{:x}", hwnd.0, String::from_utf16_lossy(&class[..n]), String::from_utf16_lossy(&title[..t]), r.left, r.top, r.right, r.bottom, GetWindowLongW(hwnd, GWL_EXSTYLE));
+                    }
+                    true.into()
+                }
+                let _ = EnumWindows(Some(each), LPARAM(0));
+            }
             Some("cursor") => {
                 let mut p = windows::Win32::Foundation::POINT::default();
                 let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
