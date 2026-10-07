@@ -141,6 +141,10 @@ impl App {
                 .collect(),
             cur: self.grid.find(current),
             pushing,
+            title: self.grid.find(current).map_or(String::new(), |pos| {
+                let name = &self.grid.rows[pos.row].name;
+                if name.is_empty() { format!("워크스페이스 {}", pos.row + 1) } else { name.clone() }
+            }),
         }
     }
 
@@ -1054,6 +1058,7 @@ pub fn render_sample(path: &str) {
     let view = View {
         rows: vec![vec![false; 4], vec![false, false], vec![false, false, true]],
         anchors: vec![2, 1, 0],
+        title: "워크스페이스 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
         pushing: Some(Dir::Right),
     };

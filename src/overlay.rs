@@ -11,10 +11,16 @@ use windows::{
     Win32::{
         Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
+            DirectWrite::{
+                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+                DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+            },
             Dwm::DwmFlush,
             Direct2D::{
                 Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F},
-                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
             },
@@ -45,6 +51,8 @@ const CELL_W: f32 = 46.0;
 const CELL_H: f32 = 30.0;
 const GAP: f32 = 7.0;
 const PAD: f32 = 20.0;
+/// Room under the grid for the workspace name.
+const TITLE_H: f32 = 26.0;
 /// Time constants (seconds) of the exponential easing.
 const SLIDE_TAU: f32 = 0.018;
 const FADE_TAU: f32 = 0.025;
@@ -62,11 +70,16 @@ pub struct View {
     pub cur: Option<Pos>,
     /// The user is pushing against this edge; one more push creates a cell.
     pub pushing: Option<Dir>,
+    /// Name of the current workspace, shown under the grid.
+    pub title: String,
 }
 
 pub struct Overlay {
     hwnd: HWND,
     target: ID2D1DCRenderTarget,
+    /// Text format for the workspace name, made for `text_scale`.
+    text: Option<IDWriteTextFormat>,
+    text_scale: f32,
     dc: HDC,
     bitmap: HBITMAP,
     stock: HGDIOBJ,
@@ -166,6 +179,8 @@ impl Overlay {
             Ok(Overlay {
                 hwnd,
                 target,
+                text: None,
+                text_scale: 0.0,
                 dc: CreateCompatibleDC(None),
                 bitmap: HBITMAP(0),
                 stock: HGDIOBJ(0),
@@ -323,7 +338,8 @@ impl Overlay {
         let cols = self.view.columns() as f32;
         let rows = self.view.rows.len().max(1) as f32;
         let w = PAD * 2.0 + cols * CELL_W + (cols - 1.0) * GAP;
-        let h = PAD * 2.0 + rows * CELL_H + (rows - 1.0) * GAP;
+        let title = if self.view.title.is_empty() { 0.0 } else { TITLE_H };
+        let h = PAD * 2.0 + rows * CELL_H + (rows - 1.0) * GAP + title;
         ((w * self.scale).ceil() as i32, (h * self.scale).ceil() as i32)
     }
 
@@ -359,6 +375,10 @@ impl Overlay {
     }
 
     fn render(&mut self) {
+        if self.text.is_none() || self.text_scale != self.scale {
+            self.text = make_text_format(self.scale).ok();
+            self.text_scale = self.scale;
+        }
         let size = self.wanted_size();
         if !self.ensure_bitmap(size) || self.draw().is_err() {
             return;
@@ -449,6 +469,12 @@ impl Overlay {
                     fill(&shape, color(ACCENT, 0.95));
                 }
             }
+            if let (Some(format), false) = (&self.text, self.view.title.is_empty()) {
+                let area = D2D_RECT_F { left: PAD * s, top: h - (PAD * 0.55 + TITLE_H) * s, right: w - PAD * s, bottom: h - PAD * 0.55 * s };
+                let wide: Vec<u16> = self.view.title.encode_utf16().collect();
+                brush.SetColor(&color(WHITE, 0.88));
+                t.DrawText(&wide, format, &area, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            }
             t.EndDraw(None, None)
         }
     }
@@ -460,6 +486,8 @@ impl Overlay {
         self.highlight = (highlight.0 + view.shift(highlight.1 as usize), highlight.1);
         self.view = view;
         self.scale = scale;
+        self.text = make_text_format(scale).ok();
+        self.text_scale = scale;
         let size = self.wanted_size();
         if !self.ensure_bitmap(size) || self.draw().is_err() {
             return None;
@@ -479,6 +507,25 @@ impl Drop for Overlay {
             }
             DeleteDC(self.dc);
         }
+    }
+}
+
+fn make_text_format(scale: f32) -> Result<IDWriteTextFormat> {
+    unsafe {
+        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+        let format = factory.CreateTextFormat(
+            w!("Segoe UI"),
+            None,
+            DWRITE_FONT_WEIGHT(600),
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            13.0 * scale,
+            w!("ko-kr"),
+        )?;
+        format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        Ok(format)
     }
 }
 
