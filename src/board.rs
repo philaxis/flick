@@ -7,7 +7,7 @@
 
 use crate::{
     grid::{self, CellId, Dir, Grid, Row},
-    paint::{self, accent, rect, rgba, white, Canvas, Dib, Painter, Rect},
+    paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Painter, Rect},
     vd,
 };
 use std::collections::HashMap;
@@ -67,6 +67,8 @@ pub struct WindowModel {
 
 pub struct CellModel {
     pub id: CellId,
+    /// Marked by the user to stand out.
+    pub emphasised: bool,
     /// Topmost first.
     pub windows: Vec<WindowModel>,
 }
@@ -124,6 +126,8 @@ pub enum Action {
     SetPin { window: HWND, row: bool, all: bool },
     /// Show the menu of a workspace (close its windows, remove it).
     RowMenu(usize),
+    /// Show the menu of a cell (make it stand out).
+    CellMenu(CellId),
     Rename(usize, String),
 }
 
@@ -209,6 +213,7 @@ struct AppBadge {
 
 struct CellLayout {
     id: CellId,
+    emphasised: bool,
     body: Rect,
     close: Rect,
     apps: Vec<AppBadge>,
@@ -847,7 +852,10 @@ impl Board {
                 Action::None
             }
             WM_LBUTTONUP => self.mouse_up(x, y),
-            WM_RBUTTONUP => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
+            WM_RBUTTONUP => match self.hit_test(x, y) {
+                Hit::Cell(id) | Hit::CellClose(id) => Action::CellMenu(id),
+                _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
+            },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_CHAR => {
                 if let (Some((_, text)), Some(c)) = (&mut self.editing, char::from_u32(wparam.0 as u32)) {
@@ -1258,10 +1266,15 @@ impl Board {
             }
         }
         p.fill(&cell.body, radius, white(if in_selected_row { 0.14 } else { 0.07 } * dim));
+        if cell.emphasised {
+            p.fill(&cell.body, radius, warm(0.26 * dim));
+        }
         if drop_target {
             p.stroke(&cell.body, radius, 2.5 * s, accent(1.0));
         } else if is_selected {
             p.stroke(&cell.body, radius, 2.0 * s, accent(dim));
+        } else if cell.emphasised {
+            p.stroke(&cell.body, radius, 1.5 * s, warm(0.95 * dim));
         } else if hovering {
             p.stroke(&cell.body, radius, 1.0, white(0.35 * dim));
         }
@@ -1593,6 +1606,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
             let (apps, more) = layout_badges(cell, &body, (cell_w, cell_h), icon, s);
             cells.push(CellLayout {
                 id: cell.id.clone(),
+                emphasised: cell.emphasised,
                 body,
                 close: rect(body.right - 15.0 * s, body.top - 5.0 * s, 20.0 * s, 20.0 * s),
                 apps,

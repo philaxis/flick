@@ -58,6 +58,12 @@ pub fn accent(a: f32) -> D2D1_COLOR_F {
     rgba(0.34, 0.62, 1.0, a)
 }
 
+/// The colour of a cell the user marked to stand out. Warm, so that it is
+/// taken for neither the current cell nor the selection.
+pub fn warm(a: f32) -> D2D1_COLOR_F {
+    rgba(1.0, 0.66, 0.24, a)
+}
+
 /// The dark background of the full windows (the board, the settings).
 pub fn backdrop() -> D2D1_COLOR_F {
     rgba(0.050, 0.055, 0.068, 1.0)

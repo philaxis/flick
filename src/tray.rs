@@ -178,6 +178,14 @@ pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
         .find(|c| *c as usize == picked)
 }
 
+/// The menu of a cell in the board's map, at the cursor: whether it stands
+/// out. Returns true when the user picked the item, to change that.
+pub fn cell_menu(owner: HWND, emphasised: bool) -> bool {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return false };
+    add_item(menu, 1, w!("강조"), emphasised);
+    pick(menu, owner) == 1
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum RowCommand {
     CloseWindows = 1,

@@ -6,7 +6,7 @@
 
 use crate::{
     grid::{Dir, Pos},
-    paint::{self, accent, rect, rgba, white, DcTarget, Dib, Painter},
+    paint::{self, accent, rect, rgba, warm, white, DcTarget, Dib, Painter},
     vd,
 };
 use std::{
@@ -45,11 +45,19 @@ const TITLE_H: f32 = 26.0;
 const SLIDE_TAU: f32 = 0.018;
 const FADE_TAU: f32 = 0.025;
 
-/// What the minimap should show. `rows[r][c]` is true for a cell that was
-/// just created and is still empty.
+/// One cell of the minimap.
+#[derive(Clone, Copy, Default)]
+pub struct CellView {
+    /// Just created and still empty.
+    pub fresh: bool,
+    /// Marked by the user to stand out.
+    pub emphasised: bool,
+}
+
+/// What the minimap should show.
 #[derive(Clone, Default)]
 pub struct View {
-    pub rows: Vec<Vec<bool>>,
+    pub rows: Vec<Vec<CellView>>,
     /// Per row, the column a vertical move would land on. Rows are shifted
     /// sideways so that these line up in one column.
     pub anchors: Vec<usize>,
@@ -352,16 +360,22 @@ impl Overlay {
         p.stroke(&panel, 16.0 * s, 1.0, white(0.10));
 
         let cur = self.view.cur;
+        let mut emphasised = Vec::new();
         for (r, row) in self.view.rows.iter().enumerate() {
             let in_current_row = cur.is_some_and(|c| c.row == r);
             let shift = self.shifts.get(r).copied().unwrap_or_else(|| self.view.shift(r));
-            for (c, &fresh) in row.iter().enumerate() {
+            for (c, view) in row.iter().enumerate() {
                 let cell = rect(cell_x(c as f32 + shift), cell_y(r as f32), cw, ch);
-                if fresh {
+                if view.emphasised {
+                    p.fill(&cell, radius, warm(if in_current_row { 0.42 } else { 0.30 }));
+                } else if view.fresh {
                     // A cell that will vanish again if left empty: outline only.
                     p.stroke(&cell, radius, 1.2 * s, white(0.30));
                 } else {
                     p.fill(&cell, radius, white(if in_current_row { 0.17 } else { 0.08 }));
+                }
+                if view.emphasised {
+                    emphasised.push(cell);
                 }
             }
         }
@@ -385,6 +399,12 @@ impl Overlay {
                 };
                 p.fill(&shape, bar / 2.0, accent(0.95));
             }
+        }
+        // Over the highlight, so that the mark shows on the current cell too.
+        for cell in &emphasised {
+            let inset = 0.75 * s;
+            let ring = rect(cell.left + inset, cell.top + inset, cw - 2.0 * inset, ch - 2.0 * inset);
+            p.stroke(&ring, radius - inset, 1.5 * s, warm(0.95));
         }
         if let (Some(format), false) = (&self.text, self.view.title.is_empty()) {
             let bottom = h - PAD * 0.55 * s;

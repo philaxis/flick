@@ -67,6 +67,9 @@ pub struct Grid {
     /// to cell inside whichever row they are in.
     #[serde(default)]
     pub follow_apps: Vec<String>,
+    /// Cells the user marked to stand out in the map and the minimap.
+    #[serde(default)]
+    pub emphasised: Vec<CellId>,
 }
 
 impl Grid {
@@ -167,6 +170,20 @@ impl Grid {
         }
         self.rows.retain(|r| !r.cells.is_empty());
         self.ephemeral.retain(|c| c != id);
+        self.emphasised.retain(|c| c != id);
+    }
+
+    pub fn is_emphasised(&self, id: &str) -> bool {
+        self.emphasised.iter().any(|c| c == id)
+    }
+
+    /// Marks a cell to stand out, or takes the mark off again.
+    pub fn toggle_emphasis(&mut self, id: &str) {
+        if self.is_emphasised(id) {
+            self.emphasised.retain(|c| c != id);
+        } else if self.find(id).is_some() {
+            self.emphasised.push(id.to_owned());
+        }
     }
 
     /// Reconciles the grid with the desktops that actually exist. Desktops that
@@ -180,6 +197,7 @@ impl Grid {
         }
         self.rows.retain(|r| !r.cells.is_empty());
         self.ephemeral.retain(|c| actual.contains(c));
+        self.emphasised.retain(|c| actual.contains(c));
 
         let unknown: Vec<CellId> = actual.iter().filter(|id| self.find(id).is_none()).cloned().collect();
         if !unknown.is_empty() {

@@ -6,7 +6,7 @@ use crate::{
     config::{self, Config},
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_RELEASE, WM_STEP},
-    overlay::{Minimap, Overlay, View},
+    overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
     tray::{self, Command, PinCommand, PinState, RowCommand},
     vd::{self, Desktops},
@@ -94,8 +94,9 @@ struct App {
     following: HashSet<isize>,
     /// A pin menu to show once the current handler has returned.
     pending_menu: Option<(HWND, PinState)>,
-    /// Likewise the menu of a workspace in the board.
+    /// Likewise the menu of a workspace and that of a cell in the board.
     pending_row_menu: Option<usize>,
+    pending_cell_menu: Option<String>,
     /// When each cell was last shown (cells not in here count from
     /// `started`), and the cells of rows put to sleep. Both only matter with
     /// `sleep_after_minutes` set.
@@ -182,6 +183,7 @@ impl App {
             following: HashSet::new(),
             pending_menu: None,
             pending_row_menu: None,
+            pending_cell_menu: None,
             seen: HashMap::new(),
             asleep: HashSet::new(),
             started: Instant::now(),
@@ -268,7 +270,10 @@ impl App {
                 .grid
                 .rows
                 .iter()
-                .map(|row| row.cells.iter().map(|id| self.grid.ephemeral.contains(id)).collect())
+                .map(|row| {
+                    let cell = |id| CellView { fresh: self.grid.ephemeral.contains(id), emphasised: self.grid.is_emphasised(id) };
+                    row.cells.iter().map(cell).collect()
+                })
                 .collect(),
             anchors: self.grid.rows.iter().map(Row::anchor).collect(),
             cur,
@@ -559,7 +564,7 @@ impl App {
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
                         let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
-                        CellModel { id: id.clone(), windows }
+                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), windows }
                     })
                     .collect();
                 RowModel {
@@ -636,9 +641,14 @@ impl App {
                 vd::ask_to_close(hwnd);
                 return self.refresh_board_in(500);
             }
+            // The menus are shown once this handler has returned
+            // (`run_pending_menus`).
             Action::RowMenu(row) => {
-                // Shown once this handler has returned (`run_pending_menus`).
                 self.pending_row_menu = Some(row);
+                return;
+            }
+            Action::CellMenu(id) => {
+                self.pending_cell_menu = Some(id);
                 return;
             }
 
@@ -1072,10 +1082,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
 /// because a menu pumps messages, which must be able to reach the app.
 fn run_pending_menus(owner: HWND) {
     run_row_menu(owner);
+    run_cell_menu(owner);
     if let Some((window, state)) = with_app(|app| app.pending_menu.take()).flatten() {
         if let Some(command) = tray::pin_menu(owner, state) {
             with_app(|app| app.apply_pin(window, command));
         }
+    }
+}
+
+/// The menu of a cell in the board's map, if one was asked for.
+fn run_cell_menu(owner: HWND) {
+    let pending = with_app(|app| {
+        let id = app.pending_cell_menu.take()?;
+        Some((app.grid.is_emphasised(&id), id))
+    })
+    .flatten();
+    let Some((emphasised, id)) = pending else { return };
+    if tray::cell_menu(owner, emphasised) {
+        with_app(|app| {
+            app.grid.toggle_emphasis(&id);
+            app.save();
+            app.refresh_board();
+        });
     }
 }
 
@@ -1221,7 +1249,11 @@ fn write_raw(path: &str, (w, h): (i32, i32), pixels: &[u8]) {
 pub fn render_sample(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let view = View {
-        rows: vec![vec![false; 4], vec![false, false], vec![false, false, true]],
+        rows: vec![
+            vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }, CellView::default(), CellView::default()],
+            vec![CellView::default(); 2],
+            vec![CellView::default(), CellView::default(), CellView { fresh: true, ..CellView::default() }],
+        ],
         anchors: vec![2, 1, 0],
         title: "워크스페이스 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
@@ -1251,6 +1283,11 @@ pub fn render_board(path: &str) {
         let moved = app.grid.rows[0].cells.last().cloned().unwrap_or_default();
         app.grid.move_cell_to_new_row(&moved, 1);
         app.grid.rows[1].name = "예시 행".into();
+    }
+    // A cell made to stand out, when the user has none.
+    if app.grid.emphasised.is_empty() {
+        let other = app.grid.rows.iter().flat_map(|row| &row.cells).find(|id| **id != desktops.current).cloned();
+        app.grid.emphasised.extend(other);
     }
     let model = app.model(&desktops);
     let size = (2560, 1440);
