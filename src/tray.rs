@@ -26,6 +26,7 @@ const RUN_VALUE: PCWSTR = w!("Flick");
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {
     Peek = 1,
+    ChangeTrigger,
     OpenConfig,
     ReloadConfig,
     ToggleAutostart,
@@ -93,6 +94,7 @@ pub fn menu(hwnd: HWND) -> Option<Command> {
         };
         item(Command::Peek, w!("격자 보기"), false);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        item(Command::ChangeTrigger, w!("트리거 버튼 바꾸기…"), false);
         item(Command::OpenConfig, w!("설정 파일 열기"), false);
         item(Command::ReloadConfig, w!("설정 다시 읽기"), false);
         item(Command::ToggleAutostart, w!("윈도우 시작 시 실행"), autostart_enabled());
@@ -106,7 +108,7 @@ pub fn menu(hwnd: HWND) -> Option<Command> {
         let picked =
             TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, hwnd, None);
         let _ = DestroyMenu(menu);
-        [Command::Peek, Command::OpenConfig, Command::ReloadConfig, Command::ToggleAutostart, Command::Exit]
+        [Command::Peek, Command::ChangeTrigger, Command::OpenConfig, Command::ReloadConfig, Command::ToggleAutostart, Command::Exit]
             .into_iter()
             .find(|c| *c as i32 == picked.0)
     }

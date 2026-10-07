@@ -31,6 +31,14 @@ fn main() {
             Some("step") => post(WM_APP + 1, args[2].parse().unwrap()),
             Some("click") => post(WM_APP + 2, 0),
             Some("release") => post(WM_APP + 3, 0),
+            Some("change-trigger") => post(WM_APP + 12, 0),
+            Some("xbutton") => {
+                // xbutton <down|up>: the mouse "forward" side button.
+                use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT};
+                let flags = if args[2] == "down" { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP };
+                let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { mouseData: 2, dwFlags: flags, ..Default::default() } } };
+                SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+            }
             Some("shot") => {
                 let (x, y) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
                 let (w, h) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
@@ -111,6 +119,17 @@ fn main() {
                 let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
                 let _ = GetLastInputInfo(&mut info);
                 println!("{}", windows::Win32::System::SystemInformation::GetTickCount().wrapping_sub(info.dwTime));
+            }
+            Some("pixel") => {
+                // pixel <x> <y>: colour of the board window's own surface there, and of the screen.
+                use windows::Win32::Graphics::Gdi::{GetPixel, ReleaseDC};
+                let board = FindWindowW(w!("flick.board"), None);
+                let (x, y): (i32, i32) = (args[2].parse().unwrap(), args[3].parse().unwrap());
+                let window = GetDC(board);
+                let screen = GetDC(None);
+                println!("window {:06x} screen {:06x}", GetPixel(window, x, y).0, GetPixel(screen, x, y).0);
+                ReleaseDC(board, window);
+                ReleaseDC(None, screen);
             }
             Some("cursor") => {
                 let mut p = windows::Win32::Foundation::POINT::default();

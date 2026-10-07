@@ -8,8 +8,9 @@ use crate::grid::{CellId, Dir, Grid};
 use std::collections::HashMap;
 use windows::{
     core::{w, ComInterface, Result},
+    Foundation::Numerics::Matrix3x2,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -33,11 +34,12 @@ use windows::{
             Dwm::{
                 DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+                DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
-                BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
+                BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
+                GetMonitorInfoW, HMONITOR,
                 InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, ValidateRect, BITMAPINFO, BITMAPINFOHEADER,
                 DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
             },
@@ -107,8 +109,10 @@ pub enum Action {
     MoveWindow(HWND, CellId),
     MoveCell { id: CellId, row: usize, index: usize },
     MoveCellToNewRow { id: CellId, at: usize },
-    AddCell(usize),
-    AddRow,
+    /// Add a desktop to a row, at its front or its end.
+    AddCell { row: usize, front: bool },
+    /// Add a row with one desktop, above the first or below the last.
+    AddRow { top: bool },
     RemoveCell(CellId),
     /// Ask a window to close.
     CloseWindow(HWND),
@@ -194,7 +198,9 @@ struct RowLayout {
     top: f32,
     bottom: f32,
     cells: Vec<CellLayout>,
+    /// The "add a cell" buttons after and before the row.
     plus: Rect,
+    plus_left: Rect,
 }
 
 /// One window of the selected cell, shown large with its title.
@@ -221,7 +227,9 @@ struct Layout {
     /// The column on which every row's landing cell is lined up.
     spine: Rect,
     rows: Vec<RowLayout>,
+    /// The "add a row" buttons below and above the rows.
     add_row: Rect,
+    add_row_top: Rect,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -237,7 +245,9 @@ enum Hit {
     TileClose(isize),
     CellClose(CellId),
     Plus(usize),
+    PlusLeft(usize),
     AddRow,
+    AddRowTop,
     RowClose(usize),
     RowName(usize),
 }
@@ -291,6 +301,15 @@ pub struct Board {
     press: Option<Press>,
     cursor: (f32, f32),
     cursor_before: (f32, f32),
+    /// Every monitor, in the board window's coordinates. The board spans
+    /// them all; `home` (the one the cursor was on) also holds the map.
+    monitors: Vec<Rect>,
+    home: Rect,
+    /// Tiles keep the order they were first shown in, so that pinning a
+    /// window (which moves it between lists) does not shuffle them.
+    tile_order: Vec<isize>,
+    /// Screen position of the board window's top-left corner.
+    origin: (i32, i32),
     /// Row whose close button was clicked once and waits for confirmation.
     armed_row: Option<usize>,
     editing: Option<(usize, String)>,
@@ -345,6 +364,10 @@ impl Board {
                 press: None,
                 cursor: (0.0, 0.0),
                 cursor_before: (0.0, 0.0),
+                monitors: Vec::new(),
+                home: Rect::default(),
+                tile_order: Vec::new(),
+                origin: (0, 0),
                 armed_row: None,
                 editing: None,
             })
@@ -365,6 +388,10 @@ impl Board {
 
     /// Covers the monitor under the cursor and shows `model`.
     pub fn open(&mut self, model: Model, grid: Grid) {
+        unsafe extern "system" fn collect(_: HMONITOR, _: HDC, area: *mut RECT, out: LPARAM) -> BOOL {
+            (*(out.0 as *mut Vec<RECT>)).push(*area);
+            true.into()
+        }
         unsafe {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
@@ -375,21 +402,41 @@ impl Board {
             }
             let (mut dpi, mut dpi_y) = (96u32, 96u32);
             let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
-            let area = info.rcMonitor;
-            let size = (area.right - area.left, area.bottom - area.top);
+            let mut screens: Vec<RECT> = Vec::new();
+            EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut screens as *mut _ as isize));
+            if screens.is_empty() {
+                screens.push(info.rcMonitor);
+            }
+            // One window over every monitor, so no screen is left showing
+            // the desktop while the board is up.
+            let left = screens.iter().map(|r| r.left).min().unwrap_or(0);
+            let top = screens.iter().map(|r| r.top).min().unwrap_or(0);
+            let right = screens.iter().map(|r| r.right).max().unwrap_or(0);
+            let bottom = screens.iter().map(|r| r.bottom).max().unwrap_or(0);
+            let local = |r: &RECT| Rect {
+                left: (r.left - left) as f32,
+                top: (r.top - top) as f32,
+                right: (r.right - left) as f32,
+                bottom: (r.bottom - top) as f32,
+            };
+            self.monitors = screens.iter().map(local).collect();
+            self.home = local(&info.rcMonitor);
+            let size = (right - left, bottom - top);
             if self.scale != dpi as f32 / 96.0 {
                 self.fonts = None;
                 self.map_fonts = None;
             }
             self.scale = dpi as f32 / 96.0;
             self.size = size;
+            self.origin = (left, top);
             self.selected = model.current.clone();
+            self.tile_order.clear();
             self.hover = Hit::Nothing;
             self.press = None;
             self.armed_row = None;
             self.editing = None;
             self.open = true;
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, area.left, area.top, size.0, size.1, SWP_SHOWWINDOW);
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, size.0, size.1, SWP_SHOWWINDOW);
         }
         self.set_model(model, grid);
     }
@@ -408,6 +455,7 @@ impl Board {
         let selected = self.selected.clone();
         self.nav.visit(&selected);
         self.press = None;
+        self.settle_tile_order();
         self.relayout();
         self.register_thumbnails();
         self.invalidate();
@@ -434,6 +482,8 @@ impl Board {
             self.nav.visit(&id);
             self.selected = id;
             // Other windows to show, and the rows slide to stay lined up.
+            self.tile_order.clear();
+            self.settle_tile_order();
             self.relayout();
             self.register_thumbnails();
             self.invalidate();
@@ -456,12 +506,37 @@ impl Board {
     /// pinned to every desktop (flagged), which are visible there as well.
     fn tile_windows(&self) -> Vec<(&WindowModel, bool)> {
         let cell = self.selected_cell().into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
-        cell.chain(self.model.pinned.iter().map(|w| (w, true))).collect()
+        let mut windows: Vec<(&WindowModel, bool)> = cell.chain(self.model.pinned.iter().map(|w| (w, true))).collect();
+        let place = |hwnd: HWND| self.tile_order.iter().position(|h| *h == hwnd.0).unwrap_or(usize::MAX);
+        windows.sort_by_key(|(w, _)| place(w.hwnd));
+        windows
+    }
+
+    /// Remembers the order of the tiles now shown; windows seen for the
+    /// first time go after the ones already placed.
+    fn settle_tile_order(&mut self) {
+        let shown: Vec<isize> = self.tile_windows().iter().map(|(w, _)| w.hwnd.0).collect();
+        self.tile_order = shown;
+    }
+
+    /// Index of the monitor a window is on (by its centre), the home monitor
+    /// when it is off every screen.
+    fn monitor_of(&self, window: &WindowModel) -> usize {
+        let r = window.rect;
+        let x = ((r.left + r.right) / 2 - self.origin.0) as f32;
+        let y = ((r.top + r.bottom) / 2 - self.origin.1) as f32;
+        let home = self.monitors.iter().position(|m| *m == self.home).unwrap_or(0);
+        self.monitors.iter().position(|m| contains(m, x, y)).unwrap_or(home)
+    }
+
+    /// The cursor in the home monitor's coordinates, which the map is laid out in.
+    fn local(&self, x: f32, y: f32) -> (f32, f32) {
+        (x - self.home.left, y - self.home.top)
     }
 
     fn relayout(&mut self) {
         let s = self.scale;
-        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        let (w, h) = (self.home.right - self.home.left, self.home.bottom - self.home.top);
         // Each row is shifted so that the cell a vertical move would land on
         // (the one it was last left on) sits in the same column for all rows.
         let anchors: Vec<usize> = self
@@ -474,11 +549,29 @@ impl Board {
                 last.and_then(|id| row.cells.iter().position(|cell| cell.id == *id)).unwrap_or(0)
             })
             .collect();
+        // The map and the label are laid out inside the home monitor (and
+        // drawn shifted to it); the tiles are placed in window coordinates,
+        // each on the monitor its window is on.
         let mut layout = compute_layout(&self.model, &anchors, (w, h - FOOTER * s), s * MAP_SCALE);
         let margin = 40.0 * s;
         layout.tiles_label = rect(margin, 22.0 * s, w - 2.0 * margin, 30.0 * s);
-        layout.tiles_area = Rect { left: margin, top: 64.0 * s, right: w - margin, bottom: layout.map_top - 26.0 * s };
-        layout.tiles = layout_tiles(&self.tile_windows(), &layout.tiles_area, s);
+        let windows = self.tile_windows();
+        let mut tiles = Vec::new();
+        for (m, monitor) in self.monitors.iter().enumerate() {
+            let is_home = *monitor == self.home;
+            let area = Rect {
+                left: monitor.left + margin,
+                top: monitor.top + if is_home { 64.0 * s } else { margin },
+                right: monitor.right - margin,
+                bottom: if is_home { self.home.top + layout.map_top - 26.0 * s } else { monitor.bottom - margin },
+            };
+            if is_home {
+                layout.tiles_area = area;
+            }
+            let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
+            tiles.extend(layout_tiles(&here, &area, s));
+        }
+        layout.tiles = tiles;
         self.layout = layout;
     }
 
@@ -499,10 +592,17 @@ impl Board {
             }
             return self.tile_hit(tile.hwnd);
         }
+        let (x, y) = self.local(x, y);
         if contains(&self.layout.add_row, x, y) {
             return Hit::AddRow;
         }
+        if contains(&self.layout.add_row_top, x, y) {
+            return Hit::AddRowTop;
+        }
         for (r, row) in self.layout.rows.iter().enumerate() {
+            if contains(&row.plus_left, x, y) {
+                return Hit::PlusLeft(r);
+            }
             if contains(&row.close, x, y) {
                 return Hit::RowClose(r);
             }
@@ -531,10 +631,12 @@ impl Board {
     fn cell_at(&self, x: f32, y: f32) -> Option<&CellLayout> {
         // A little slack around each square makes it an easier drop target.
         let slack = 5.0 * self.scale;
+        let (x, y) = self.local(x, y);
         self.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| contains(&grow(&cell.body, slack), x, y))
     }
 
     fn slot_at(&self, dragged: &str, x: f32, y: f32) -> Option<Slot> {
+        let (x, y) = self.local(x, y);
         let rows = &self.layout.rows;
         let (first, last) = (rows.first()?, rows.last()?);
         if y < first.top {
@@ -619,7 +721,23 @@ impl Board {
                     props.opacity = 215;
                 }
                 Some(tile) => {
-                    props.rcDestination = to_rect(&tile.thumb);
+                    // Fill the tile's width without distorting the picture:
+                    // a window taller than the tile shows its upper part, a
+                    // shorter one sits at the top.
+                    let t = &tile.thumb;
+                    let (tw, th) = (t.right - t.left, t.bottom - t.top);
+                    let mut dest = *t;
+                    if let Ok(size) = unsafe { DwmQueryThumbnailSourceSize(thumb) } {
+                        let (sw, sh) = (size.cx.max(1) as f32, size.cy.max(1) as f32);
+                        let shown = th * sw / tw;
+                        if shown < sh {
+                            props.dwFlags |= DWM_TNP_RECTSOURCE;
+                            props.rcSource = RECT { left: 0, top: 0, right: size.cx, bottom: shown.round() as i32 };
+                        } else {
+                            dest.bottom = t.top + sh * tw / sw;
+                        }
+                    }
+                    props.rcDestination = to_rect(&dest);
                     // A minimized window shows what it last looked like, faded.
                     // (Without a kept picture the source is only a sliver.)
                     if self.tile_windows().iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized) {
@@ -791,7 +909,10 @@ impl Board {
             return;
         }
         let hover = self.hit_test(x, y);
-        let over_header = |px: f32, py: f32| self.layout.rows.iter().position(|row| contains(&row.header, px, py));
+        let over_header = |px: f32, py: f32| {
+            let (px, py) = self.local(px, py);
+            self.layout.rows.iter().position(|row| contains(&row.header, px, py))
+        };
         if hover != self.hover || over_header(x, y) != over_header(self.cursor_before.0, self.cursor_before.1) {
             self.hover = hover;
             self.invalidate();
@@ -841,8 +962,10 @@ impl Board {
             }
             Hit::TileClose(hwnd) => Action::CloseWindow(HWND(hwnd)),
             Hit::CellClose(id) => Action::RemoveCell(id),
-            Hit::Plus(row) => Action::AddCell(row),
-            Hit::AddRow => Action::AddRow,
+            Hit::Plus(row) => Action::AddCell { row, front: false },
+            Hit::PlusLeft(row) => Action::AddCell { row, front: true },
+            Hit::AddRow => Action::AddRow { top: false },
+            Hit::AddRowTop => Action::AddRow { top: true },
             Hit::RowClose(row) if self.armed_row == Some(row) => {
                 self.armed_row = None;
                 Action::CloseRow(row)
@@ -916,10 +1039,32 @@ impl Board {
             t.Clear(Some(&rgba(0.050, 0.055, 0.068, 1.0)));
         }
         self.draw_tiles(t, fonts, s)?;
-        let hovered = self.draw_map(t, map_fonts, s * MAP_SCALE)?;
+        // Everything from here on belongs to the home monitor.
+        unsafe {
+            t.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
+        }
+        let hovered = self.draw_map(t, map_fonts, s * MAP_SCALE);
+        let footer = self.draw_footer(t, fonts, s, hovered.as_ref().ok().cloned().flatten());
+        unsafe {
+            t.SetTransform(&Matrix3x2::identity());
+        }
+        hovered.and(footer)
+    }
+
+    /// The cell label at the top and the hint line at the bottom of the home monitor.
+    fn draw_footer(&self, t: &ID2D1RenderTarget, fonts: &Fonts, s: f32, hovered: Option<String>) -> Result<()> {
         unsafe {
             let brush = t.CreateSolidColorBrush(&white(1.0), None)?;
-            let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+            let (w, h) = (self.home.right - self.home.left, self.home.bottom - self.home.top);
+            let place = self.nav.find(&self.selected);
+            if let Some(p) = place {
+                let name = self.model.rows.get(p.row).map(|row| row.name.clone()).unwrap_or_default();
+                let row = if name.is_empty() { format!("워크스페이스 {}", p.row + 1) } else { name };
+                let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
+                let wide: Vec<u16> = format!("{row}  ·  {}번 칸{here}", p.col + 1).encode_utf16().collect();
+                brush.SetColor(&white(0.80));
+                t.DrawText(&wide, &fonts.label, &self.layout.tiles_label, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+            }
             let footer = rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s);
             let pointed = match &self.hover {
                 Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
@@ -951,13 +1096,6 @@ impl Board {
                 brush.SetColor(&colour);
                 t.DrawText(&wide, font, area, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
             };
-            let place = self.nav.find(&self.selected);
-            let row_name = place.and_then(|p| self.model.rows.get(p.row)).map(|row| row.name.clone()).unwrap_or_default();
-            if let Some(p) = place {
-                let row = if row_name.is_empty() { format!("워크스페이스 {}", p.row + 1) } else { row_name };
-                let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
-                text(&format!("{row}  ·  {}번 칸{here}", p.col + 1), &fonts.label, &self.layout.tiles_label, white(0.80));
-            }
             if self.layout.tiles.is_empty() {
                 text("이 칸에는 창이 없습니다", &fonts.centered, &self.layout.tiles_area, white(0.28));
             }
@@ -1049,6 +1187,8 @@ impl Board {
             let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|c| c.id.as_str());
             let selected_row = self.nav.find(&self.selected).map(|pos| pos.row);
             let radius = 8.0 * s;
+            // The map is drawn shifted onto the home monitor.
+            let cursor = self.local(self.cursor.0, self.cursor.1);
 
             // The column vertical moves travel along.
             fill(&self.layout.spine, 10.0 * s, white(0.035));
@@ -1056,7 +1196,7 @@ impl Board {
             for (r, (row, model)) in self.layout.rows.iter().zip(&self.model.rows).enumerate() {
                 // Row label; memory and the close button only while pointed at.
                 let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
-                let pointed = contains(&row.header, self.cursor.0, self.cursor.1) && self.press.is_none();
+                let pointed = contains(&row.header, cursor.0, cursor.1) && self.press.is_none();
                 let name = match editing {
                     Some((_, typed)) => format!("{typed}▏"),
                     None if model.name.is_empty() => format!("워크스페이스 {}", r + 1),
@@ -1118,18 +1258,22 @@ impl Board {
                     }
                 }
 
-                let hot = self.hover == Hit::Plus(r);
-                if hot {
-                    fill(&row.plus, radius, white(0.10));
+                for (area, hit) in [(&row.plus, Hit::Plus(r)), (&row.plus_left, Hit::PlusLeft(r))] {
+                    let hot = self.hover == hit;
+                    if hot {
+                        fill(area, radius, white(0.10));
+                    }
+                    text("+", &fonts.big, area, white(if hot { 0.95 } else { 0.22 }));
                 }
-                text("+", &fonts.big, &row.plus, white(if hot { 0.95 } else { 0.22 }));
             }
 
-            let hot = self.hover == Hit::AddRow;
-            if hot {
-                fill(&self.layout.add_row, radius, white(0.10));
+            for (area, hit) in [(&self.layout.add_row, Hit::AddRow), (&self.layout.add_row_top, Hit::AddRowTop)] {
+                let hot = self.hover == hit;
+                if hot {
+                    fill(area, radius, white(0.10));
+                }
+                text("+", &fonts.big, area, white(if hot { 0.95 } else { 0.22 }));
             }
-            text("+", &fonts.big, &self.layout.add_row, white(if hot { 0.95 } else { 0.22 }));
 
             // Drag feedback.
             if let Some(id) = dragged_cell {
@@ -1145,13 +1289,13 @@ impl Board {
                     }
                     None => {}
                 }
-                let (cx, cy) = self.cursor;
+                let (cx, cy) = cursor;
                 stroke(&rect(cx - 40.0 * s, cy - 25.0 * s, 80.0 * s, 50.0 * s), radius, 2.0 * s, accent(0.9));
             }
             if let Some(hwnd) = self.dragged_window() {
                 // A minimized window has no thumbnail to follow the cursor.
                 if !self.thumbs.iter().any(|&(h, _, _)| h == hwnd) {
-                    let (cx, cy) = self.cursor;
+                    let (cx, cy) = cursor;
                     let area = rect(cx - 16.0 * s, cy - 16.0 * s, 32.0 * s, 32.0 * s);
                     if let Some(bitmap) = self.icons.get(&hwnd) {
                         t.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
@@ -1167,6 +1311,8 @@ impl Board {
     pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32) -> Option<Vec<u8>> {
         self.size = size;
         self.scale = scale;
+        self.home = rect(0.0, 0.0, size.0 as f32, size.1 as f32);
+        self.monitors = vec![self.home];
         self.selected = model.current.clone();
         self.model = model;
         self.nav = grid;
@@ -1463,24 +1609,26 @@ fn compute_layout(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) ->
     let columns = (lead + tail) as f32;
 
     // Squares of a fixed look, shrunk only when the grid would not fit.
-    let fit_w = (w - 2.0 * margin - header_w) / (columns + 0.6) - gap;
-    let fit_h = (h * MAX_SHARE) / (rows + 0.6) - gap;
+    let fit_w = (w - 2.0 * margin - header_w) / (columns + 1.2) - gap;
+    let fit_h = (h * MAX_SHARE) / (rows + 1.2) - gap;
     let cell_h = (62.0 * s).min(fit_h).min(fit_w * 0.62).max(22.0 * s);
     let cell_w = cell_h / 0.62;
     let pitch = cell_w + gap;
     let row_pitch = cell_h + gap;
     let plus = cell_h * 0.6;
 
-    let total_w = header_w + columns * pitch + plus;
-    let total_h = rows * row_pitch + plus;
+    let total_w = header_w + plus + gap + columns * pitch + plus;
+    let total_h = plus + gap + rows * row_pitch + plus;
     let x0 = ((w - total_w) / 2.0).max(margin);
     let mut y = h - total_h - 10.0 * s;
-    let cells_x = x0 + header_w;
+    let cells_x = x0 + header_w + plus + gap;
     let spine_x = cells_x + lead as f32 * pitch;
     let icon = (cell_h * 0.36).min(22.0 * s);
     let count_w = icon * 0.62;
 
     let mut layout = Layout { map_top: y, ..Layout::default() };
+    layout.add_row_top = rect(spine_x + (cell_w - plus) / 2.0, y, plus, plus);
+    y += plus + gap;
     let rows_top = y;
     for (r, row) in model.rows.iter().enumerate() {
         let mut x = spine_x - anchor(r) as f32 * pitch;
@@ -1530,12 +1678,13 @@ fn compute_layout(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) ->
         let first_x = spine_x - anchor(r) as f32 * pitch;
         layout.rows.push(RowLayout {
             header: rect(x0, y, header_w, cell_h),
-            name: rect(x0, y + cell_h / 2.0 - 20.0 * s, (first_x - x0 - 12.0 * s).min(header_w - 12.0 * s).max(40.0 * s), 20.0 * s),
+            name: rect(x0, y + cell_h / 2.0 - 20.0 * s, header_w - 12.0 * s, 20.0 * s),
             close: rect(x0, y + cell_h / 2.0 + 2.0 * s, 140.0 * s, 20.0 * s),
             top: y - gap / 2.0,
             bottom: y + cell_h + gap / 2.0,
             cells,
             plus: rect(x, y + (cell_h - plus) / 2.0, plus, plus),
+            plus_left: rect(first_x - gap - plus, y + (cell_h - plus) / 2.0, plus, plus),
         });
         y += row_pitch;
     }

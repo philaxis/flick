@@ -13,7 +13,7 @@ use crate::grid::Dir;
 use std::{
     cell::{Cell, RefCell},
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
 };
@@ -48,12 +48,16 @@ pub const WM_CLICK: u32 = WM_APP + 2;
 /// The trigger was released after at least one step.
 pub const WM_RELEASE: u32 = WM_APP + 3;
 
+/// The user finished choosing a new trigger; wparam is 1 when one was chosen
+/// (fetch it with `take_captured`) and 0 when it was cancelled.
+pub const WM_CAPTURED: u32 = WM_APP + 4;
+
 /// Thread message telling the hook thread to pick up new settings.
 const WM_RELOAD: u32 = WM_APP + 20;
 /// Marks key events we replay ourselves, so the hook lets them through.
 const OWN_INPUT: usize = 0x4B41_4E4B;
 /// All keys of a chord must go down within this long to count as one press.
-const CHORD_WINDOW_MS: u32 = 60;
+const CHORD_WINDOW_MS: u32 = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Trigger {
@@ -65,7 +69,26 @@ pub enum Trigger {
     Chord(Vec<u32>),
 }
 
+/// The config-file name of a key (the inverse of `key_code`).
+fn key_name(key: u32) -> String {
+    match key {
+        0x13 => "pause".into(),
+        0x14 => "capslock".into(),
+        0x20 => "space".into(),
+        0x5D => "apps".into(),
+        0x91 => "scrolllock".into(),
+        0xA3 => "rctrl".into(),
+        0xA5 => "ralt".into(),
+        0x30..=0x39 | 0x41..=0x5A => (key as u8 as char).to_ascii_lowercase().to_string(),
+        0x70..=0x87 => format!("f{}", key - 0x70 + 1),
+        _ => format!("vk{key:02x}"),
+    }
+}
+
 fn key_code(name: &str) -> Option<u32> {
+    if let Some(hex) = name.strip_prefix("vk") {
+        return u32::from_str_radix(hex, 16).ok().filter(|code| (1..=0xFE).contains(code));
+    }
     Some(match name {
         "pause" => 0x13,
         "capslock" => 0x14,
@@ -89,6 +112,27 @@ fn key_code(name: &str) -> Option<u32> {
 }
 
 impl Trigger {
+    /// How this trigger is written in the config file.
+    pub fn to_config(&self) -> String {
+        match self {
+            Trigger::XButton1 => "xbutton1".into(),
+            Trigger::XButton2 => "xbutton2".into(),
+            Trigger::Middle => "middle".into(),
+            Trigger::Key(key) => key_name(*key),
+            Trigger::Chord(keys) => keys.iter().map(|key| key_name(*key)).collect::<Vec<_>>().join("+"),
+        }
+    }
+
+    /// How this trigger is called when talking to the user.
+    pub fn describe(&self) -> String {
+        match self {
+            Trigger::XButton1 => "마우스 뒤로 버튼".into(),
+            Trigger::XButton2 => "마우스 앞으로 버튼".into(),
+            Trigger::Middle => "마우스 휠 버튼".into(),
+            _ => self.to_config().to_uppercase(),
+        }
+    }
+
     fn parse_one(name: &str) -> Option<Trigger> {
         Some(match name {
             "xbutton1" => Trigger::XButton1,
@@ -150,6 +194,58 @@ impl Settings {
     }
 }
 
+/// While set, the next button or key combination pressed is reported as the
+/// new trigger instead of being acted on.
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+static CAPTURED: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn begin_capture() {
+    CAPTURING.store(true, Ordering::SeqCst);
+}
+
+pub fn cancel_capture() {
+    CAPTURING.store(false, Ordering::SeqCst);
+}
+
+pub fn take_captured() -> Option<String> {
+    CAPTURED.lock().unwrap().take()
+}
+
+fn finish_capture(s: &Settings, result: Option<String>) {
+    CAPTURING.store(false, Ordering::SeqCst);
+    CAPTURE_KEYS.with(|keys| keys.borrow_mut().clear());
+    let chosen = result.is_some();
+    *CAPTURED.lock().unwrap() = result;
+    post(s, WM_CAPTURED, chosen as usize);
+}
+
+/// Keys count as one combination from the first press to the first release.
+fn capture_key(s: &Settings, key: u32, up: bool) -> bool {
+    const ESCAPE: u32 = 0x1B;
+    if !up {
+        if key == ESCAPE {
+            finish_capture(s, None);
+        } else {
+            CAPTURE_KEYS.with(|keys| {
+                let mut keys = keys.borrow_mut();
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            });
+        }
+        return true;
+    }
+    let keys = CAPTURE_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
+    // A single letter or digit as a hold-trigger would make it untypable.
+    let typable = |key: u32| (0x30..=0x5A).contains(&key) || key == 0x20;
+    match keys.as_slice() {
+        [] => {}
+        [only] if typable(*only) => {}
+        keys => finish_capture(s, Some(keys.iter().map(|key| key_name(*key)).collect::<Vec<_>>().join("+"))),
+    }
+    true
+}
+
 /// Settings handed from the app to the hook thread.
 static SHARED: Mutex<Option<Settings>> = Mutex::new(None);
 static THREAD: AtomicU32 = AtomicU32::new(0);
@@ -157,7 +253,10 @@ static THREAD: AtomicU32 = AtomicU32::new(0);
 // State of the hook thread.
 thread_local! {
     static SETTINGS: RefCell<Option<Settings>> = const { RefCell::new(None) };
-    static HELD: Cell<bool> = const { Cell::new(false) };
+    /// Which triggers are down right now (bits below). The gesture lasts
+    /// while any of them is, so letting go of one does not end a hold kept
+    /// by another.
+    static SOURCES: Cell<u8> = const { Cell::new(0) };
     static STEPPED: Cell<bool> = const { Cell::new(false) };
     /// Mouse travel not yet converted into steps.
     static ACCUM: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
@@ -170,6 +269,8 @@ thread_local! {
     /// Chord keys still down after the chord fired; their events are dropped.
     static SWALLOW: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     static CHORD_TIMER: Cell<usize> = const { Cell::new(0) };
+    /// Keys pressed so far while a new trigger is being chosen.
+    static CAPTURE_KEYS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Starts the hook thread (once) and gives it these settings.
@@ -199,7 +300,7 @@ fn reload() {
     SETTINGS.with(|slot| *slot.borrow_mut() = settings);
     flush_pending(None);
     SWALLOW.with(|keys| keys.borrow_mut().clear());
-    if HELD.replace(false) {
+    if SOURCES.replace(0) != 0 {
         listen_raw(false);
     }
 }
@@ -259,8 +360,20 @@ fn listen_raw(on: bool) {
     }
 }
 
-fn press() {
-    if !HELD.replace(true) {
+const SRC_XBUTTON1: u8 = 1;
+const SRC_XBUTTON2: u8 = 2;
+const SRC_MIDDLE: u8 = 4;
+const SRC_KEY: u8 = 8;
+const SRC_CHORD: u8 = 16;
+
+fn held() -> bool {
+    SOURCES.get() != 0
+}
+
+fn press(source: u8) {
+    let before = SOURCES.get();
+    SOURCES.set(before | source);
+    if before == 0 {
         STEPPED.set(false);
         ACCUM.set((0, 0));
         LAST_ABSOLUTE.set(None);
@@ -268,8 +381,10 @@ fn press() {
     }
 }
 
-fn release(s: &Settings) {
-    if HELD.replace(false) {
+fn release(s: &Settings, source: u8) {
+    let before = SOURCES.get();
+    SOURCES.set(before & !source);
+    if before != 0 && SOURCES.get() == 0 {
         listen_raw(false);
         post(s, if STEPPED.get() { WM_RELEASE } else { WM_CLICK }, 0);
     }
@@ -280,7 +395,7 @@ fn release(s: &Settings) {
 fn on_raw_input(handle: HRAWINPUT) {
     const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
     const MOUSE_VIRTUAL_DESKTOP: u16 = 0x02;
-    if !HELD.get() {
+    if !held() {
         return;
     }
     let mut raw = RAWINPUT::default();
@@ -358,21 +473,35 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
 fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     let xbutton = (info.mouseData >> 16) as u16;
     let button = match message {
-        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 1 => Some(Trigger::XButton1),
-        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 2 => Some(Trigger::XButton2),
-        WM_MBUTTONDOWN | WM_MBUTTONUP => Some(Trigger::Middle),
+        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 1 => Some((Trigger::XButton1, SRC_XBUTTON1)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 2 => Some((Trigger::XButton2, SRC_XBUTTON2)),
+        WM_MBUTTONDOWN | WM_MBUTTONUP => Some((Trigger::Middle, SRC_MIDDLE)),
         _ => None,
     };
-    if button.is_some_and(|button| s.triggers.contains(&button)) {
-        match message {
-            WM_XBUTTONDOWN | WM_MBUTTONDOWN => press(),
-            _ => release(s),
+    let down = matches!(message, WM_XBUTTONDOWN | WM_MBUTTONDOWN);
+    if CAPTURING.load(Ordering::SeqCst) {
+        // Choosing a new trigger: the first button pressed is it.
+        return match button {
+            Some((trigger, _)) if down => {
+                finish_capture(s, Some(trigger.to_config()));
+                true
+            }
+            _ => false,
+        };
+    }
+    if let Some((trigger, source)) = button {
+        if s.triggers.contains(&trigger) {
+            if down {
+                press(source);
+            } else {
+                release(s, source);
+            }
+            return true;
         }
-        return true;
     }
     // The cursor stays put while the trigger is held; the movement itself is
     // read from raw input (`on_raw_input`).
-    message == WM_MOUSEMOVE && HELD.get()
+    message == WM_MOUSEMOVE && held()
 }
 
 fn key_event(key: u32, up: bool) -> INPUT {
@@ -429,7 +558,7 @@ fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
     if swallowed {
         // The chord is over as soon as one of its keys comes up.
         if up {
-            release(s);
+            release(s, SRC_CHORD);
         }
         return true;
     }
@@ -456,7 +585,7 @@ fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
         }
         let keys = PENDING.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
         SWALLOW.with(|slot| *slot.borrow_mut() = keys);
-        press();
+        press(SRC_CHORD);
     } else if CHORD_TIMER.get() == 0 {
         CHORD_TIMER.set(unsafe { SetTimer(None, 0, CHORD_WINDOW_MS, Some(chord_timeout)) });
     }
@@ -464,11 +593,14 @@ fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
 }
 
 fn on_key(s: &Settings, key: u32, up: bool) -> bool {
+    if CAPTURING.load(Ordering::SeqCst) {
+        return capture_key(s, key, up);
+    }
     if s.triggers.contains(&Trigger::Key(key)) {
         if up {
-            release(s);
+            release(s, SRC_KEY);
         } else {
-            press();
+            press(SRC_KEY);
         }
         return true;
     }

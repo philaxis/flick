@@ -22,8 +22,8 @@ const DEFAULT_CONFIG: &str = r#"# Flick 설정. 저장한 뒤 트레이 아이�
 trigger = "xbutton2"
 
 # 한 칸 넘어가는 데 필요한 이동 거리(픽셀). 세로를 더 길게 두면 실수로 행이 바뀌지 않습니다.
-step_x = 140
-step_y = 180
+step_x = 260
+step_y = 320
 
 # 새 칸/새 행은 전체 격자 뷰(딸깍)에서 마우스로 만듭니다.
 # 여기에 1 이상을 넣으면 격자 가장자리에서 그 횟수만큼 더 밀 때도 만들어집니다. 0이면 만들지 않습니다.
@@ -56,8 +56,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             trigger: "xbutton2".into(),
-            step_x: 140,
-            step_y: 180,
+            step_x: 260,
+            step_y: 320,
             edge_create_pushes: 0,
             carry_modifier: "shift".into(),
             hotkeys: true,
@@ -100,6 +100,30 @@ pub fn load_config() -> (Config, Option<String>) {
             (Config::default(), None)
         }
     }
+}
+
+/// Rewrites the `trigger` line of the config file, keeping everything else.
+pub fn set_trigger(value: &str) {
+    let path = config_path();
+    let text = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
+    let line = format!("trigger = \"{value}\"");
+    let mut replaced = false;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|old| {
+            if !replaced && old.trim_start().starts_with("trigger") && old.contains('=') {
+                replaced = true;
+                line.clone()
+            } else {
+                old.to_owned()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.insert(0, line);
+    }
+    let _ = fs::create_dir_all(dir());
+    let _ = fs::write(path, lines.join("\n") + "\n");
 }
 
 pub fn load_grid() -> Grid {

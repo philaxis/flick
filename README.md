@@ -1,92 +1,38 @@
-# Flick — 가상 데스크톱 2D 격자
+<p align="center"><a href="README.md">English</a> · <a href="README.ko.md">한국어</a> · <a href="README.zh.md">中文</a></p>
 
-**Flick turns Windows 11 virtual desktops into a 2D grid.** Hold a button and flick the mouse to move between desktops; rows are workspaces. Free, open source (MIT), one small exe. · [Website](https://philaxis.github.io/flick/) · [Download](https://github.com/philaxis/flick/releases/latest/download/Flick.exe)
+<p align="center"><img src="assets/icon-256.png" width="96" alt="Flick"></p>
 
-윈도우 11의 가상 데스크톱을 일렬이 아닌 **2D 격자**로 쓰게 해 주는 상주 프로그램입니다.
-행은 워크스페이스, 그 안의 칸은 그 작업의 화면들입니다. 행마다 길이가 달라도 됩니다.
+<p align="center"><strong><a href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe">⬇ Download Flick for Windows</a></strong></p>
 
-## 설치
+<p align="center">Hold a button, flick the mouse, and you are on the next desktop.</p>
 
-[Flick.exe](https://github.com/philaxis/flick/releases/latest/download/Flick.exe)를 받아 한 번 실행하면 스스로 설치하고 실행합니다.
+<p align="center"><a href="https://philaxis.github.io/flick/">See how it works on the Flick website</a></p>
 
-- 설치 위치: `%LOCALAPPDATA%\Flick`
-- 시작 메뉴 바로가기, 윈도우 시작 시 자동 실행, "설치된 앱" 목록 등록
-- 제거: 설정 → 앱 → 설치된 앱 → Flick → 제거 (또는 `Flick.exe --uninstall`)
-- 설치 없이 그 자리에서 실행: `Flick.exe --portable`
+---
 
-윈도우 11 23H2(22631.3085 이상) 전용입니다. 24H2는 `vendor/winvd`를 0.0.49 기준으로 올려야 합니다.
+**Your desktops become a grid.** Left and right are the screens of one job. Up and down are other jobs.
 
-## 쓰는 법
+**Hold and flick.** Hold the trigger, push the mouse, and you move one desktop that way. The pointer stays where it was.
 
-기본 트리거는 마우스 옆면의 **"앞으로" 버튼**입니다.
+**Tap to see everything.** Tap the trigger for the windows on this desktop and a small map of all of them. Drag a window onto the map to move it.
 
-| 동작 | 결과 |
-|---|---|
-| 누른 채 밀기 | 그 방향 칸으로 즉시 이동 (좌우 = 같은 행, 위아래 = 다른 행) |
-| 딸깍 | 전체 뷰 열기(선택한 칸의 창 목록 + 아래 작은 지도). 다시 딸깍/Enter/칸 클릭 = 그 칸으로 이동, Esc = 취소 |
-| 뷰가 열린 채 누르고 밀기, 방향키 | 선택 칸만 이동 |
-| Shift + 누른 채 밀기 | 활성 창을 들고 이동 |
-| `Ctrl+Alt+Win+방향키` | 키보드로 이동 (Shift 추가 = 창 들고 이동) |
-| `Ctrl+Alt+Win+P` | 활성 창의 고정 메뉴 |
+**Any button you like.** It starts as the mouse "forward" button. Right-click the tray icon → *Change trigger* and press whatever you want instead, even several keys at once.
 
-위아래로 움직이면 그 행에서 마지막에 있던 칸으로 갑니다. 처음 가는 행은 첫 칸입니다.
-지도와 미니맵은 각 행을 좌우로 밀어, 도착할 칸이 지금 칸의 바로 위아래에 오도록 보여 줍니다.
-누르고 있는 동안 커서는 움직이지 않습니다.
+**Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
 
-격자 뷰 안에서:
+## Get started
 
-- 창(미리보기나 아이콘)을 끌어 다른 칸으로 옮기기
-- 칸을 끌어 재배치 (같은 행, 다른 행, 행 사이 = 새 행)
-- `+` 칸 추가, `+ 새 워크스페이스` 행 추가, 칸의 `✕` 삭제
-- 행 이름 더블클릭(F2)으로 변경, 행별 메모리 추정치, "이 행 닫기"(두 번 눌러 확인)
-- 창 미리보기 제목 줄의 `행 고정` / `전체 고정` (둘 중 하나만), 우클릭하면 앱 단위 고정 메뉴
-  - **행 안에서 따라오게** (창 / 앱): 그 행 안에서 좌우로 움직일 때 따라옴
-  - **모든 칸에 고정** (창 / 앱): 어느 칸에서나 보임
+1. Download with the button above and run it. It installs itself and starts with Windows.
+2. Hold the trigger and flick the mouse sideways.
+3. Tap the trigger and press **+** on the map to add a desktop or a new row.
 
-듀얼모니터에서는 모든 모니터가 함께 전환됩니다(윈도우 가상 데스크톱의 동작).
+## Good to know
 
-## 설정
+- Windows 11 23H2 only for now. 24H2 is not supported yet.
+- To remove it: Settings → Apps → Installed apps → Flick.
 
-트레이 아이콘 우클릭 → "설정 파일 열기" (`%APPDATA%\Flick\config.toml`), 저장 후 "설정 다시 읽기".
+## Build
 
-| 항목 | 기본값 | 설명 |
-|---|---|---|
-| `trigger` | `xbutton2` | `xbutton1`, `xbutton2`, `middle`, `capslock`, `scrolllock`, `pause`, `apps`, `ralt`, `rctrl`, `f1`~`f24`. 쉼표로 여러 개, `e+r+t`처럼 `+`로 묶으면 동시 누르기 (예: `xbutton2, e+r+t`) |
-| `step_x`, `step_y` | 140, 180 | 한 칸 넘어가는 이동 거리(픽셀) |
-| `edge_create_pushes` | 0 | 1 이상이면 가장자리에서 그 횟수만큼 더 밀 때도 새 칸을 만듦. 기본은 뷰에서만 생성 |
-| `carry_modifier` | `shift` | 창을 들고 이동하는 보조 키 (`shift`, `ctrl`, `alt`) |
-| `hotkeys` | `true` | 키보드 단축키 사용 |
-| `sleep_after_minutes` | 0 | 이 시간 동안 안 간 행의 앱 메모리를 내보냄 (0 = 끔) |
+`cargo build --release` on Windows, or `scripts/build-wsl.sh build --release` from WSL.
 
-격자 배치는 `%APPDATA%\Flick\state.json`, 오류 기록은 같은 폴더의 `log.txt`에 남습니다.
-
-## 빌드
-
-```sh
-cargo build --release              # 윈도우에서
-scripts/build-wsl.sh build --release   # WSL에서 (윈도우 쪽 MSVC·SDK 라이브러리 사용)
-cargo test                         # 격자 규칙 테스트 (리눅스에서도 실행됨)
-```
-
-결과물은 `target/x86_64-pc-windows-msvc/release/Flick.exe` 하나입니다.
-
-## 구조
-
-| 파일 | 역할 |
-|---|---|
-| `src/grid.rs` | 격자 모델과 이동 규칙 (윈도우 의존 없음) |
-| `src/app.rs` | 입력·격자·가상 데스크톱·화면을 잇는 본체 |
-| `src/input.rs` | 전역 마우스/키보드 훅, 제스처 판정 |
-| `src/overlay.rs` | 이동 중에 뜨는 미니맵 |
-| `src/board.rs` | 전체 격자 뷰 (배치, 끌기, 실시간 미리보기) |
-| `src/vd.rs` | 가상 데스크톱·창·프로세스 정보 |
-| `src/tray.rs` | 트레이 아이콘과 메뉴, 자동 실행 |
-| `src/install.rs` | 자체 설치/제거 |
-| `vendor/winvd` | 가상 데스크톱 비공식 API 라이브러리(0.0.46)에 순서 변경 함수만 추가한 사본 |
-| `examples/drive.rs` | 실행 중인 앱을 조작하고 화면을 캡처하는 점검 도구 |
-
-가상 데스크톱 전환은 윈도우의 비공식 인터페이스를 쓰므로, 윈도우 대규모 업데이트 뒤에는 `vendor/winvd`를 맞는 버전으로 바꿔야 할 수 있습니다.
-
-## 라이선스
-
-[MIT](LICENSE). `vendor/winvd`는 Jari Pennanen의 [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor)(MIT)에서 가져온 것입니다.
+[MIT](LICENSE). `vendor/winvd` comes from [VirtualDesktopAccessor](https://github.com/Ciantic/VirtualDesktopAccessor) (MIT).

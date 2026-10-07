@@ -31,7 +31,9 @@ use windows::{
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+                CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetSystemMetrics,
+                SM_CXSCREEN, SM_CYSCREEN, WINDOW_STYLE, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WS_VISIBLE,
                 GetMessageW, IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
                 RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, MB_ICONWARNING,
                 MB_OK, MSG, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
@@ -44,6 +46,8 @@ use winvd::DesktopEvent;
 
 const WM_TRAY: u32 = WM_APP + 10;
 const WM_DESKTOP_EVENT: u32 = WM_APP + 11;
+/// Starts choosing a new trigger; what the tray menu item sends.
+const WM_CHANGE_TRIGGER: u32 = WM_APP + 12;
 
 /// How long the minimap stays after the trigger is released, after a hotkey,
 /// and after a plain click.
@@ -65,6 +69,12 @@ struct App {
     board: Board,
     /// The window that had focus when the board opened, to give it back on cancel.
     focus_before_board: HWND,
+    /// The "press the new trigger" prompt, while it is up.
+    trigger_prompt: HWND,
+    /// Steps are arriving from a held trigger; `unsettled` when one of them
+    /// left keyboard focus behind on the desktop it came from.
+    in_gesture: bool,
+    unsettled: bool,
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
     following: HashSet<isize>,
@@ -351,14 +361,30 @@ impl App {
             return;
         }
         self.visit(to);
-        config::save_grid(&self.grid);
         if carried {
             vd::force_foreground(window);
+        } else if self.in_gesture {
+            // Mid-gesture more steps may follow at once; handing focus over
+            // and saving wait until the trigger is let go (`finish_gesture`).
+            self.unsettled = true;
         } else {
             vd::focus_top_window();
         }
+        if !self.in_gesture {
+            config::save_grid(&self.grid);
+        }
         let view = self.view(to, None);
         self.overlay.show(view, Some(from), None);
+    }
+
+    /// The trigger was released: do what the steps of the gesture put off.
+    fn finish_gesture(&mut self) {
+        if std::mem::take(&mut self.in_gesture) {
+            if std::mem::take(&mut self.unsettled) {
+                vd::focus_top_window();
+            }
+            config::save_grid(&self.grid);
+        }
     }
 
     fn settle(&mut self, linger_ms: u64) {
@@ -478,18 +504,19 @@ impl App {
             }
             Action::MoveCell { id, row, index } => self.grid.move_cell(&id, row, index),
             Action::MoveCellToNewRow { id, at } => self.grid.move_cell_to_new_row(&id, at),
-            Action::AddCell(row) => {
+            Action::AddCell { row, front } => {
                 // Placed in the grid before the next sync, which would otherwise
                 // file the unknown desktop under the current row.
                 if let Some(id) = winvd::create_desktop().ok().and_then(|d| vd::id_of(&d)) {
                     if let Some(row) = self.grid.rows.get_mut(row) {
-                        row.cells.push(id);
+                        row.cells.insert(if front { 0 } else { row.cells.len() }, id);
                     }
                 }
             }
-            Action::AddRow => {
+            Action::AddRow { top } => {
                 if let Some(id) = winvd::create_desktop().ok().and_then(|d| vd::id_of(&d)) {
-                    self.grid.rows.push(Row { name: String::new(), cells: vec![id], last: None });
+                    let at = if top { 0 } else { self.grid.rows.len() };
+                    self.grid.rows.insert(at, Row { name: String::new(), cells: vec![id], last: None });
                 }
             }
             Action::RemoveCell(id) => self.remove_cells(&[id]),
@@ -617,6 +644,53 @@ impl App {
         self.refresh_board();
     }
 
+    /// Asks for a new trigger: a small prompt stays up until a button or key
+    /// combination is pressed (or Esc).
+    fn begin_trigger_change(&mut self) {
+        self.end_trigger_prompt();
+        unsafe {
+            let (w, h) = (560, 96);
+            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let prompt = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("\n새 트리거로 쓸 마우스 버튼이나 키를 누르세요.\n키는 여러 개를 함께 눌러도 됩니다.   Esc: 취소"),
+                WS_POPUP | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(1), // SS_CENTER
+                (sw - w) / 2,
+                (sh - h) / 3,
+                w,
+                h,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.trigger_prompt = prompt;
+        }
+        input::begin_capture();
+    }
+
+    fn end_trigger_prompt(&mut self) {
+        if self.trigger_prompt.0 != 0 {
+            unsafe {
+                let _ = DestroyWindow(self.trigger_prompt);
+            }
+            self.trigger_prompt = HWND(0);
+        }
+        input::cancel_capture();
+    }
+
+    /// The user pressed what the trigger should be from now on.
+    fn trigger_chosen(&mut self) {
+        self.end_trigger_prompt();
+        let Some(value) = input::take_captured() else { return };
+        config::set_trigger(&value);
+        self.apply_config();
+        let (triggers, _) = Trigger::parse_list(&value);
+        let name = triggers.first().map(Trigger::describe).unwrap_or(value);
+        tray::notify(self.hwnd, "트리거를 바꿨습니다", &format!("이제 {name}: 누른 채 밀면 칸 이동, 눌렀다 떼면 전체 보기."));
+    }
+
     /// Applies the config file: hooks and hotkeys.
     fn apply_config(&mut self) {
         let (config, error) = config::load_config();
@@ -661,6 +735,9 @@ fn on_tray_command(hwnd: HWND, command: Command) {
         Command::Peek => {
             with_app(App::open_board);
         }
+        Command::ChangeTrigger => unsafe {
+            let _ = PostMessageW(hwnd, WM_CHANGE_TRIGGER, WPARAM(0), LPARAM(0));
+        },
         Command::OpenConfig => unsafe {
             let path = HSTRING::from(config::config_path().as_os_str());
             ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
@@ -684,15 +761,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     match message {
         WM_STEP => {
             if let Some(dir) = input::dir_from_index(wparam.0) {
-                with_app(|app| app.step(dir, app.carry_held()));
+                with_app(|app| {
+                    app.in_gesture = true;
+                    app.step(dir, app.carry_held());
+                    // Timer messages wait behind queued steps, so advance the
+                    // minimap's animation here as well.
+                    app.overlay.tick();
+                });
             }
         }
         WM_CLICK => {
             with_app(App::toggle_board);
         }
+        WM_CHANGE_TRIGGER => {
+            with_app(App::begin_trigger_change);
+        }
+        input::WM_CAPTURED => {
+            with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.end_trigger_prompt() });
+        }
         WM_RELEASE => {
             with_app(|app| {
                 app.edge = None;
+                app.finish_gesture();
                 app.settle(LINGER_RELEASE_MS);
             });
         }
@@ -842,6 +932,9 @@ pub fn run(first_run: bool) {
         edge: None,
         board,
         focus_before_board: HWND(0),
+        trigger_prompt: HWND(0),
+        in_gesture: false,
+        unsettled: false,
         following: HashSet::new(),
         pending_menu: None,
         seen: HashMap::new(),
@@ -859,7 +952,7 @@ pub fn run(first_run: bool) {
     tray::add(hwnd, WM_TRAY);
     if first_run {
         tray::set_autostart(true);
-        tray::notify(hwnd, "설치되어 실행 중입니다", "마우스 '앞으로' 버튼을 누른 채 밀면 칸 이동, 딸깍하면 전체 격자가 열립니다. 설정은 이 아이콘을 우클릭하세요.");
+        tray::notify(hwnd, "설치되어 실행 중입니다", "트리거(처음에는 마우스 앞으로 버튼)를 누른 채 밀면 칸 이동, 눌렀다 떼면 전체 보기. 트리거는 이 아이콘을 우클릭해 바꿉니다.");
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
 
@@ -908,6 +1001,9 @@ pub fn render_board(path: &str) {
         edge: None,
         board,
         focus_before_board: HWND(0),
+        trigger_prompt: HWND(0),
+        in_gesture: false,
+        unsettled: false,
         following: HashSet::new(),
         pending_menu: None,
         seen: HashMap::new(),
