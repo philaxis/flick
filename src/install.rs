@@ -17,7 +17,10 @@ use windows::{
         Foundation::{LPARAM, WPARAM},
         System::{
             Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED},
-            Registry::{RegDeleteKeyValueW, RegDeleteTreeW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, REG_SZ},
+            Registry::{
+                RegDeleteKeyValueW, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+                REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+            },
         },
         UI::{
             Shell::{IShellLinkW, ShellLink},
@@ -52,6 +55,31 @@ fn shortcut() -> PathBuf {
 
 fn uninstall_key() -> HSTRING {
     HSTRING::from(format!("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{APP_NAME}"))
+}
+
+/// Windows' build and update revision, e.g. (22631, 6199).
+pub fn windows_build() -> Option<(u32, u32)> {
+    let key = w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    unsafe {
+        let mut text = [0u16; 16];
+        let mut size = std::mem::size_of_val(&text) as u32;
+        RegGetValueW(HKEY_LOCAL_MACHINE, key, w!("CurrentBuild"), RRF_RT_REG_SZ, None, Some(text.as_mut_ptr().cast()), Some(&mut size)).ok()?;
+        let len = text.iter().position(|c| *c == 0).unwrap_or(text.len());
+        let build: u32 = String::from_utf16_lossy(&text[..len]).trim().parse().ok()?;
+        let mut revision = 0u32;
+        let mut size = 4u32;
+        let _ = RegGetValueW(HKEY_LOCAL_MACHINE, key, w!("UBR"), RRF_RT_REG_DWORD, None, Some(&mut revision as *mut u32 as *mut _), Some(&mut size));
+        Some((build, revision))
+    }
+}
+
+/// Whether the virtual desktop interfaces this build of the app was written
+/// against exist on this Windows. They are undocumented and change between
+/// Windows versions; calling the wrong layout can crash the shell, so on
+/// anything else the app must not start at all.
+pub fn windows_supported() -> bool {
+    matches!(windows_build(), Some((22621, revision)) if revision >= 3155)
+        || matches!(windows_build(), Some((22631, revision)) if revision >= 3085)
 }
 
 /// Whether this process is the installed copy.

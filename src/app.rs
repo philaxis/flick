@@ -117,6 +117,11 @@ pub fn log(message: &str) {
     }
 }
 
+/// A message box for something the user must know before the app exits.
+pub fn notice(text: &str) {
+    warn(text);
+}
+
 fn warn(text: &str) {
     log(text);
     unsafe {

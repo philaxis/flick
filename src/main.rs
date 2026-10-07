@@ -41,6 +41,14 @@ fn main() {
     if flag == Some("--uninstall") {
         return install::uninstall();
     }
+    // Refuse to run where the Windows internals differ, before installing or
+    // touching anything.
+    if flag != Some("--force") && !install::windows_supported() {
+        let build = install::windows_build().map_or("알 수 없음".to_owned(), |(b, r)| format!("{b}.{r}"));
+        return app::notice(&format!(
+            "이 윈도우에서는 Flick을 실행하지 않습니다.\n\n지금은 윈도우 11 23H2(빌드 22631.3085 이상)만 지원합니다.\n이 PC의 빌드: {build}\n\nFlick does not run on this version of Windows yet (Windows 11 23H2 only)."
+        ));
+    }
     // Started from a download folder or the like: install, then let the
     // installed copy take over. `--portable` and debug builds run in place.
     if flag != Some("--portable") && !cfg!(debug_assertions) && !install::running_installed() {
