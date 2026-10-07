@@ -148,7 +148,10 @@ pub fn set_autostart(enabled: bool) {
         let Ok(exe) = std::env::current_exe() else { return };
         let command = HSTRING::from(format!("\"{}\"", exe.display()));
         let bytes = (command.len() + 1) * 2;
-        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &name, REG_SZ.0, Some(command.as_ptr().cast()), bytes as u32);
+        let set = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &name, REG_SZ.0, Some(command.as_ptr().cast()), bytes as u32);
+        if let Err(e) = set {
+            crate::app::log(&format!("the run-at-startup entry could not be written: {e}"));
+        }
     }
 }
 

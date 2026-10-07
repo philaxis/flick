@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::{
-    core::{w, Result, PCWSTR},
+    core::{w, Error, Result, PCWSTR},
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
@@ -90,7 +90,7 @@ impl View {
 /// and its place.
 fn create_window() -> Result<HWND> {
     unsafe {
-        Ok(CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             WINDOW_CLASS,
             w!("Flick"),
@@ -103,7 +103,11 @@ fn create_window() -> Result<HWND> {
             None,
             GetModuleHandleW(None)?,
             None,
-        ))
+        );
+        if hwnd.0 == 0 {
+            return Err(Error::from_win32());
+        }
+        Ok(hwnd)
     }
 }
 
@@ -427,7 +431,10 @@ impl Minimap {
     pub fn spawn() -> Minimap {
         let (requests, inbox) = mpsc::channel::<Request>();
         std::thread::spawn(move || {
-            let Ok(mut overlay) = Overlay::new() else { return };
+            let mut overlay = match Overlay::new() {
+                Ok(overlay) => overlay,
+                Err(e) => return crate::app::log(&format!("minimap failed: {e}")),
+            };
             let apply = |overlay: &mut Overlay, request: Request| match request {
                 Request::Show(view, from) => overlay.show(view, from),
                 Request::Update(view) => overlay.update(view),

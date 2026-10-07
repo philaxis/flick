@@ -3,7 +3,7 @@
 
 use crate::grid::Grid;
 use serde::Deserialize;
-use std::{fs, path::PathBuf};
+use std::{fs, io, path::PathBuf};
 
 /// The app's display name. Also used for the install folder, the settings
 /// folder, the Start menu shortcut and the registry entries; the exe name in
@@ -111,7 +111,7 @@ pub fn load_config() -> (Config, Option<String>) {
 }
 
 /// Rewrites the `trigger` line of the config file, keeping everything else.
-pub fn set_trigger(value: &str) {
+pub fn set_trigger(value: &str) -> io::Result<()> {
     let path = config_path();
     let text = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
     let line = format!("trigger = \"{value}\"");
@@ -130,20 +130,22 @@ pub fn set_trigger(value: &str) {
     if !replaced {
         lines.insert(0, line);
     }
-    let _ = fs::create_dir_all(dir());
-    let _ = fs::write(path, lines.join("\n") + "\n");
+    fs::create_dir_all(dir())?;
+    fs::write(path, lines.join("\n") + "\n")
 }
 
-pub fn load_grid() -> Grid {
-    fs::read_to_string(state_path())
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_grid(grid: &Grid) {
-    let _ = fs::create_dir_all(dir());
-    if let Ok(text) = serde_json::to_string_pretty(grid) {
-        let _ = fs::write(state_path(), text);
+/// Loads the saved grid. Without a saved one, or with one that cannot be
+/// read (which is reported), the grid starts empty and is filled from the
+/// desktops that exist.
+pub fn load_grid() -> (Grid, Option<String>) {
+    let Ok(text) = fs::read_to_string(state_path()) else { return (Grid::default(), None) };
+    match serde_json::from_str(&text) {
+        Ok(grid) => (grid, None),
+        Err(e) => (Grid::default(), Some(e.to_string())),
     }
+}
+
+pub fn save_grid(grid: &Grid) -> io::Result<()> {
+    fs::create_dir_all(dir())?;
+    fs::write(state_path(), serde_json::to_string_pretty(grid)?)
 }

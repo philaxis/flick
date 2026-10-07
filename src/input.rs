@@ -371,8 +371,10 @@ fn listen_raw(on: bool) {
         dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
         hwndTarget: if on { window } else { HWND(0) },
     };
-    unsafe {
-        let _ = RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+    let registered = unsafe { RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
+    if let (true, Err(e)) = (on, registered) {
+        // Without it the held trigger sees no movement at all.
+        crate::app::log(&format!("raw mouse input could not be registered: {e}"));
     }
 }
 

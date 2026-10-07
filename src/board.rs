@@ -12,7 +12,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use windows::{
-    core::{w, Result},
+    core::{w, Error, Result},
     Foundation::Numerics::Matrix3x2,
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
@@ -377,6 +377,9 @@ impl Board {
                 instance,
                 None,
             );
+            if hwnd.0 == 0 {
+                return Err(Error::from_win32());
+            }
             Ok(Board {
                 hwnd,
                 factory: paint::d2d_factory()?,

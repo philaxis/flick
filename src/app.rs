@@ -153,10 +153,14 @@ impl App {
         events: mpsc::Receiver<(String, String)>,
         listener: Option<vdapi::DesktopEventThread>,
     ) -> App {
+        let (grid, error) = config::load_grid();
+        if let Some(error) = error {
+            log(&format!("state.json could not be read, starting from the desktops as they are: {error}"));
+        }
         App {
             hwnd,
             config: Config::default(),
-            grid: config::load_grid(),
+            grid,
             minimap: Minimap::spawn(),
             edge: None,
             board,
@@ -182,15 +186,21 @@ impl App {
     fn sync(&mut self) -> Option<Desktops> {
         let desktops = Desktops::read()?;
         if self.grid.sync(&desktops.ids(), &desktops.current) {
-            config::save_grid(&self.grid);
+            self.save();
         }
         Some(desktops)
+    }
+
+    fn save(&self) {
+        if let Err(e) = config::save_grid(&self.grid) {
+            log(&format!("saving the grid failed: {e}"));
+        }
     }
 
     /// Saves the grid and reorders Windows' own desktop list to match it
     /// (row after row), so Win+Ctrl+arrows and Task View agree with the grid.
     fn commit(&mut self) {
-        config::save_grid(&self.grid);
+        self.save();
         let Some(desktops) = Desktops::read() else { return };
         let wanted: Vec<&String> = self.grid.rows.iter().flat_map(|row| &row.cells).collect();
         let mut actual = desktops.ids();
@@ -223,12 +233,20 @@ impl App {
     }
 
     /// Switches to a desktop without Windows' own name label popping up.
-    fn switch(&self, target: vdapi::Desktop) -> vdapi::Result<()> {
+    /// Returns whether that worked.
+    fn switch(&self, target: vdapi::Desktop) -> bool {
         vd::set_switch_label_hidden(true);
         unsafe {
             SetTimer(self.hwnd, LABEL_TIMER_ID, LABEL_HIDE_MS, None);
         }
-        vdapi::switch_desktop(target)
+        vdapi::switch_desktop(target).map_err(|e| log(&format!("switch_desktop failed: {e:?}"))).is_ok()
+    }
+
+    /// Creates a desktop and returns its id. The caller places it in the
+    /// grid before the next `sync`, which would file a desktop it does not
+    /// know under the current row.
+    fn create_desktop(&self) -> Option<String> {
+        vdapi::create_desktop().map_err(|e| log(&format!("create_desktop failed: {e:?}"))).ok().map(|d| d.id())
     }
 
     /// What the minimap shows with the user on `current`.
@@ -311,7 +329,7 @@ impl App {
         if let Err(e) = result {
             log(&format!("pin change failed: {e:?}"));
         }
-        config::save_grid(&self.grid);
+        self.save();
         self.refresh_board();
     }
 
@@ -438,8 +456,7 @@ impl App {
             return;
         }
         self.edge = None;
-        let Ok(desktop) = vdapi::create_desktop() else { return log("create_desktop failed") };
-        let id = desktop.id();
+        let Some(id) = self.create_desktop() else { return };
         self.grid.insert_beside(from, dir, id.clone());
         self.grid.ephemeral.push(id.clone());
         self.commit();
@@ -458,8 +475,7 @@ impl App {
             && vdapi::is_window_on_current_desktop(window).unwrap_or(false)
             && vdapi::move_window_to_desktop(target, window).is_ok();
         self.bring_followers(desktops, to);
-        if let Err(e) = self.switch(target) {
-            log(&format!("switch_desktop failed: {e:?}"));
+        if !self.switch(target) {
             return;
         }
         self.visit(to);
@@ -473,7 +489,7 @@ impl App {
             vd::focus_top_window();
         }
         if !self.in_gesture {
-            config::save_grid(&self.grid);
+            self.save();
         }
         let view = self.view(to, None);
         self.minimap.show(view, Some(from));
@@ -485,7 +501,7 @@ impl App {
             if std::mem::take(&mut self.unsettled) {
                 vd::focus_top_window();
             }
-            config::save_grid(&self.grid);
+            self.save();
         }
     }
 
@@ -497,16 +513,17 @@ impl App {
         if self.grid.ephemeral.iter().any(|id| id == old) {
             // A cell created by an edge push is kept only if it got a window.
             match (desktops.get(old), desktops.get(new)) {
-                (Some(left), Some(fallback)) if vd::count_on(left) == 0 => {
-                    if vdapi::remove_desktop(left, fallback).is_ok() {
+                (Some(left), Some(fallback)) if vd::count_on(left) == 0 => match vdapi::remove_desktop(left, fallback) {
+                    Ok(()) => {
                         self.grid.remove(old);
                         self.commit();
                     }
-                }
+                    Err(e) => log(&format!("remove_desktop failed: {e:?}")),
+                },
                 _ => self.grid.ephemeral.retain(|id| id != old),
             }
         }
-        config::save_grid(&self.grid);
+        self.save();
         let view = self.view(&desktops.current, None);
         self.minimap.update(view);
         self.refresh_board();
@@ -647,8 +664,8 @@ impl App {
         if !id.is_empty() && id != desktops.current {
             let Some(target) = desktops.get(id) else { return };
             self.bring_followers(&desktops, id);
-            if let Err(e) = self.switch(target) {
-                return log(&format!("switch_desktop failed: {e:?}"));
+            if !self.switch(target) {
+                return;
             }
             self.visit(id);
         }
@@ -661,7 +678,7 @@ impl App {
             },
             _ => vd::focus_top_window(),
         }
-        config::save_grid(&self.grid);
+        self.save();
     }
 
     fn move_window(&mut self, window: HWND, cell: Option<String>, monitor: Option<RECT>) {
@@ -679,11 +696,8 @@ impl App {
         }
     }
 
-    // New desktops are placed in the grid here, before the next sync, which
-    // would file a desktop it does not know under the current row.
-
     fn add_cell(&mut self, row: usize, front: bool) {
-        if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
+        if let Some(id) = self.create_desktop() {
             if let Some(row) = self.grid.rows.get_mut(row) {
                 row.cells.insert(if front { 0 } else { row.cells.len() }, id);
             }
@@ -691,7 +705,7 @@ impl App {
     }
 
     fn add_row(&mut self, top: bool) {
-        if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
+        if let Some(id) = self.create_desktop() {
             let at = if top { 0 } else { self.grid.rows.len() };
             self.grid.rows.insert(at, Row::with_cell(id));
         }
@@ -716,7 +730,7 @@ impl App {
         };
         let (Some(desktop), Some(target)) = (desktops.get(id), desktops.get(&fallback)) else { return };
         if is_current {
-            if self.switch(target).is_err() {
+            if !self.switch(target) {
                 return;
             }
             self.visit(&fallback);
@@ -752,7 +766,7 @@ impl App {
         // Leave the workspace first if we are standing in it.
         if let Some((_, to)) = targets.iter().find(|(id, _)| *id == desktops.current) {
             let Some(target) = desktops.get(to) else { return };
-            if self.switch(target).is_err() {
+            if !self.switch(target) {
                 return;
             }
             self.visit(to);
@@ -812,7 +826,9 @@ impl App {
     fn trigger_chosen(&mut self) {
         self.end_trigger_prompt();
         let Some(value) = input::take_captured() else { return };
-        config::set_trigger(&value);
+        if let Err(e) = config::set_trigger(&value) {
+            log(&format!("writing the trigger to config.toml failed: {e}"));
+        }
         self.apply_config();
         let (triggers, _) = Trigger::parse_list(&value);
         let name = triggers.first().map(Trigger::describe).unwrap_or(value);
@@ -1070,6 +1086,9 @@ fn init() -> windows::core::Result<HWND> {
         // Never shown; it only receives messages.
         let hwnd =
             CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("Flick"), WS_OVERLAPPED, 0, 0, 0, 0, None, None, instance, None);
+        if hwnd.0 == 0 {
+            return Err(windows::core::Error::from_win32());
+        }
         Ok(hwnd)
     }
 }
