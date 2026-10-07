@@ -7,7 +7,7 @@ use crate::{
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_RELEASE, WM_STEP},
     overlay::{Minimap, Overlay, View},
-    tray::{self, Command, PinCommand, PinState},
+    tray::{self, Command, PinCommand, PinState, RowCommand},
     vd::{self, Desktops},
     vdapi,
 };
@@ -20,7 +20,7 @@ use std::{
 use windows::{
     core::{w, HSTRING, PCWSTR},
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::{
             Com::{CoInitializeEx, COINIT_MULTITHREADED},
             LibraryLoader::GetModuleHandleW,
@@ -99,6 +99,7 @@ struct App {
     /// (old id, new id) of each change of the current desktop, from `listen`.
     events: mpsc::Receiver<(String, String)>,
     _listener: Option<vdapi::DesktopEventThread>,
+    /// The message Explorer broadcasts when the taskbar is (re)created.
     taskbar_created: u32,
 }
 
@@ -133,35 +134,57 @@ pub fn warn(text: &str) {
     }
 }
 
+fn window_model(follows: bool, window: vd::WindowInfo) -> WindowModel {
+    WindowModel {
+        follows,
+        app: vd::exe_name(window.pid).unwrap_or_default(),
+        app_name: vd::app_label(window.pid),
+        hwnd: window.hwnd,
+        rect: window.rect,
+        minimized: window.minimized,
+        title: window.title,
+    }
+}
+
 impl App {
-    fn view(&self, current: &str, pushing: Option<Dir>) -> View {
-        View {
-            rows: self
-                .grid
-                .rows
-                .iter()
-                .map(|row| row.cells.iter().map(|id| self.grid.ephemeral.contains(id)).collect())
-                .collect(),
-            anchors: self.grid.rows.iter().map(Row::anchor).collect(),
-            cur: self.grid.find(current),
-            pushing,
-            title: self
-                .grid
-                .find(current)
-                .map_or(String::new(), |pos| grid::row_title(&self.grid.rows[pos.row].name, pos.row)),
+    fn new(
+        hwnd: HWND,
+        board: Board,
+        events: mpsc::Receiver<(String, String)>,
+        listener: Option<vdapi::DesktopEventThread>,
+    ) -> App {
+        App {
+            hwnd,
+            config: Config::default(),
+            grid: config::load_grid(),
+            minimap: Minimap::spawn(),
+            edge: None,
+            board,
+            focus_before_board: HWND(0),
+            trigger_prompt: HWND(0),
+            in_gesture: false,
+            unsettled: false,
+            following: HashSet::new(),
+            pending_menu: None,
+            pending_row_menu: None,
+            seen: HashMap::new(),
+            asleep: HashSet::new(),
+            started: Instant::now(),
+            events,
+            _listener: listener,
+            taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         }
     }
 
-    /// Records that `id` is being shown: per-row memory, idle clock, and its
-    /// row is awake again.
-    fn visit(&mut self, id: &str) {
-        self.grid.visit(id);
-        self.seen.insert(id.to_owned(), Instant::now());
-        if let Some(pos) = self.grid.find(id) {
-            for cell in &self.grid.rows[pos.row].cells {
-                self.asleep.remove(cell);
-            }
+    // ---- the grid and the desktops ------------------------------------------
+
+    /// Reads the real desktops and brings the grid in line with them.
+    fn sync(&mut self) -> Option<Desktops> {
+        let desktops = Desktops::read()?;
+        if self.grid.sync(&desktops.ids(), &desktops.current) {
+            config::save_grid(&self.grid);
         }
+        Some(desktops)
     }
 
     /// Saves the grid and reorders Windows' own desktop list to match it
@@ -187,10 +210,16 @@ impl App {
         }
     }
 
-    fn follows(&self, window: &vd::WindowInfo) -> bool {
-        self.following.contains(&window.hwnd.0)
-            || (!self.grid.follow_apps.is_empty()
-                && vd::exe_name(window.pid).is_some_and(|exe| self.grid.follow_apps.contains(&exe)))
+    /// Records that `id` is being shown: per-row memory, idle clock, and its
+    /// row is awake again.
+    fn visit(&mut self, id: &str) {
+        self.grid.visit(id);
+        self.seen.insert(id.to_owned(), Instant::now());
+        if let Some(pos) = self.grid.find(id) {
+            for cell in &self.grid.rows[pos.row].cells {
+                self.asleep.remove(cell);
+            }
+        }
     }
 
     /// Switches to a desktop without Windows' own name label popping up.
@@ -200,6 +229,31 @@ impl App {
             SetTimer(self.hwnd, LABEL_TIMER_ID, LABEL_HIDE_MS, None);
         }
         vdapi::switch_desktop(target)
+    }
+
+    /// What the minimap shows with the user on `current`.
+    fn view(&self, current: &str, pushing: Option<Dir>) -> View {
+        let cur = self.grid.find(current);
+        View {
+            rows: self
+                .grid
+                .rows
+                .iter()
+                .map(|row| row.cells.iter().map(|id| self.grid.ephemeral.contains(id)).collect())
+                .collect(),
+            anchors: self.grid.rows.iter().map(Row::anchor).collect(),
+            cur,
+            pushing,
+            title: cur.map_or(String::new(), |pos| grid::row_title(&self.grid.rows[pos.row].name, pos.row)),
+        }
+    }
+
+    // ---- windows that follow --------------------------------------------------
+
+    fn follows(&self, window: &vd::WindowInfo) -> bool {
+        self.following.contains(&window.hwnd.0)
+            || (!self.grid.follow_apps.is_empty()
+                && vd::exe_name(window.pid).is_some_and(|exe| self.grid.follow_apps.contains(&exe)))
     }
 
     /// Brings the windows that follow within a row over to cell `to` from the
@@ -229,6 +283,7 @@ impl App {
         }
     }
 
+    /// Toggles one kind of pinning, as picked from the pin menu.
     fn apply_pin(&mut self, hwnd: HWND, command: PinCommand) {
         let state = self.pin_state(hwnd);
         let result = match command {
@@ -259,6 +314,34 @@ impl App {
         config::save_grid(&self.grid);
         self.refresh_board();
     }
+
+    /// Sets how one window is pinned, as cycled through on its tile: within
+    /// its row, on every desktop, or neither.
+    fn set_pin(&mut self, window: HWND, row: bool, all: bool) {
+        if row {
+            self.following.insert(window.0);
+        } else {
+            self.following.remove(&window.0);
+        }
+        let result = if all {
+            vdapi::pin_window(window)
+        } else {
+            // Being shown everywhere can also come from its app being pinned.
+            if vdapi::is_pinned_app(window).unwrap_or(false) {
+                let _ = vdapi::unpin_app(window);
+            }
+            if vdapi::is_pinned_window(window).unwrap_or(false) {
+                vdapi::unpin_window(window)
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(e) = result {
+            log(&format!("pin change failed: {e:?}"));
+        }
+    }
+
+    // ---- sleeping rows --------------------------------------------------------
 
     /// Pushes the memory of rows nobody visited for a while out of RAM.
     fn sleep_idle_rows(&mut self) {
@@ -303,14 +386,7 @@ impl App {
         }
     }
 
-    /// Reads the real desktops and brings the grid in line with them.
-    fn sync(&mut self) -> Option<Desktops> {
-        let desktops = Desktops::read()?;
-        if self.grid.sync(&desktops.ids(), &desktops.current) {
-            config::save_grid(&self.grid);
-        }
-        Some(desktops)
-    }
+    // ---- moving about ---------------------------------------------------------
 
     fn carry_held(&self) -> bool {
         let key = match self.config.carry_modifier.trim().to_ascii_lowercase().as_str() {
@@ -321,8 +397,7 @@ impl App {
         unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
     }
 
-    /// Moves one cell in `dir`, creating a cell when the edge has been pushed
-    /// often enough. With `carry` the foreground window comes along.
+    /// Moves one cell in `dir`. With `carry` the foreground window comes along.
     fn step(&mut self, dir: Dir, carry: bool) {
         if self.board.is_open() {
             // With the board open the gesture only moves the selection; the
@@ -331,15 +406,21 @@ impl App {
             return;
         }
         let Some(desktops) = self.sync() else { return };
-        let current = desktops.current.clone();
-        let Some(from) = self.grid.find(&current) else { return };
-
-        if let Some(to) = self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
-            self.edge = None;
-            self.go(&desktops, from, &to, carry);
-            return;
+        let Some(from) = self.grid.find(&desktops.current) else { return };
+        match self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
+            Some(to) => {
+                self.edge = None;
+                self.go(&desktops, from, &to, carry);
+            }
+            None => self.push_edge(&desktops, from, dir, carry),
         }
+    }
 
+    /// A step against the edge of the grid. It only shows the minimap, unless
+    /// `edge_create_pushes` is set and the edge has now been pushed that
+    /// often: then a cell is created there and gone to.
+    fn push_edge(&mut self, desktops: &Desktops, from: Pos, dir: Dir, carry: bool) {
+        let current = desktops.current.clone();
         let pushes = match self.edge {
             Some((d, n)) if d == dir => n + 1,
             _ => 1,
@@ -350,28 +431,25 @@ impl App {
             && desktops.get(&current).is_some_and(|d| vd::count_on(d) == 0)
             && !carry;
         let may_create = self.config.edge_create_pushes > 0 && !on_empty_fresh;
-        if may_create && pushes >= self.config.edge_create_pushes {
-            self.edge = None;
-            match vdapi::create_desktop() {
-                Ok(desktop) => {
-                    let id = desktop.id();
-                    self.grid.insert_beside(from, dir, id.clone());
-                    self.grid.ephemeral.push(id.clone());
-                    self.commit();
-                    let Some(desktops) = Desktops::read() else { return };
-                    // Inserting to the left or above shifts the cell we came from.
-                    let from = self.grid.find(&current).unwrap_or(from);
-                    self.go(&desktops, from, &id, carry);
-                }
-                Err(_) => log("create_desktop failed"),
-            }
-        } else {
+        if !may_create || pushes < self.config.edge_create_pushes {
             self.edge = Some((dir, pushes));
             let view = self.view(&current, may_create.then_some(dir));
             self.minimap.show(view, None);
+            return;
         }
+        self.edge = None;
+        let Ok(desktop) = vdapi::create_desktop() else { return log("create_desktop failed") };
+        let id = desktop.id();
+        self.grid.insert_beside(from, dir, id.clone());
+        self.grid.ephemeral.push(id.clone());
+        self.commit();
+        let Some(desktops) = Desktops::read() else { return };
+        // Inserting to the left or above shifts the cell we came from.
+        let from = self.grid.find(&current).unwrap_or(from);
+        self.go(&desktops, from, &id, carry);
     }
 
+    /// Switches from the cell at `from` to cell `to` and shows the minimap.
     fn go(&mut self, desktops: &Desktops, from: Pos, to: &str, carry: bool) {
         let Some(target) = desktops.get(to) else { return };
         let window = unsafe { GetForegroundWindow() };
@@ -411,6 +489,31 @@ impl App {
         }
     }
 
+    /// The current desktop changed, by us or by Windows' own shortcuts.
+    fn desktop_changed(&mut self, old: &str, new: &str) {
+        let Some(desktops) = self.sync() else { return };
+        self.visit(new);
+        self.bring_followers(&desktops, new);
+        if self.grid.ephemeral.iter().any(|id| id == old) {
+            // A cell created by an edge push is kept only if it got a window.
+            match (desktops.get(old), desktops.get(new)) {
+                (Some(left), Some(fallback)) if vd::count_on(left) == 0 => {
+                    if vdapi::remove_desktop(left, fallback).is_ok() {
+                        self.grid.remove(old);
+                        self.commit();
+                    }
+                }
+                _ => self.grid.ephemeral.retain(|id| id != old),
+            }
+        }
+        config::save_grid(&self.grid);
+        let view = self.view(&desktops.current, None);
+        self.minimap.update(view);
+        self.refresh_board();
+    }
+
+    // ---- the board ------------------------------------------------------------
+
     fn model(&self, desktops: &Desktops) -> Model {
         let mut windows = vd::windows(&desktops.current);
         let parents = vd::process_parents();
@@ -427,10 +530,7 @@ impl App {
                         let (here, rest): (Vec<_>, Vec<_>) = windows.drain(..).partition(|w| w.desktop == *id);
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
-                        let windows = here
-                            .into_iter()
-                            .map(|w| WindowModel { follows: self.follows(&w), app: vd::exe_name(w.pid).unwrap_or_default(), app_name: vd::app_label(w.pid), hwnd: w.hwnd, rect: w.rect, minimized: w.minimized, title: w.title })
-                            .collect();
+                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
                         CellModel { id: id.clone(), windows }
                     })
                     .collect();
@@ -442,10 +542,7 @@ impl App {
                 }
             })
             .collect();
-        let pinned = vd::pinned_windows()
-            .into_iter()
-            .map(|w| WindowModel { follows: false, app: vd::exe_name(w.pid).unwrap_or_default(), app_name: vd::app_label(w.pid), hwnd: w.hwnd, rect: w.rect, minimized: w.minimized, title: w.title })
-            .collect();
+        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, w)).collect();
         Model { rows, pinned, current: desktops.current.clone() }
     }
 
@@ -468,6 +565,14 @@ impl App {
         }
     }
 
+    /// Refreshes the board once windows asked to close have had a moment to
+    /// go (or to ask about saving).
+    fn refresh_board_in(&self, ms: u32) {
+        unsafe {
+            SetTimer(self.hwnd, REFRESH_TIMER_ID, ms, None);
+        }
+    }
+
     /// A click of the trigger opens the board; the next one goes to the
     /// selected cell.
     fn toggle_board(&mut self) {
@@ -479,104 +584,43 @@ impl App {
         }
     }
 
+    fn board_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        let started = Instant::now();
+        let action = self.board.handle(message, wparam, lparam)?;
+        let handled = started.elapsed();
+        self.perform(action);
+        // Kept as a diagnostic: anything this slow is felt as a hitch.
+        if started.elapsed() > Duration::from_millis(250) {
+            log(&format!("slow board message {message:#x}: handle {handled:?}, total {:?}", started.elapsed()));
+        }
+        Some(LRESULT(0))
+    }
+
+    /// Carries out what the user asked for in the board.
     fn perform(&mut self, action: Action) {
         match action {
+            // These leave the grid and the windows as they are.
             Action::None => return,
             Action::Dismiss => return self.board.close(),
-            Action::Cancel => {
-                self.board.close();
-                if unsafe { IsWindow(self.focus_before_board) }.as_bool() {
-                    vd::force_foreground(self.focus_before_board);
-                }
-                return;
-            }
-            Action::Go(id, window) => {
-                self.board.close();
-                let Some(desktops) = self.sync() else { return };
-                // An empty id is a window pinned everywhere: stay on this desktop.
-                if !id.is_empty() && id != desktops.current {
-                    let Some(target) = desktops.get(&id) else { return };
-                    self.bring_followers(&desktops, &id);
-                    if let Err(e) = self.switch(target) {
-                        return log(&format!("switch_desktop failed: {e:?}"));
-                    }
-                    self.visit(&id);
-                }
-                match window {
-                    Some(hwnd) if unsafe { IsWindow(hwnd) }.as_bool() => unsafe {
-                        if IsIconic(hwnd).as_bool() {
-                            ShowWindow(hwnd, SW_RESTORE);
-                        }
-                        vd::force_foreground(hwnd);
-                    },
-                    _ => vd::focus_top_window(),
-                }
-                config::save_grid(&self.grid);
-                return;
-            }
-            Action::MoveWindow { window, cell, monitor } => {
-                if let Some(id) = cell {
-                    if let Some(target) = Desktops::read().and_then(|d| d.get(&id)) {
-                        if let Err(e) = vdapi::move_window_to_desktop(target, window) {
-                            log(&format!("move_window_to_desktop failed: {e:?}"));
-                        }
-                        self.grid.ephemeral.retain(|cell| *cell != id);
-                    }
-                }
-                if let Some(monitor) = monitor {
-                    vd::move_to_monitor(window, monitor);
-                }
-            }
-            Action::MoveCell { id, row, index } => self.grid.move_cell(&id, row, index),
-            Action::MoveCellToNewRow { id, at } => self.grid.move_cell_to_new_row(&id, at),
-            Action::AddCell { row, front } => {
-                // Placed in the grid before the next sync, which would otherwise
-                // file the unknown desktop under the current row.
-                if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
-                    if let Some(row) = self.grid.rows.get_mut(row) {
-                        row.cells.insert(if front { 0 } else { row.cells.len() }, id);
-                    }
-                }
-            }
-            Action::AddRow { top } => {
-                if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
-                    let at = if top { 0 } else { self.grid.rows.len() };
-                    self.grid.rows.insert(at, Row::with_cell(id));
-                }
-            }
-            Action::RemoveCell(id) => self.remove_cell(&id),
-            Action::SetPin { window, row, all } => {
-                if row {
-                    self.following.insert(window.0);
-                } else {
-                    self.following.remove(&window.0);
-                }
-                let result = if all {
-                    vdapi::pin_window(window)
-                } else {
-                    // Being shown everywhere can also come from its app being pinned.
-                    if vdapi::is_pinned_app(window).unwrap_or(false) {
-                        let _ = vdapi::unpin_app(window);
-                    }
-                    if vdapi::is_pinned_window(window).unwrap_or(false) { vdapi::unpin_window(window) } else { Ok(()) }
-                };
-                if let Err(e) = result {
-                    log(&format!("pin change failed: {e:?}"));
-                }
-            }
+            Action::Cancel => return self.cancel_board(),
+            Action::Go(id, window) => return self.leave_board(&id, window),
             Action::CloseWindow(hwnd) => {
                 vd::ask_to_close(hwnd);
-                // The window needs a moment to go (or to ask about saving).
-                unsafe {
-                    SetTimer(self.hwnd, REFRESH_TIMER_ID, 500, None);
-                }
-                return;
+                return self.refresh_board_in(500);
             }
             Action::RowMenu(row) => {
-                // Shown once this handler has returned (`run_pending_menu`).
+                // Shown once this handler has returned (`run_pending_menus`).
                 self.pending_row_menu = Some(row);
                 return;
             }
+
+            Action::MoveWindow { window, cell, monitor } => self.move_window(window, cell, monitor),
+            Action::MoveCell { id, row, index } => self.grid.move_cell(&id, row, index),
+            Action::MoveCellToNewRow { id, at } => self.grid.move_cell_to_new_row(&id, at),
+            Action::AddCell { row, front } => self.add_cell(row, front),
+            Action::AddRow { top } => self.add_row(top),
+            Action::RemoveCell(id) => self.remove_cell(&id),
+            Action::SetPin { window, row, all } => self.set_pin(window, row, all),
             Action::Rename(row, name) => {
                 if let Some(row) = self.grid.rows.get_mut(row) {
                     row.name = name;
@@ -587,6 +631,102 @@ impl App {
         self.refresh_board();
     }
 
+    /// Closes the board and gives focus back to where it was.
+    fn cancel_board(&mut self) {
+        self.board.close();
+        if unsafe { IsWindow(self.focus_before_board) }.as_bool() {
+            vd::force_foreground(self.focus_before_board);
+        }
+    }
+
+    /// Closes the board and goes to cell `id`, focusing `window` if given.
+    /// An empty id stands for a window shown on every desktop: stay here.
+    fn leave_board(&mut self, id: &str, window: Option<HWND>) {
+        self.board.close();
+        let Some(desktops) = self.sync() else { return };
+        if !id.is_empty() && id != desktops.current {
+            let Some(target) = desktops.get(id) else { return };
+            self.bring_followers(&desktops, id);
+            if let Err(e) = self.switch(target) {
+                return log(&format!("switch_desktop failed: {e:?}"));
+            }
+            self.visit(id);
+        }
+        match window {
+            Some(hwnd) if unsafe { IsWindow(hwnd) }.as_bool() => unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                vd::force_foreground(hwnd);
+            },
+            _ => vd::focus_top_window(),
+        }
+        config::save_grid(&self.grid);
+    }
+
+    fn move_window(&mut self, window: HWND, cell: Option<String>, monitor: Option<RECT>) {
+        if let Some(id) = cell {
+            if let Some(target) = Desktops::read().and_then(|d| d.get(&id)) {
+                if let Err(e) = vdapi::move_window_to_desktop(target, window) {
+                    log(&format!("move_window_to_desktop failed: {e:?}"));
+                }
+                // The cell has held a window now, so it stays.
+                self.grid.ephemeral.retain(|cell| *cell != id);
+            }
+        }
+        if let Some(monitor) = monitor {
+            vd::move_to_monitor(window, monitor);
+        }
+    }
+
+    // New desktops are placed in the grid here, before the next sync, which
+    // would file a desktop it does not know under the current row.
+
+    fn add_cell(&mut self, row: usize, front: bool) {
+        if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
+            if let Some(row) = self.grid.rows.get_mut(row) {
+                row.cells.insert(if front { 0 } else { row.cells.len() }, id);
+            }
+        }
+    }
+
+    fn add_row(&mut self, top: bool) {
+        if let Ok(id) = vdapi::create_desktop().map(|d| d.id()) {
+            let at = if top { 0 } else { self.grid.rows.len() };
+            self.grid.rows.insert(at, Row::with_cell(id));
+        }
+    }
+
+    /// Deletes a desktop, moving its windows to a cell that stays: the left
+    /// (else the right) neighbour in its row when there is one, else the
+    /// current cell, else the landing cell of the row above or below.
+    fn remove_cell(&mut self, id: &str) {
+        let Some(desktops) = self.sync() else { return };
+        let Some(pos) = self.grid.find(id) else { return };
+        let is_current = desktops.current == id;
+        let neighbours: Vec<&String> = self.grid.rows[pos.row].cells.iter().filter(|c| *c != id).collect();
+        let fallback = if !neighbours.is_empty() {
+            neighbours[pos.col.saturating_sub(1).min(neighbours.len() - 1)].clone()
+        } else if !is_current {
+            desktops.current.clone()
+        } else {
+            let other = if pos.row > 0 { pos.row - 1 } else { pos.row + 1 };
+            let Some(row) = self.grid.rows.get(other) else { return };
+            row.cells[row.anchor()].clone()
+        };
+        let (Some(desktop), Some(target)) = (desktops.get(id), desktops.get(&fallback)) else { return };
+        if is_current {
+            if self.switch(target).is_err() {
+                return;
+            }
+            self.visit(&fallback);
+        }
+        match vdapi::remove_desktop(desktop, target) {
+            Ok(()) => self.grid.remove(id),
+            Err(e) => log(&format!("remove_desktop failed: {e:?}")),
+        }
+    }
+
     /// Asks every window of a workspace to close; the workspace stays.
     fn close_row_windows(&mut self, row: usize) {
         let Some(desktops) = self.sync() else { return };
@@ -594,9 +734,7 @@ impl App {
         for window in vd::windows(&desktops.current).iter().filter(|w| ids.contains(&w.desktop)) {
             vd::ask_to_close(window.hwnd);
         }
-        unsafe {
-            SetTimer(self.hwnd, REFRESH_TIMER_ID, 600, None);
-        }
+        self.refresh_board_in(600);
     }
 
     /// Removes a workspace. Each of its desktops hands its windows to the
@@ -617,8 +755,7 @@ impl App {
             if self.switch(target).is_err() {
                 return;
             }
-            let to = to.clone();
-            self.visit(&to);
+            self.visit(to);
         }
         for (id, to) in targets {
             if let (Some(desktop), Some(target)) = (desktops.get(&id), desktops.get(&to)) {
@@ -632,84 +769,22 @@ impl App {
         self.refresh_board();
     }
 
-    /// Deletes a desktop, moving its windows to a cell that stays: the left
-    /// (else the right) neighbour in its row when there is one, else the
-    /// current cell, else the landing cell of the row above or below.
-    fn remove_cell(&mut self, id: &str) {
-        let Some(desktops) = self.sync() else { return };
-        let Some(pos) = self.grid.find(id) else { return };
-        let is_current = desktops.current == id;
-        let neighbours: Vec<&String> = self.grid.rows[pos.row].cells.iter().filter(|c| *c != id).collect();
-        let fallback = if !neighbours.is_empty() {
-            neighbours[pos.col.saturating_sub(1).min(neighbours.len() - 1)].clone()
-        } else if !is_current {
-            desktops.current.clone()
-        } else {
-            let other = if pos.row > 0 { pos.row - 1 } else { pos.row + 1 };
-            let Some(row) = self.grid.rows.get(other) else { return };
-            row.last.clone().filter(|id| row.cells.contains(id)).unwrap_or_else(|| row.cells[0].clone())
-        };
-        let (Some(desktop), Some(target)) = (desktops.get(id), desktops.get(&fallback)) else { return };
-        if is_current {
-            if self.switch(target).is_err() {
-                return;
-            }
-            self.visit(&fallback);
-        }
-        match vdapi::remove_desktop(desktop, target) {
-            Ok(()) => self.grid.remove(id),
-            Err(e) => log(&format!("remove_desktop failed: {e:?}")),
-        }
-    }
-
-    fn board_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
-        let started = Instant::now();
-        let action = self.board.handle(message, wparam, lparam)?;
-        let handled = started.elapsed();
-        self.perform(action);
-        // Kept as a diagnostic: anything this slow is felt as a hitch.
-        if started.elapsed() > Duration::from_millis(250) {
-            log(&format!("slow board message {message:#x}: handle {handled:?}, total {:?}", started.elapsed()));
-        }
-        Some(LRESULT(0))
-    }
-
-    /// The current desktop changed, by us or by Windows' own shortcuts.
-    fn desktop_changed(&mut self, old: &str, new: &str) {
-        let Some(desktops) = self.sync() else { return };
-        self.visit(new);
-        // Also covers switches made with Windows' own shortcuts.
-        self.bring_followers(&desktops, new);
-        if self.grid.ephemeral.iter().any(|id| id == old) {
-            // A cell created by an edge push is kept only if it got a window.
-            match (desktops.get(old), desktops.get(new)) {
-                (Some(left), Some(fallback)) if vd::count_on(left) == 0 => {
-                    if vdapi::remove_desktop(left, fallback).is_ok() {
-                        self.grid.remove(old);
-                        self.commit();
-                    }
-                }
-                _ => self.grid.ephemeral.retain(|id| id != old),
-            }
-        }
-        config::save_grid(&self.grid);
-        let view = self.view(&desktops.current, None);
-        self.minimap.update(view);
-        self.refresh_board();
-    }
+    // ---- settings -------------------------------------------------------------
 
     /// Asks for a new trigger: a small prompt stays up until a button or key
     /// combination is pressed (or Esc).
     fn begin_trigger_change(&mut self) {
+        /// The static control's style for centred text.
+        const SS_CENTER: WINDOW_STYLE = WINDOW_STYLE(1);
         self.end_trigger_prompt();
         unsafe {
             let (w, h) = (560, 96);
             let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            let prompt = CreateWindowExW(
+            self.trigger_prompt = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 w!("STATIC"),
                 w!("\n새 트리거로 쓸 마우스 버튼이나 키를 누르세요.\n키는 여러 개를 함께 눌러도 됩니다.   Esc: 취소"),
-                WS_POPUP | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(1), // SS_CENTER
+                WS_POPUP | WS_VISIBLE | WS_BORDER | SS_CENTER,
                 (sw - w) / 2,
                 (sh - h) / 3,
                 w,
@@ -719,7 +794,6 @@ impl App {
                 None,
                 None,
             );
-            self.trigger_prompt = prompt;
         }
         input::begin_capture();
     }
@@ -745,7 +819,7 @@ impl App {
         tray::notify(self.hwnd, "트리거를 바꿨습니다", &format!("이제 {name}: 누른 채 밀면 칸 이동, 눌렀다 떼면 전체 보기."));
     }
 
-    /// Applies the config file: hooks and hotkeys.
+    /// Applies the config file: hooks, hotkeys and the sleep timer.
     fn apply_config(&mut self) {
         let (config, error) = config::load_config();
         if let Some(error) = error {
@@ -759,28 +833,37 @@ impl App {
             triggers.push(Trigger::XButton2);
         }
         input::install(self.hwnd, triggers, config.step_x, config.step_y, config.vertical_sticky);
-
+        self.register_hotkeys(config.hotkeys);
         unsafe {
-            for id in 0..=PIN_HOTKEY_ID {
-                let _ = UnregisterHotKey(self.hwnd, id);
-            }
             let _ = KillTimer(self.hwnd, SLEEP_TIMER_ID);
             if config.sleep_after_minutes > 0 {
                 SetTimer(self.hwnd, SLEEP_TIMER_ID, 60_000, None);
             }
-            if config.hotkeys {
-                let base = MOD_CONTROL | MOD_ALT | MOD_WIN;
-                let _ = RegisterHotKey(self.hwnd, PIN_HOTKEY_ID, HOT_KEY_MODIFIERS(base.0), 'P' as u32);
-                for (i, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
-                    for (carry, mods) in [(0, base), (4, base | MOD_SHIFT)] {
-                        if RegisterHotKey(self.hwnd, i as i32 + carry, HOT_KEY_MODIFIERS(mods.0), key.0 as u32).is_err() {
-                            log(&format!("hotkey {} could not be registered", i as i32 + carry));
-                        }
+        }
+        self.config = config;
+    }
+
+    /// Ctrl+Alt+Win with an arrow moves, with Shift added it carries the
+    /// active window along, and with P it opens the pin menu.
+    fn register_hotkeys(&self, enabled: bool) {
+        unsafe {
+            for id in 0..=PIN_HOTKEY_ID {
+                let _ = UnregisterHotKey(self.hwnd, id);
+            }
+            if !enabled {
+                return;
+            }
+            let base = MOD_CONTROL | MOD_ALT | MOD_WIN;
+            let _ = RegisterHotKey(self.hwnd, PIN_HOTKEY_ID, HOT_KEY_MODIFIERS(base.0), 'P' as u32);
+            for (i, key) in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN].into_iter().enumerate() {
+                for (carry, mods) in [(0, base), (4, base | MOD_SHIFT)] {
+                    let id = i as i32 + carry;
+                    if RegisterHotKey(self.hwnd, id, HOT_KEY_MODIFIERS(mods.0), key.0 as u32).is_err() {
+                        log(&format!("hotkey {id} could not be registered"));
                     }
                 }
             }
         }
-        self.config = config;
     }
 }
 
@@ -806,10 +889,11 @@ fn on_tray_command(hwnd: HWND, command: Command) {
     }
 }
 
+/// The window procedure of both the app's hidden message window and the board.
 unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if hwnd.0 == BOARD_HWND.get() {
         let handled = with_app(|app| app.board_message(message, wparam, lparam)).flatten();
-        run_pending_menu(hwnd);
+        run_pending_menus(hwnd);
         return handled.unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam));
     }
     match message {
@@ -824,12 +908,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_CLICK => {
             with_app(App::toggle_board);
         }
-        WM_CHANGE_TRIGGER => {
-            with_app(App::begin_trigger_change);
-        }
-        WM_CAPTURED => {
-            with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.end_trigger_prompt() });
-        }
         WM_RELEASE => {
             with_app(|app| {
                 app.edge = None;
@@ -837,12 +915,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });
         }
+        WM_CHANGE_TRIGGER => {
+            with_app(App::begin_trigger_change);
+        }
+        WM_CAPTURED => {
+            with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.end_trigger_prompt() });
+        }
         WM_HOTKEY if wparam.0 as i32 == PIN_HOTKEY_ID => {
             let window = GetForegroundWindow();
             if vd::is_app_window(window) {
                 with_app(|app| app.pending_menu = Some((window, app.pin_state(window))));
+                // The menu needs its owner in the foreground to close on a
+                // click elsewhere.
                 vd::force_foreground(hwnd);
-                run_pending_menu(hwnd);
+                run_pending_menus(hwnd);
                 vd::force_foreground(window);
             }
         }
@@ -900,43 +986,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     LRESULT(0)
 }
 
-/// Shows the workspace menu or the pin menu a handler asked for. It runs after
-/// the handler returned because a menu pumps messages, which must be able to
-/// reach the app.
-fn run_pending_menu(owner: HWND) {
-    let row = with_app(|app| {
+/// Shows the menus a handler asked for. They run after the handler returned
+/// because a menu pumps messages, which must be able to reach the app.
+fn run_pending_menus(owner: HWND) {
+    run_row_menu(owner);
+    if let Some((window, state)) = with_app(|app| app.pending_menu.take()).flatten() {
+        if let Some(command) = tray::pin_menu(owner, state) {
+            with_app(|app| app.apply_pin(window, command));
+        }
+    }
+}
+
+/// The menu of a workspace in the board, if one was asked for.
+fn run_row_menu(owner: HWND) {
+    let pending = with_app(|app| {
         let row = app.pending_row_menu.take()?;
         let (name, summary) = app.board.row_summary(row)?;
         Some((row, format!("{name}: {summary}"), app.grid.rows.len() > 1))
     })
     .flatten();
-    if let Some((row, summary, removable)) = row {
-        match tray::row_menu(owner, &summary, removable) {
-            Some(tray::RowCommand::CloseWindows) => {
-                // Closing windows can lose work, so it is asked about in earnest,
-                // with "No" as the default answer.
-                let text = format!(
-                    "{summary}\n\n이 워크스페이스의 창을 전부 닫습니다.\n저장하지 않은 작업은 잃을 수 있고, 되돌릴 수 없습니다.\n\n정말 닫을까요?"
-                );
-                with_app(|app| app.board.set_modal(true));
-                let answer = unsafe {
-                    MessageBoxW(owner, &HSTRING::from(text), w!("창을 모두 닫습니다"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
-                };
-                with_app(|app| app.board.set_modal(false));
-                if answer == IDYES {
-                    with_app(|app| app.close_row_windows(row));
-                }
+    let Some((row, summary, removable)) = pending else { return };
+    match tray::row_menu(owner, &summary, removable) {
+        Some(RowCommand::CloseWindows) => {
+            // Closing windows can lose work, so it is asked about in earnest,
+            // with "No" as the default answer.
+            let text = format!(
+                "{summary}\n\n이 워크스페이스의 창을 전부 닫습니다.\n저장하지 않은 작업은 잃을 수 있고, 되돌릴 수 없습니다.\n\n정말 닫을까요?"
+            );
+            with_app(|app| app.board.set_modal(true));
+            let answer = unsafe {
+                MessageBoxW(owner, &HSTRING::from(text), w!("창을 모두 닫습니다"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
+            };
+            with_app(|app| app.board.set_modal(false));
+            if answer == IDYES {
+                with_app(|app| app.close_row_windows(row));
             }
-            Some(tray::RowCommand::Remove) => {
-                with_app(|app| app.remove_row(row));
-            }
-            None => {}
         }
-    }
-    if let Some((window, state)) = with_app(|app| app.pending_menu.take()).flatten() {
-        if let Some(command) = tray::pin_menu(owner, state) {
-            with_app(|app| app.apply_pin(window, command));
+        Some(RowCommand::Remove) => {
+            with_app(|app| app.remove_row(row));
         }
+        None => {}
     }
 }
 
@@ -962,6 +1051,7 @@ fn listen(hwnd: HWND) -> (mpsc::Receiver<(String, String)>, Option<vdapi::Deskto
     (rx, listener)
 }
 
+/// Sets the process up and creates the app's message window.
 fn init() -> windows::core::Result<HWND> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -994,34 +1084,13 @@ pub fn run(first_run: bool) {
         Ok(board) => board,
         Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
     };
-    let minimap = Minimap::spawn();
     BOARD_HWND.set(board.hwnd().0);
     if Desktops::read().is_none() {
         return warn("가상 데스크톱에 접근하지 못했습니다. 이 윈도우 빌드를 지원하지 않는 것일 수 있습니다.");
     }
 
     let (events, listener) = listen(hwnd);
-    let mut app = App {
-        hwnd,
-        config: Config::default(),
-        grid: config::load_grid(),
-        minimap,
-        edge: None,
-        board,
-        focus_before_board: HWND(0),
-        trigger_prompt: HWND(0),
-        in_gesture: false,
-        unsettled: false,
-        following: HashSet::new(),
-        pending_menu: None,
-        pending_row_menu: None,
-        seen: HashMap::new(),
-        asleep: HashSet::new(),
-        started: Instant::now(),
-        events,
-        _listener: listener,
-        taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
-    };
+    let mut app = App::new(hwnd, board, events, listener);
     if let Some(desktops) = app.sync() {
         app.visit(&desktops.current);
         app.commit();
@@ -1044,8 +1113,18 @@ pub fn run(first_run: bool) {
     APP.with(|slot| slot.borrow_mut().take());
 }
 
-/// Renders sample minimaps into `path` (raw: width, height as i32 LE, then
-/// premultiplied BGRA) so the design can be reviewed without touching the desktop.
+/// Writes a picture as a raw file: width and height as i32 LE, then the
+/// BGRA pixels.
+fn write_raw(path: &str, (w, h): (i32, i32), pixels: &[u8]) {
+    let mut out = Vec::with_capacity(pixels.len() + 8);
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(pixels);
+    let _ = std::fs::write(path, out);
+}
+
+/// Renders a sample minimap into `path` (see `write_raw`; premultiplied
+/// alpha) so the design can be reviewed without touching the desktop.
 pub fn render_sample(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let view = View {
@@ -1055,17 +1134,13 @@ pub fn render_sample(path: &str) {
         cur: Some(Pos { row: 1, col: 1 }),
         pushing: Some(Dir::Right),
     };
-    if let Some(((w, h), pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
-        let mut out = Vec::with_capacity(pixels.len() + 8);
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&h.to_le_bytes());
-        out.extend_from_slice(&pixels);
-        let _ = std::fs::write(path, out);
+    if let Some((size, pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
+        write_raw(path, size, &pixels);
     }
 }
 
-/// Renders the board for the real desktops and windows into `path` (same raw
-/// format as `render_sample`), without live thumbnails and without showing it.
+/// Renders the board for the real desktops and windows into `path` (see
+/// `write_raw`), without live thumbnails and without showing it.
 pub fn render_board(path: &str) {
     // Reading the desktops needs a backend, and only a known Windows gets one.
     if vdapi::select(false).is_none() {
@@ -1075,29 +1150,7 @@ pub fn render_board(path: &str) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let Ok(board) = Board::new(wndproc) else { return };
-    let minimap = Minimap::spawn();
-    let (_tx, events) = mpsc::channel();
-    let mut app = App {
-        hwnd: HWND(0),
-        config: Config::default(),
-        grid: config::load_grid(),
-        minimap,
-        edge: None,
-        board,
-        focus_before_board: HWND(0),
-        trigger_prompt: HWND(0),
-        in_gesture: false,
-        unsettled: false,
-        following: HashSet::new(),
-        pending_menu: None,
-        pending_row_menu: None,
-        seen: HashMap::new(),
-        asleep: HashSet::new(),
-        started: Instant::now(),
-        events,
-        _listener: None,
-        taskbar_created: 0,
-    };
+    let mut app = App::new(HWND(0), board, mpsc::channel().1, None);
     let Some(desktops) = Desktops::read() else { return };
     app.grid.sync(&desktops.ids(), &desktops.current);
     // A second, shorter row so that ragged rows are visible in the picture.
@@ -1107,12 +1160,8 @@ pub fn render_board(path: &str) {
         app.grid.rows[1].name = "예시 행".into();
     }
     let model = app.model(&desktops);
-    let (w, h) = (2560, 1440);
-    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), (w, h), 1.5) {
-        let mut out = Vec::with_capacity(pixels.len() + 8);
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&h.to_le_bytes());
-        out.extend_from_slice(&pixels);
-        let _ = std::fs::write(path, out);
+    let size = (2560, 1440);
+    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5) {
+        write_raw(path, size, &pixels);
     }
 }

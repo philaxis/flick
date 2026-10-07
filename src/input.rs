@@ -12,10 +12,12 @@
 use crate::grid::Dir;
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
+    time::Instant,
 };
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -54,7 +56,8 @@ pub const WM_CAPTURED: u32 = WM_APP + 4;
 
 /// Thread message telling the hook thread to pick up new settings.
 const WM_RELOAD: u32 = WM_APP + 20;
-/// Marks key events we replay ourselves, so the hook lets them through.
+/// Marks key events we replay ourselves, so the hook lets them through. (An
+/// arbitrary number: "KANK" in ASCII.)
 const OWN_INPUT: usize = 0x4B41_4E4B;
 /// All keys of a chord must go down within this long to count as one press.
 /// Two keys next to each other are also typed in quick succession ("ty" in
@@ -268,10 +271,9 @@ thread_local! {
     /// Direction (-1 up, 1 down) of the flick the hand is still carrying
     /// through, 0 when a new flick may be taken.
     static FLICKED: Cell<i32> = const { Cell::new(0) };
-    static LAST_MOVE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    static LAST_MOVE: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The last moments of travel: (when, dx, dy).
-    static RECENT: RefCell<std::collections::VecDeque<(std::time::Instant, i32, i32)>> =
-        const { RefCell::new(std::collections::VecDeque::new()) };
+    static RECENT: RefCell<VecDeque<(Instant, i32, i32)>> = const { RefCell::new(VecDeque::new()) };
     /// The hook thread's hidden window, which receives raw mouse input.
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
@@ -280,6 +282,7 @@ thread_local! {
     static PENDING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// Chord keys still down after the chord fired; their events are dropped.
     static SWALLOW: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// The timer that gives up waiting for the rest of the chord, 0 for none.
     static CHORD_TIMER: Cell<usize> = const { Cell::new(0) };
     /// Keys pressed so far while a new trigger is being chosen.
     static CAPTURE_KEYS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -478,7 +481,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     if !s.vertical_sticky {
         return travel_linear(s, dx, dy);
     }
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     let paused = LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > FLICK_PAUSE_MS);
     let (wx, wy) = RECENT.with(|recent| {
         let mut recent = recent.borrow_mut();
@@ -597,12 +600,7 @@ fn key_event(key: u32, up: bool) -> INPUT {
 /// Gives the held-back chord keys to the apps after all (they were ordinary
 /// typing), followed by `then`, the event that showed it was not a chord.
 fn flush_pending(then: Option<(u32, bool)>) {
-    let timer = CHORD_TIMER.replace(0);
-    if timer != 0 {
-        unsafe {
-            let _ = KillTimer(None, timer);
-        }
-    }
+    stop_chord_timer();
     let mut events: Vec<INPUT> = PENDING.with(|keys| keys.borrow_mut().drain(..).map(|key| key_event(key, false)).collect());
     events.extend(then.map(|(key, up)| key_event(key, up)));
     if !events.is_empty() {
@@ -612,8 +610,31 @@ fn flush_pending(then: Option<(u32, bool)>) {
     }
 }
 
+fn stop_chord_timer() {
+    let timer = CHORD_TIMER.replace(0);
+    if timer != 0 {
+        unsafe {
+            let _ = KillTimer(None, timer);
+        }
+    }
+}
+
+/// The rest of the chord did not follow in time.
 unsafe extern "system" fn chord_timeout(_: HWND, _: u32, _: usize, _: u32) {
     flush_pending(None);
+}
+
+/// Whether `key` is one of the chord's keys still down after the chord
+/// fired. Its release ends that.
+fn swallowed(key: u32, up: bool) -> bool {
+    SWALLOW.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        let found = keys.contains(&key);
+        if found && up {
+            keys.retain(|k| *k != key);
+        }
+        found
+    })
 }
 
 /// Handles a key that is part of the chord. Returns true to swallow the event.
@@ -622,15 +643,7 @@ unsafe extern "system" fn chord_timeout(_: HWND, _: u32, _: usize, _: u32) {
 /// back briefly. If the rest follow in time the chord acts as the trigger and
 /// nothing is typed; otherwise the keys are replayed in order.
 fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
-    let swallowed = SWALLOW.with(|keys| {
-        let mut keys = keys.borrow_mut();
-        let found = keys.contains(&key);
-        if found && up {
-            keys.retain(|k| *k != key);
-        }
-        found
-    });
-    if swallowed {
+    if swallowed(key, up) {
         // The chord is over as soon as one of its keys comes up.
         if up {
             release(s, SRC_CHORD);
@@ -639,11 +652,12 @@ fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
     }
     let pending = PENDING.with(|keys| keys.borrow().contains(&key));
     if up {
+        // Released before the chord was complete: it was typing. A key no
+        // longer held back was replayed already, and its release goes through.
         if pending {
             flush_pending(Some((key, true)));
-            return true;
         }
-        return false;
+        return pending;
     }
     if pending {
         return true; // auto-repeat while waiting
@@ -654,14 +668,12 @@ fn on_chord_key(s: &Settings, chord: &[u32], key: u32, up: bool) -> bool {
         chord.iter().all(|k| keys.contains(k))
     });
     if complete {
-        let timer = CHORD_TIMER.replace(0);
-        if timer != 0 {
-            let _ = unsafe { KillTimer(None, timer) };
-        }
+        stop_chord_timer();
         let keys = PENDING.with(|keys| std::mem::take(&mut *keys.borrow_mut()));
         SWALLOW.with(|slot| *slot.borrow_mut() = keys);
         press(SRC_CHORD);
     } else if CHORD_TIMER.get() == 0 {
+        // The wait is counted from the chord's first key.
         let window = if chord.len() <= 2 { PAIR_WINDOW_MS } else { CHORD_WINDOW_MS };
         CHORD_TIMER.set(unsafe { SetTimer(None, 0, window, Some(chord_timeout)) });
     }
