@@ -18,6 +18,8 @@ mod overlay;
 #[cfg(windows)]
 mod paint;
 #[cfg(windows)]
+mod settings;
+#[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod vd;
@@ -41,6 +43,9 @@ fn main() {
         }
         if flag == "--render-board" {
             return app::render_board(path);
+        }
+        if flag == "--render-settings" {
+            return app::render_settings(path);
         }
     }
     let flag = args.get(1).map(String::as_str);

@@ -10,6 +10,7 @@
 //! reports what the device did regardless of where the cursor is.
 
 use crate::{
+    config::Config,
     grid::Dir,
     hold::{Chord, Held, Source},
 };
@@ -194,6 +195,9 @@ struct Settings {
     step_y: i32,
     /// Rows change on a quick flick rather than by distance (see `travel`).
     vertical_sticky: bool,
+    /// A movement counts as vertical only when it is this many times more
+    /// vertical than horizontal. Everything else is sideways.
+    vertical_bias: f32,
 }
 
 impl Settings {
@@ -206,6 +210,10 @@ impl Settings {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    fn is_vertical(&self, dx: i32, dy: i32) -> bool {
+        dy.abs() as f32 >= self.vertical_bias * dx.abs() as f32
     }
 }
 
@@ -292,9 +300,15 @@ thread_local! {
 }
 
 /// Starts the hook thread (once) and gives it these settings.
-pub fn install(target: HWND, triggers: Vec<Trigger>, step_x: i32, step_y: i32, vertical_sticky: bool) {
-    *SHARED.lock().unwrap() =
-        Some(Settings { target: target.0, triggers, step_x: step_x.max(20), step_y: step_y.max(20), vertical_sticky });
+pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
+    *SHARED.lock().unwrap() = Some(Settings {
+        target: target.0,
+        triggers,
+        step_x: config.step_x.max(20),
+        step_y: config.step_y.max(20),
+        vertical_sticky: config.vertical_sticky,
+        vertical_bias: config.vertical_bias(),
+    });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
             std::thread::spawn(hook_thread);
@@ -459,11 +473,6 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-/// A movement counts as vertical only when it is this many times more
-/// vertical than horizontal (about 27 degrees either side of straight up or
-/// down). Everything else is sideways, the far more common move.
-const VERTICAL_BIAS: f32 = 2.0;
-
 /// Vertical flicks are judged over the last this-many milliseconds of travel.
 const FLICK_WINDOW_MS: u128 = 150;
 /// With no movement for this long the hand has stopped.
@@ -499,7 +508,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
         recent.iter().fold((0, 0), |(x, y), (_, dx, dy)| (x + dx, y + dy))
     });
     let (mut ax, _) = ACCUM.get();
-    if wy.abs() as f32 >= VERTICAL_BIAS * wx.abs() as f32 {
+    if s.is_vertical(wx, wy) {
         // Moving up or down: nothing of it counts sideways.
         ax = 0;
         if FLICKED.get() == 0 && wy.abs() >= (s.step_y / 2).max(40) {
@@ -528,7 +537,7 @@ fn travel_linear(s: &Settings, dx: i32, dy: i32) {
     ax += dx;
     ay += dy;
     loop {
-        let vertical = ay.abs() as f32 >= VERTICAL_BIAS * ax.abs() as f32;
+        let vertical = s.is_vertical(ax, ay);
         let dir = if vertical && ay.abs() >= s.step_y {
             let dir = if ay > 0 { Dir::Down } else { Dir::Up };
             ay -= ay.signum() * s.step_y;
@@ -636,6 +645,8 @@ fn on_key(s: &Settings, key: u32, up: bool) -> bool {
     if CAPTURING.load(Ordering::SeqCst) {
         return capture_key(s, key, up);
     }
+    // Keys of a choice that was given up must not count towards the next.
+    CAPTURE_KEYS.with(|keys| keys.borrow_mut().clear());
     if s.triggers.contains(&Trigger::Key(key)) {
         if up {
             release(s, Source::Key(key));

@@ -1,5 +1,6 @@
-//! Direct2D, DirectWrite and GDI plumbing shared by the minimap and the board.
-//! Both draw into a memory bitmap, which is then handed to their window.
+//! Direct2D, DirectWrite and GDI plumbing shared by the minimap, the board and
+//! the settings window. All draw into a memory bitmap, which is then handed to
+//! their window.
 
 use std::ffi::c_void;
 use windows::{
@@ -8,12 +9,16 @@ use windows::{
         Foundation::RECT,
         Graphics::{
             Direct2D::{
-                Common::{D2D1_ALPHA_MODE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F},
-                D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
-                ID2D1SolidColorBrush, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FEATURE_LEVEL_DEFAULT,
-                D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
+                Common::{
+                    D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+                    D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F,
+                },
+                D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1PathGeometry,
+                ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
+                D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+                D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
+                D2D1_SWEEP_DIRECTION_CLOCKWISE,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -51,6 +56,11 @@ pub fn white(a: f32) -> D2D1_COLOR_F {
 /// The colour of the current cell and of whatever is selected.
 pub fn accent(a: f32) -> D2D1_COLOR_F {
     rgba(0.34, 0.62, 1.0, a)
+}
+
+/// The dark background of the full windows (the board, the settings).
+pub fn backdrop() -> D2D1_COLOR_F {
+    rgba(0.050, 0.055, 0.068, 1.0)
 }
 
 /// A top-down 32-bit BGRA bitmap, selected into a memory DC of its own.
@@ -154,6 +164,48 @@ impl DcTarget {
     }
 }
 
+/// An opaque memory bitmap with a Direct2D target bound to it.
+pub struct Canvas {
+    pub dib: Dib,
+    pub target: DcTarget,
+}
+
+impl Canvas {
+    pub fn new(factory: &ID2D1Factory, size: (i32, i32)) -> Result<Canvas> {
+        let target = DcTarget::new(factory, D2D1_ALPHA_MODE_IGNORE)?;
+        let dib = Dib::new(size)?;
+        target.bind(&dib)?;
+        Ok(Canvas { dib, target })
+    }
+}
+
+/// The point `radius` from `centre` at `degrees` clockwise from straight up.
+pub fn on_circle(centre: (f32, f32), radius: f32, degrees: f32) -> (f32, f32) {
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    (centre.0 + radius * sin, centre.1 - radius * cos)
+}
+
+/// A slice of a disc, from `from` to `to` degrees clockwise from straight up.
+pub fn pie(factory: &ID2D1Factory, centre: (f32, f32), radius: f32, from: f32, to: f32) -> Result<ID2D1PathGeometry> {
+    let point = |(x, y): (f32, f32)| D2D_POINT_2F { x, y };
+    unsafe {
+        let path = factory.CreatePathGeometry()?;
+        let sink = path.Open()?;
+        sink.BeginFigure(point(centre), D2D1_FIGURE_BEGIN_FILLED);
+        sink.AddLine(point(on_circle(centre, radius, from)));
+        sink.AddArc(&D2D1_ARC_SEGMENT {
+            point: point(on_circle(centre, radius, to)),
+            size: D2D_SIZE_F { width: radius, height: radius },
+            rotationAngle: 0.0,
+            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            arcSize: if to - from > 180.0 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+        });
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+        sink.Close()?;
+        Ok(path)
+    }
+}
+
 /// A single-line text format in the UI font, centred vertically in its box.
 pub fn text_format(
     factory: &IDWriteFactory,
@@ -228,6 +280,29 @@ impl<'a> Painter<'a> {
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
+        }
+    }
+
+    pub fn fill_shape(&self, shape: &ID2D1PathGeometry, colour: D2D1_COLOR_F) {
+        unsafe {
+            self.brush.SetColor(&colour);
+            self.target.FillGeometry(shape, &self.brush, None);
+        }
+    }
+
+    pub fn disc(&self, centre: (f32, f32), radius: f32, colour: D2D1_COLOR_F) {
+        let ellipse = D2D1_ELLIPSE { point: D2D_POINT_2F { x: centre.0, y: centre.1 }, radiusX: radius, radiusY: radius };
+        unsafe {
+            self.brush.SetColor(&colour);
+            self.target.FillEllipse(&ellipse, &self.brush);
+        }
+    }
+
+    pub fn line(&self, from: (f32, f32), to: (f32, f32), width: f32, colour: D2D1_COLOR_F) {
+        let point = |(x, y): (f32, f32)| D2D_POINT_2F { x, y };
+        unsafe {
+            self.brush.SetColor(&colour);
+            self.target.DrawLine(point(from), point(to), &self.brush, width, None);
         }
     }
 

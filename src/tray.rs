@@ -1,4 +1,4 @@
-//! Notification-area icon, its menu, and the "run at startup" registry entry.
+//! Notification-area icon, the menus, and the "run at startup" registry entry.
 
 use crate::config::APP_NAME;
 use windows::{
@@ -28,15 +28,12 @@ pub const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 #[derive(Clone, Copy, PartialEq)]
 pub enum Command {
     Peek = 1,
-    ChangeTrigger,
-    OpenConfig,
-    ReloadConfig,
-    ToggleAutostart,
+    Settings,
     Exit,
 }
 
 /// The app icon embedded in the exe (resource id 1), at tray size.
-fn app_icon() -> HICON {
+pub fn app_icon() -> HICON {
     unsafe {
         let size = GetSystemMetrics(SM_CXSMICON);
         GetModuleHandleW(None)
@@ -116,21 +113,15 @@ fn pick(menu: HMENU, owner: HWND) -> usize {
 /// Shows the tray icon's menu at the cursor and returns what was picked.
 pub fn menu(hwnd: HWND) -> Option<Command> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
-    add_item(menu, Command::Peek as usize, w!("격자 보기"), false);
-    add_separator(menu);
-    add_item(menu, Command::ChangeTrigger as usize, w!("트리거 버튼 바꾸기…"), false);
-    add_item(menu, Command::OpenConfig as usize, w!("설정 파일 열기"), false);
-    add_item(menu, Command::ReloadConfig as usize, w!("설정 다시 읽기"), false);
-    add_item(menu, Command::ToggleAutostart as usize, w!("윈도우 시작 시 실행"), autostart_enabled());
+    add_item(menu, Command::Peek as usize, w!("전체 보기"), false);
+    add_item(menu, Command::Settings as usize, w!("설정…"), false);
     add_separator(menu);
     add_item(menu, Command::Exit as usize, w!("종료"), false);
     unsafe {
         let _ = SetForegroundWindow(hwnd);
     }
     let picked = pick(menu, hwnd);
-    [Command::Peek, Command::ChangeTrigger, Command::OpenConfig, Command::ReloadConfig, Command::ToggleAutostart, Command::Exit]
-        .into_iter()
-        .find(|c| *c as usize == picked)
+    [Command::Peek, Command::Settings, Command::Exit].into_iter().find(|c| *c as usize == picked)
 }
 
 pub fn autostart_enabled() -> bool {

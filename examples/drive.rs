@@ -1,12 +1,12 @@
 //! Test driver: posts the app's own messages to the running instance, sends
 //! input and captures the screen, so behaviour can be checked without a person
 //! at the mouse.
-//!   drive step <0..3> | click | release | change-trigger
+//!   drive step <0..3> | click | release | settings
 //!   drive xbutton <down|up> | mouse <x> <y> [down|up|rdown|rup] | move <dx> <dy>
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
-//! (src/input.rs) and `WM_CHANGE_TRIGGER` (src/app.rs).
+//! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
 // here as it is, and this driver uses a small part of it.
 #[allow(dead_code)]
@@ -43,7 +43,7 @@ fn main() {
             Some("step") => post(WM_APP + 1, args[2].parse().unwrap()),
             Some("click") => post(WM_APP + 2, 0),
             Some("release") => post(WM_APP + 3, 0),
-            Some("change-trigger") => post(WM_APP + 12, 0),
+            Some("settings") => post(WM_APP + 12, 0),
             Some("xbutton") => {
                 // xbutton <down|up>: the mouse "forward" side button.
                 use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT};

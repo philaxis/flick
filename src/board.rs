@@ -7,7 +7,7 @@
 
 use crate::{
     grid::{self, CellId, Dir, Grid, Row},
-    paint::{self, accent, rect, rgba, white, DcTarget, Dib, Painter, Rect},
+    paint::{self, accent, rect, rgba, white, Canvas, Dib, Painter, Rect},
     vd,
 };
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::{
-                    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
+                    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
                 },
                 ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_PROPERTIES,
             },
@@ -1088,7 +1088,7 @@ impl Board {
     fn draw(&self, target: &ID2D1RenderTarget) -> Result<()> {
         let Some(fonts) = &self.fonts else { return Ok(()) };
         unsafe {
-            target.Clear(Some(&rgba(0.050, 0.055, 0.068, 1.0)));
+            target.Clear(Some(&paint::backdrop()));
         }
         let p = Painter::new(target)?;
         // The tiles are placed in the window's coordinates; each map, and the
@@ -1346,21 +1346,6 @@ impl Board {
         self.fonts = None;
         let _ = self.draw_to_canvas()?;
         Some(self.canvas.as_ref()?.dib.pixels().to_vec())
-    }
-}
-
-/// A memory bitmap with a Direct2D target bound to it.
-struct Canvas {
-    dib: Dib,
-    target: DcTarget,
-}
-
-impl Canvas {
-    fn new(factory: &ID2D1Factory, size: (i32, i32)) -> Result<Canvas> {
-        let target = DcTarget::new(factory, D2D1_ALPHA_MODE_IGNORE)?;
-        let dib = Dib::new(size)?;
-        target.bind(&dib)?;
-        Ok(Canvas { dib, target })
     }
 }
 

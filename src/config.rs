@@ -3,7 +3,7 @@
 
 use crate::grid::Grid;
 use serde::Deserialize;
-use std::{fs, io, path::PathBuf};
+use std::{fs, io, path::PathBuf, time::SystemTime};
 
 /// The app's display name. Also used for the install folder, the settings
 /// folder, the Start menu shortcut and the registry entries; the exe name in
@@ -12,7 +12,8 @@ pub const APP_NAME: &str = "Flick";
 /// Settings folders of versions under earlier names, newest first.
 const OLD_DIRS: [&str; 2] = ["KanKan", "desk2d"];
 
-const DEFAULT_CONFIG: &str = r#"# Flick 설정. 저장한 뒤 트레이 아이콘 메뉴의 "설정 다시 읽기"를 누르면 적용됩니다.
+const DEFAULT_CONFIG: &str = r#"# Flick 설정. 저장하면 바로 적용됩니다.
+# 트리거, 각도, 거리는 트레이 아이콘 우클릭 → "설정…" 창에서도 바꿉니다.
 
 # 누르고 있는 동안 마우스를 움직이면 칸을 이동하는 버튼. 쉼표로 여러 개를 함께 쓸 수 있습니다.
 #   마우스: "xbutton1"(뒤로), "xbutton2"(앞으로), "middle"(휠 버튼)
@@ -29,7 +30,10 @@ step_y = 320
 # false로 하면 좌우처럼 민 거리만큼 계속 넘어갑니다.
 vertical_sticky = true
 
-# 새 칸/새 행은 전체 격자 뷰(딸깍)에서 마우스로 만듭니다.
+# 위아래로 치는 각도: 똑바로 위(아래)에서 좌우로 이 각도 안쪽으로 밀어야 위아래입니다. 나머지는 좌우입니다.
+vertical_angle = 26.6
+
+# 새 칸/새 행은 전체 보기(트리거를 눌렀다 떼기)에서 마우스로 만듭니다.
 # 여기에 1 이상을 넣으면 격자 가장자리에서 그 횟수만큼 더 밀 때도 만들어집니다. 0이면 만들지 않습니다.
 edge_create_pushes = 0
 
@@ -51,6 +55,9 @@ pub struct Config {
     pub step_x: i32,
     pub step_y: i32,
     pub vertical_sticky: bool,
+    /// Degrees either side of straight up or down within which a movement
+    /// counts as vertical.
+    pub vertical_angle: f32,
     pub edge_create_pushes: u32,
     pub carry_modifier: String,
     pub hotkeys: bool,
@@ -64,11 +71,24 @@ impl Default for Config {
             step_x: 260,
             step_y: 320,
             vertical_sticky: true,
+            // 2:1, vertical to horizontal.
+            vertical_angle: 26.6,
             edge_create_pushes: 0,
             carry_modifier: "shift".into(),
             hotkeys: true,
             sleep_after_minutes: 0,
         }
+    }
+}
+
+/// The narrowest and the widest `vertical_angle` made use of.
+pub const VERTICAL_ANGLES: (f32, f32) = (10.0, 70.0);
+
+impl Config {
+    /// How many times more vertical than horizontal a movement must be to
+    /// count as vertical.
+    pub fn vertical_bias(&self) -> f32 {
+        1.0 / self.vertical_angle.clamp(VERTICAL_ANGLES.0, VERTICAL_ANGLES.1).to_radians().tan()
     }
 }
 
@@ -110,28 +130,31 @@ pub fn load_config() -> (Config, Option<String>) {
     }
 }
 
-/// Rewrites the `trigger` line of the config file, keeping everything else.
-pub fn set_trigger(value: &str) -> io::Result<()> {
+/// `text` (a config file) with `key` set to `value`, written as TOML. Only
+/// that key's line changes, so the user's comments and other lines stay; a
+/// key the file does not have yet is added at the end.
+fn with_value(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = {value}");
+    let is_key = |old: &str| old.split_once('=').is_some_and(|(name, _)| name.trim() == key);
+    let mut lines: Vec<&str> = text.lines().collect();
+    match lines.iter().position(|old| is_key(old)) {
+        Some(at) => lines[at] = &line,
+        None => lines.push(&line),
+    }
+    lines.join("\n") + "\n"
+}
+
+/// Sets one value in the config file, keeping everything else in it.
+pub fn set_value(key: &str, value: &str) -> io::Result<()> {
     let path = config_path();
     let text = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
-    let line = format!("trigger = \"{value}\"");
-    let mut replaced = false;
-    let mut lines: Vec<String> = text
-        .lines()
-        .map(|old| {
-            if !replaced && old.trim_start().starts_with("trigger") && old.contains('=') {
-                replaced = true;
-                line.clone()
-            } else {
-                old.to_owned()
-            }
-        })
-        .collect();
-    if !replaced {
-        lines.insert(0, line);
-    }
     fs::create_dir_all(dir())?;
-    fs::write(path, lines.join("\n") + "\n")
+    fs::write(path, with_value(&text, key, value))
+}
+
+/// When the config file was last written, to notice the user saving it.
+pub fn config_modified() -> Option<SystemTime> {
+    fs::metadata(config_path()).and_then(|file| file.modified()).ok()
 }
 
 /// Loads the saved grid. Without a saved one, or with one that cannot be
@@ -148,4 +171,24 @@ pub fn load_grid() -> (Grid, Option<String>) {
 pub fn save_grid(grid: &Grid) -> io::Result<()> {
     fs::create_dir_all(dir())?;
     fs::write(state_path(), serde_json::to_string_pretty(grid)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Changing a setting from the settings window rewrites the user's file:
+    /// their comments and other values must survive, a key that only starts
+    /// like the one being set must not be mistaken for it, and a key missing
+    /// from an older file must be added.
+    #[test]
+    fn setting_a_value_keeps_the_rest_of_the_file() {
+        let file = "# mine\ntrigger_note = 1\ntrigger = \"xbutton2\"  # forward\n\nstep_x = 260\n";
+        let changed = with_value(file, "trigger", "\"f13\"");
+        assert_eq!(changed, "# mine\ntrigger_note = 1\ntrigger = \"f13\"\n\nstep_x = 260\n");
+        let added = with_value(&changed, "vertical_angle", "30");
+        assert_eq!(added, format!("{changed}vertical_angle = 30\n"));
+        let config: Config = toml::from_str(&added).unwrap();
+        assert_eq!((config.trigger.as_str(), config.step_x, config.vertical_angle), ("f13", 260, 30.0));
+    }
 }

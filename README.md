@@ -16,7 +16,7 @@
 
 **Tap to see everything.** Tap the trigger for the windows on this desktop and a small map of all of them. Drag a window onto the map to move it.
 
-**Any button you like.** It starts as the mouse "forward" button. Right-click the tray icon → *Change trigger* and press whatever you want instead, even several keys at once.
+**Any button you like.** It starts as the mouse "forward" button. Right-click the tray icon → *설정…* (Settings) → *바꾸기* (Change) and press whatever you want instead, even several keys at once.
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
 

@@ -1,5 +1,5 @@
-//! Wires input, the grid model, the virtual desktops, the minimap and the
-//! board together.
+//! Wires input, the grid model, the virtual desktops, the minimap, the board
+//! and the settings window together.
 
 use crate::{
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
@@ -7,6 +7,7 @@ use crate::{
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_RELEASE, WM_STEP},
     overlay::{Minimap, Overlay, View},
+    settings::{self, Settings},
     tray::{self, Command, PinCommand, PinState, RowCommand},
     vd::{self, Desktops},
     vdapi,
@@ -15,7 +16,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use windows::{
     core::{w, HSTRING, PCWSTR},
@@ -34,12 +35,11 @@ use windows::{
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
-                GetSystemMetrics, IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage,
-                RegisterClassW, RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2,
-                MB_ICONWARNING, MB_OK, MB_YESNO, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SW_SHOWNORMAL,
-                WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP,
-                WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
+                IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+                RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
+                MB_OK, MB_YESNO, MSG, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE,
+                WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+                WS_OVERLAPPED,
             },
         },
     },
@@ -47,8 +47,8 @@ use windows::{
 
 const WM_TRAY: u32 = WM_APP + 10;
 const WM_DESKTOP_EVENT: u32 = WM_APP + 11;
-/// Starts choosing a new trigger; what the tray menu item sends.
-const WM_CHANGE_TRIGGER: u32 = WM_APP + 12;
+/// Opens the settings window; for the test driver (examples/drive.rs).
+const WM_OPEN_SETTINGS: u32 = WM_APP + 12;
 
 /// How long the minimap stays after the trigger is released and after a
 /// hotkey (which has no release to wait for).
@@ -62,6 +62,9 @@ const SLEEP_TIMER_ID: usize = 3;
 const LABEL_TIMER_ID: usize = 4;
 /// How long that label would have stayed up.
 const LABEL_HIDE_MS: u32 = 1600;
+/// Periodic look at the config file, to apply it when the user saves it.
+const CONFIG_TIMER_ID: usize = 5;
+const CONFIG_CHECK_MS: u32 = 2000;
 /// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
 /// do the same carrying the active window, and this one opens the pin menu.
 const PIN_HOTKEY_ID: i32 = 8;
@@ -77,8 +80,11 @@ struct App {
     board: Board,
     /// The window that had focus when the board opened, to give it back on cancel.
     focus_before_board: HWND,
-    /// The "press the new trigger" prompt, while it is up.
-    trigger_prompt: HWND,
+    settings: Settings,
+    /// The settings window is waiting for the new trigger to be pressed.
+    capturing: bool,
+    /// When the config file that is in use was written.
+    config_seen: Option<SystemTime>,
     /// Steps are arriving from a held trigger; `unsettled` when one of them
     /// left keyboard focus behind on the desktop it came from.
     in_gesture: bool,
@@ -105,8 +111,10 @@ struct App {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-    /// The board's window, readable without borrowing the app.
+    /// The windows of the board and of the settings, readable without
+    /// borrowing the app.
     static BOARD_HWND: Cell<isize> = const { Cell::new(0) };
+    static SETTINGS_HWND: Cell<isize> = const { Cell::new(0) };
 }
 
 /// Runs `f` on the app unless it is already borrowed, which happens when a
@@ -150,6 +158,7 @@ impl App {
     fn new(
         hwnd: HWND,
         board: Board,
+        settings: Settings,
         events: mpsc::Receiver<(String, String)>,
         listener: Option<vdapi::DesktopEventThread>,
     ) -> App {
@@ -165,7 +174,9 @@ impl App {
             edge: None,
             board,
             focus_before_board: HWND(0),
-            trigger_prompt: HWND(0),
+            settings,
+            capturing: false,
+            config_seen: None,
             in_gesture: false,
             unsettled: false,
             following: HashSet::new(),
@@ -785,70 +796,107 @@ impl App {
 
     // ---- settings -------------------------------------------------------------
 
-    /// Asks for a new trigger: a small prompt stays up until a button or key
-    /// combination is pressed (or Esc).
-    fn begin_trigger_change(&mut self) {
-        /// The static control's style for centred text.
-        const SS_CENTER: WINDOW_STYLE = WINDOW_STYLE(1);
-        self.end_trigger_prompt();
-        unsafe {
-            let (w, h) = (560, 96);
-            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            self.trigger_prompt = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                w!("STATIC"),
-                w!("\n새 트리거로 쓸 마우스 버튼이나 키를 누르세요.\n키는 여러 개를 함께 눌러도 됩니다.   Esc: 취소"),
-                WS_POPUP | WS_VISIBLE | WS_BORDER | SS_CENTER,
-                (sw - w) / 2,
-                (sh - h) / 3,
-                w,
-                h,
-                None,
-                None,
-                None,
-                None,
-            );
+    /// What the settings window shows: the config in use.
+    fn settings_view(&self) -> settings::View {
+        settings::View {
+            trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
+            capturing: self.capturing,
+            angle: self.config.vertical_angle,
+            step_x: self.config.step_x,
+            step_y: self.config.step_y,
+            sticky: self.config.vertical_sticky,
+            autostart: tray::autostart_enabled(),
         }
-        input::begin_capture();
     }
 
-    fn end_trigger_prompt(&mut self) {
-        if self.trigger_prompt.0 != 0 {
-            unsafe {
-                let _ = DestroyWindow(self.trigger_prompt);
-            }
-            self.trigger_prompt = HWND(0);
+    fn open_settings(&mut self) {
+        let view = self.settings_view();
+        self.settings.open(view);
+        vd::force_foreground(self.settings.hwnd());
+    }
+
+    fn refresh_settings(&mut self) {
+        if self.settings.is_open() {
+            let view = self.settings_view();
+            self.settings.set_view(view);
         }
-        input::cancel_capture();
+    }
+
+    fn close_settings(&mut self) {
+        self.capture_trigger(false);
+        self.settings.close();
+    }
+
+    /// Starts or stops waiting for the user to press the new trigger.
+    fn capture_trigger(&mut self, on: bool) {
+        self.capturing = on;
+        if on {
+            input::begin_capture();
+        } else {
+            input::cancel_capture();
+        }
+        self.refresh_settings();
     }
 
     /// The user pressed what the trigger should be from now on.
     fn trigger_chosen(&mut self) {
-        self.end_trigger_prompt();
-        let Some(value) = input::take_captured() else { return };
-        if let Err(e) = config::set_trigger(&value) {
-            log(&format!("writing the trigger to config.toml failed: {e}"));
+        self.capture_trigger(false);
+        if let Some(value) = input::take_captured() {
+            self.set_config("trigger", &format!("\"{value}\""));
+        }
+    }
+
+    /// Writes one value to the config file and applies the file.
+    fn set_config(&mut self, key: &str, value: &str) {
+        if let Err(e) = config::set_value(key, value) {
+            log(&format!("writing {key} to config.toml failed: {e}"));
         }
         self.apply_config();
-        let (triggers, _) = Trigger::parse_list(&value);
-        let name = triggers.first().map(Trigger::describe).unwrap_or(value);
-        tray::notify(self.hwnd, "트리거를 바꿨습니다", &format!("이제 {name}: 누른 채 밀면 칸 이동, 눌렀다 떼면 전체 보기."));
+    }
+
+    fn settings_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        match self.settings.handle(message, wparam, lparam)? {
+            settings::Action::None => {}
+            settings::Action::Try { angle, step_x, step_y } => {
+                // Felt at once while dragging; written when the drag ends.
+                let config = Config { vertical_angle: angle, step_x, step_y, ..self.config.clone() };
+                input::install(self.hwnd, triggers(&config).0, &config);
+            }
+            settings::Action::Set(key, value) => self.set_config(key, &value),
+            settings::Action::Capture(on) => self.capture_trigger(on),
+            settings::Action::Autostart(on) => {
+                tray::set_autostart(on);
+                self.refresh_settings();
+            }
+            settings::Action::OpenFile => unsafe {
+                let path = HSTRING::from(config::config_path().as_os_str());
+                ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
+            },
+            settings::Action::Close => self.close_settings(),
+        }
+        Some(LRESULT(0))
+    }
+
+    /// Applies the config file if it was saved since it was last read.
+    fn apply_saved_config(&mut self) {
+        if config::config_modified() != self.config_seen {
+            self.apply_config();
+        }
     }
 
     /// Applies the config file: hooks, hotkeys and the sleep timer.
     fn apply_config(&mut self) {
         let (config, error) = config::load_config();
+        // Noted first, so that a file reported as broken is not reported again.
+        self.config_seen = config::config_modified();
         if let Some(error) = error {
             warn(&format!("config.toml을 읽지 못해 기본값을 씁니다.\n\n{error}"));
         }
-        let (mut triggers, unknown) = Trigger::parse_list(&config.trigger);
+        let (triggers, unknown) = triggers(&config);
         if !unknown.is_empty() {
             warn(&format!("config.toml의 trigger에서 알 수 없는 항목: {}", unknown.join(", ")));
         }
-        if triggers.is_empty() {
-            triggers.push(Trigger::XButton2);
-        }
-        input::install(self.hwnd, triggers, config.step_x, config.step_y, config.vertical_sticky);
+        input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);
         unsafe {
             let _ = KillTimer(self.hwnd, SLEEP_TIMER_ID);
@@ -857,6 +905,7 @@ impl App {
             }
         }
         self.config = config;
+        self.refresh_settings();
     }
 
     /// Ctrl+Alt+Win with an arrow moves, with Shift added it carries the
@@ -883,30 +932,44 @@ impl App {
     }
 }
 
+/// The triggers a config asks for (the mouse's forward button when it names
+/// none that is known) and the entries of it that were not understood.
+fn triggers(config: &Config) -> (Vec<Trigger>, Vec<String>) {
+    let (mut triggers, unknown) = Trigger::parse_list(&config.trigger);
+    if triggers.is_empty() {
+        triggers.push(Trigger::XButton2);
+    }
+    (triggers, unknown)
+}
+
 fn on_tray_command(hwnd: HWND, command: Command) {
     match command {
         Command::Peek => {
             with_app(App::open_board);
         }
-        Command::ChangeTrigger => unsafe {
-            let _ = PostMessageW(hwnd, WM_CHANGE_TRIGGER, WPARAM(0), LPARAM(0));
-        },
-        Command::OpenConfig => unsafe {
-            let path = HSTRING::from(config::config_path().as_os_str());
-            ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
-        },
-        Command::ReloadConfig => {
-            with_app(App::apply_config);
+        Command::Settings => {
+            with_app(App::open_settings);
         }
-        Command::ToggleAutostart => tray::set_autostart(!tray::autostart_enabled()),
         Command::Exit => unsafe {
             let _ = DestroyWindow(hwnd);
         },
     }
 }
 
-/// The window procedure of both the app's hidden message window and the board.
+/// The window procedure of the app's hidden message window, the board and
+/// the settings window.
 unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if hwnd.0 == SETTINGS_HWND.get() {
+        if message == WM_CLOSE {
+            // Its close button puts it away; the window itself is kept.
+            if with_app(App::close_settings).is_none() {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            return LRESULT(0);
+        }
+        let handled = with_app(|app| app.settings_message(message, wparam, lparam)).flatten();
+        return handled.unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam));
+    }
     if hwnd.0 == BOARD_HWND.get() {
         let handled = with_app(|app| app.board_message(message, wparam, lparam)).flatten();
         run_pending_menus(hwnd);
@@ -931,11 +994,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });
         }
-        WM_CHANGE_TRIGGER => {
-            with_app(App::begin_trigger_change);
+        WM_OPEN_SETTINGS => {
+            with_app(App::open_settings);
         }
         WM_CAPTURED => {
-            with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.end_trigger_prompt() });
+            with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.capture_trigger(false) });
         }
         WM_HOTKEY if wparam.0 as i32 == PIN_HOTKEY_ID => {
             let window = GetForegroundWindow();
@@ -966,6 +1029,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_TIMER if wparam.0 == SLEEP_TIMER_ID => {
             with_app(App::sleep_idle_rows);
+        }
+        WM_TIMER if wparam.0 == CONFIG_TIMER_ID => {
+            with_app(App::apply_saved_config);
         }
         WM_DESKTOP_EVENT => {
             with_app(|app| {
@@ -1104,21 +1170,29 @@ pub fn run(first_run: bool) {
         Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
     };
     BOARD_HWND.set(board.hwnd().0);
+    let settings = match Settings::new(wndproc, tray::app_icon()) {
+        Ok(settings) => settings,
+        Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
+    };
+    SETTINGS_HWND.set(settings.hwnd().0);
     if Desktops::read().is_none() {
         return warn("가상 데스크톱에 접근하지 못했습니다. 이 윈도우 빌드를 지원하지 않는 것일 수 있습니다.");
     }
 
     let (events, listener) = listen(hwnd);
-    let mut app = App::new(hwnd, board, events, listener);
+    let mut app = App::new(hwnd, board, settings, events, listener);
     if let Some(desktops) = app.sync() {
         app.visit(&desktops.current);
         app.commit();
     }
     app.apply_config();
+    unsafe {
+        SetTimer(hwnd, CONFIG_TIMER_ID, CONFIG_CHECK_MS, None);
+    }
     tray::add(hwnd, WM_TRAY);
     if first_run {
         tray::set_autostart(true);
-        tray::notify(hwnd, "설치되어 실행 중입니다", "트리거(처음에는 마우스 앞으로 버튼)를 누른 채 밀면 칸 이동, 눌렀다 떼면 전체 보기. 트리거는 이 아이콘을 우클릭해 바꿉니다.");
+        tray::notify(hwnd, "Flick이 켜졌습니다", "마우스 앞으로 버튼을 누른 채 밀면 옆 칸, 눌렀다 떼면 전체 보기. 버튼은 이 아이콘 우클릭 → 설정에서 바꿉니다.");
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
 
@@ -1168,8 +1242,8 @@ pub fn render_board(path: &str) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    let Ok(board) = Board::new(wndproc) else { return };
-    let mut app = App::new(HWND(0), board, mpsc::channel().1, None);
+    let (Ok(board), Ok(settings)) = (Board::new(wndproc), Settings::new(wndproc, Default::default())) else { return };
+    let mut app = App::new(HWND(0), board, settings, mpsc::channel().1, None);
     let Some(desktops) = Desktops::read() else { return };
     app.grid.sync(&desktops.ids(), &desktops.current);
     // A second, shorter row so that ragged rows are visible in the picture.
@@ -1181,6 +1255,25 @@ pub fn render_board(path: &str) {
     let model = app.model(&desktops);
     let size = (2560, 1440);
     if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5) {
+        write_raw(path, size, &pixels);
+    }
+}
+
+/// Renders the settings window showing the default settings into `path`
+/// (see `write_raw`), without showing it.
+pub fn render_settings(path: &str) {
+    let Ok(mut window) = Settings::new(wndproc, Default::default()) else { return };
+    let config = Config::default();
+    let view = settings::View {
+        trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
+        capturing: false,
+        angle: config.vertical_angle,
+        step_x: config.step_x,
+        step_y: config.step_y,
+        sticky: config.vertical_sticky,
+        autostart: true,
+    };
+    if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
         write_raw(path, size, &pixels);
     }
 }
