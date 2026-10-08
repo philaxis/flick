@@ -539,7 +539,7 @@ unsafe fn level_of(process: HANDLE) -> Option<u32> {
 /// Whether a window belongs to a process above this one (run as
 /// administrator while this one is not). Windows keeps what is typed and
 /// clicked there from the hooks and the raw input of a process below.
-fn above_us(window: HWND) -> bool {
+pub fn above_us(window: HWND) -> bool {
     if window.0 == 0 {
         return false;
     }

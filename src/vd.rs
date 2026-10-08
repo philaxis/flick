@@ -117,10 +117,10 @@ pub fn focus_top_window() {
 }
 
 /// Asks a window to close, as its own close button would.
-pub fn ask_to_close(hwnd: HWND) {
-    unsafe {
-        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-    }
+/// False when Windows would not pass the request on, as it does not to a
+/// window run as administrator from an app that is not.
+pub fn ask_to_close(hwnd: HWND) -> bool {
+    unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
 fn pinned_everywhere(hwnd: HWND) -> bool {

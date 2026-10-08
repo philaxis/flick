@@ -16,7 +16,7 @@ use windows::{
     core::{w, Error, Result},
     Foundation::Numerics::Matrix3x2,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -51,7 +51,7 @@ use windows::{
             WindowsAndMessaging::{
                 CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
-                ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
+                GetCursorPos, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -135,8 +135,10 @@ pub enum Action {
     SetPin { window: HWND, row: bool, all: bool },
     /// Show the menu of a workspace (close its windows, remove it).
     RowMenu(usize),
-    /// Show the menu of a cell (make it stand out).
-    CellMenu(CellId),
+    /// Make a cell stand out, or stop it doing so.
+    ToggleEmphasis(CellId),
+    /// Move a workspace to before row `at`, counted without the moved one.
+    MoveRow { from: usize, at: usize },
     Rename(usize, String),
 }
 
@@ -202,19 +204,14 @@ impl Pin {
     fn label(self) -> &'static str {
         match self {
             Pin::Off => "고정",
-            Pin::Row => "워크스페이스 고정",
+            Pin::Row => "행 고정",
             Pin::Everywhere => "전체 고정",
         }
     }
 
-    /// Width of the button, which is only as wide as its label, unscaled.
-    fn width(self) -> f32 {
-        match self {
-            Pin::Off => 46.0,
-            Pin::Row => 118.0,
-            Pin::Everywhere => 74.0,
-        }
-    }
+    /// Width of the button, unscaled: the same in every state, so that a
+    /// click changes what it says and nothing else.
+    const WIDTH: f32 = 74.0;
 }
 
 /// One app in a map cell: its icon and how many windows it has there.
@@ -314,6 +311,9 @@ enum Slot {
     NewRow { at: usize, y: f32 },
 }
 
+/// How long a tile says that its window could not be asked to close.
+const REFUSAL_MS: u128 = 6000;
+
 struct Press {
     hit: Hit,
     x: f32,
@@ -382,6 +382,8 @@ pub struct Board {
     /// on. The map shifts under it then, and whatever cell that puts there
     /// must not be taken for one the user is resting on.
     rested_at: Option<(f32, f32)>,
+    /// A window that could not be asked to close, and when that was found.
+    refused: Option<(isize, Instant)>,
 }
 
 impl Board {
@@ -446,6 +448,7 @@ impl Board {
                 dwell_ms: 0,
                 dwell: None,
                 rested_at: None,
+                refused: None,
             })
         }
     }
@@ -511,6 +514,7 @@ impl Board {
         self.press = None;
         self.rest_on(None);
         self.rested_at = None;
+        self.refused = None;
         self.stop_editing();
         self.open = true;
         unsafe {
@@ -534,7 +538,28 @@ impl Board {
         self.nav.visit(&selected);
         self.press = None;
         self.relayout();
+        self.hover_under_cursor();
         self.register_thumbnails();
+        self.invalidate();
+    }
+
+    /// Takes what is under the cursor now as hovered. The board opening or
+    /// its content changing puts things under a cursor that has not moved.
+    fn hover_under_cursor(&mut self) {
+        let mut at = POINT::default();
+        unsafe {
+            if GetCursorPos(&mut at).is_err() {
+                return;
+            }
+        }
+        let (x, y) = ((at.x - self.origin.0) as f32, (at.y - self.origin.1) as f32);
+        self.cursor = (x, y);
+        self.hover = self.hit_test(x, y);
+    }
+
+    /// A window could not be asked to close: its tile says so for a while.
+    pub fn close_refused(&mut self, hwnd: HWND) {
+        self.refused = Some((hwnd.0, Instant::now()));
         self.invalidate();
     }
 
@@ -833,6 +858,28 @@ impl Board {
         }
     }
 
+    fn dragged_row(&self) -> Option<usize> {
+        match &self.press {
+            Some(Press { hit: Hit::RowName(row), dragging: true, .. }) => Some(*row),
+            _ => None,
+        }
+    }
+
+    /// Where the dragged workspace `from` would land if dropped at height
+    /// `y`: its place among the others, and where to draw the marker, in the
+    /// coordinates of the map under the cursor.
+    fn row_slot_at(&self, from: usize, y: f32) -> Option<(usize, f32)> {
+        let (map, _, y) = self.map_at(self.cursor.0, y);
+        let rows = &map.layout.rows;
+        let others: Vec<&RowLayout> = rows.iter().enumerate().filter(|(r, _)| *r != from).map(|(_, row)| row).collect();
+        let at = others.iter().filter(|row| (row.top + row.bottom) / 2.0 < y).count();
+        let line = match others.get(at) {
+            Some(below) => below.top,
+            None => others.last().copied().or(rows.last())?.bottom,
+        };
+        Some((at, line))
+    }
+
     fn dragged_cell(&self) -> Option<&str> {
         match &self.press {
             Some(Press { hit: Hit::Cell(id), dragging: true, .. }) => Some(id.as_str()),
@@ -949,7 +996,7 @@ impl Board {
             }
             WM_LBUTTONUP => self.mouse_up(x, y),
             WM_RBUTTONUP => match self.hit_test(x, y) {
-                Hit::Cell(id) | Hit::CellClose(id) => Action::CellMenu(id),
+                Hit::Cell(id) | Hit::CellClose(id) => Action::ToggleEmphasis(id),
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
@@ -1017,7 +1064,9 @@ impl Board {
             let _ = ImmReleaseContext(self.hwnd, context);
         }
         self.invalidate();
-        Some((row, name.trim().to_owned()))
+        // A workspace always has a name: one left empty keeps what it had.
+        let name = name.trim();
+        (!name.is_empty()).then(|| (row, name.to_owned()))
     }
 
     fn key_down(&mut self, key: u16) -> Action {
@@ -1070,7 +1119,7 @@ impl Board {
             // A window shown on every desktop has no cell to be dragged out of.
             let draggable = match &press.hit {
                 Hit::Window { cell, .. } => !cell.is_empty(),
-                Hit::Cell(_) => true,
+                Hit::Cell(_) | Hit::RowName(_) => true,
                 _ => false,
             };
             let mut raise = None;
@@ -1120,6 +1169,10 @@ impl Board {
                     Some(Slot::Row { row, index, .. }) => Action::MoveCell { id: id.clone(), row, index },
                     Some(Slot::NewRow { at, .. }) => Action::MoveCellToNewRow { id: id.clone(), at },
                     None => Action::None,
+                },
+                Hit::RowName(from) => match self.row_slot_at(*from, y) {
+                    Some((at, _)) if at != *from => Action::MoveRow { from: *from, at },
+                    _ => Action::None,
                 },
                 _ => Action::None,
             };
@@ -1299,7 +1352,7 @@ impl Board {
                 hint("머물기: 창 보기   ·   클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조")
             }
             Hit::Cell(_) | Hit::CellClose(_) => hint("클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조"),
-            Hit::RowName(_) => hint("더블클릭: 이름 바꾸기   ·   우클릭: 창 닫기, 없애기"),
+            Hit::RowName(_) => hint("끌기: 순서 바꾸기   ·   더블클릭: 이름 바꾸기   ·   우클릭: 창 닫기, 없애기"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("칸 추가"),
             Hit::AddRow | Hit::AddRowTop => hint("워크스페이스 추가"),
             Hit::Nothing => None,
@@ -1381,6 +1434,12 @@ impl Board {
             p.text(pin.label(), &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
         }
 
+        if self.refused.is_some_and(|(hwnd, at)| hwnd == tile.hwnd.0 && at.elapsed().as_millis() < REFUSAL_MS) {
+            // Over the title: the live picture of the window covers the rest.
+            let note = Rect { bottom: tile.thumb.top, ..tile.frame };
+            p.fill(&note, 9.0 * s, danger(0.95));
+            p.text("관리자 권한 창: 닫을 수 없음", &fonts.centered, &note, white(1.0));
+        }
         let over = self.hover == Hit::TileClose(tile.hwnd.0);
         if over {
             p.fill(&tile.close, 5.0 * s, danger(0.90));
@@ -1428,7 +1487,8 @@ impl Board {
             Some((_, typed)) => format!("{typed}{}▏", self.composing),
             None => grid::row_title(name, r),
         };
-        let hot = self.hover == Hit::RowName(r) && self.press.is_none();
+        let dragged = self.dragged_row() == Some(r);
+        let hot = (self.hover == Hit::RowName(r) && self.press.is_none()) || dragged;
         if editing.is_some() || hot {
             // While typing the box follows the text being typed.
             let width = text_width(&name, 12.0 * s) + 4.0 * s;
@@ -1495,10 +1555,10 @@ impl Board {
     /// One of the "+" buttons, which `hit` is the hit-test result of.
     fn draw_plus(&self, p: &Painter, fonts: &Fonts, area: &Rect, hit: Hit) {
         let hot = self.hover == hit;
-        if hot {
-            p.fill(area, 8.0 * self.scale, white(0.10));
-        }
-        p.text("+", &fonts.big, area, white(if hot { 0.95 } else { 0.22 }));
+        // A button to be seen at a glance: it is the only way to add a cell.
+        p.fill(area, 8.0 * self.scale, white(if hot { 0.22 } else { 0.07 }));
+        p.stroke(area, 8.0 * self.scale, 1.0, white(if hot { 0.60 } else { 0.24 }));
+        p.text("+", &fonts.big, area, white(if hot { 1.0 } else { 0.72 }));
     }
 
     /// Drag feedback on the map under the cursor: where a dragged cell would
@@ -1506,6 +1566,12 @@ impl Board {
     fn draw_drag(&self, p: &Painter, map: &Map) {
         let s = self.scale;
         let (cx, cy) = (self.cursor.0 - map.area.left, self.cursor.1 - map.area.top);
+        if let Some(from) = self.dragged_row() {
+            if let (Some((_, line)), Some(row)) = (self.row_slot_at(from, self.cursor.1), map.layout.rows.get(from)) {
+                let right = map.layout.spine.right;
+                p.fill(&rect(row.header.left, line - 2.0 * s, right - row.header.left, 4.0 * s), 2.0 * s, accent(1.0));
+            }
+        }
         if let Some(id) = self.dragged_cell() {
             match self.slot_at(id, self.cursor.0, self.cursor.1) {
                 Some(Slot::Row { row, x, .. }) => {
@@ -1645,7 +1711,7 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     let sizes: Vec<(f32, f32)> =
         windows.iter().map(|(w, _)| ((w.rect.right - w.rect.left).max(1) as f32, (w.rect.bottom - w.rect.top).max(1) as f32)).collect();
     // Not narrower than the title bar needs for its buttons and a few letters.
-    let min_widths: Vec<f32> = windows.iter().map(|(w, everywhere)| (120.0 + Pin::of(w, *everywhere).width()) * s).collect();
+    let min_widths: Vec<f32> = vec![(120.0 + Pin::WIDTH) * s; windows.len()];
     let space = Space {
         area: (aw, ah),
         title: title_h,
@@ -1658,9 +1724,9 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     placed
         .into_iter()
         .zip(windows)
-        .map(|(at, &(window, everywhere))| {
+        .map(|(at, &(window, _))| {
             let (x, y, w) = (area.left + at.x, area.top + at.y, at.w);
-            let pin_w = Pin::of(window, everywhere).width() * s;
+            let pin_w = Pin::WIDTH * s;
             let (close_w, pin_h) = (28.0 * s, 24.0 * s);
             let pin_y = y + (title_h - pin_h) / 2.0;
             let close = rect(x + w - 6.0 * s - close_w, pin_y, close_w, pin_h);

@@ -112,6 +112,29 @@ impl Grid {
         self.rows.retain(|r| !r.cells.is_empty());
     }
 
+    /// Moves row `from` to before row `at`, where `at` counts the rows
+    /// without the moved one.
+    pub fn move_row(&mut self, from: usize, at: usize) {
+        if from < self.rows.len() {
+            let row = self.rows.remove(from);
+            self.rows.insert(at.min(self.rows.len()), row);
+        }
+    }
+
+    /// Gives every row without a name one: "워크스페이스 N" with the lowest
+    /// number no row has yet. Returns whether any was given.
+    pub fn name_unnamed(&mut self) -> bool {
+        let mut changed = false;
+        for r in 0..self.rows.len() {
+            if self.rows[r].name.trim().is_empty() {
+                let name = (1..).map(|n| format!("워크스페이스 {n}")).find(|name| self.rows.iter().all(|row| row.name != *name));
+                self.rows[r].name = name.unwrap_or_default();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Moves a cell into a new row inserted before row `at`.
     pub fn move_cell_to_new_row(&mut self, id: &str, at: usize) {
         let Some(from) = self.find(id) else { return };

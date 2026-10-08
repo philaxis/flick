@@ -94,9 +94,8 @@ struct App {
     following: HashSet<isize>,
     /// A pin menu to show once the current handler has returned.
     pending_menu: Option<(HWND, PinState)>,
-    /// Likewise the menu of a workspace and that of a cell in the board.
+    /// Likewise the menu of a workspace in the board.
     pending_row_menu: Option<usize>,
-    pending_cell_menu: Option<String>,
     /// When each cell was last shown (cells not in here count from
     /// `started`), and the cells of rows put to sleep. Both only matter with
     /// `sleep_after_minutes` set.
@@ -182,7 +181,6 @@ impl App {
             following: HashSet::new(),
             pending_menu: None,
             pending_row_menu: None,
-            pending_cell_menu: None,
             seen: HashMap::new(),
             asleep: HashSet::new(),
             started: Instant::now(),
@@ -197,7 +195,9 @@ impl App {
     /// Reads the real desktops and brings the grid in line with them.
     fn sync(&mut self) -> Option<Desktops> {
         let desktops = Desktops::read()?;
-        if self.grid.sync(&desktops.ids(), &desktops.current) {
+        // Both must run: a row made just now is still to be named.
+        let synced = self.grid.sync(&desktops.ids(), &desktops.current);
+        if self.grid.name_unnamed() || synced {
             self.save();
         }
         Some(desktops)
@@ -597,7 +597,9 @@ impl App {
             Action::Cancel => return self.cancel_board(),
             Action::Go(id, window) => return self.leave_board(&id, window),
             Action::CloseWindow(hwnd) => {
-                vd::ask_to_close(hwnd);
+                if input::above_us(hwnd) || !vd::ask_to_close(hwnd) {
+                    self.board.close_refused(hwnd);
+                }
                 return self.refresh_board_in(500);
             }
             // The menus are shown once this handler has returned
@@ -606,14 +608,12 @@ impl App {
                 self.pending_row_menu = Some(row);
                 return;
             }
-            Action::CellMenu(id) => {
-                self.pending_cell_menu = Some(id);
-                return;
-            }
 
             Action::MoveWindow { window, cell, monitor } => self.move_window(window, cell, monitor),
             Action::MoveCell { id, row, index } => self.grid.move_cell(&id, row, index),
             Action::MoveCellToNewRow { id, at } => self.grid.move_cell_to_new_row(&id, at),
+            Action::MoveRow { from, at } => self.grid.move_row(from, at),
+            Action::ToggleEmphasis(id) => self.grid.toggle_emphasis(&id),
             Action::AddCell { row, front } => self.add_cell(row, front),
             Action::AddRow { top } => self.add_row(top),
             Action::RemoveCell(id) => self.remove_cell(&id),
@@ -1060,28 +1060,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
 /// because a menu pumps messages, which must be able to reach the app.
 fn run_pending_menus(owner: HWND) {
     run_row_menu(owner);
-    run_cell_menu(owner);
     if let Some((window, state)) = with_app(|app| app.pending_menu.take()).flatten() {
         if let Some(command) = tray::pin_menu(owner, state) {
             with_app(|app| app.apply_pin(window, command));
         }
-    }
-}
-
-/// The menu of a cell in the board's map, if one was asked for.
-fn run_cell_menu(owner: HWND) {
-    let pending = with_app(|app| {
-        let id = app.pending_cell_menu.take()?;
-        Some((app.grid.is_emphasised(&id), id))
-    })
-    .flatten();
-    let Some((emphasised, id)) = pending else { return };
-    if tray::cell_menu(owner, emphasised) {
-        with_app(|app| {
-            app.grid.toggle_emphasis(&id);
-            app.save();
-            app.refresh_board();
-        });
     }
 }
 

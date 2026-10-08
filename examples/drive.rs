@@ -151,8 +151,8 @@ fn main() {
                 let class = windows::core::HSTRING::from(args[2].as_str());
                 let number = |i: usize| args[i].parse::<isize>().unwrap();
                 let window = FindWindowW(&class, None);
-                let _ = PostMessageW(window, number(3) as u32, WPARAM(number(4) as usize), LPARAM(number(5)));
-                println!("window {:x}", window.0);
+                let posted = PostMessageW(window, number(3) as u32, WPARAM(number(4) as usize), LPARAM(number(5)));
+                println!("window {:x} {:?}", window.0, posted.map_err(|e| e.message().to_string()));
             }
             Some("client") => {
                 // client <class>: where the inside of that window is on the screen, and its size.
