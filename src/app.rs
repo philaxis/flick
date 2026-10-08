@@ -67,6 +67,11 @@ const CONFIG_TIMER_ID: usize = 5;
 /// One-shot timer that tells the app again that the trigger was let go of,
 /// when it was too busy to hear it.
 const RELEASE_TIMER_ID: usize = 6;
+/// One-shot timer that gives the board the keyboard back (`Action::Dismiss`).
+const RECLAIM_TIMER_ID: usize = 7;
+/// For this long after the board opened, or a cell was added or removed in
+/// it, Windows may still hand the keyboard to a window of its own choosing.
+const BOARD_SETTLES_MS: u64 = 1500;
 const CONFIG_CHECK_MS: u32 = 2000;
 /// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
 /// do the same carrying the active window, and this one opens the pin menu.
@@ -78,6 +83,9 @@ struct App {
     grid: Grid,
     minimap: Minimap,
     board: Board,
+    /// Until when the board losing the keyboard is Windows' doing, not the
+    /// user's (see `BOARD_SETTLES_MS`).
+    board_settling: Instant,
     /// The window that had focus when the board opened, to give it back on cancel.
     focus_before_board: HWND,
     settings: Settings,
@@ -173,6 +181,7 @@ impl App {
             grid,
             minimap: Minimap::spawn(),
             board,
+            board_settling: Instant::now(),
             focus_before_board: HWND(0),
             settings,
             capturing: false,
@@ -577,6 +586,7 @@ impl App {
         let model = self.model(&desktops);
         self.board.set_dwell(self.config.dwell_ms);
         self.board.open(model, self.grid.clone());
+        self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
         vd::force_foreground(self.board.hwnd());
     }
 
@@ -659,6 +669,16 @@ impl App {
         match action {
             // These are done with here: no grid to commit, no board to rebuild.
             Action::None => return,
+            // Right after a switch of desktops, or a desktop made or removed,
+            // Windows gives the keyboard to a window of that desktop: the
+            // board takes it back instead of closing under the user's hand.
+            Action::Dismiss if Instant::now() < self.board_settling => {
+                debug_log!("app: the board lost the keyboard while settling, and takes it back");
+                unsafe {
+                    SetTimer(self.hwnd, RECLAIM_TIMER_ID, 40, None);
+                }
+                return;
+            }
             Action::Dismiss => return self.board.close(),
             Action::Cancel => return self.cancel_board(),
             Action::Go(id, window) => return self.leave_board(&id, window),
@@ -680,9 +700,18 @@ impl App {
             Action::MoveCellToNewRow { id, at } => self.grid.move_cell_to_new_row(&id, at),
             Action::MoveRow { from, at } => self.grid.move_row(from, at),
             Action::ToggleEmphasis(id) => self.grid.toggle_emphasis(&id),
-            Action::AddCell { row, front } => self.add_cell(row, front),
-            Action::AddRow { top } => self.add_row(top),
-            Action::RemoveCell(id) => self.remove_cell(&id),
+            Action::AddCell { row, front } => {
+                self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
+                self.add_cell(row, front)
+            }
+            Action::AddRow { top } => {
+                self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
+                self.add_row(top)
+            }
+            Action::RemoveCell(id) => {
+                self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
+                self.remove_cell(&id)
+            }
             Action::SetPin { window, row, all } => self.set_pin(window, row, all),
             Action::SetTop { window, on } => self.set_top(window, on),
             Action::Rename(row, name) => {
@@ -1077,6 +1106,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     app.minimap.hide_after(LINGER_HOTKEY_MS);
                 });
             }
+        }
+        WM_TIMER if wparam.0 == RECLAIM_TIMER_ID => {
+            let _ = KillTimer(hwnd, RECLAIM_TIMER_ID);
+            with_app(|app| {
+                if app.board.is_open() {
+                    vd::force_foreground(app.board.hwnd());
+                }
+            });
         }
         WM_TIMER if wparam.0 == LABEL_TIMER_ID => {
             let _ = KillTimer(hwnd, LABEL_TIMER_ID);

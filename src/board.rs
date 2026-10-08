@@ -1294,7 +1294,7 @@ impl Board {
             return Action::None;
         }
         let near = |(at, cx, cy): (Instant, f32, f32)| at.elapsed().as_millis() < SECOND_CLICK_MS && (x - cx).hypot(y - cy) < 12.0 * self.scale;
-        if self.changed_at.take().is_some_and(near) {
+        if self.changed_at.is_some_and(near) {
             debug_log!("board: click ignored, right upon one that added or took away something here");
             return Action::None;
         }
