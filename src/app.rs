@@ -436,6 +436,7 @@ impl App {
         if self.board.is_open() {
             // With the board open the gesture only moves the selection; the
             // desktop changes once, when the board is confirmed.
+            debug_log!("app: {dir:?} moves the selection, the board being open");
             self.board.select_dir(dir);
             return;
         }
@@ -443,10 +444,14 @@ impl App {
         let Some(from) = self.grid.find(&desktops.current) else { return };
         match self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
             Some(to) => {
+                debug_log!("app: {dir:?} from row {} cell {}", from.row, from.col);
                 self.edge = None;
                 self.go(&desktops, from, &to, carry);
             }
-            None => self.push_edge(&desktops, from, dir, carry),
+            None => {
+                debug_log!("app: {dir:?} from row {} cell {}: nothing that way", from.row, from.col);
+                self.push_edge(&desktops, from, dir, carry)
+            }
         }
     }
 
@@ -960,6 +965,10 @@ fn on_tray_command(hwnd: HWND, command: Command) {
         Command::Settings => {
             with_app(App::open_settings);
         }
+        Command::DebugLog => unsafe {
+            let select = HSTRING::from(format!("/select,\"{}\"", crate::debuglog::path().display()));
+            ShellExecuteW(None, w!("open"), w!("explorer.exe"), &select, PCWSTR::null(), SW_SHOWNORMAL);
+        },
         Command::Exit => unsafe {
             let _ = DestroyWindow(hwnd);
         },
@@ -988,10 +997,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     match message {
         WM_STEP => {
             if let Some(dir) = input::dir_from_index(wparam.0) {
-                with_app(|app| {
+                #[cfg(feature = "debug-log")]
+                let started = Instant::now();
+                let taken = with_app(|app| {
                     app.in_gesture = true;
                     app.step(dir, app.carry_held());
                 });
+                debug_log!("app: {dir:?} {} in {:?}", if taken.is_some() { "done" } else { "dropped, the app being busy" }, started.elapsed());
+                let _ = taken;
             }
         }
         WM_CLICK => {
@@ -1206,6 +1219,12 @@ pub fn run(first_run: bool) {
         return warn("가상 데스크톱에 접근하지 못했습니다. 이 윈도우 빌드를 지원하지 않는 것일 수 있습니다.");
     }
 
+    debug_log!(
+        "Flick {}, Windows build {:?}, monitors {:?}",
+        env!("CARGO_PKG_VERSION"),
+        vdapi::windows_build(),
+        vd::monitors().iter().map(|m| (m.bounds.right - m.bounds.left, m.bounds.bottom - m.bounds.top, m.scale)).collect::<Vec<_>>()
+    );
     let (events, listener) = listen(hwnd);
     let mut app = App::new(hwnd, board, settings, events, listener);
     if let Some(desktops) = app.sync() {

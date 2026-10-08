@@ -13,6 +13,11 @@ build = "build.rs"
 name = "Flick"
 path = "src/main.rs"
 
+[features]
+# Keeps a record of what the input hooks saw and did (src/debuglog.rs), for
+# finding out why a gesture was not taken. Not for the released exe.
+debug-log = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

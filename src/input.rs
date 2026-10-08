@@ -338,6 +338,13 @@ fn reload() {
     });
     replay(&held_back);
     watch_chord();
+    #[cfg(feature = "debug-log")]
+    if let Some(s) = &settings {
+        debug_log!(
+            "settings: triggers {:?}, step_x {}, step_y {}, flick {}, vertical when dy >= {:.2} dx",
+            s.triggers, s.step_x, s.step_y, s.vertical_sticky, s.vertical_bias
+        );
+    }
     SETTINGS.with(|slot| *slot.borrow_mut() = settings);
     if HELD.with(|held| held.borrow_mut().clear()) {
         listen_raw(false);
@@ -406,7 +413,9 @@ fn held() -> bool {
 }
 
 fn press(source: Source) {
-    if HELD.with(|held| held.borrow_mut().press(source)) {
+    let began = HELD.with(|held| held.borrow_mut().press(source));
+    debug_log!("down {source:?}{}", if began { ": hold begins" } else { "" });
+    if began {
         STEPPED.set(false);
         ACCUM.set((0, 0));
         FLICKED.set(0);
@@ -418,7 +427,14 @@ fn press(source: Source) {
 }
 
 fn release(s: &Settings, source: Source) {
-    if HELD.with(|held| held.borrow_mut().release(source)) {
+    let ended = HELD.with(|held| held.borrow_mut().release(source));
+    debug_log!("up {source:?}{}", if ended { ": hold ends" } else { "" });
+    if ended {
+        debug_log!(
+            "hold ended as a {}; cursor movements held back meanwhile: {}",
+            if STEPPED.get() { "move" } else { "click" },
+            crate::debuglog::take_held_back()
+        );
         listen_raw(false);
         post(s, if STEPPED.get() { WM_RELEASE } else { WM_CLICK }, 0);
     }
@@ -440,6 +456,8 @@ fn on_raw_input(handle: HRAWINPUT) {
         return;
     }
     let mouse = unsafe { raw.data.mouse };
+    #[cfg(feature = "debug-log")]
+    crate::debuglog::device(raw.header.hDevice);
     let (dx, dy) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
         // Absolute pointers report a position in 0..65535 across the screen;
         // the movement is the difference from the previous report.
@@ -493,6 +511,9 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     }
     let now = Instant::now();
     let paused = LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > FLICK_PAUSE_MS);
+    if paused {
+        debug_log!("(a pause)");
+    }
     let (wx, wy) = RECENT.with(|recent| {
         let mut recent = recent.borrow_mut();
         // A stop, or turning round after a flick, starts a fresh stroke.
@@ -510,11 +531,15 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     let (mut ax, _) = ACCUM.get();
     if s.is_vertical(wx, wy) {
         // Moving up or down: nothing of it counts sideways.
+        if ax != 0 {
+            debug_log!("sideways travel of {ax} dropped: the last moments count as vertical");
+        }
         ax = 0;
         if FLICKED.get() == 0 && wy.abs() >= (s.step_y / 2).max(40) {
             FLICKED.set(wy.signum());
             RECENT.with(|recent| recent.borrow_mut().clear());
             STEPPED.set(true);
+            debug_log!("step {}", if wy > 0 { "down" } else { "up" });
             post(s, WM_STEP, dir_index(if wy > 0 { Dir::Down } else { Dir::Up }));
         }
     } else {
@@ -524,9 +549,15 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
             ax -= ax.signum() * s.step_x;
             FLICKED.set(0);
             STEPPED.set(true);
+            debug_log!("step {dir:?}");
             post(s, WM_STEP, dir_index(dir));
         }
     }
+    debug_log!(
+        "move {dx} {dy}: last moments {wx} {wy} ({}), sideways so far {ax} of {}",
+        if s.is_vertical(wx, wy) { "vertical" } else { "sideways" },
+        s.step_x
+    );
     ACCUM.set((ax, 0));
 }
 
@@ -552,8 +583,10 @@ fn travel_linear(s: &Settings, dx: i32, dy: i32) {
             break;
         };
         STEPPED.set(true);
+        debug_log!("step {dir:?}");
         post(s, WM_STEP, dir_index(dir));
     }
+    debug_log!("move {dx} {dy}: so far {ax} of {}, {ay} of {}", s.step_x, s.step_y);
     ACCUM.set((ax, ay));
 }
 
@@ -589,7 +622,12 @@ fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     }
     // The cursor stays put while the trigger is held; the movement itself is
     // read from raw input (`on_raw_input`).
-    message == WM_MOUSEMOVE && held()
+    let held_back = message == WM_MOUSEMOVE && held();
+    #[cfg(feature = "debug-log")]
+    if held_back {
+        crate::debuglog::held_back();
+    }
+    held_back
 }
 
 fn key_event(key: u32, up: bool) -> INPUT {
@@ -637,6 +675,7 @@ fn watch_chord() {
 /// The rest of the chord did not follow in time.
 unsafe extern "system" fn chord_timeout(_: HWND, _: u32, _: usize, _: u32) {
     let held_back = CHORD.with(|chord| chord.borrow_mut().timeout());
+    debug_log!("the chord's keys did not all go down in time: typing");
     replay(&held_back);
     watch_chord();
 }

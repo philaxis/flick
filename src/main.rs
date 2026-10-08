@@ -1,5 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+#[macro_use]
+mod debuglog;
+
 mod config;
 mod grid;
 

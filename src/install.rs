@@ -127,7 +127,8 @@ pub fn install() -> std::io::Result<()> {
     let key = uninstall_key(APP_NAME);
     let path = exe.to_string_lossy();
     set_string(&key, w!("DisplayName"), APP_NAME);
-    set_string(&key, w!("DisplayVersion"), env!("CARGO_PKG_VERSION"));
+    let version = if crate::debuglog::ON { concat!(env!("CARGO_PKG_VERSION"), " debug") } else { env!("CARGO_PKG_VERSION") };
+    set_string(&key, w!("DisplayVersion"), version);
     set_string(&key, w!("DisplayIcon"), &path);
     set_string(&key, w!("InstallLocation"), &install_dir(APP_NAME).to_string_lossy());
     set_string(&key, w!("UninstallString"), &format!("\"{path}\" --uninstall"));
