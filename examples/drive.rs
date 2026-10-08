@@ -6,7 +6,7 @@
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
 //!   drive post <class> <message> <wparam> <lparam> | client <class>
-//!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND>
+//!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND> | mem
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -236,6 +236,36 @@ fn main() {
                 windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&[nudge], std::mem::size_of_val(&nudge) as i32);
                 let done = SetForegroundWindow(window).as_bool();
                 println!("0x{:x} {done}", before.0);
+            }
+            Some("mem") => {
+                // mem: what the running app holds. Working set and private bytes in MB, GDI and
+                // USER objects, handles and threads.
+                use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+                use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+                use windows::Win32::System::Threading::{GetGuiResources, GetProcessHandleCount, OpenProcess, GR_GDIOBJECTS, GR_USEROBJECTS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+                use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(app, Some(&mut pid));
+                let Ok(process) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) else { return println!("no app") };
+                let mut memory = PROCESS_MEMORY_COUNTERS_EX::default();
+                let _ = K32GetProcessMemoryInfo(process, &mut memory as *mut _ as *mut PROCESS_MEMORY_COUNTERS, std::mem::size_of_val(&memory) as u32);
+                let mut handles = 0u32;
+                let _ = GetProcessHandleCount(process, &mut handles);
+                let mut threads = 0;
+                if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
+                    let mut entry = THREADENTRY32 { dwSize: std::mem::size_of::<THREADENTRY32>() as u32, ..Default::default() };
+                    let mut more = Thread32First(snapshot, &mut entry).is_ok();
+                    while more {
+                        threads += (entry.th32OwnerProcessID == pid) as u32;
+                        more = Thread32Next(snapshot, &mut entry).is_ok();
+                    }
+                }
+                let mb = |bytes: usize| bytes as f64 / 1048576.0;
+                println!(
+                    "ws {:.1} private {:.1} peak-ws {:.1} gdi {} user {} handles {handles} threads {threads}",
+                    mb(memory.WorkingSetSize), mb(memory.PrivateUsage), mb(memory.PeakWorkingSetSize),
+                    GetGuiResources(process, GR_GDIOBJECTS), GetGuiResources(process, GR_USEROBJECTS)
+                );
             }
             Some("typetest") => typetest(),
             Some("idle") => {

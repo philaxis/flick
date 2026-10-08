@@ -546,6 +546,9 @@ impl Board {
         self.rest_on(None);
         self.clear_thumbnails();
         self.icons.clear();
+        // A picture the size of every screen together, of no use until the
+        // board is opened again.
+        self.canvas = None;
         self.press = None;
         unsafe {
             let _ = ReleaseCapture();

@@ -297,6 +297,7 @@ impl Settings {
 
     pub fn close(&mut self) {
         self.press = None;
+        self.canvas = None;
         unsafe {
             let _ = ReleaseCapture();
             ShowWindow(self.hwnd, SW_HIDE);
