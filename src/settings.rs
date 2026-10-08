@@ -44,7 +44,7 @@ use windows::{
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
-const SIZE: (f32, f32) = (400.0, 658.0);
+const SIZE: (f32, f32) = (400.0, 704.0);
 /// The dial: its centre and its radius.
 const DIAL: ((f32, f32), f32) = ((200.0, 146.0), 104.0);
 /// Top of the first row and the height of each.
@@ -71,6 +71,8 @@ pub struct View {
     /// See `Config::dwell_ms`.
     pub dwell_ms: i32,
     pub autostart: bool,
+    /// Flick is set to run as administrator (`admin`).
+    pub admin: bool,
 }
 
 /// What the user asked for; carried out by the app.
@@ -83,6 +85,8 @@ pub enum Action {
     /// Start (or give up) waiting for a new trigger to be pressed.
     Capture(bool),
     Autostart(bool),
+    /// Run as administrator from now on, or no longer.
+    Admin(bool),
     /// Open the config file, which has the settings not shown here.
     OpenFile,
     Close,
@@ -100,6 +104,7 @@ enum Hit {
     StepY,
     Dwell,
     Autostart,
+    Admin,
     File,
 }
 
@@ -112,6 +117,7 @@ struct Layout {
     step_y: Rect,
     dwell: Rect,
     autostart: Rect,
+    admin: Rect,
     file: Rect,
 }
 
@@ -131,7 +137,8 @@ impl Layout {
             step_y: slider(3.0),
             dwell: slider(4.0),
             autostart: right(5.0, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(6.0) + 8.0) * s, 150.0 * s, 26.0 * s),
+            admin: right(6.0, 44.0, 24.0),
+            file: rect(EDGES.0 * s, (row(7.0) + 8.0) * s, 150.0 * s, 26.0 * s),
         }
     }
 
@@ -152,6 +159,7 @@ impl Layout {
             (&self.step_y, Hit::StepY),
             (&self.dwell, Hit::Dwell),
             (&self.autostart, Hit::Autostart),
+            (&self.admin, Hit::Admin),
             (&self.file, Hit::File),
         ]
         .into_iter()
@@ -465,6 +473,7 @@ impl Settings {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Mode(sticky) if sticky != self.view.sticky => Action::Set("vertical_sticky", sticky.to_string()),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
+            Hit::Admin => Action::Admin(!self.view.admin),
             Hit::File => Action::OpenFile,
             _ => Action::None,
         }
@@ -564,12 +573,11 @@ impl Settings {
         self.draw_slider(&p, fonts, &layout.dwell, view.dwell_ms, RESTS, &rest, Hit::Dwell);
 
         label(5.0, "윈도우 시작 시 실행");
-        let switch = &layout.autostart;
-        let (h, on) = (switch.bottom - switch.top, view.autostart);
-        let hot = self.hover == Hit::Autostart;
-        p.fill(switch, h / 2.0, if on { accent(0.95) } else { white(if hot { 0.22 } else { 0.14 }) });
-        let knob = if on { switch.right - h / 2.0 } else { switch.left + h / 2.0 };
-        p.disc((knob, switch.top + h / 2.0), h / 2.0 - 3.0 * s, white(0.95));
+        self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
+        // For the trigger to work on windows run as administrator, and to
+        // close them from the board.
+        label(6.0, "관리자 권한으로 실행");
+        self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
 
         let hot = self.hover == Hit::File;
         p.text("그 밖의 설정: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
@@ -612,6 +620,14 @@ impl Settings {
         p.text(&format!("위아래 ±{a:.0}°"), &fonts.heading, &below(18.0, 26.0), white(0.92));
         p.text("경계를 끌면 위아래로 치는 폭이 바뀝니다", &fonts.hint, &below(44.0, 20.0), white(0.40));
         Ok(())
+    }
+
+    fn draw_switch(&self, p: &Painter, switch: &Rect, on: bool, hit: Hit) {
+        let h = switch.bottom - switch.top;
+        let hot = self.hover == hit;
+        p.fill(switch, h / 2.0, if on { accent(0.95) } else { white(if hot { 0.22 } else { 0.14 }) });
+        let knob = if on { switch.right - h / 2.0 } else { switch.left + h / 2.0 };
+        p.disc((knob, switch.top + h / 2.0), h / 2.0 - 3.0 * self.scale, white(0.95));
     }
 
     fn draw_button(&self, p: &Painter, fonts: &Fonts, area: &Rect, text: &str, hit: Hit) {

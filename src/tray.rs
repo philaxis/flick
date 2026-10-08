@@ -138,19 +138,19 @@ pub fn menu(hwnd: HWND) -> Option<Command> {
 }
 
 pub fn autostart_enabled() -> bool {
-    let name = HSTRING::from(APP_NAME);
+    let name = HSTRING::from(crate::admin::task_name());
     unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, &name, RRF_RT_REG_SZ, None, None, None).is_ok() }
 }
 
 pub fn set_autostart(enabled: bool) {
-    let name = HSTRING::from(APP_NAME);
+    let name = HSTRING::from(crate::admin::task_name());
     unsafe {
         if !enabled {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &name);
             return;
         }
         let Ok(exe) = std::env::current_exe() else { return };
-        let command = HSTRING::from(format!("\"{}\"", exe.display()));
+        let command = HSTRING::from(format!("\"{}\"{}", exe.display(), crate::admin::portable_flag()));
         let bytes = (command.len() + 1) * 2;
         let set = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, &name, REG_SZ.0, Some(command.as_ptr().cast()), bytes as u32);
         if let Err(e) = set {

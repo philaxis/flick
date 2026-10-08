@@ -150,6 +150,10 @@ pub fn install() -> std::io::Result<()> {
 }
 
 pub fn uninstall() {
+    // Removing the task that runs the app as administrator takes being one.
+    if crate::admin::uninstall() {
+        return;
+    }
     stop_running();
     crate::tray::set_autostart(false);
     unsafe {

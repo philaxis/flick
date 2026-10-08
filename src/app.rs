@@ -2,6 +2,7 @@
 //! and the settings window together.
 
 use crate::{
+    admin,
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
     grid::{self, Dir, Grid, Pos, Row},
@@ -91,6 +92,10 @@ struct App {
     settings: Settings,
     /// The settings window is waiting for the new trigger to be pressed.
     capturing: bool,
+    /// Set to run as administrator (`admin`), and to start with Windows.
+    /// Kept here because asking Windows for either takes a moment.
+    admin: bool,
+    autostart: bool,
     /// When the config file that is in use was written.
     config_seen: Option<SystemTime>,
     /// Steps are arriving from a held trigger; `unsettled` when one of them
@@ -185,6 +190,8 @@ impl App {
             focus_before_board: HWND(0),
             settings,
             capturing: false,
+            admin: false,
+            autostart: false,
             config_seen: None,
             in_gesture: false,
             unsettled: false,
@@ -884,11 +891,59 @@ impl App {
             step_y: self.config.step_y,
             sticky: self.config.vertical_sticky,
             dwell_ms: self.config.dwell_ms as i32,
-            autostart: tray::autostart_enabled(),
+            autostart: self.autostart,
+            admin: self.admin,
         }
     }
 
+    /// Reads whether the app is set to run as administrator and to start
+    /// with Windows. The scheduled task that does the first does the second
+    /// too while there is one; otherwise it is the entry in the registry.
+    fn read_startup(&mut self) {
+        self.admin = admin::enabled();
+        self.autostart = if self.admin { admin::at_sign_in() } else { tray::autostart_enabled() };
+    }
+
+    fn set_autostart(&mut self, on: bool) {
+        if self.admin {
+            admin::set_at_sign_in(on);
+        } else {
+            tray::set_autostart(on);
+        }
+        self.read_startup();
+        self.refresh_settings();
+    }
+
+    /// Turns running as administrator on or off. Either way another Flick
+    /// takes over when it worked, and this one quits.
+    fn set_admin(&mut self, on: bool) {
+        let quit = if on {
+            let taken_over = admin::turn_on(self.autostart);
+            // The task starts it with Windows from here on.
+            if admin::enabled() && self.autostart {
+                tray::set_autostart(false);
+            }
+            taken_over
+        } else {
+            let at_sign_in = self.autostart;
+            let taken_over = admin::turn_off();
+            if !admin::enabled() && at_sign_in {
+                tray::set_autostart(true);
+            }
+            taken_over
+        };
+        if quit {
+            unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            return;
+        }
+        self.read_startup();
+        self.refresh_settings();
+    }
+
     fn open_settings(&mut self) {
+        self.read_startup();
         let view = self.settings_view();
         self.settings.open(view);
         vd::force_foreground(self.settings.hwnd());
@@ -943,10 +998,8 @@ impl App {
             }
             settings::Action::Set(key, value) => self.set_config(key, &value),
             settings::Action::Capture(on) => self.capture_trigger(on),
-            settings::Action::Autostart(on) => {
-                tray::set_autostart(on);
-                self.refresh_settings();
-            }
+            settings::Action::Autostart(on) => self.set_autostart(on),
+            settings::Action::Admin(on) => self.set_admin(on),
             settings::Action::OpenFile => unsafe {
                 let path = HSTRING::from(config::config_path().as_os_str());
                 ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
@@ -1271,6 +1324,9 @@ fn init() -> windows::core::Result<HWND> {
         if hwnd.0 == 0 {
             return Err(windows::core::Error::from_win32());
         }
+        // Also when run as administrator: an installer of a newer version
+        // closes it, and the test driver opens its settings.
+        admin::let_in(hwnd, &[WM_CLOSE, WM_OPEN_SETTINGS]);
         Ok(hwnd)
     }
 }
@@ -1416,8 +1472,6 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
         }
     }
     let size = (2560, 1440);
-    let look = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    app.board.set_look(look("FLICK_PLUS"), look("FLICK_PINS"));
     if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5) {
         write_raw(path, size, &pixels);
     }
@@ -1437,6 +1491,7 @@ pub fn render_settings(path: &str) {
         sticky: config.vertical_sticky,
         dwell_ms: config.dwell_ms as i32,
         autostart: true,
+        admin: false,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
         write_raw(path, size, &pixels);

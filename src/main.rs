@@ -8,6 +8,8 @@ mod config;
 mod grid;
 
 #[cfg(windows)]
+mod admin;
+#[cfg(windows)]
 mod app;
 #[cfg(windows)]
 mod board;
@@ -62,6 +64,12 @@ fn main() {
         }
     }
     let flag = args.get(1).map(String::as_str);
+    admin::set_portable(args.iter().any(|arg| arg == "--portable"));
+    // What the settings run, as administrator, to turn that setting on or off.
+    if flag == Some("--admin") {
+        let arguments: Vec<String> = args[2..].iter().filter(|arg| *arg != "--portable").cloned().collect();
+        std::process::exit(admin::helper(&arguments));
+    }
     if flag == Some("--uninstall") {
         return install::uninstall();
     }
@@ -81,11 +89,30 @@ fn main() {
             Err(e) => app::log(&format!("install failed, running in place: {e}")),
         }
     }
-    // One instance only: two sets of hooks would step twice per gesture.
-    let _mutex = unsafe { CreateMutexW(None, true, w!("flick.single-instance")) };
-    if unsafe { GetLastError() } == Err(ERROR_ALREADY_EXISTS.into()) {
+    // Set to run as administrator: the scheduled task that does so takes over.
+    if admin::hand_over() {
         return;
     }
+    // One instance only: two sets of hooks would step twice per gesture. One
+    // that is just quitting to let this one take over (the setting to run
+    // as administrator was changed) is waited for a moment.
+    let mut tries = 0;
+    let _mutex = loop {
+        let mutex = unsafe { CreateMutexW(None, true, w!("flick.single-instance")) };
+        if unsafe { GetLastError() } != Err(ERROR_ALREADY_EXISTS.into()) {
+            break mutex;
+        }
+        tries += 1;
+        if tries > 30 {
+            return;
+        }
+        if let Ok(mutex) = mutex {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(mutex);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
     app::run(flag == Some("--first-run"));
 }
 
