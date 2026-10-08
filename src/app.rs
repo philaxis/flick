@@ -5,7 +5,7 @@ use crate::{
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
     grid::{self, Dir, Grid, Pos, Row},
-    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_RELEASE, WM_STEP},
+    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
     tray::{self, Command, PinCommand, PinState, RowCommand},
@@ -467,21 +467,23 @@ impl App {
         unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
     }
 
-    /// Moves one cell in `dir`. With `carry` the foreground window comes along.
-    fn step(&mut self, dir: Dir, carry: bool) {
+    /// Moves one cell in `dir`. With `carry` the foreground window comes
+    /// along. Returns false when there is no cell that way.
+    fn step(&mut self, dir: Dir, carry: bool) -> bool {
         if self.board.is_open() {
             // With the board open the gesture only moves the selection; the
             // desktop changes once, when the board is confirmed.
             debug_log!("app: {dir:?} moves the selection, the board being open");
             self.board.select_dir(dir);
-            return;
+            return true;
         }
-        let Some(desktops) = self.sync() else { return };
-        let Some(from) = self.grid.find(&desktops.current) else { return };
+        let Some(desktops) = self.sync() else { return true };
+        let Some(from) = self.grid.find(&desktops.current) else { return true };
         match self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
             Some(to) => {
                 debug_log!("app: {dir:?} from row {} cell {}", from.row, from.col);
                 self.go(&desktops, from, &to, carry);
+                true
             }
             None => {
                 // The edge of the grid: the minimap shows where one is and
@@ -490,7 +492,20 @@ impl App {
                 debug_log!("app: {dir:?} from row {} cell {}: nothing that way", from.row, from.col);
                 let view = self.view(&desktops.current);
                 self.minimap.show(view, None);
+                false
             }
+        }
+    }
+
+    /// The held trigger is travelling sideways: the minimap comes up at once
+    /// and follows the hand, before any step is taken.
+    fn show_drag(&mut self) {
+        if self.board.is_open() {
+            return;
+        }
+        if let Some(desktops) = self.sync() {
+            let view = self.view(&desktops.current);
+            self.minimap.show(view, None);
         }
     }
 
@@ -1051,11 +1066,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 let started = Instant::now();
                 let taken = with_app(|app| {
                     app.in_gesture = true;
-                    app.step(dir, app.carry_held());
+                    app.step(dir, app.carry_held())
                 });
+                // Dropped steps count as gone: the hand is not to be shown
+                // ahead of the cell for the rest of the hold.
+                input::step_taken(lparam.0 as u32, dir, taken.unwrap_or(true));
                 debug_log!("app: {dir:?} {} in {:?}", if taken.is_some() { "done" } else { "dropped, the app being busy" }, started.elapsed());
                 let _ = taken;
             }
+        }
+        WM_DRAG => {
+            with_app(App::show_drag);
         }
         WM_CLICK => {
             #[cfg(feature = "debug-log")]

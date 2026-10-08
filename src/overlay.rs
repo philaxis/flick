@@ -44,6 +44,8 @@ const TITLE_H: f32 = 26.0;
 /// Time constants (seconds) of the exponential easing.
 const SLIDE_TAU: f32 = 0.018;
 const FADE_TAU: f32 = 0.025;
+/// How far past the end of its row the highlight is pushed, in cells.
+const EDGE_GIVE: f32 = 0.16;
 
 /// One cell of the minimap.
 #[derive(Clone, Copy, Default)]
@@ -127,6 +129,9 @@ pub struct Overlay {
     /// Highlight position in (column, row) cell units, eased toward `view.cur`.
     /// The column is measured on screen, i.e. after the row's shift.
     highlight: (f32, f32),
+    /// The highlight's column when the debug record last told of it.
+    #[cfg(feature = "debug-log")]
+    logged: f32,
     /// Each row's sideways shift in cells, eased toward `View::shift`.
     shifts: Vec<f32>,
     alpha: f32,
@@ -163,6 +168,8 @@ impl Overlay {
             canvas: None,
             view: View::default(),
             highlight: (0.0, 0.0),
+            #[cfg(feature = "debug-log")]
+            logged: 0.0,
             shifts: Vec::new(),
             alpha: 0.0,
             visible: false,
@@ -235,7 +242,17 @@ impl Overlay {
             *shift += (self.view.shift(r) - *shift) * k;
         }
         if let Some(cur) = self.view.cur {
-            self.highlight.0 += (cur.col as f32 + self.view.shift(cur.row) - self.highlight.0) * k;
+            // With the trigger held the highlight goes where the hand is, also
+            // between cells, and a little past the ends of the row.
+            let last = self.view.rows.get(cur.row).map_or(0, |row| row.len().saturating_sub(1)) as f32;
+            let col = (cur.col as f32 + crate::input::drag_offset()).clamp(-EDGE_GIVE, last + EDGE_GIVE);
+            self.highlight.0 += (col + self.view.shift(cur.row) - self.highlight.0) * k;
+            #[cfg(feature = "debug-log")]
+            if col != cur.col as f32 && (self.highlight.0 - self.logged).abs() >= 0.1 {
+                // Where the highlight is drawn while it follows the hand.
+                self.logged = self.highlight.0;
+                debug_log!("minimap: cell {} of {}, highlight drawn at {:.2}", cur.col, last as usize + 1, self.highlight.0 - self.view.shift(cur.row));
+            }
             self.highlight.1 += (cur.row as f32 - self.highlight.1) * k;
         }
 
