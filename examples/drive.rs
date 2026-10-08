@@ -5,6 +5,8 @@
 //!   drive xbutton <down|up> | mouse <x> <y> [down|up|rdown|rup] | move <dx> <dy>
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
+//!   drive post <class> <message> <wparam> <lparam> | client <class>
+//!   drive key <down|up> <vk hex>... | keystate <vk hex>...
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -143,6 +145,39 @@ fn main() {
                 let events: Vec<_> = args[3].chars().map(|c| key(c, up)).collect();
                 windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&events, std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32);
             }
+            Some("post") => {
+                // post <class> <message> <wparam> <lparam>: any message to the first window of a class.
+                let class = windows::core::HSTRING::from(args[2].as_str());
+                let number = |i: usize| args[i].parse::<isize>().unwrap();
+                let window = FindWindowW(&class, None);
+                let _ = PostMessageW(window, number(3) as u32, WPARAM(number(4) as usize), LPARAM(number(5)));
+                println!("window {:x}", window.0);
+            }
+            Some("client") => {
+                // client <class>: where the inside of that window is on the screen, and its size.
+                use windows::Win32::Foundation::{POINT, RECT};
+                use windows::Win32::Graphics::Gdi::ClientToScreen;
+                use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsWindowVisible};
+                let window = FindWindowW(&windows::core::HSTRING::from(args[2].as_str()), None);
+                let (mut origin, mut inside) = (POINT::default(), RECT::default());
+                let _ = ClientToScreen(window, &mut origin);
+                let _ = GetClientRect(window, &mut inside);
+                println!("{} {} {} {} visible {}", origin.x, origin.y, inside.right, inside.bottom, IsWindowVisible(window).as_bool() as u8);
+            }
+            Some("key") => {
+                // key <down|up> <vk hex>...: presses or releases keys by virtual-key code, all at once.
+                let up = args[2] == "up";
+                let events: Vec<_> = args[3..].iter().map(|vk| key_vk(u32::from_str_radix(vk, 16).unwrap(), up)).collect();
+                windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&events, std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32);
+            }
+            Some("keystate") => {
+                // keystate <vk hex>...: whether Windows holds each key or button to be down right now.
+                for vk in &args[2..] {
+                    let down = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from_str_radix(vk, 16).unwrap()) < 0;
+                    print!("{vk}:{} ", if down { "down" } else { "up" });
+                }
+                println!();
+            }
             Some("typetest") => typetest(),
             Some("idle") => {
                 // Milliseconds since anyone (or anything) last produced input.
@@ -214,8 +249,12 @@ fn main() {
 
 #[cfg(windows)]
 fn key(c: char, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    key_vk(c.to_ascii_uppercase() as u32, up)
+}
+
+#[cfg(windows)]
+fn key_vk(vk: u32, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
-    let vk = c.to_ascii_uppercase() as u32;
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -286,11 +325,20 @@ fn typetest() {
         send(&[key('e', true)]);
         pump(200);
         println!("after rollover re: {:?} (expected \"werthewerere\")", text(edit));
+        // One chord key held alone for long, then released: it is typing, and
+        // must not be left down.
+        send(&[key('w', false)]);
+        pump(400);
+        send(&[key('w', true)]);
+        pump(300);
+        let stuck = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState('W' as i32) < 0;
+        println!("after w held alone: {:?} (expected \"werthewererew\"), w still down: {stuck}", text(edit));
         // The chord: all three at once, held, released.
         send(&[key('w', false), key('e', false), key('r', false)]);
         pump(400);
         send(&[key('w', true), key('e', true), key('r', true)]);
         pump(400);
+        // (Tapping the chord opens the board, which takes the focus.)
         println!("after chord: {:?} (expected unchanged)", text(edit));
         let _ = DestroyWindow(edit);
     }
