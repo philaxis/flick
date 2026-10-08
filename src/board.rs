@@ -1,5 +1,5 @@
-//! The full-screen view: the selected cell's windows as large live previews
-//! and, at the bottom of every monitor, a small map of all rows and cells.
+//! The full-screen view: the selected cell's windows as live previews, each
+//! as large among the others as the window itself is, and, at the bottom of every monitor, a small map of all rows and cells.
 //! Windows can be dragged onto cells and monitors, cells around the map.
 //!
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
@@ -8,6 +8,7 @@
 use crate::{
     grid::{self, CellId, Dir, Grid, Row},
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Painter, Rect},
+    tiles::{self, Space},
     vd,
 };
 use std::collections::HashMap;
@@ -30,7 +31,7 @@ use windows::{
             Dwm::{
                 DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+                DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
@@ -783,34 +784,34 @@ impl Board {
                 fSourceClientAreaOnly: false.into(),
                 ..Default::default()
             };
+            let source = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok();
+            // The picture as large as fits into `w` by `h` without being
+            // distorted or made larger than the window is.
+            let fitted = |w: f32, h: f32| match source {
+                Some(source) => {
+                    let (sw, sh) = (source.cx.max(1) as f32, source.cy.max(1) as f32);
+                    let scale = (w / sw).min(h / sh).min(1.0);
+                    (sw * scale, sh * scale)
+                }
+                None => (w, h),
+            };
             match self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
                 Some(tile) if dragged == Some(hwnd) => {
                     // Follows the cursor, small enough to see the map under it.
                     let (tw, th) = size(&tile.thumb);
-                    let aspect = tw / th.max(1.0);
                     let (cx, cy) = self.cursor;
-                    let w = 200.0 * self.scale;
-                    props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - w / aspect / 2.0, w, w / aspect));
+                    let (w, h) = fitted(tw.min(200.0 * self.scale), th);
+                    props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
                     props.opacity = 215;
                 }
                 Some(tile) => {
-                    // Fill the tile's width without distorting the picture:
-                    // a window taller than the tile shows its upper part, a
-                    // shorter one sits at the top.
+                    // A tile has the shape of its window and the picture
+                    // fills it; in one that had to be made wider or higher
+                    // for its buttons the picture sits in the middle.
                     let (tw, th) = size(&tile.thumb);
-                    let mut dest = tile.thumb;
-                    let source = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok();
-                    if let Some(source) = source {
-                        let (sw, sh) = (source.cx.max(1) as f32, source.cy.max(1) as f32);
-                        let shown = th * sw / tw;
-                        if shown < sh {
-                            props.dwFlags |= DWM_TNP_RECTSOURCE;
-                            props.rcSource = RECT { left: 0, top: 0, right: source.cx, bottom: shown.round() as i32 };
-                        } else {
-                            dest.bottom = dest.top + sh * tw / sw;
-                        }
-                    }
-                    props.rcDestination = to_rect(&dest);
+                    let (w, h) = fitted(tw, th);
+                    let (cx, cy) = centre(&tile.thumb);
+                    props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
                     // A minimized window shows what it last looked like, faded.
                     // (Without a kept picture the source is only a sliver.)
                     if windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized) {
@@ -1530,86 +1531,52 @@ fn display_title(title: &str, app: &str, max_chars: usize) -> String {
     title.to_owned()
 }
 
-/// Splits windows of the given proportions (width over height) into rows of
-/// previews of one common height that fit an area of `aw` by `ah`, trying one
-/// to four rows and keeping the split that gives the tallest previews.
-/// Returns that height and the indices of each row's windows.
-fn split_into_rows(aspects: &[f32], (aw, ah): (f32, f32), title_h: f32, gap: f32, max_height: f32) -> (f32, Vec<Vec<usize>>) {
-    let total: f32 = aspects.iter().sum();
-    let mut best: (f32, Vec<Vec<usize>>) = (0.0, Vec::new());
-    for rows in 1..=aspects.len().min(4) {
-        let target = total / rows as f32;
-        let mut split: Vec<Vec<usize>> = vec![Vec::new()];
-        let mut filled = 0.0;
-        for (i, aspect) in aspects.iter().enumerate() {
-            if filled + aspect / 2.0 > target && split.len() < rows && !split[split.len() - 1].is_empty() {
-                split.push(Vec::new());
-                filled = 0.0;
-            }
-            let last = split.len() - 1;
-            split[last].push(i);
-            filled += aspect;
-        }
-        let count = split.len() as f32;
-        let by_height = (ah - gap * (count - 1.0)) / count - title_h;
-        let by_width = split
-            .iter()
-            .map(|row| (aw - gap * (row.len() as f32 - 1.0)) / row.iter().map(|i| aspects[*i]).sum::<f32>())
-            .fold(f32::INFINITY, f32::min);
-        let height = by_height.min(by_width).min(max_height);
-        if height > best.0 {
-            best = (height, split);
-        }
-    }
-    best
-}
+/// The largest share of the width of its area one preview may take, and the
+/// highest it may be, unscaled.
+const TILE_MAX: (f32, f32) = (0.6, 430.0);
+/// The lowest a preview may be, unscaled.
+const TILE_MIN_HEIGHT: f32 = 60.0;
 
-/// Lays out windows as rows of previews that keep each window's
-/// proportions, as large as fits (like Task View), centred in `area`.
+/// Lays out windows as rows of titled previews, all at one scale so that
+/// each is as large among the others as its window is (see `tiles`), centred
+/// in `area`.
 fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<TileLayout> {
-    let aspects: Vec<f32> = windows
-        .iter()
-        .map(|(w, _)| {
-            // Not narrower than the title bar needs for its buttons.
-            let r = w.rect;
-            ((r.right - r.left).max(1) as f32 / (r.bottom - r.top).max(1) as f32).clamp(1.1, 2.4)
-        })
-        .collect();
     let (aw, ah) = size(area);
     let (title_h, gap) = (46.0 * s, 26.0 * s);
-    let (height, split) = split_into_rows(&aspects, (aw, ah), title_h, gap, 430.0 * s);
-    if height <= 8.0 {
-        return Vec::new();
-    }
-    let block = split.len() as f32 * (title_h + height) + (split.len() as f32 - 1.0) * gap;
-    let mut y = area.top + (ah - block) / 2.0;
+    let sizes: Vec<(f32, f32)> =
+        windows.iter().map(|(w, _)| ((w.rect.right - w.rect.left).max(1) as f32, (w.rect.bottom - w.rect.top).max(1) as f32)).collect();
+    // Not narrower than the title bar needs for its buttons and a few letters.
+    let min_widths: Vec<f32> = windows.iter().map(|(w, everywhere)| (120.0 + Pin::of(w, *everywhere).width()) * s).collect();
+    let space = Space {
+        area: (aw, ah),
+        title: title_h,
+        gap,
+        max: (aw * TILE_MAX.0, (TILE_MAX.1 * s).min(ah - title_h).max(1.0)),
+        min_height: TILE_MIN_HEIGHT * s,
+    };
     let icon = 24.0 * s;
-    let mut tiles = Vec::new();
-    for row in &split {
-        let width: f32 = row.iter().map(|i| aspects[*i] * height).sum::<f32>() + gap * (row.len() as f32 - 1.0);
-        let mut x = area.left + (aw - width) / 2.0;
-        for &i in row {
-            let (window, everywhere) = windows[i];
-            let w = aspects[i] * height;
+    let placed = tiles::arrange(&sizes, &min_widths, &space);
+    placed
+        .into_iter()
+        .zip(windows)
+        .map(|(at, &(window, everywhere))| {
+            let (x, y, w) = (area.left + at.x, area.top + at.y, at.w);
             let pin_w = Pin::of(window, everywhere).width() * s;
             let (close_w, pin_h) = (28.0 * s, 24.0 * s);
             let pin_y = y + (title_h - pin_h) / 2.0;
             let close = rect(x + w - 6.0 * s - close_w, pin_y, close_w, pin_h);
             let pin = rect(close.left - 4.0 * s - pin_w, pin_y, pin_w, pin_h);
-            tiles.push(TileLayout {
+            TileLayout {
                 hwnd: window.hwnd,
-                frame: rect(x, y, w, title_h + height),
+                frame: rect(x, y, w, title_h + at.h),
                 icon: rect(x + 10.0 * s, y + (title_h - icon) / 2.0, icon, icon),
                 title: rect(x + 18.0 * s + icon, y, (close.left - 6.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
-                thumb: rect(x, y + title_h, w, height),
+                thumb: rect(x, y + title_h, w, at.h),
                 pin,
                 close,
-            });
-            x += w + gap;
-        }
-        y += title_h + height + gap;
-    }
-    tiles
+            }
+        })
+        .collect()
 }
 
 /// The badges of one map cell (`body`, of size `cell_w` by `cell_h`), one per

@@ -1264,8 +1264,10 @@ pub fn render_sample(path: &str) {
 }
 
 /// Renders the board for the real desktops and windows into `path` (see
-/// `write_raw`), without live thumbnails and without showing it.
-pub fn render_board(path: &str) {
+/// `write_raw`), without live thumbnails and without showing it. With
+/// `sizes` ("1920x1040,400x300") the current cell holds made-up windows of
+/// those sizes instead of its own, to see how any mix of them is laid out.
+pub fn render_board(path: &str, sizes: Option<&str>) {
     // Reading the desktops needs a backend, and only a known Windows gets one.
     if vdapi::select(false).is_none() {
         return;
@@ -1288,7 +1290,27 @@ pub fn render_board(path: &str) {
         let other = app.grid.rows.iter().flat_map(|row| &row.cells).find(|id| **id != desktops.current).cloned();
         app.grid.emphasised.extend(other);
     }
-    let model = app.model(&desktops);
+    let mut model = app.model(&desktops);
+    if let Some(sizes) = sizes {
+        let made_up = sizes.split(',').filter_map(|size| size.trim().split_once('x')).enumerate().filter_map(|(i, (w, h))| {
+            let (w, h): (i32, i32) = (w.parse().ok()?, h.parse().ok()?);
+            Some(WindowModel {
+                follows: false,
+                app: format!("sample{i}"),
+                app_name: String::new(),
+                // No window has such a handle; it only tells the tiles apart.
+                hwnd: HWND(-1 - i as isize),
+                rect: RECT { left: 0, top: 0, right: w, bottom: h },
+                minimized: false,
+                title: format!("{w} × {h}"),
+            })
+        });
+        let made_up: Vec<WindowModel> = made_up.collect();
+        model.pinned.clear();
+        if let Some(cell) = model.rows.iter_mut().flat_map(|row| &mut row.cells).find(|cell| cell.id == desktops.current) {
+            cell.windows = made_up;
+        }
+    }
     let size = (2560, 1440);
     if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5) {
         write_raw(path, size, &pixels);

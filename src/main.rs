@@ -19,6 +19,8 @@ mod overlay;
 mod paint;
 #[cfg(windows)]
 mod settings;
+#[cfg(any(windows, test))]
+mod tiles;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -37,12 +39,19 @@ fn main() {
     };
 
     let args: Vec<String> = std::env::args().collect();
+    // `--render-board <file> 1920x1040,400x300` draws made-up windows of
+    // those sizes in place of the current cell's.
+    if let [_, flag, path, sizes] = args.as_slice() {
+        if flag == "--render-board" {
+            return app::render_board(path, Some(sizes));
+        }
+    }
     if let [_, flag, path] = args.as_slice() {
         if flag == "--render" {
             return app::render_sample(path);
         }
         if flag == "--render-board" {
-            return app::render_board(path);
+            return app::render_board(path, None);
         }
         if flag == "--render-settings" {
             return app::render_settings(path);
