@@ -545,6 +545,11 @@ impl Board {
         Some(format!("{name}  ·  창 {windows}개  ·  {}{asleep}", format_memory(model.memory)))
     }
 
+    /// A question about the board is up and waits for its answer.
+    pub fn is_modal(&self) -> bool {
+        self.modal
+    }
+
     pub fn set_modal(&mut self, modal: bool) {
         self.modal = modal;
     }

@@ -632,7 +632,11 @@ impl App {
     /// A click of the trigger opens the board; the next one goes to the
     /// selected cell.
     fn toggle_board(&mut self) {
-        if self.board.is_open() {
+        if self.board.is_modal() {
+            // The question that is up is about the board as it is: it stays
+            // until answered.
+            debug_log!("app: click ignored, a question being up");
+        } else if self.board.is_open() {
             let selected = self.board.selected();
             self.perform(Action::Go(selected, None));
         } else {
