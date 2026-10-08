@@ -341,7 +341,6 @@ struct Fonts {
     label: IDWriteTextFormat,
     small: IDWriteTextFormat,
     centered: IDWriteTextFormat,
-    big: IDWriteTextFormat,
 }
 
 pub struct Board {
@@ -401,9 +400,8 @@ pub struct Board {
     /// did moves other things under the cursor, and a second click made in
     /// the same breath must not land on those.
     changed_at: Option<(Instant, f32, f32)>,
-    /// How the + buttons are drawn and where pinned windows are placed
-    /// (`set_look`).
-    plus_look: u8,
+    /// Where pinned windows are placed (`split_area`). Not settled yet: the
+    /// environment variable FLICK_PINS (1 or 2) tries the other ways out.
     pin_layout: u8,
     /// The headings of the parts the tiles are placed in, when pinned
     /// windows have a part of their own.
@@ -523,8 +521,7 @@ impl Board {
                 rested_at: None,
                 refused: None,
                 changed_at: None,
-                plus_look: 0,
-                pin_layout: 0,
+                pin_layout: std::env::var("FLICK_PINS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                 sections: Vec::new(),
             })
         }
@@ -554,13 +551,6 @@ impl Board {
 
     pub fn selected(&self) -> CellId {
         self.selected.clone()
-    }
-
-    /// For trying out looks: how the + buttons are drawn and where pinned
-    /// windows are placed (see `draw_plus` and `split_area`).
-    pub fn set_look(&mut self, plus: u8, pins: u8) {
-        self.plus_look = plus;
-        self.pin_layout = pins;
     }
 
     /// See `Config::dwell_ms`.
@@ -1610,11 +1600,11 @@ impl Board {
             for cell in &row.cells {
                 self.draw_cell(p, fonts, cell, in_selected_row, drop_cell == Some(cell.id.as_str()));
             }
-            self.draw_plus(p, fonts, &row.plus, Hit::Plus(r));
-            self.draw_plus(p, fonts, &row.plus_left, Hit::PlusLeft(r));
+            self.draw_plus(p, &row.plus, Hit::Plus(r));
+            self.draw_plus(p, &row.plus_left, Hit::PlusLeft(r));
         }
-        self.draw_plus(p, fonts, &layout.add_row, Hit::AddRow);
-        self.draw_plus(p, fonts, &layout.add_row_top, Hit::AddRowTop);
+        self.draw_plus(p, &layout.add_row, Hit::AddRow);
+        self.draw_plus(p, &layout.add_row_top, Hit::AddRowTop);
 
         // What is being dragged is drawn only on the monitor the cursor is on.
         if contains(&map.area, self.cursor.0, self.cursor.1) {
@@ -1701,40 +1691,18 @@ impl Board {
     }
 
     /// One of the "+" buttons, which `hit` is the hit-test result of.
-    fn draw_plus(&self, p: &Painter, fonts: &Fonts, area: &Rect, hit: Hit) {
+    fn draw_plus(&self, p: &Painter, area: &Rect, hit: Hit) {
         let hot = self.hover == hit;
         let s = self.scale;
         let (cx, cy) = centre(area);
         let half = size(area).0.min(size(area).1) / 2.0;
-        // The sign itself, as two bars: to be seen at a glance, being the
-        // only way to add a cell, and not to be taken for a cell.
-        let sign = |arm: f32, width: f32, colour: D2D1_COLOR_F| {
-            p.line((cx - arm, cy), (cx + arm, cy), width, colour);
-            p.line((cx, cy - arm), (cx, cy + arm), width, colour);
-        };
-        match self.plus_look {
-            1 => {
-                if hot {
-                    p.disc((cx, cy), half * 0.9, white(0.12));
-                }
-                sign(half * 0.42, 2.0 * s, white(if hot { 1.0 } else { 0.62 }));
-            }
-            2 => {
-                p.disc((cx, cy), half * 0.72, white(if hot { 0.24 } else { 0.10 }));
-                sign(half * 0.30, 1.8 * s, white(if hot { 1.0 } else { 0.80 }));
-            }
-            3 => {
-                if hot {
-                    p.disc((cx, cy), half * 0.9, accent(0.18));
-                }
-                sign(half * 0.42, 2.0 * s, accent(if hot { 1.0 } else { 0.85 }));
-            }
-            _ => {
-                p.fill(area, 8.0 * s, white(if hot { 0.22 } else { 0.07 }));
-                p.stroke(area, 8.0 * s, 1.0, white(if hot { 0.60 } else { 0.24 }));
-                p.text("+", &fonts.big, area, white(if hot { 1.0 } else { 0.72 }));
-            }
-        }
+        // A small round button with the sign as two bars: to be seen at a
+        // glance, being the only way to add a cell, and not to be taken for
+        // a cell, as a box of a cell's size was.
+        let (arm, colour) = (half * 0.30, white(if hot { 1.0 } else { 0.80 }));
+        p.disc((cx, cy), half * 0.72, white(if hot { 0.24 } else { 0.10 }));
+        p.line((cx - arm, cy), (cx + arm, cy), 1.8 * s, colour);
+        p.line((cx, cy - arm), (cx, cy + arm), 1.8 * s, colour);
     }
 
     /// Drag feedback on the map under the cursor: where a dragged cell would
@@ -1811,7 +1779,6 @@ fn make_fonts(scale: f32) -> Result<Fonts> {
         label: make(15.0, 600, DWRITE_TEXT_ALIGNMENT_LEADING)?,
         small: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
         centered: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-        big: make(22.0, 300, DWRITE_TEXT_ALIGNMENT_CENTER)?,
     })
 }
 
