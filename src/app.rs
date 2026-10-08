@@ -150,6 +150,7 @@ fn window_model(follows: bool, window: vd::WindowInfo) -> WindowModel {
         hwnd: window.hwnd,
         rect: window.rect,
         minimized: window.minimized,
+        topmost: vd::is_topmost(window.hwnd),
         title: window.title,
     }
 }
@@ -347,6 +348,15 @@ impl App {
     /// Sets how one window is pinned, as cycled through on its tile: within
     /// its row, on every desktop, or neither.
     fn set_pin(&mut self, window: HWND, row: bool, all: bool) {
+        // A window that gets pinned is, as a rule, one to keep in sight: it
+        // goes above the others, which its tile can turn off again. Unpinned,
+        // it goes back, unless it was above the others before we came.
+        let was = self.following.contains(&window.0) || vdapi::is_pinned_window(window).unwrap_or(false);
+        match (was, row || all) {
+            (false, true) if !vd::is_topmost(window) => self.set_top(window, true),
+            (true, false) if self.grid.kept_on_top.iter().any(|(hwnd, _)| *hwnd == window.0) => self.set_top(window, false),
+            _ => {}
+        }
         if row {
             self.following.insert(window.0);
         } else {
@@ -368,6 +378,28 @@ impl App {
         if let Err(e) = result {
             log(&format!("pin change failed: {e:?}"));
         }
+    }
+
+    /// Puts a window above the others or takes it down again, and keeps
+    /// note of the ones put up here.
+    fn set_top(&mut self, window: HWND, on: bool) {
+        if !vd::set_topmost(window, on) {
+            log("a window could not be put above the others or taken down");
+            return self.board.close_refused(window);
+        }
+        self.grid.kept_on_top.retain(|(hwnd, _)| *hwnd != window.0);
+        if on {
+            self.grid.kept_on_top.push((window.0, vd::exe_of_window(window).unwrap_or_default()));
+        }
+    }
+
+    /// Forgets the windows put above the others that are gone (a handle may
+    /// by now be another app's window).
+    fn forget_gone_windows(&mut self) {
+        self.following.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
+        self.grid.kept_on_top.retain(|(hwnd, exe)| {
+            unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && vd::exe_of_window(HWND(*hwnd)).unwrap_or_default() == *exe
+        });
     }
 
     // ---- sleeping rows --------------------------------------------------------
@@ -539,7 +571,7 @@ impl App {
 
     fn open_board(&mut self) {
         let Some(desktops) = self.sync() else { return };
-        self.following.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
+        self.forget_gone_windows();
         self.minimap.hide_after(0);
         self.focus_before_board = unsafe { GetForegroundWindow() };
         let model = self.model(&desktops);
@@ -590,6 +622,40 @@ impl App {
 
     /// Carries out what the user asked for in the board.
     fn perform(&mut self, action: Action) {
+        #[cfg(feature = "debug-log")]
+        match &action {
+            Action::None => {}
+            Action::Dismiss => {
+                debug_log!("app: board closed, having lost the keyboard");
+            }
+            Action::Cancel => {
+                debug_log!("app: board closed");
+            }
+            Action::Go(id, _) => {
+                debug_log!("app: board closed to go to cell {}", &id[..4.min(id.len())]);
+            }
+            Action::CloseWindow(hwnd) => {
+                debug_log!("app: asked window {:x} to close", hwnd.0);
+            }
+            Action::SetPin { window, row, all } => {
+                debug_log!("app: pin of {:x}: row {row}, everywhere {all}", window.0);
+            }
+            Action::SetTop { window, on } => {
+                debug_log!("app: above the others {:x}: {on}", window.0);
+            }
+            Action::ToggleEmphasis(id) => {
+                debug_log!("app: emphasis toggled on cell {}", &id[..4.min(id.len())]);
+            }
+            Action::AddCell { .. } | Action::AddRow { .. } => {
+                debug_log!("app: a cell is added");
+            }
+            Action::RemoveCell(id) => {
+                debug_log!("app: cell {} is removed", &id[..4.min(id.len())]);
+            }
+            _ => {
+                debug_log!("app: the board is rearranged");
+            }
+        }
         match action {
             // These are done with here: no grid to commit, no board to rebuild.
             Action::None => return,
@@ -618,6 +684,7 @@ impl App {
             Action::AddRow { top } => self.add_row(top),
             Action::RemoveCell(id) => self.remove_cell(&id),
             Action::SetPin { window, row, all } => self.set_pin(window, row, all),
+            Action::SetTop { window, on } => self.set_top(window, on),
             Action::Rename(row, name) => {
                 if let Some(row) = self.grid.rows.get_mut(row) {
                     row.name = name;
@@ -962,7 +1029,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             }
         }
         WM_CLICK => {
-            with_app(App::toggle_board);
+            #[cfg(feature = "debug-log")]
+            let started = Instant::now();
+            let taken = with_app(App::toggle_board);
+            debug_log!("app: click {} in {:?}", if taken.is_some() { "taken" } else { "ignored, the app being busy (a menu or a question is up)" }, started.elapsed());
+            let _ = taken;
         }
         WM_RELEASE => {
             let heard = with_app(|app| {
@@ -1267,16 +1338,28 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
                 hwnd: HWND(-1 - i as isize),
                 rect: RECT { left: 0, top: 0, right: w, bottom: h },
                 minimized: false,
+                topmost: false,
                 title: format!("{w} × {h}"),
             })
         });
-        let made_up: Vec<WindowModel> = made_up.collect();
+        let mut made_up: Vec<WindowModel> = made_up.collect();
         model.pinned.clear();
+        // For pictures of how pinned windows are placed: the first made-up
+        // window is pinned everywhere, the second to its workspace.
+        if std::env::var_os("FLICK_PINS").is_some() && made_up.len() > 2 {
+            made_up[1].follows = true;
+            made_up[1].topmost = true;
+            let mut everywhere = made_up.remove(0);
+            everywhere.topmost = true;
+            model.pinned.push(everywhere);
+        }
         if let Some(cell) = model.rows.iter_mut().flat_map(|row| &mut row.cells).find(|cell| cell.id == desktops.current) {
             cell.windows = made_up;
         }
     }
     let size = (2560, 1440);
+    let look = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    app.board.set_look(look("FLICK_PLUS"), look("FLICK_PINS"));
     if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5) {
         write_raw(path, size, &pixels);
     }

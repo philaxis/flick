@@ -66,6 +66,10 @@ pub struct Grid {
     /// Cells the user marked to stand out in the map and the minimap.
     #[serde(default)]
     pub emphasised: Vec<CellId>,
+    /// Windows this app put above the others (handle and executable name),
+    /// so that it takes back only what it did itself, also after a restart.
+    #[serde(default)]
+    pub kept_on_top: Vec<(isize, String)>,
 }
 
 impl Grid {

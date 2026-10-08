@@ -71,12 +71,16 @@ const WM_RELOAD: u32 = WM_APP + 20;
 const WM_WOKE: u32 = WM_APP + 21;
 /// Two clicks of the trigger closer together than this are one.
 const CLICK_APART_MS: u128 = 300;
+/// Clicks following each other faster than this are a held button sending
+/// its key combination over and over, not a hand: none of them counts.
+const REPEAT_APART_MS: u128 = 120;
 /// While something is held, this often it is checked that letting go of it
 /// could still be seen (`blind`).
 const WATCH_MS: u32 = 100;
 /// The hooks are put in afresh this often while nothing is going on: Windows
-/// drops a hook that was slow to answer, without a word.
-const REHOOK_MS: u32 = 60_000;
+/// drops a hook that was slow to answer, without a word, and until then the
+/// trigger does nothing at all.
+const REHOOK_MS: u32 = 5_000;
 /// Marks key events we replay ourselves, so the hook lets them through. (An
 /// arbitrary number: "KANK" in ASCII.)
 const OWN_INPUT: usize = 0x4B41_4E4B;
@@ -321,8 +325,10 @@ thread_local! {
     /// How far the mouse got from where it was when the hold began: where it
     /// is now, and the farthest it was.
     static STRAYED: Cell<((i32, i32), i32)> = const { Cell::new(((0, 0), 0)) };
-    /// When the trigger was last clicked.
+    /// When a click of the trigger was last taken, and when the trigger was
+    /// last clicked at all.
     static LAST_CLICK: Cell<Option<Instant>> = const { Cell::new(None) };
+    static LAST_TAP: Cell<Option<Instant>> = const { Cell::new(None) };
     /// When the first key of the chord was held back.
     static CHORD_BEGAN: Cell<Option<Instant>> = const { Cell::new(None) };
     /// This process' integrity level, and those found of other processes.
@@ -410,6 +416,11 @@ fn hook() {
 unsafe extern "system" fn rehook(_: HWND, _: u32, _: usize, _: u32) {
     if !held() && !CHORD.with(|chord| chord.borrow().waiting()) {
         hook();
+    }
+    // In the record once a minute, to show the hook thread alive.
+    thread_local!(static ROUNDS: Cell<u32> = const { Cell::new(0) });
+    if ROUNDS.replace((ROUNDS.get() + 1) % (60_000 / REHOOK_MS)) == 0 {
+        debug_log!("hooks put in afresh every {REHOOK_MS} ms; held: {}", held());
     }
 }
 
@@ -511,7 +522,7 @@ fn stop_listening() {
 /// of: for when letting go could not be seen, or does not matter any more.
 fn end_hold(why: &str) {
     if HELD.with(|held| held.borrow_mut().clear()) {
-        debug_log!("hold ended by the app: {why}");
+        debug_log!("press ignored from here on, hold ended by the app: {why}");
         let _ = why;
         CHORD.with(|chord| chord.borrow_mut().let_go());
         stop_listening();
@@ -625,13 +636,24 @@ fn release(s: &Settings, source: Source) {
         }
         // Nor is a click right upon a click one: nobody opens the board and
         // answers it that fast, but a button set up to send a key combination
-        // may send it over and over while it is held.
+        // may send it over and over while it is held. Only a click that was
+        // taken counts here: a hand clicking away quickly must not find
+        // every click after the first ignored for as long as it goes on.
         let now = Instant::now();
-        let again = stayed && LAST_CLICK.replace(stayed.then_some(now)).is_some_and(|last| now.duration_since(last).as_millis() < CLICK_APART_MS);
+        let within = |last: Option<Instant>, ms: u128| last.is_some_and(|last| now.duration_since(last).as_millis() < ms);
+        // Even those are not ignored for longer than a second on end.
+        let again = stayed
+            && (within(LAST_CLICK.get(), CLICK_APART_MS) || (within(LAST_TAP.get(), REPEAT_APART_MS) && within(LAST_CLICK.get(), 1000)));
         if again {
-            debug_log!("no click: one was made less than {CLICK_APART_MS} ms ago");
+            debug_log!("click ignored: one was taken less than {CLICK_APART_MS} ms ago, or they come faster than a hand clicks");
         }
         let click = stayed && !again;
+        if stayed {
+            LAST_TAP.set(Some(now));
+        }
+        if click {
+            LAST_CLICK.set(Some(now));
+        }
         post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
     }
 }

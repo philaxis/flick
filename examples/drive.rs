@@ -332,6 +332,11 @@ fn main() {
                 println!("foreground on current desktop: {:?} title: {}", vdapi::is_window_on_current_desktop(fg), String::from_utf16_lossy(&title[..n]).chars().take(30).collect::<String>());
                 println!("board {:?} rect {:?} visible {:?} cloaked {} style {:x} ex {:x} fg {:?}", board, r, IsWindowVisible(board), cloaked, GetWindowLongW(board, GWL_STYLE), GetWindowLongW(board, GWL_EXSTYLE), GetForegroundWindow());
             }
+            Some("mkdesk") => {
+                // mkdesk: creates a desktop for a test and prints its id.
+                vdapi::select(false);
+                println!("{:?}", vdapi::create_desktop().map(|d| d.id()));
+            }
             Some("rmdesk") => {
                 // rmdesk <id prefix>: removes a desktop a test made; its windows go to the current one.
                 vdapi::select(false);

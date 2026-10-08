@@ -30,9 +30,10 @@ use windows::{
             WindowsAndMessaging::{
                 EnumWindows, FindWindowExW, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-                IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, ShowWindow,
-                GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
-                WINDOWPLACEMENT, WM_CLOSE, WS_EX_TOOLWINDOW,
+                IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
+                ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_CLOSE,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
     },
@@ -121,6 +122,18 @@ pub fn focus_top_window() {
 /// window run as administrator from an app that is not.
 pub fn ask_to_close(hwnd: HWND) -> bool {
     unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
+/// Whether a window is kept above the others ("always on top").
+pub fn is_topmost(hwnd: HWND) -> bool {
+    unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 }
+}
+
+/// Keeps a window above the others, or stops doing so. False when Windows
+/// would not have it (a window run as administrator).
+pub fn set_topmost(hwnd: HWND, on: bool) -> bool {
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    unsafe { SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) }.is_ok() && is_topmost(hwnd) == on
 }
 
 fn pinned_everywhere(hwnd: HWND) -> bool {

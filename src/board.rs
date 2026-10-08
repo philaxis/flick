@@ -72,6 +72,8 @@ pub struct WindowModel {
     pub app_name: String,
     /// Follows the user from cell to cell inside its row.
     pub follows: bool,
+    /// Kept above the other windows.
+    pub topmost: bool,
 }
 
 pub struct CellModel {
@@ -133,6 +135,8 @@ pub enum Action {
     /// Set how one window is pinned: following within its row, shown on
     /// every desktop, or neither (never both).
     SetPin { window: HWND, row: bool, all: bool },
+    /// Keep a window above the others, or stop doing so.
+    SetTop { window: HWND, on: bool },
     /// Show the menu of a workspace (close its windows, remove it).
     RowMenu(usize),
     /// Make a cell stand out, or stop it doing so.
@@ -212,6 +216,8 @@ impl Pin {
     /// Width of the button, unscaled: the same in every state, so that a
     /// click changes what it says and nothing else.
     const WIDTH: f32 = 74.0;
+    /// Width of the "above the others" button that goes with it.
+    const TOP_WIDTH: f32 = 46.0;
 }
 
 /// One app in a map cell: its icon and how many windows it has there.
@@ -258,7 +264,9 @@ struct TileLayout {
     /// takes its place at the right end of this while it is shown.
     title: Rect,
     thumb: Rect,
-    /// The pin button and the close button at the right of the title bar.
+    /// The "above the others" button, the pin button and the close button
+    /// at the right of the title bar.
+    top: Rect,
     pin: Rect,
     close: Rect,
 }
@@ -294,6 +302,7 @@ enum Hit {
     Cell(CellId),
     /// A tile's pin button and its close button.
     Pin(isize),
+    Top(isize),
     TileClose(isize),
     CellClose(CellId),
     Plus(usize),
@@ -310,6 +319,10 @@ enum Slot {
     Row { row: usize, index: usize, x: f32 },
     NewRow { at: usize, y: f32 },
 }
+
+/// For this long after a click added or took away something, another click
+/// on the same spot does nothing.
+const SECOND_CLICK_MS: u128 = 500;
 
 /// How long a tile says that its window could not be asked to close.
 const REFUSAL_MS: u128 = 6000;
@@ -384,6 +397,66 @@ pub struct Board {
     rested_at: Option<(f32, f32)>,
     /// A window that could not be asked to close, and when that was found.
     refused: Option<(isize, Instant)>,
+    /// When and where a click last added or took away something. What it
+    /// did moves other things under the cursor, and a second click made in
+    /// the same breath must not land on those.
+    changed_at: Option<(Instant, f32, f32)>,
+    /// How the + buttons are drawn and where pinned windows are placed
+    /// (`set_look`).
+    plus_look: u8,
+    pin_layout: u8,
+    /// The headings of the parts the tiles are placed in, when pinned
+    /// windows have a part of their own.
+    sections: Vec<(Rect, &'static str)>,
+}
+
+/// The parts of `area` the tiles go into: all in one (layout 0), or pinned
+/// windows in parts of their own, where they stay whichever cell is looked
+/// at: columns side by side (1), or a shelf along the top (2). Each part has
+/// a heading, or none.
+fn split_area<'a>(
+    layout: u8,
+    here: &[(&'a WindowModel, bool)],
+    area: &Rect,
+    s: f32,
+) -> Vec<(Rect, Option<&'static str>, Vec<(&'a WindowModel, bool)>)> {
+    let pick = |f: fn(&WindowModel, bool) -> bool| -> Vec<(&'a WindowModel, bool)> { here.iter().filter(|(w, e)| f(w, *e)).copied().collect() };
+    let all = pick(|_, everywhere| everywhere);
+    let row = pick(|w, everywhere| !everywhere && w.follows);
+    let rest = pick(|w, everywhere| !everywhere && !w.follows);
+    if layout == 0 || (all.is_empty() && row.is_empty()) {
+        return vec![(*area, None, here.to_vec())];
+    }
+    let (w, h) = size(area);
+    let (head, gap) = (24.0 * s, 20.0 * s);
+    let under = |r: Rect| Rect { top: r.top + head, ..r };
+    let mut parts = Vec::new();
+    if layout == 1 {
+        // Columns: each kind of pinned window a narrow one at the left.
+        let column = w * 0.22;
+        let mut x = area.left;
+        for (name, group) in [("전체 고정", all), ("행 고정", row)] {
+            if !group.is_empty() {
+                parts.push((under(rect(x, area.top, column, h)), Some(name), group));
+                x += column + gap;
+            }
+        }
+        parts.push((under(Rect { left: x, ..*area }), Some("이 칸"), rest));
+    } else {
+        // A shelf along the top, shared by the two kinds by how many each has.
+        let shelf = h * 0.30;
+        let share = all.len() as f32 / (all.len() + row.len()) as f32;
+        let split = area.left + (w - gap) * share;
+        if !all.is_empty() {
+            parts.push((under(Rect { right: if row.is_empty() { area.right } else { split }, bottom: area.top + shelf, ..*area }), Some("전체 고정"), all));
+        }
+        if !row.is_empty() {
+            let left = if parts.is_empty() { area.left } else { split + gap };
+            parts.push((under(Rect { left, bottom: area.top + shelf, ..*area }), Some("행 고정"), row));
+        }
+        parts.push((Rect { top: area.top + shelf + gap, ..*area }, None, rest));
+    }
+    parts
 }
 
 impl Board {
@@ -449,6 +522,10 @@ impl Board {
                 dwell: None,
                 rested_at: None,
                 refused: None,
+                changed_at: None,
+                plus_look: 0,
+                pin_layout: 0,
+                sections: Vec::new(),
             })
         }
     }
@@ -477,6 +554,13 @@ impl Board {
 
     pub fn selected(&self) -> CellId {
         self.selected.clone()
+    }
+
+    /// For trying out looks: how the + buttons are drawn and where pinned
+    /// windows are placed (see `draw_plus` and `split_area`).
+    pub fn set_look(&mut self, plus: u8, pins: u8) {
+        self.plus_look = plus;
+        self.pin_layout = pins;
     }
 
     /// See `Config::dwell_ms`.
@@ -701,6 +785,7 @@ impl Board {
         let windows = self.tile_windows();
         let mut tiles = Vec::new();
         let mut tiles_area = Rect::default();
+        let mut sections = Vec::new();
         let mut maps = Vec::new();
         for (m, monitor) in self.monitors.iter().enumerate() {
             let is_home = *monitor == self.home;
@@ -713,16 +798,38 @@ impl Board {
                 right: monitor.right - margin,
                 bottom: monitor.top + layout.top - 26.0 * s,
             };
-            if is_home {
-                tiles_area = area;
-            }
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
-            tiles.extend(layout_tiles(&here, &area, s));
+            for (part, name, group) in split_area(self.pin_layout, &here, &area, s) {
+                if let Some(name) = name {
+                    sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, name));
+                }
+                // The part of the cell's own windows comes last.
+                if is_home {
+                    tiles_area = part;
+                }
+                tiles.extend(layout_tiles(&group, &part, s));
+            }
             maps.push(Map { monitor: m, area: *monitor, layout });
         }
         maps.sort_by_key(|map| map.area != self.home);
         self.label = rect(margin, 22.0 * s, size(&self.home).0 - 2.0 * margin, 30.0 * s);
+        #[cfg(feature = "debug-log")]
+        if self.open {
+            // Where things are, in screen coordinates, for telling a test where to click.
+            let at = |r: &Rect, map: &Map| format!("{:.0},{:.0}", centre(r).0 + map.area.left + self.origin.0 as f32, centre(r).1 + map.area.top + self.origin.1 as f32);
+            let flat = Map::default();
+            let home = &maps[maps.iter().position(|map| map.area == self.home).unwrap_or(0)];
+            let rows: Vec<String> = home.layout.rows.iter().map(|row| {
+                format!("name {} plusleft {} plus {} cells [{}]", at(&row.name, home), at(&row.plus_left, home), at(&row.plus, home),
+                    row.cells.iter().map(|c| format!("{}@{}x{}", &c.id[..4.min(c.id.len())], at(&c.body, home), at(&c.close, home))).collect::<Vec<_>>().join(" "))
+            }).collect();
+            debug_log!("board: layout addrowtop {} addrow {} rows {}", at(&home.layout.add_row_top, home), at(&home.layout.add_row, home), rows.join(" | "));
+            for tile in &tiles {
+                debug_log!("board: tile {:x} top {} pin {} close {}", tile.hwnd.0, at(&tile.top, &flat), at(&tile.pin, &flat), at(&tile.close, &flat));
+            }
+        }
         self.tiles = tiles;
+        self.sections = sections;
         self.tiles_area = tiles_area;
         self.maps = maps;
     }
@@ -745,6 +852,9 @@ impl Board {
         if let Some(tile) = self.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
             if contains(&tile.pin, x, y) {
                 return Hit::Pin(tile.hwnd.0);
+            }
+            if contains(&tile.top, x, y) {
+                return Hit::Top(tile.hwnd.0);
             }
             if contains(&tile.close, x, y) {
                 return Hit::TileClose(tile.hwnd.0);
@@ -1183,6 +1293,14 @@ impl Board {
         if self.hit_test(x, y) != press.hit {
             return Action::None;
         }
+        let near = |(at, cx, cy): (Instant, f32, f32)| at.elapsed().as_millis() < SECOND_CLICK_MS && (x - cx).hypot(y - cy) < 12.0 * self.scale;
+        if self.changed_at.take().is_some_and(near) {
+            debug_log!("board: click ignored, right upon one that added or took away something here");
+            return Action::None;
+        }
+        if matches!(press.hit, Hit::Plus(_) | Hit::PlusLeft(_) | Hit::AddRow | Hit::AddRowTop | Hit::CellClose(_) | Hit::TileClose(_)) {
+            self.changed_at = Some((Instant::now(), x, y));
+        }
         self.click(press.hit)
     }
 
@@ -1218,6 +1336,11 @@ impl Board {
                     Pin::Everywhere => (false, false),
                 };
                 Action::SetPin { window: HWND(hwnd), row, all }
+            }
+            Hit::Top(hwnd) => {
+                let windows = self.tile_windows();
+                let Some((window, _)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
+                Action::SetTop { window: HWND(hwnd), on: !window.topmost }
             }
             Hit::TileClose(hwnd) => Action::CloseWindow(HWND(hwnd)),
             Hit::CellClose(id) => Action::RemoveCell(id),
@@ -1339,6 +1462,10 @@ impl Board {
             return None;
         }
         match &self.hover {
+            Hit::Top(hwnd) => {
+                let on = self.tile_windows().iter().any(|(w, _)| w.hwnd.0 == *hwnd && w.topmost);
+                hint(if on { "맨 위에 띄움: 켜짐   ·   클릭: 끄기" } else { "클릭: 다른 창들 위에 늘 띄워 두기" })
+            }
             Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => {
                 let windows = self.tile_windows();
                 let (window, _) = windows.iter().find(|(w, _)| w.hwnd.0 == *hwnd)?;
@@ -1375,10 +1502,15 @@ impl Board {
 
     /// The selected cell's windows as large titled previews.
     fn draw_tiles(&self, p: &Painter, fonts: &Fonts) {
-        if self.tiles.is_empty() {
+        let windows = self.tile_windows();
+        let in_parts = !self.sections.is_empty();
+        if if in_parts { !windows.iter().any(|(w, everywhere)| !everywhere && !w.follows) } else { self.tiles.is_empty() } {
             p.text("이 칸에는 창이 없습니다", &fonts.centered, &self.tiles_area, white(0.28));
         }
-        let windows = self.tile_windows();
+        for (area, name) in &self.sections {
+            p.text(name, &fonts.small, area, white(0.45));
+            p.fill_square(&Rect { top: area.bottom - 5.0 * self.scale, bottom: area.bottom - 4.0 * self.scale, ..*area }, white(0.08));
+        }
         for tile in &self.tiles {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
                 self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere));
@@ -1390,11 +1522,14 @@ impl Board {
         let s = self.scale;
         let hot = self.hover == self.tile_hit(tile.hwnd);
         // The cursor is on the tile or on one of its buttons.
-        let pointed = hot || matches!(&self.hover, Hit::Pin(hwnd) | Hit::TileClose(hwnd) if *hwnd == tile.hwnd.0);
+        let pointed = hot || matches!(&self.hover, Hit::Pin(hwnd) | Hit::Top(hwnd) | Hit::TileClose(hwnd) if *hwnd == tile.hwnd.0);
         // A window that is not pinned shows the button for it only then, so
-        // that a narrow tile has room for its title.
+        // that a narrow tile has room for its title. Likewise the button
+        // that keeps it above the others, which sits right beside.
         let show_pin = pin != Pin::Off || pointed;
-        let title_bar = Rect { right: if show_pin { tile.pin.left - 8.0 * s } else { tile.title.right }, ..tile.title };
+        let show_top = window.topmost || pointed;
+        let buttons = if show_top { tile.top.left } else { tile.pin.left };
+        let title_bar = Rect { right: if show_pin || show_top { buttons - 8.0 * s } else { tile.title.right }, ..tile.title };
         let dim = if self.dragged_window() == Some(tile.hwnd.0) { 0.35 } else { 1.0 };
         p.fill(&tile.frame, 9.0 * s, rgba(0.125, 0.135, 0.165, dim));
         // Stand-in under the live thumbnail (and all there is for a minimized window).
@@ -1433,12 +1568,20 @@ impl Board {
             p.fill(&tile.pin, 5.0 * s, colour);
             p.text(pin.label(), &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
         }
+        if show_top {
+            // One of a pair with the pin button: same height, same corners.
+            let over = self.hover == Hit::Top(tile.hwnd.0);
+            let fill = if window.topmost { warm(0.92 * dim) } else { white(if over { 0.20 } else { 0.07 } * dim) };
+            p.fill(&tile.top, 5.0 * s, fill);
+            let ink = if window.topmost { rgba(0.10, 0.09, 0.07, dim) } else { white(if over { 1.0 } else { 0.50 } * dim) };
+            p.text("맨 위", &fonts.centered, &tile.top, ink);
+        }
 
         if self.refused.is_some_and(|(hwnd, at)| hwnd == tile.hwnd.0 && at.elapsed().as_millis() < REFUSAL_MS) {
             // Over the title: the live picture of the window covers the rest.
             let note = Rect { bottom: tile.thumb.top, ..tile.frame };
             p.fill(&note, 9.0 * s, danger(0.95));
-            p.text("관리자 권한 창: 닫을 수 없음", &fonts.centered, &note, white(1.0));
+            p.text("관리자 권한 창: 바꿀 수 없음", &fonts.centered, &note, white(1.0));
         }
         let over = self.hover == Hit::TileClose(tile.hwnd.0);
         if over {
@@ -1523,6 +1666,11 @@ impl Board {
         } else if hovering {
             p.stroke(&cell.body, radius, 1.0, white(0.35 * dim));
         }
+        if cell.emphasised && (is_selected || drop_target) {
+            // The selection's frame took the place of the mark's: a second
+            // one inside it, or marking the selected cell would show nothing.
+            p.stroke(&grow(&cell.body, -4.0 * s), (radius - 4.0 * s).max(1.0), 2.0 * s, warm(0.95 * dim));
+        }
         if let Some(share) = self.rested(&cell.id) {
             // Filling up while the cursor rests here; full, the board turns to it.
             let w = size(&cell.body).0;
@@ -1555,10 +1703,38 @@ impl Board {
     /// One of the "+" buttons, which `hit` is the hit-test result of.
     fn draw_plus(&self, p: &Painter, fonts: &Fonts, area: &Rect, hit: Hit) {
         let hot = self.hover == hit;
-        // A button to be seen at a glance: it is the only way to add a cell.
-        p.fill(area, 8.0 * self.scale, white(if hot { 0.22 } else { 0.07 }));
-        p.stroke(area, 8.0 * self.scale, 1.0, white(if hot { 0.60 } else { 0.24 }));
-        p.text("+", &fonts.big, area, white(if hot { 1.0 } else { 0.72 }));
+        let s = self.scale;
+        let (cx, cy) = centre(area);
+        let half = size(area).0.min(size(area).1) / 2.0;
+        // The sign itself, as two bars: to be seen at a glance, being the
+        // only way to add a cell, and not to be taken for a cell.
+        let sign = |arm: f32, width: f32, colour: D2D1_COLOR_F| {
+            p.line((cx - arm, cy), (cx + arm, cy), width, colour);
+            p.line((cx, cy - arm), (cx, cy + arm), width, colour);
+        };
+        match self.plus_look {
+            1 => {
+                if hot {
+                    p.disc((cx, cy), half * 0.9, white(0.12));
+                }
+                sign(half * 0.42, 2.0 * s, white(if hot { 1.0 } else { 0.62 }));
+            }
+            2 => {
+                p.disc((cx, cy), half * 0.72, white(if hot { 0.24 } else { 0.10 }));
+                sign(half * 0.30, 1.8 * s, white(if hot { 1.0 } else { 0.80 }));
+            }
+            3 => {
+                if hot {
+                    p.disc((cx, cy), half * 0.9, accent(0.18));
+                }
+                sign(half * 0.42, 2.0 * s, accent(if hot { 1.0 } else { 0.85 }));
+            }
+            _ => {
+                p.fill(area, 8.0 * s, white(if hot { 0.22 } else { 0.07 }));
+                p.stroke(area, 8.0 * s, 1.0, white(if hot { 0.60 } else { 0.24 }));
+                p.text("+", &fonts.big, area, white(if hot { 1.0 } else { 0.72 }));
+            }
+        }
     }
 
     /// Drag feedback on the map under the cursor: where a dragged cell would
@@ -1711,7 +1887,7 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     let sizes: Vec<(f32, f32)> =
         windows.iter().map(|(w, _)| ((w.rect.right - w.rect.left).max(1) as f32, (w.rect.bottom - w.rect.top).max(1) as f32)).collect();
     // Not narrower than the title bar needs for its buttons and a few letters.
-    let min_widths: Vec<f32> = vec![(120.0 + Pin::WIDTH) * s; windows.len()];
+    let min_widths: Vec<f32> = vec![(124.0 + Pin::WIDTH + Pin::TOP_WIDTH) * s; windows.len()];
     let space = Space {
         area: (aw, ah),
         title: title_h,
@@ -1731,12 +1907,14 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
             let pin_y = y + (title_h - pin_h) / 2.0;
             let close = rect(x + w - 6.0 * s - close_w, pin_y, close_w, pin_h);
             let pin = rect(close.left - 4.0 * s - pin_w, pin_y, pin_w, pin_h);
+            let top = rect(pin.left - 3.0 * s - Pin::TOP_WIDTH * s, pin_y, Pin::TOP_WIDTH * s, pin_h);
             TileLayout {
                 hwnd: window.hwnd,
                 frame: rect(x, y, w, title_h + at.h),
                 icon: rect(x + 10.0 * s, y + (title_h - icon) / 2.0, icon, icon),
                 title: rect(x + 18.0 * s + icon, y, (close.left - 6.0 * s - (x + 18.0 * s + icon)).max(0.0), title_h),
                 thumb: rect(x, y + title_h, w, at.h),
+                top,
                 pin,
                 close,
             }
