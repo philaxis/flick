@@ -593,6 +593,7 @@ impl App {
         self.minimap.hide_after(0);
         self.focus_before_board = unsafe { GetForegroundWindow() };
         let model = self.model(&desktops);
+        self.board.set_dwell(self.config.dwell_ms);
         self.board.open(model, self.grid.clone());
         vd::force_foreground(self.board.hwnd());
     }
@@ -823,6 +824,7 @@ impl App {
             step_x: self.config.step_x,
             step_y: self.config.step_y,
             sticky: self.config.vertical_sticky,
+            dwell_ms: self.config.dwell_ms as i32,
             autostart: tray::autostart_enabled(),
         }
     }
@@ -922,6 +924,7 @@ impl App {
                 SetTimer(self.hwnd, SLEEP_TIMER_ID, 60_000, None);
             }
         }
+        self.board.set_dwell(config.dwell_ms);
         self.config = config;
         self.refresh_settings();
     }
@@ -1363,6 +1366,7 @@ pub fn render_settings(path: &str) {
         step_x: config.step_x,
         step_y: config.step_y,
         sticky: config.vertical_sticky,
+        dwell_ms: config.dwell_ms as i32,
         autostart: true,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {

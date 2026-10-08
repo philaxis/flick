@@ -44,7 +44,7 @@ use windows::{
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
-const SIZE: (f32, f32) = (400.0, 612.0);
+const SIZE: (f32, f32) = (400.0, 658.0);
 /// The dial: its centre and its radius.
 const DIAL: ((f32, f32), f32) = ((200.0, 146.0), 104.0);
 /// Top of the first row and the height of each.
@@ -53,6 +53,8 @@ const ROWS: (f32, f32) = (330.0, 46.0);
 const EDGES: (f32, f32) = (28.0, 372.0);
 /// What the distance sliders span, and the step they move in.
 const DISTANCES: (i32, i32, i32) = (80, 600, 10);
+/// The same for how long to rest on a cell, in milliseconds; none is "off".
+const RESTS: (i32, i32, i32) = (0, 1500, 100);
 
 /// What the window shows.
 #[derive(Clone, Default)]
@@ -66,6 +68,8 @@ pub struct View {
     pub step_x: i32,
     pub step_y: i32,
     pub sticky: bool,
+    /// See `Config::dwell_ms`.
+    pub dwell_ms: i32,
     pub autostart: bool,
 }
 
@@ -94,6 +98,7 @@ enum Hit {
     /// One half of the vertical mode switch: flick (true) or distance.
     Mode(bool),
     StepY,
+    Dwell,
     Autostart,
     File,
 }
@@ -105,6 +110,7 @@ struct Layout {
     step_x: Rect,
     mode: [Rect; 2],
     step_y: Rect,
+    dwell: Rect,
     autostart: Rect,
     file: Rect,
 }
@@ -123,8 +129,9 @@ impl Layout {
             step_x: slider(1.0),
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
             step_y: slider(3.0),
-            autostart: right(4.0, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(5.0) + 8.0) * s, 150.0 * s, 26.0 * s),
+            dwell: slider(4.0),
+            autostart: right(5.0, 44.0, 24.0),
+            file: rect(EDGES.0 * s, (row(6.0) + 8.0) * s, 150.0 * s, 26.0 * s),
         }
     }
 
@@ -143,6 +150,7 @@ impl Layout {
             (&self.mode[0], Hit::Mode(true)),
             (&self.mode[1], Hit::Mode(false)),
             (&self.step_y, Hit::StepY),
+            (&self.dwell, Hit::Dwell),
             (&self.autostart, Hit::Autostart),
             (&self.file, Hit::File),
         ]
@@ -358,6 +366,7 @@ impl Settings {
             Hit::Dial => Some(self.view.angle),
             Hit::StepX => Some(self.view.step_x as f32),
             Hit::StepY => Some(self.view.step_y as f32),
+            Hit::Dwell => Some(self.view.dwell_ms as f32),
             _ => None,
         }
     }
@@ -373,12 +382,12 @@ impl Settings {
     fn drag(&mut self, x: f32, y: f32) -> Action {
         let Some(Press { hit, offset, .. }) = self.press else { return Action::None };
         let layout = Layout::new(self.scale);
-        let distance = |track: &Rect| {
+        let along = |track: &Rect, (low, high, step): (i32, i32, i32)| {
             let (from, to) = slider_ends(track, self.scale);
-            let (low, high, step) = DISTANCES;
             let at = ((x - from) / (to - from)).clamp(0.0, 1.0);
             ((low as f32 + at * (high - low) as f32) / step as f32).round() as i32 * step
         };
+        let distance = |track: &Rect| along(track, DISTANCES);
         match hit {
             Hit::Dial => {
                 let degrees = (self.degrees_at(x, y) + offset).round();
@@ -386,6 +395,12 @@ impl Settings {
             }
             Hit::StepX => self.view.step_x = distance(&layout.step_x),
             Hit::StepY => self.view.step_y = distance(&layout.step_y),
+            Hit::Dwell => {
+                // Nothing of the gesture: only shown until the drag ends.
+                self.view.dwell_ms = along(&layout.dwell, RESTS);
+                self.invalidate();
+                return Action::None;
+            }
             _ => return Action::None,
         }
         self.invalidate();
@@ -437,6 +452,7 @@ impl Settings {
             let key = match hit {
                 Hit::Dial => "vertical_angle",
                 Hit::StepX => "step_x",
+                Hit::Dwell => "dwell_ms",
                 _ => "step_y",
             };
             return if now == before { Action::None } else { Action::Set(key, format!("{now}")) };
@@ -520,7 +536,7 @@ impl Settings {
         self.draw_button(&p, fonts, &layout.trigger, if view.capturing { "취소" } else { "바꾸기" }, Hit::Trigger);
 
         label(1.0, "좌우 거리");
-        self.draw_slider(&p, fonts, &layout.step_x, view.step_x, Hit::StepX);
+        self.draw_slider(&p, fonts, &layout.step_x, view.step_x, DISTANCES, &view.step_x.to_string(), Hit::StepX);
 
         label(2.0, "위아래");
         // One switch with two halves; the half in use is lit.
@@ -536,9 +552,17 @@ impl Settings {
         // A flick is judged by how far it gets in a moment, so the same
         // number sets how hard it must be.
         label(3.0, if view.sticky { "휙 세기" } else { "위아래 거리" });
-        self.draw_slider(&p, fonts, &layout.step_y, view.step_y, Hit::StepY);
+        self.draw_slider(&p, fonts, &layout.step_y, view.step_y, DISTANCES, &view.step_y.to_string(), Hit::StepY);
 
-        label(4.0, "윈도우 시작 시 실행");
+        // In the board: resting the cursor on a cell of the map shows it.
+        label(4.0, "칸에 머물러 보기");
+        let rest = match view.dwell_ms {
+            0 => "끔".to_owned(),
+            ms => format!("{:.1}초", ms as f32 / 1000.0),
+        };
+        self.draw_slider(&p, fonts, &layout.dwell, view.dwell_ms, RESTS, &rest, Hit::Dwell);
+
+        label(5.0, "윈도우 시작 시 실행");
         let switch = &layout.autostart;
         let (h, on) = (switch.bottom - switch.top, view.autostart);
         let hot = self.hover == Hit::Autostart;
@@ -595,11 +619,13 @@ impl Settings {
         p.text(text, &fonts.button, area, white(if hot { 1.0 } else { 0.85 }));
     }
 
-    /// A distance: a track with a knob, and the number after it.
-    fn draw_slider(&self, p: &Painter, fonts: &Fonts, area: &Rect, value: i32, hit: Hit) {
+    /// A value within `span`: a track with a knob, and the value in words
+    /// after it.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_slider(&self, p: &Painter, fonts: &Fonts, area: &Rect, value: i32, span: (i32, i32, i32), words: &str, hit: Hit) {
         let s = self.scale;
         let (from, to) = slider_ends(area, s);
-        let (low, high, _) = DISTANCES;
+        let (low, high, _) = span;
         let at = from + (to - from) * ((value - low) as f32 / (high - low) as f32).clamp(0.0, 1.0);
         let middle = (area.top + area.bottom) / 2.0;
         let active = self.hover == hit || matches!(self.press, Some(Press { hit: pressed, .. }) if pressed == hit);
@@ -607,7 +633,7 @@ impl Settings {
         p.fill(&rect(from, middle - 2.0 * s, at - from, 4.0 * s), 2.0 * s, accent(0.95));
         p.disc((at, middle), if active { 8.0 } else { 6.5 } * s, white(0.95));
         let number = Rect { left: area.right, right: EDGES.1 * s, ..*area };
-        p.text(&value.to_string(), &fonts.value, &number, white(0.92));
+        p.text(words, &fonts.value, &number, white(0.92));
     }
 
     /// Draws the window showing `view` into a bitmap and returns its size and

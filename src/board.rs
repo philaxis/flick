@@ -11,7 +11,7 @@ use crate::{
     tiles::{self, Space},
     vd,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 use windows::{
     core::{w, Error, Result},
     Foundation::Numerics::Matrix3x2,
@@ -50,11 +50,11 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
-                SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST, ICON_BIG, IDC_ARROW,
-                SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND, WM_GETICON,
-                WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-                WS_POPUP,
+                KillTimer, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
+                ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
+                WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
@@ -143,6 +143,10 @@ pub enum Action {
 /// Height of the line at the bottom that says what the thing under the
 /// cursor is or does, in unscaled units.
 const FOOTER: f32 = 44.0;
+/// The timer that runs while the cursor rests on a cell of the map, and how
+/// often it redraws the bar that shows how long it has.
+const DWELL_TIMER_ID: usize = 1;
+const DWELL_TICK_MS: u32 = 30;
 /// The longest name a workspace can be given, in characters.
 const NAME_LENGTH: usize = 24;
 
@@ -369,6 +373,15 @@ pub struct Board {
     /// What the input method is still putting together (a Korean syllable
     /// in the making), shown after the typed text.
     composing: String,
+    /// How long the cursor must rest on a cell of the map for the board to
+    /// turn to it, in milliseconds; 0 for never.
+    dwell_ms: u32,
+    /// The cell the cursor is resting on, and since when.
+    dwell: Option<(CellId, Instant)>,
+    /// Where the cursor was when the board last turned to a cell it rested
+    /// on. The map shifts under it then, and whatever cell that puts there
+    /// must not be taken for one the user is resting on.
+    rested_at: Option<(f32, f32)>,
 }
 
 impl Board {
@@ -430,6 +443,9 @@ impl Board {
                 origin: (0, 0),
                 editing: None,
                 composing: String::new(),
+                dwell_ms: 0,
+                dwell: None,
+                rested_at: None,
             })
         }
     }
@@ -460,6 +476,11 @@ impl Board {
         self.selected.clone()
     }
 
+    /// See `Config::dwell_ms`.
+    pub fn set_dwell(&mut self, ms: u32) {
+        self.dwell_ms = ms;
+    }
+
     /// Covers every monitor and shows `model`.
     pub fn open(&mut self, model: Model, grid: Grid) {
         let monitors = vd::monitors();
@@ -488,6 +509,8 @@ impl Board {
         self.selected = model.current.clone();
         self.hover = Hit::Nothing;
         self.press = None;
+        self.rest_on(None);
+        self.rested_at = None;
         self.stop_editing();
         self.open = true;
         unsafe {
@@ -520,6 +543,7 @@ impl Board {
             return;
         }
         self.open = false;
+        self.rest_on(None);
         self.clear_thumbnails();
         self.icons.clear();
         self.press = None;
@@ -533,13 +557,61 @@ impl Board {
     pub fn select_dir(&mut self, dir: Dir) {
         let Some(from) = self.nav.find(&self.selected) else { return };
         if let Some(id) = self.nav.target(from, dir).and_then(|pos| self.nav.id_at(pos).cloned()) {
-            self.nav.visit(&id);
-            self.selected = id;
-            // Other windows to show, and the rows slide to stay lined up.
-            self.relayout();
-            self.register_thumbnails();
-            self.invalidate();
+            self.select(id, true);
         }
+    }
+
+    /// Turns the board to a cell: its windows are shown. With `line_up` the
+    /// rows slide to stay lined up on it, as they will be once it is gone
+    /// to; without, the map stays as it is, for the mouse to go on from
+    /// where it is.
+    fn select(&mut self, id: CellId, line_up: bool) {
+        if line_up {
+            self.nav.visit(&id);
+        }
+        self.selected = id;
+        self.relayout();
+        self.register_thumbnails();
+        self.invalidate();
+    }
+
+    /// Notes which cell of the map the cursor rests on, if any, and keeps
+    /// the timer that counts the rest going for as long as it does.
+    fn rest_on(&mut self, cell: Option<CellId>) {
+        if self.dwell.as_ref().map(|(id, _)| id) == cell.as_ref() {
+            return;
+        }
+        self.dwell = cell.map(|id| (id, Instant::now()));
+        unsafe {
+            match self.dwell {
+                Some(_) => {
+                    SetTimer(self.hwnd, DWELL_TIMER_ID, DWELL_TICK_MS, None);
+                }
+                None => {
+                    let _ = KillTimer(self.hwnd, DWELL_TIMER_ID);
+                }
+            }
+        }
+        self.invalidate();
+    }
+
+    /// How much of the time it takes has the cursor rested on this cell.
+    fn rested(&self, cell: &str) -> Option<f32> {
+        let (id, since) = self.dwell.as_ref()?;
+        (id == cell && self.dwell_ms > 0).then(|| (since.elapsed().as_millis() as f32 / self.dwell_ms as f32).min(1.0))
+    }
+
+    /// The rest timer ticked: the bar grows, and at its end the board turns
+    /// to the cell.
+    fn rest_tick(&mut self) {
+        let Some((id, _)) = self.dwell.clone() else { return self.rest_on(None) };
+        if self.rested(&id).is_some_and(|share| share >= 1.0) {
+            self.rest_on(None);
+            self.rested_at = Some(self.cursor);
+            self.select(id, false);
+            self.hover = self.hit_test(self.cursor.0, self.cursor.1);
+        }
+        self.invalidate();
     }
 
     fn invalidate(&self) {
@@ -878,6 +950,10 @@ impl Board {
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
+            WM_TIMER if wparam.0 == DWELL_TIMER_ID => {
+                self.rest_tick();
+                Action::None
+            }
             WM_CHAR => {
                 if let (Some((_, text)), Some(c)) = (&mut self.editing, char::from_u32(wparam.0 as u32)) {
                     if !c.is_control() && text.chars().count() < NAME_LENGTH {
@@ -974,6 +1050,7 @@ impl Board {
     fn mouse_down(&mut self, x: f32, y: f32) -> Action {
         let hit = self.hit_test(x, y);
         self.cursor = (x, y);
+        self.rest_on(None);
         self.press = Some(Press { hit, x, y, dragging: false });
         unsafe {
             SetCapture(self.hwnd);
@@ -1010,6 +1087,17 @@ impl Board {
             return;
         }
         let hover = self.hit_test(x, y);
+        // Resting on a cell other than the one shown turns the board to it;
+        // not on the cell the map put under the cursor by turning, though,
+        // until the cursor has been moved.
+        if self.rested_at.is_some_and(|(rx, ry)| (x - rx).hypot(y - ry) > 8.0 * self.scale) {
+            self.rested_at = None;
+        }
+        let resting = match &hover {
+            Hit::Cell(id) if *id != self.selected && self.dwell_ms > 0 && self.rested_at.is_none() && self.editing.is_none() => Some(id.clone()),
+            _ => None,
+        };
+        self.rest_on(resting);
         if hover != self.hover {
             self.hover = hover;
             self.invalidate();
@@ -1204,6 +1292,9 @@ impl Board {
                 };
                 Some((title, 0.85))
             }
+            Hit::Cell(_) | Hit::CellClose(_) if self.dwell_ms > 0 => {
+                hint("머물기: 창 보기   ·   클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조")
+            }
             Hit::Cell(_) | Hit::CellClose(_) => hint("클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조"),
             Hit::RowName(_) => hint("더블클릭: 이름 바꾸기   ·   우클릭: 창 닫기, 없애기"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("칸 추가"),
@@ -1368,6 +1459,11 @@ impl Board {
             p.stroke(&cell.body, radius, 1.5 * s, warm(0.95 * dim));
         } else if hovering {
             p.stroke(&cell.body, radius, 1.0, white(0.35 * dim));
+        }
+        if let Some(share) = self.rested(&cell.id) {
+            // Filling up while the cursor rests here; full, the board turns to it.
+            let w = size(&cell.body).0;
+            p.fill(&rect(cell.body.left + 6.0 * s, cell.body.bottom - 6.0 * s, (w - 12.0 * s) * share, 3.0 * s), 1.5 * s, accent(0.95));
         }
         if cell.id == self.model.current {
             // Where the user actually is, as opposed to what is selected.
