@@ -74,6 +74,16 @@ pub fn is_app_window(hwnd: HWND) -> bool {
     }
 }
 
+/// A window of Windows itself that looks like an app's: the input method's
+/// ("Windows Input Experience") and its like. They count as being on every
+/// desktop, yet giving one the keyboard brings back the desktop it was made
+/// on, so a switch must never hand the keyboard to one.
+fn is_shell_surface(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    String::from_utf16_lossy(&class[..n]) == "Windows.UI.Core.CoreWindow"
+}
+
 /// App windows in Z order, topmost first.
 pub fn app_windows() -> Vec<HWND> {
     unsafe extern "system" fn each(hwnd: HWND, out: LPARAM) -> BOOL {
@@ -112,8 +122,9 @@ pub fn force_foreground(hwnd: HWND) {
 /// or to the shell when that desktop is empty.
 pub fn focus_top_window() {
     let top = app_windows().into_iter().find(|hwnd| unsafe {
-        !IsIconic(*hwnd).as_bool() && vdapi::is_window_on_current_desktop(*hwnd).unwrap_or(false)
+        !IsIconic(*hwnd).as_bool() && !is_shell_surface(*hwnd) && vdapi::is_window_on_current_desktop(*hwnd).unwrap_or(false)
     });
+    debug_log!("vd: focus goes to {:x?}", top.map(|h| h.0));
     force_foreground(top.unwrap_or_else(|| unsafe { GetShellWindow() }));
 }
 

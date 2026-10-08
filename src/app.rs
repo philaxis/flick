@@ -73,6 +73,9 @@ const RECLAIM_TIMER_ID: usize = 7;
 /// For this long after the board opened, or a cell was added or removed in
 /// it, Windows may still hand the keyboard to a window of its own choosing.
 const BOARD_SETTLES_MS: u64 = 1500;
+/// For this long after going to a cell from the board, Windows may go back
+/// to the cell left.
+const GOING_SETTLES_MS: u64 = 700;
 const CONFIG_CHECK_MS: u32 = 2000;
 /// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
 /// do the same carrying the active window, and this one opens the pin menu.
@@ -89,6 +92,9 @@ struct App {
     board_settling: Instant,
     /// The window that had focus when the board opened, to give it back on cancel.
     focus_before_board: HWND,
+    /// The cell gone to from the board and when, for as long as Windows may
+    /// still go back on it.
+    going: Option<(String, Instant)>,
     settings: Settings,
     /// The settings window is waiting for the new trigger to be pressed.
     capturing: bool,
@@ -188,6 +194,7 @@ impl App {
             board,
             board_settling: Instant::now(),
             focus_before_board: HWND(0),
+            going: None,
             settings,
             capturing: false,
             admin: false,
@@ -557,6 +564,23 @@ impl App {
 
     /// The current desktop changed, by us or by Windows' own shortcuts.
     fn desktop_changed(&mut self, new: &str) {
+        debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
+        // Windows went back on a cell just gone to from the board: it had
+        // given the keyboard to a window of the cell left. Go once more.
+        if let Some((target, when)) = self.going.take() {
+            if new != target && when.elapsed() < Duration::from_millis(GOING_SETTLES_MS) {
+                debug_log!("app: Windows went back, going to {} again", &target[..4.min(target.len())]);
+                if let Some(desktop) = Desktops::read().and_then(|d| d.get(&target)) {
+                    if self.switch(desktop) {
+                        vd::focus_top_window();
+                    }
+                }
+                return;
+            }
+            if new == target {
+                self.going = Some((target, when));
+            }
+        }
         let Some(desktops) = self.sync() else { return };
         self.visit(new);
         self.bring_followers(&desktops, new);
@@ -761,15 +785,18 @@ impl App {
     /// Closes the board and goes to cell `id`, focusing `window` if given.
     /// An empty id stands for a window shown on every desktop: stay here.
     fn leave_board(&mut self, id: &str, window: Option<HWND>) {
-        self.board.close();
-        let Some(desktops) = self.sync() else { return };
+        // The board stays up until the keyboard is with a window of the cell
+        // gone to. Hidden while it has the keyboard, Windows gives that to
+        // the window under it, one of the cell left, and goes back there.
+        let Some(desktops) = self.sync() else { return self.board.close() };
         if !id.is_empty() && id != desktops.current {
-            let Some(target) = desktops.get(id) else { return };
+            let Some(target) = desktops.get(id) else { return self.board.close() };
             self.bring_followers(&desktops, id);
             if !self.switch(target) {
-                return;
+                return self.board.close();
             }
             self.visit(id);
+            self.going = Some((id.to_owned(), Instant::now()));
         }
         match window {
             Some(hwnd) if unsafe { IsWindow(hwnd) }.as_bool() => unsafe {
@@ -780,6 +807,7 @@ impl App {
             },
             _ => vd::focus_top_window(),
         }
+        self.board.close();
         self.save();
     }
 

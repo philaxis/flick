@@ -131,7 +131,10 @@ impl Grid {
         let mut changed = false;
         for r in 0..self.rows.len() {
             if self.rows[r].name.trim().is_empty() {
-                let name = (1..).map(|n| format!("Workspace {n}")).find(|name| self.rows.iter().all(|row| row.name != *name));
+                // Rows named by versions that spoke Korean keep their numbers.
+                let name = (1..)
+                    .find(|n| self.rows.iter().all(|row| row.name != format!("Workspace {n}") && row.name != format!("워크스페이스 {n}")))
+                    .map(|n| format!("Workspace {n}"));
                 self.rows[r].name = name.unwrap_or_default();
                 changed = true;
             }
