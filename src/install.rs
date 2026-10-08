@@ -100,7 +100,7 @@ fn create_shortcut(exe: &Path) -> windows::core::Result<()> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         link.SetPath(&HSTRING::from(exe.as_os_str()))?;
-        link.SetDescription(w!("가상 데스크톱을 2D 격자로 이동"))?;
+        link.SetDescription(w!("Move through virtual desktops as a 2D grid"))?;
         link.cast::<IPersistFile>()?.Save(&HSTRING::from(shortcut(APP_NAME).as_os_str()), true)
     }
 }
@@ -160,7 +160,7 @@ pub fn uninstall() {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &uninstall_key(APP_NAME));
     }
     let _ = fs::remove_file(shortcut(APP_NAME));
-    let text = format!("제거했습니다.\n설정과 칸 배치는 %APPDATA%\\{APP_NAME} 폴더에 남아 있습니다.");
+    let text = format!("Flick was uninstalled.\nYour settings and layout are still in the %APPDATA%\\{APP_NAME} folder.");
     unsafe {
         MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(APP_NAME), MB_OK | MB_ICONINFORMATION);
     }

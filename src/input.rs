@@ -218,9 +218,9 @@ impl Trigger {
     /// How this trigger is called when talking to the user.
     pub fn describe(&self) -> String {
         match self {
-            Trigger::XButton1 => "마우스 뒤로 버튼".into(),
-            Trigger::XButton2 => "마우스 앞으로 버튼".into(),
-            Trigger::Middle => "마우스 휠 버튼".into(),
+            Trigger::XButton1 => "Mouse back button".into(),
+            Trigger::XButton2 => "Mouse forward button".into(),
+            Trigger::Middle => "Mouse wheel button".into(),
             _ => self.to_config().to_uppercase(),
         }
     }

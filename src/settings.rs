@@ -138,7 +138,7 @@ impl Layout {
             dwell: slider(4.0),
             autostart: right(5.0, 44.0, 24.0),
             admin: right(6.0, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(7.0) + 8.0) * s, 150.0 * s, 26.0 * s),
+            file: rect(EDGES.0 * s, (row(7.0) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -239,7 +239,7 @@ impl Settings {
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 class,
-                w!("Flick 설정"),
+                w!("Flick Settings"),
                 WS_POPUP | WS_CAPTION | WS_SYSMENU,
                 0,
                 0,
@@ -537,21 +537,21 @@ impl Settings {
         let row = |i: f32| rect(EDGES.0 * s, (ROWS.0 + i * ROWS.1) * s, (EDGES.1 - EDGES.0) * s, ROWS.1 * s);
         let label = |i: f32, text: &str| p.text(text, &fonts.label, &row(i), white(0.62));
 
-        label(0.0, "트리거");
+        label(0.0, "Trigger");
         let (words, colour) = match view.capturing {
-            true => ("쓸 버튼이나 키를 누르세요", accent(1.0)),
+            true => ("Press the button or key to use", accent(1.0)),
             false => (view.trigger.as_str(), white(0.92)),
         };
         p.text(words, &fonts.value, &Rect { right: layout.trigger.left - 12.0 * s, ..row(0.0) }, colour);
-        self.draw_button(&p, fonts, &layout.trigger, if view.capturing { "취소" } else { "바꾸기" }, Hit::Trigger);
+        self.draw_button(&p, fonts, &layout.trigger, if view.capturing { "Cancel" } else { "Change" }, Hit::Trigger);
 
-        label(1.0, "좌우 거리");
+        label(1.0, "Sideways distance");
         self.draw_slider(&p, fonts, &layout.step_x, view.step_x, DISTANCES, &view.step_x.to_string(), Hit::StepX);
 
-        label(2.0, "위아래");
+        label(2.0, "Up and down");
         // One switch with two halves; the half in use is lit.
         p.fill(&Rect { right: layout.mode[1].right, ..layout.mode[0] }, 7.0 * s, white(0.08));
-        for (area, sticky, text) in [(&layout.mode[0], true, "휙 밀기"), (&layout.mode[1], false, "거리")] {
+        for (area, sticky, text) in [(&layout.mode[0], true, "Flick"), (&layout.mode[1], false, "Distance")] {
             let on = view.sticky == sticky;
             let hot = self.hover == Hit::Mode(sticky);
             if on {
@@ -561,26 +561,26 @@ impl Settings {
         }
         // A flick is judged by how far it gets in a moment, so the same
         // number sets how hard it must be.
-        label(3.0, if view.sticky { "휙 세기" } else { "위아래 거리" });
+        label(3.0, if view.sticky { "Flick strength" } else { "Vertical distance" });
         self.draw_slider(&p, fonts, &layout.step_y, view.step_y, DISTANCES, &view.step_y.to_string(), Hit::StepY);
 
         // In the board: resting the cursor on a cell of the map shows it.
-        label(4.0, "칸에 머물러 보기");
+        label(4.0, "Hover preview");
         let rest = match view.dwell_ms {
-            0 => "끔".to_owned(),
-            ms => format!("{:.1}초", ms as f32 / 1000.0),
+            0 => "Off".to_owned(),
+            ms => format!("{:.1} s", ms as f32 / 1000.0),
         };
         self.draw_slider(&p, fonts, &layout.dwell, view.dwell_ms, RESTS, &rest, Hit::Dwell);
 
-        label(5.0, "윈도우 시작 시 실행");
+        label(5.0, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
         // For the trigger to work on windows run as administrator, and to
         // close them from the board.
-        label(6.0, "관리자 권한으로 실행");
+        label(6.0, "Run as administrator");
         self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
 
         let hot = self.hover == Hit::File;
-        p.text("그 밖의 설정: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
+        p.text("More settings: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
         Ok(())
     }
 
@@ -611,14 +611,14 @@ impl Settings {
             let at = on_circle(centre, radius * out, degrees);
             p.text(text, &fonts.button, &rect(at.0 - 40.0 * s, at.1 - 12.0 * s, 80.0 * s, 24.0 * s), white(0.95));
         };
-        name("위", 0.0, 0.66);
-        name("아래", 180.0, 0.66);
-        name("왼쪽", 270.0, 0.56);
-        name("오른쪽", 90.0, 0.56);
+        name("Up", 0.0, 0.66);
+        name("Down", 180.0, 0.66);
+        name("Left", 270.0, 0.56);
+        name("Right", 90.0, 0.56);
 
         let below = |top: f32, height: f32| rect(0.0, (DIAL.0 .1 + DIAL.1 + top) * s, SIZE.0 * s, height * s);
-        p.text(&format!("위아래 ±{a:.0}°"), &fonts.heading, &below(18.0, 26.0), white(0.92));
-        p.text("경계를 끌면 위아래로 치는 폭이 바뀝니다", &fonts.hint, &below(44.0, 20.0), white(0.40));
+        p.text(&format!("Up and down ±{a:.0}°"), &fonts.heading, &below(18.0, 26.0), white(0.92));
+        p.text("Drag an edge to change how wide up and down are", &fonts.hint, &below(44.0, 20.0), white(0.40));
         Ok(())
     }
 

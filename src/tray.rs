@@ -123,13 +123,13 @@ fn pick(menu: HMENU, owner: HWND) -> usize {
 /// Shows the tray icon's menu at the cursor and returns what was picked.
 pub fn menu(hwnd: HWND) -> Option<Command> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
-    add_item(menu, Command::Peek as usize, w!("전체 보기"), false);
-    add_item(menu, Command::Settings as usize, w!("설정…"), false);
+    add_item(menu, Command::Peek as usize, w!("Overview"), false);
+    add_item(menu, Command::Settings as usize, w!("Settings…"), false);
     if crate::debuglog::ON {
-        add_item(menu, Command::DebugLog as usize, w!("디버그 기록 파일 보기"), false);
+        add_item(menu, Command::DebugLog as usize, w!("Show the debug log file"), false);
     }
     add_separator(menu);
-    add_item(menu, Command::Exit as usize, w!("종료"), false);
+    add_item(menu, Command::Exit as usize, w!("Exit"), false);
     unsafe {
         let _ = SetForegroundWindow(hwnd);
     }
@@ -181,11 +181,11 @@ pub enum PinCommand {
 pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     // In the words of the pin button on the board's tiles.
-    add_item(menu, PinCommand::RowWindow as usize, w!("이 창: 워크스페이스 고정"), state.row_window);
-    add_item(menu, PinCommand::RowApp as usize, w!("이 앱: 워크스페이스 고정"), state.row_app);
+    add_item(menu, PinCommand::RowWindow as usize, w!("This window: pin to this row"), state.row_window);
+    add_item(menu, PinCommand::RowApp as usize, w!("This app: pin to this row"), state.row_app);
     add_separator(menu);
-    add_item(menu, PinCommand::AllWindow as usize, w!("이 창: 전체 고정"), state.all_window);
-    add_item(menu, PinCommand::AllApp as usize, w!("이 앱: 전체 고정"), state.all_app);
+    add_item(menu, PinCommand::AllWindow as usize, w!("This window: pin to all rows"), state.all_window);
+    add_item(menu, PinCommand::AllApp as usize, w!("This app: pin to all rows"), state.all_app);
     let picked = pick(menu, owner);
     [PinCommand::RowWindow, PinCommand::RowApp, PinCommand::AllWindow, PinCommand::AllApp]
         .into_iter()
@@ -205,10 +205,10 @@ pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowComman
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     add_note(menu, summary);
     add_separator(menu);
-    add_item(menu, RowCommand::CloseWindows as usize, w!("창 모두 닫기…"), false);
+    add_item(menu, RowCommand::CloseWindows as usize, w!("Close all windows…"), false);
     if removable {
         // Its windows are not closed; they go to the nearest cell that stays.
-        add_item(menu, RowCommand::Remove as usize, w!("워크스페이스만 없애기"), false);
+        add_item(menu, RowCommand::Remove as usize, w!("Remove the workspace only"), false);
     }
     let picked = pick(menu, owner);
     [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as usize == picked)

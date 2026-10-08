@@ -1026,11 +1026,11 @@ impl App {
         // Noted first, so that a file reported as broken is not reported again.
         self.config_seen = config::config_modified();
         if let Some(error) = error {
-            warn(&format!("config.toml을 읽지 못해 기본값을 씁니다.\n\n{error}"));
+            warn(&format!("Could not read config.toml, so the defaults are used.\n\n{error}"));
         }
         let (triggers, unknown) = triggers(&config);
         if !unknown.is_empty() {
-            warn(&format!("config.toml의 trigger에서 알 수 없는 항목: {}", unknown.join(", ")));
+            warn(&format!("Unknown entries in trigger in config.toml: {}", unknown.join(", ")));
         }
         input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);
@@ -1266,11 +1266,11 @@ fn run_row_menu(owner: HWND) {
             // Closing windows can lose work, so it is asked about in earnest,
             // with "No" as the default answer.
             let text = format!(
-                "{summary}\n\n이 워크스페이스의 창을 모두 닫습니다.\n저장하지 않은 작업은 잃을 수 있고, 되돌릴 수 없습니다.\n\n정말 닫을까요?"
+                "{summary}\n\nThis closes every window in this workspace.\nUnsaved work can be lost, and this cannot be undone.\n\nClose them all?"
             );
             with_app(|app| app.board.set_modal(true));
             let answer = unsafe {
-                MessageBoxW(owner, &HSTRING::from(text), w!("창 모두 닫기"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
+                MessageBoxW(owner, &HSTRING::from(text), w!("Close all windows"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
             };
             with_app(|app| app.board.set_modal(false));
             if answer == IDYES {
@@ -1339,20 +1339,20 @@ pub fn run(first_run: bool) {
     std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     let hwnd = match init() {
         Ok(hwnd) => hwnd,
-        Err(e) => return warn(&format!("시작하지 못했습니다: {e}")),
+        Err(e) => return warn(&format!("Flick could not start: {e}")),
     };
     let board = match Board::new(wndproc) {
         Ok(board) => board,
-        Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
+        Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
     };
     BOARD_HWND.set(board.hwnd().0);
     let settings = match Settings::new(wndproc, tray::app_icon()) {
         Ok(settings) => settings,
-        Err(e) => return warn(&format!("화면을 만들지 못했습니다: {e}")),
+        Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
     };
     SETTINGS_HWND.set(settings.hwnd().0);
     if Desktops::read().is_none() {
-        return warn("가상 데스크톱에 접근하지 못했습니다. 이 윈도우 빌드를 지원하지 않는 것일 수 있습니다.");
+        return warn("Flick could not reach the virtual desktops. This build of Windows may not be supported.");
     }
 
     debug_log!(
@@ -1374,7 +1374,7 @@ pub fn run(first_run: bool) {
     tray::add(hwnd, WM_TRAY);
     if first_run {
         tray::set_autostart(true);
-        tray::notify(hwnd, "Flick이 켜졌습니다", "마우스 앞으로 버튼을 누른 채 밀면 옆 칸, 눌렀다 떼면 전체 보기. 버튼은 이 아이콘 우클릭 → 설정에서 바꿉니다.");
+        tray::notify(hwnd, "Flick is running", "Hold the mouse forward button and move to go to the next cell; click it for the overview. Right-click this icon → Settings to change the button.");
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
 
@@ -1409,7 +1409,7 @@ pub fn render_sample(path: &str) {
             vec![CellView::default(); 3],
         ],
         anchors: vec![2, 1, 0],
-        title: "워크스페이스 2".into(),
+        title: "Workspace 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
     };
     if let Some((size, pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
@@ -1437,7 +1437,7 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
     if app.grid.rows.len() == 1 && app.grid.rows[0].cells.len() > 1 {
         let moved = app.grid.rows[0].cells.last().cloned().unwrap_or_default();
         app.grid.move_cell_to_new_row(&moved, 1);
-        app.grid.rows[1].name = "예시 행".into();
+        app.grid.rows[1].name = "Example row".into();
     }
     // A cell made to stand out, when the user has none.
     if app.grid.emphasised.is_empty() {

@@ -207,9 +207,9 @@ impl Pin {
 
     fn label(self) -> &'static str {
         match self {
-            Pin::Off => "고정",
-            Pin::Row => "행 고정",
-            Pin::Everywhere => "전체 고정",
+            Pin::Off => "Pin",
+            Pin::Row => "This row",
+            Pin::Everywhere => "All rows",
         }
     }
 
@@ -433,24 +433,24 @@ fn split_area<'a>(
         // Columns: each kind of pinned window a narrow one at the left.
         let column = w * 0.22;
         let mut x = area.left;
-        for (name, group) in [("전체 고정", all), ("행 고정", row)] {
+        for (name, group) in [("All rows", all), ("This row", row)] {
             if !group.is_empty() {
                 parts.push((under(rect(x, area.top, column, h)), Some(name), group));
                 x += column + gap;
             }
         }
-        parts.push((under(Rect { left: x, ..*area }), Some("이 칸"), rest));
+        parts.push((under(Rect { left: x, ..*area }), Some("This cell"), rest));
     } else {
         // A shelf along the top, shared by the two kinds by how many each has.
         let shelf = h * 0.30;
         let share = all.len() as f32 / (all.len() + row.len()) as f32;
         let split = area.left + (w - gap) * share;
         if !all.is_empty() {
-            parts.push((under(Rect { right: if row.is_empty() { area.right } else { split }, bottom: area.top + shelf, ..*area }), Some("전체 고정"), all));
+            parts.push((under(Rect { right: if row.is_empty() { area.right } else { split }, bottom: area.top + shelf, ..*area }), Some("All rows"), all));
         }
         if !row.is_empty() {
             let left = if parts.is_empty() { area.left } else { split + gap };
-            parts.push((under(Rect { left, bottom: area.top + shelf, ..*area }), Some("행 고정"), row));
+            parts.push((under(Rect { left, bottom: area.top + shelf, ..*area }), Some("This row"), row));
         }
         parts.push((Rect { top: area.top + shelf + gap, ..*area }, None, rest));
     }
@@ -540,9 +540,10 @@ impl Board {
     pub fn row_summary(&self, row: usize) -> Option<String> {
         let model = self.model.rows.get(row)?;
         let windows: usize = model.cells.iter().map(|c| c.windows.len()).sum();
-        let asleep = if model.asleep { "  ·  재움" } else { "" };
+        let asleep = if model.asleep { "  ·  asleep" } else { "" };
         let name = grid::row_title(&model.name, row);
-        Some(format!("{name}  ·  창 {windows}개  ·  {}{asleep}", format_memory(model.memory)))
+        let count = if windows == 1 { "1 window".to_owned() } else { format!("{windows} windows") };
+        Some(format!("{name}  ·  {count}  ·  {}{asleep}", format_memory(model.memory)))
     }
 
     /// A question about the board is up and waits for its answer.
@@ -1444,13 +1445,13 @@ impl Board {
     fn footer(&self) -> Option<(String, f32)> {
         let hint = |text: &str| Some((text.to_owned(), 0.50));
         if self.editing.is_some() {
-            return hint("Enter: 저장   ·   Esc: 취소");
+            return hint("Enter: save   ·   Esc: cancel");
         }
         if self.dragged_window().is_some() {
             return hint(if self.monitors.len() > 1 {
-                "칸에 놓으면 그 칸으로, 다른 모니터에 놓으면 그 모니터로 옮겨집니다"
+                "Drop on a cell to move it there, or on another monitor to move it to that monitor"
             } else {
-                "칸에 놓으면 그 칸으로 옮겨집니다"
+                "Drop on a cell to move it there"
             });
         }
         if self.press.is_some() {
@@ -1459,7 +1460,7 @@ impl Board {
         match &self.hover {
             Hit::Top(hwnd) => {
                 let on = self.tile_windows().iter().any(|(w, _)| w.hwnd.0 == *hwnd && w.topmost);
-                hint(if on { "맨 위에 띄움: 켜짐   ·   클릭: 끄기" } else { "클릭: 다른 창들 위에 늘 띄워 두기" })
+                hint(if on { "Always on top: on   ·   Click: turn off" } else { "Click: keep above other windows" })
             }
             Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::TileClose(hwnd) => {
                 let windows = self.tile_windows();
@@ -1471,12 +1472,12 @@ impl Board {
                 Some((title, 0.85))
             }
             Hit::Cell(_) | Hit::CellClose(_) if self.dwell_ms > 0 => {
-                hint("머물기: 창 보기   ·   클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조")
+                hint("Hover: show windows   ·   Click: go   ·   Drag: move   ·   Right-click: highlight")
             }
-            Hit::Cell(_) | Hit::CellClose(_) => hint("클릭: 가기   ·   끌기: 자리 옮기기   ·   우클릭: 강조"),
-            Hit::RowName(_) => hint("끌기: 순서 바꾸기   ·   더블클릭: 이름 바꾸기   ·   우클릭: 창 닫기, 없애기"),
-            Hit::Plus(_) | Hit::PlusLeft(_) => hint("칸 추가"),
-            Hit::AddRow | Hit::AddRowTop => hint("워크스페이스 추가"),
+            Hit::Cell(_) | Hit::CellClose(_) => hint("Click: go   ·   Drag: move   ·   Right-click: highlight"),
+            Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
+            Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
+            Hit::AddRow | Hit::AddRowTop => hint("Add a workspace"),
             Hit::Nothing => None,
         }
     }
@@ -1487,8 +1488,8 @@ impl Board {
         let (w, h) = size(&self.home);
         if let Some(pos) = self.nav.find(&self.selected) {
             let row = grid::row_title(self.model.rows.get(pos.row).map_or("", |row| &row.name), pos.row);
-            let here = if self.selected == self.model.current { "   ● 현재" } else { "" };
-            p.text(&format!("{row}  ·  {}번 칸{here}", pos.col + 1), &fonts.label, &self.label, white(0.80));
+            let here = if self.selected == self.model.current { "   ● current" } else { "" };
+            p.text(&format!("{row}  ·  cell {}{here}", pos.col + 1), &fonts.label, &self.label, white(0.80));
         }
         if let Some((line, alpha)) = self.footer() {
             p.text(&line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
@@ -1500,7 +1501,7 @@ impl Board {
         let windows = self.tile_windows();
         let in_parts = !self.sections.is_empty();
         if if in_parts { !windows.iter().any(|(w, everywhere)| !everywhere && !w.follows) } else { self.tiles.is_empty() } {
-            p.text("이 칸에는 창이 없습니다", &fonts.centered, &self.tiles_area, white(0.28));
+            p.text("No windows in this cell", &fonts.centered, &self.tiles_area, white(0.28));
         }
         for (area, name) in &self.sections {
             p.text(name, &fonts.small, area, white(0.45));
@@ -1536,7 +1537,7 @@ impl Board {
         }
         if window.minimized {
             let note = Rect { top: tile.thumb.bottom - 26.0 * s, ..tile.thumb };
-            p.text("최소화됨", &fonts.centered, &note, white(0.40 * dim));
+            p.text("Minimized", &fonts.centered, &note, white(0.40 * dim));
         }
 
         // Two lines: the app, then what this window of it is about.
@@ -1569,14 +1570,14 @@ impl Board {
             let fill = if window.topmost { warm(0.92 * dim) } else { white(if over { 0.20 } else { 0.07 } * dim) };
             p.fill(&tile.top, 5.0 * s, fill);
             let ink = if window.topmost { rgba(0.10, 0.09, 0.07, dim) } else { white(if over { 1.0 } else { 0.50 } * dim) };
-            p.text("맨 위", &fonts.centered, &tile.top, ink);
+            p.text("On top", &fonts.centered, &tile.top, ink);
         }
 
         if self.refused.is_some_and(|(hwnd, at)| hwnd == tile.hwnd.0 && at.elapsed().as_millis() < REFUSAL_MS) {
             // Over the title: the live picture of the window covers the rest.
             let note = Rect { bottom: tile.thumb.top, ..tile.frame };
             p.fill(&note, 9.0 * s, danger(0.95));
-            p.text("관리자 권한 창: 바꿀 수 없음", &fonts.centered, &note, white(1.0));
+            p.text("Runs as administrator: cannot be changed", &fonts.centered, &note, white(1.0));
         }
         let over = self.hover == Hit::TileClose(tile.hwnd.0);
         if over {

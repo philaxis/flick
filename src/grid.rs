@@ -50,7 +50,7 @@ impl Row {
 /// given it one.
 pub fn row_title(name: &str, index: usize) -> String {
     if name.is_empty() {
-        format!("워크스페이스 {}", index + 1)
+        format!("Workspace {}", index + 1)
     } else {
         name.to_owned()
     }
@@ -125,13 +125,13 @@ impl Grid {
         }
     }
 
-    /// Gives every row without a name one: "워크스페이스 N" with the lowest
+    /// Gives every row without a name one: "Workspace N" with the lowest
     /// number no row has yet. Returns whether any was given.
     pub fn name_unnamed(&mut self) -> bool {
         let mut changed = false;
         for r in 0..self.rows.len() {
             if self.rows[r].name.trim().is_empty() {
-                let name = (1..).map(|n| format!("워크스페이스 {n}")).find(|name| self.rows.iter().all(|row| row.name != *name));
+                let name = (1..).map(|n| format!("Workspace {n}")).find(|name| self.rows.iter().all(|row| row.name != *name));
                 self.rows[r].name = name.unwrap_or_default();
                 changed = true;
             }

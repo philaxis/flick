@@ -12,40 +12,40 @@ pub const APP_NAME: &str = "Flick";
 /// Settings folders of versions under earlier names, newest first.
 const OLD_DIRS: [&str; 2] = ["KanKan", "desk2d"];
 
-const DEFAULT_CONFIG: &str = r#"# Flick 설정. 저장하면 바로 적용됩니다.
-# 트리거, 각도, 거리는 트레이 아이콘 우클릭 → "설정…" 창에서도 바꿉니다.
+const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them at once.
+# Trigger, angle and distances can also be changed in the window at tray icon → "Settings…".
 
-# 누르고 있는 동안 마우스를 움직이면 칸을 이동하는 버튼. 쉼표로 여러 개를 함께 쓸 수 있습니다.
-#   마우스: "xbutton1"(뒤로), "xbutton2"(앞으로), "middle"(휠 버튼)
-#   키보드: "capslock", "scrolllock", "pause", "apps", "ralt", "rctrl", "f1" ~ "f24"
-#   동시 누르기: "w+e+r"처럼 +로 묶은 키들을 한 번에 누르고 있는 동안 (하나만 쓸 수 있음)
-#   예: trigger = "xbutton2, w+e+r"
+# The button to hold while moving the mouse to go from cell to cell. Several can be listed with commas.
+#   Mouse: "xbutton1" (back), "xbutton2" (forward), "middle" (wheel button)
+#   Keyboard: "capslock", "scrolllock", "pause", "apps", "ralt", "rctrl", "f1" to "f24"
+#   Chord: keys joined with +, like "w+e+r", held down together (only one chord)
+#   Example: trigger = "xbutton2, w+e+r"
 trigger = "xbutton2"
 
-# 한 칸 넘어가는 데 필요한 이동 거리(픽셀). 세로를 더 길게 두면 실수로 워크스페이스가 바뀌지 않습니다.
+# How far to move (pixels) to go one cell. A longer vertical distance keeps you from changing workspace by accident.
 step_x = 260
 step_y = 320
 
-# 위아래는 빠르게 휙 밀 때마다 워크스페이스 하나씩 넘어갑니다(휙-휙은 둘, 손을 천천히 되돌리는 움직임은 무시).
-# false로 하면 좌우처럼 민 거리만큼 계속 넘어갑니다.
+# Up and down, each quick flick goes one workspace (two flicks go two; slowly bringing the hand back is ignored).
+# With false it keeps going by the distance moved, like sideways.
 vertical_sticky = true
 
-# 위아래로 치는 각도: 똑바로 위(아래)에서 좌우로 이 각도 안쪽으로 밀어야 위아래입니다. 나머지는 좌우입니다.
+# The angle that counts as up or down: within this many degrees of straight up (or down). The rest is sideways.
 vertical_angle = 26.6
 
-# 전체 보기의 지도에서 칸 위에 커서를 이 시간(밀리초) 동안 두면 그 칸의 창들을 보여 줍니다. 0이면 쓰지 않습니다.
+# In the overview, resting the cursor on a cell of the map for this long (milliseconds) shows that cell's windows. 0 turns it off.
 dwell_ms = 500
 
-# 새 칸과 새 워크스페이스는 전체 보기(트리거를 눌렀다 떼기)의 +로만 만듭니다.
+# New cells and new workspaces are made only with + in the overview (click the trigger).
 
-# 제스처 중에 이 키를 같이 누르고 있으면 지금 활성 창을 들고 이동합니다. "shift", "ctrl", "alt"
+# Holding this key during the gesture carries the active window along. "shift", "ctrl", "alt"
 carry_modifier = "shift"
 
-# Ctrl+Alt+Win+방향키로 이동 (Shift를 더하면 창을 들고 이동), Ctrl+Alt+Win+P로 활성 창 고정 메뉴
+# Ctrl+Alt+Win+arrows to move (add Shift to carry the window), Ctrl+Alt+Win+P for the pin menu of the active window
 hotkeys = true
 
-# 이 시간(분) 동안 가지 않은 워크스페이스의 앱 메모리를 윈도우가 압축/페이지아웃하게 합니다.
-# 돌아가면 잠깐 버벅일 수 있습니다. 0이면 쓰지 않습니다.
+# Lets Windows compress or page out the memory of apps in a workspace not visited for this long (minutes).
+# Coming back may stutter for a moment. 0 turns it off.
 sleep_after_minutes = 0
 "#;
 
