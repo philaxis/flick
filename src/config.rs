@@ -36,9 +36,7 @@ vertical_angle = 26.6
 # 전체 보기의 지도에서 칸 위에 커서를 이 시간(밀리초) 동안 두면 그 칸의 창들을 보여 줍니다. 0이면 쓰지 않습니다.
 dwell_ms = 500
 
-# 새 칸과 새 워크스페이스는 전체 보기(트리거를 눌렀다 떼기)에서 마우스로 만듭니다.
-# 여기에 1 이상을 넣으면 격자 가장자리에서 그 횟수만큼 더 밀 때도 만들어집니다. 0이면 만들지 않습니다.
-edge_create_pushes = 0
+# 새 칸과 새 워크스페이스는 전체 보기(트리거를 눌렀다 떼기)의 +로만 만듭니다.
 
 # 제스처 중에 이 키를 같이 누르고 있으면 지금 활성 창을 들고 이동합니다. "shift", "ctrl", "alt"
 carry_modifier = "shift"
@@ -64,7 +62,6 @@ pub struct Config {
     /// How long the cursor must rest on a cell of the board's map for the
     /// board to turn to that cell, in milliseconds; 0 for never.
     pub dwell_ms: u32,
-    pub edge_create_pushes: u32,
     pub carry_modifier: String,
     pub hotkeys: bool,
     pub sleep_after_minutes: u32,
@@ -83,7 +80,6 @@ impl Default for Config {
             // not taken, short enough not to feel like waiting: about what
             // Windows waits before showing a taskbar preview or a tooltip.
             dwell_ms: 500,
-            edge_create_pushes: 0,
             carry_modifier: "shift".into(),
             hotkeys: true,
             sleep_after_minutes: 0,

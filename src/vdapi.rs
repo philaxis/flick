@@ -202,12 +202,6 @@ mod shell {
         }
     }
 
-    pub fn is_window_on_desktop(desktop: Desktop, hwnd: HWND) -> Result<bool> {
-        match backend()? {
-            Backend::Win23H2 => Ok(v23::is_window_on_desktop(desktop.v23(), hwnd)?),
-            Backend::Win24H2 => Ok(v24::is_window_on_desktop(desktop.v24(), hwnd_v24(hwnd))?),
-        }
-    }
 
     /// The calls that take a window and nothing else.
     macro_rules! window_calls {

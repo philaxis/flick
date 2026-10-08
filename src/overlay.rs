@@ -5,7 +5,7 @@
 //! virtual desktop) drawn with Direct2D into a premultiplied-alpha bitmap.
 
 use crate::{
-    grid::{Dir, Pos},
+    grid::Pos,
     paint::{self, accent, rect, rgba, warm, white, DcTarget, Dib, Painter},
     vd,
 };
@@ -48,8 +48,6 @@ const FADE_TAU: f32 = 0.025;
 /// One cell of the minimap.
 #[derive(Clone, Copy, Default)]
 pub struct CellView {
-    /// Just created and still empty.
-    pub fresh: bool,
     /// Marked by the user to stand out.
     pub emphasised: bool,
 }
@@ -62,8 +60,6 @@ pub struct View {
     /// sideways so that these line up in one column.
     pub anchors: Vec<usize>,
     pub cur: Option<Pos>,
-    /// The user is pushing against this edge; enough pushes create a cell.
-    pub pushing: Option<Dir>,
     /// Name of the current workspace, shown under the grid.
     pub title: String,
 }
@@ -368,9 +364,6 @@ impl Overlay {
                 let cell = rect(cell_x(c as f32 + shift), cell_y(r as f32), cw, ch);
                 if view.emphasised {
                     p.fill(&cell, radius, warm(if in_current_row { 0.42 } else { 0.30 }));
-                } else if view.fresh {
-                    // A cell that will vanish again if left empty: outline only.
-                    p.stroke(&cell, radius, 1.2 * s, white(0.30));
                 } else {
                     p.fill(&cell, radius, white(if in_current_row { 0.17 } else { 0.08 }));
                 }
@@ -387,18 +380,6 @@ impl Overlay {
                 p.fill(&rect(x - g, y - g, cw + 2.0 * g, ch + 2.0 * g), radius + g, accent(a));
             }
             p.fill(&rect(x, y, cw, ch), radius, accent(1.0));
-
-            // Pushing against an edge: a bar on that side of the current cell.
-            if let Some(dir) = self.view.pushing {
-                let (bar, off) = (4.0 * s, 8.0 * s);
-                let shape = match dir {
-                    Dir::Left => rect(x - off - bar, y + ch * 0.2, bar, ch * 0.6),
-                    Dir::Right => rect(x + cw + off, y + ch * 0.2, bar, ch * 0.6),
-                    Dir::Up => rect(x + cw * 0.25, y - off - bar, cw * 0.5, bar),
-                    Dir::Down => rect(x + cw * 0.25, y + ch + off, cw * 0.5, bar),
-                };
-                p.fill(&shape, bar / 2.0, accent(0.95));
-            }
         }
         // Over the highlight, so that the mark shows on the current cell too.
         for cell in &emphasised {

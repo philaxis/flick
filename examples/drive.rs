@@ -7,6 +7,7 @@
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
 //!   drive post <class> <message> <wparam> <lparam> | client <class>
 //!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND> | mem
+//!   drive rmdesk <desktop id prefix>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -330,6 +331,16 @@ fn main() {
                 vdapi::select(false);
                 println!("foreground on current desktop: {:?} title: {}", vdapi::is_window_on_current_desktop(fg), String::from_utf16_lossy(&title[..n]).chars().take(30).collect::<String>());
                 println!("board {:?} rect {:?} visible {:?} cloaked {} style {:x} ex {:x} fg {:?}", board, r, IsWindowVisible(board), cloaked, GetWindowLongW(board, GWL_STYLE), GetWindowLongW(board, GWL_EXSTYLE), GetForegroundWindow());
+            }
+            Some("rmdesk") => {
+                // rmdesk <id prefix>: removes a desktop a test made; its windows go to the current one.
+                vdapi::select(false);
+                let wanted = args[2].to_ascii_uppercase();
+                let (all, current) = (vdapi::get_desktops().unwrap_or_default(), vdapi::get_current_desktop());
+                match (all.into_iter().find(|d| d.id().starts_with(&wanted)), current) {
+                    (Some(desktop), Ok(current)) if desktop != current => println!("{:?}", vdapi::remove_desktop(desktop, current)),
+                    _ => println!("not removed: no such desktop, or it is the current one"),
+                }
             }
             _ => println!("app window: {:?}", app),
         }

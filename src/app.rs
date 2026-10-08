@@ -77,9 +77,6 @@ struct App {
     config: Config,
     grid: Grid,
     minimap: Minimap,
-    /// Consecutive pushes against the same edge of the grid, counted towards
-    /// `edge_create_pushes`.
-    edge: Option<(Dir, u32)>,
     board: Board,
     /// The window that had focus when the board opened, to give it back on cancel.
     focus_before_board: HWND,
@@ -175,7 +172,6 @@ impl App {
             config: Config::default(),
             grid,
             minimap: Minimap::spawn(),
-            edge: None,
             board,
             focus_before_board: HWND(0),
             settings,
@@ -266,21 +262,17 @@ impl App {
     }
 
     /// What the minimap shows with the user on `current`.
-    fn view(&self, current: &str, pushing: Option<Dir>) -> View {
+    fn view(&self, current: &str) -> View {
         let cur = self.grid.find(current);
         View {
             rows: self
                 .grid
                 .rows
                 .iter()
-                .map(|row| {
-                    let cell = |id| CellView { fresh: self.grid.ephemeral.contains(id), emphasised: self.grid.is_emphasised(id) };
-                    row.cells.iter().map(cell).collect()
-                })
+                .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id) }).collect())
                 .collect(),
             anchors: self.grid.rows.iter().map(Row::anchor).collect(),
             cur,
-            pushing,
             title: cur.map_or(String::new(), |pos| grid::row_title(&self.grid.rows[pos.row].name, pos.row)),
         }
     }
@@ -448,46 +440,17 @@ impl App {
         match self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
             Some(to) => {
                 debug_log!("app: {dir:?} from row {} cell {}", from.row, from.col);
-                self.edge = None;
                 self.go(&desktops, from, &to, carry);
             }
             None => {
+                // The edge of the grid: the minimap shows where one is and
+                // nothing else happens. Cells are only ever added in the
+                // board, with its + buttons.
                 debug_log!("app: {dir:?} from row {} cell {}: nothing that way", from.row, from.col);
-                self.push_edge(&desktops, from, dir, carry)
+                let view = self.view(&desktops.current);
+                self.minimap.show(view, None);
             }
         }
-    }
-
-    /// A step against the edge of the grid. It only shows the minimap, unless
-    /// `edge_create_pushes` is set and the edge has now been pushed that
-    /// often: then a cell is created there and gone to.
-    fn push_edge(&mut self, desktops: &Desktops, from: Pos, dir: Dir, carry: bool) {
-        let current = desktops.current.clone();
-        let pushes = match self.edge {
-            Some((d, n)) if d == dir => n + 1,
-            _ => 1,
-        };
-        // Do not chain empty cells: a fresh cell nobody put a window on yet
-        // would be deleted the moment it is left.
-        let on_empty_fresh = self.grid.ephemeral.contains(&current)
-            && desktops.get(&current).is_some_and(|d| vd::count_on(d) == 0)
-            && !carry;
-        let may_create = self.config.edge_create_pushes > 0 && !on_empty_fresh;
-        if !may_create || pushes < self.config.edge_create_pushes {
-            self.edge = Some((dir, pushes));
-            let view = self.view(&current, may_create.then_some(dir));
-            self.minimap.show(view, None);
-            return;
-        }
-        self.edge = None;
-        let Some(id) = self.create_desktop() else { return };
-        self.grid.insert_beside(from, dir, id.clone());
-        self.grid.ephemeral.push(id.clone());
-        self.commit();
-        let Some(desktops) = Desktops::read() else { return };
-        // Inserting to the left or above shifts the cell we came from.
-        let from = self.grid.find(&current).unwrap_or(from);
-        self.go(&desktops, from, &id, carry);
     }
 
     /// Switches from the cell at `from` to cell `to` and shows the minimap.
@@ -515,7 +478,7 @@ impl App {
         if !self.in_gesture {
             self.save();
         }
-        let view = self.view(to, None);
+        let view = self.view(to);
         self.minimap.show(view, Some(from));
     }
 
@@ -530,25 +493,12 @@ impl App {
     }
 
     /// The current desktop changed, by us or by Windows' own shortcuts.
-    fn desktop_changed(&mut self, old: &str, new: &str) {
+    fn desktop_changed(&mut self, new: &str) {
         let Some(desktops) = self.sync() else { return };
         self.visit(new);
         self.bring_followers(&desktops, new);
-        if self.grid.ephemeral.iter().any(|id| id == old) {
-            // A cell created by an edge push is kept only if it got a window.
-            match (desktops.get(old), desktops.get(new)) {
-                (Some(left), Some(fallback)) if vd::count_on(left) == 0 => match vdapi::remove_desktop(left, fallback) {
-                    Ok(()) => {
-                        self.grid.remove(old);
-                        self.commit();
-                    }
-                    Err(e) => log(&format!("remove_desktop failed: {e:?}")),
-                },
-                _ => self.grid.ephemeral.retain(|id| id != old),
-            }
-        }
         self.save();
-        let view = self.view(&desktops.current, None);
+        let view = self.view(&desktops.current);
         self.minimap.update(view);
         self.refresh_board();
     }
@@ -717,8 +667,6 @@ impl App {
                 if let Err(e) = vdapi::move_window_to_desktop(target, window) {
                     log(&format!("move_window_to_desktop failed: {e:?}"));
                 }
-                // The cell has held a window now, so it stays.
-                self.grid.ephemeral.retain(|cell| *cell != id);
             }
         }
         if let Some(monitor) = monitor {
@@ -1018,7 +966,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_RELEASE => {
             let heard = with_app(|app| {
-                app.edge = None;
                 app.finish_gesture();
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });
@@ -1076,8 +1023,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_DESKTOP_EVENT => {
             with_app(|app| {
-                while let Ok((old, new)) = app.events.try_recv() {
-                    app.desktop_changed(&old, &new);
+                while let Ok((_, new)) = app.events.try_recv() {
+                    app.desktop_changed(&new);
                 }
             });
         }
@@ -1286,14 +1233,13 @@ pub fn render_sample(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let view = View {
         rows: vec![
-            vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }, CellView::default(), CellView::default()],
+            vec![CellView::default(), CellView { emphasised: true }, CellView::default(), CellView::default()],
             vec![CellView::default(); 2],
-            vec![CellView::default(), CellView::default(), CellView { fresh: true, ..CellView::default() }],
+            vec![CellView::default(); 3],
         ],
         anchors: vec![2, 1, 0],
         title: "워크스페이스 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
-        pushing: Some(Dir::Right),
     };
     if let Some((size, pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
         write_raw(path, size, &pixels);

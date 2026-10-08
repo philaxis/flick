@@ -59,10 +59,6 @@ pub fn row_title(name: &str, index: usize) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     pub rows: Vec<Row>,
-    /// Cells created by pushing past an edge that have not held a window yet.
-    /// They are removed again when left empty.
-    #[serde(default)]
-    pub ephemeral: Vec<CellId>,
     /// Executable names (lower case) whose windows follow the user from cell
     /// to cell inside whichever row they are in.
     #[serde(default)]
@@ -100,17 +96,6 @@ impl Grid {
     pub fn visit(&mut self, id: &str) {
         if let Some(pos) = self.find(id) {
             self.rows[pos.row].last = Some(id.to_owned());
-        }
-    }
-
-    /// Inserts a newly created cell next to `from` in direction `dir`:
-    /// sideways it joins the same row, vertically it starts a new row.
-    pub fn insert_beside(&mut self, from: Pos, dir: Dir, id: CellId) {
-        match dir {
-            Dir::Left => self.rows[from.row].cells.insert(from.col, id),
-            Dir::Right => self.rows[from.row].cells.insert(from.col + 1, id),
-            Dir::Up => self.rows.insert(from.row, Row::with_cell(id)),
-            Dir::Down => self.rows.insert(from.row + 1, Row::with_cell(id)),
         }
     }
 
@@ -169,7 +154,6 @@ impl Grid {
             r.cells.retain(|c| c != id);
         }
         self.rows.retain(|r| !r.cells.is_empty());
-        self.ephemeral.retain(|c| c != id);
         self.emphasised.retain(|c| c != id);
     }
 
@@ -196,7 +180,6 @@ impl Grid {
             r.cells.retain(|c| actual.contains(c));
         }
         self.rows.retain(|r| !r.cells.is_empty());
-        self.ephemeral.retain(|c| actual.contains(c));
         self.emphasised.retain(|c| actual.contains(c));
 
         let unknown: Vec<CellId> = actual.iter().filter(|id| self.find(id).is_none()).cloned().collect();
@@ -254,7 +237,7 @@ mod tests {
     fn remembered_column_follows_the_desktop_not_the_index() {
         let mut g = grid(&[&["a1", "a2"], &["b1"]]);
         g.visit("a2");
-        g.insert_beside(Pos { row: 0, col: 0 }, Dir::Left, "a0".into());
+        g.rows[0].cells.insert(0, "a0".into());
         assert_eq!(go(&mut g, "b1", Dir::Up).as_deref(), Some("a2"));
 
         let actual: Vec<String> = ["a0", "a1", "b1", "new"].iter().map(|s| s.to_string()).collect();

@@ -88,13 +88,6 @@ pub fn app_windows() -> Vec<HWND> {
     out
 }
 
-pub fn count_on(desktop: Desktop) -> usize {
-    app_windows()
-        .into_iter()
-        .filter(|hwnd| vdapi::is_window_on_desktop(desktop, *hwnd).unwrap_or(false))
-        .count()
-}
-
 /// `SetForegroundWindow` is refused for background processes unless we share
 /// input state with the thread that currently owns the foreground.
 pub fn force_foreground(hwnd: HWND) {
