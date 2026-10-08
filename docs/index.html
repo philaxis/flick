@@ -73,7 +73,10 @@ h1 span.on{color:var(--accent-ink);transition-duration:.08s}
 .end{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-top:clamp(80px,12vw,170px);padding-top:34px;border-top:1px solid var(--line)}
 .end .brand{font-size:clamp(34px,5vw,64px);gap:18px;letter-spacing:-.035em}
 .end .brand img{width:clamp(44px,5.4vw,70px);height:auto}
-footer{display:flex;gap:8px;padding-block:44px 40px;font-size:13px;color:var(--mute)}
+footer{display:flex;gap:8px;padding-block:44px 22px;font-size:13px;color:var(--mute)}
+/* A note for the curious, kept out of the way. */
+.inspiration{margin:0;padding-bottom:40px;max-width:68ch;font-size:12px;line-height:1.65;color:var(--mute);opacity:.62}
+.inspiration b{display:block;margin-bottom:3px;font-weight:500;font-size:11px;letter-spacing:.06em;text-transform:uppercase}
 footer a{text-decoration:underline;text-decoration-color:var(--line);text-underline-offset:3px}
 footer a:hover{color:var(--ink)}
 
@@ -121,10 +124,6 @@ footer a:hover{color:var(--ink)}
 
     <section class="end">
       <div class="brand"><img src="icon.png" alt="" width="70" height="70">Flick</div>
-      <a class="dl" href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe">
-        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2.5v9M5 8l4 4 4-4M3 15.5h12"/></svg>
-        <span data-ko="다운로드" data-en="Download">다운로드</span>
-      </a>
     </section>
   </main>
 
@@ -133,6 +132,7 @@ footer a:hover{color:var(--ink)}
     <a href="https://github.com/philaxis/flick" data-ko="소스" data-en="source">소스</a><span>·</span>
     <span>made by <a href="https://philaxis.github.io">philaxis</a></span>
   </footer>
+  <p class="inspiration"><b>Design inspiration</b><span data-ko="Flick의 아이디어는 단백질 접힘 현상에서 일부 영감을 받았습니다. 일렬로 연결된 아미노산들이 접히면서 복잡한 공간 구조를 형성한다는 점이 흥미로웠습니다. 그렇다면 가상 데스크톱도 꼭 일렬로 배치해야 할까요? 우리가 작업을 구분하고 연결하는 방식에 따라 공간적으로 배치할 수는 없을까요?" data-en="The idea for Flick was partly inspired by protein folding — how a linear chain of amino acids can fold into a complex spatial structure. It made me wonder: why should virtual desktops be confined to a single line? What if we could arrange them in a space that better reflects how we organize our work?">Flick의 아이디어는 단백질 접힘 현상에서 일부 영감을 받았습니다. 일렬로 연결된 아미노산들이 접히면서 복잡한 공간 구조를 형성한다는 점이 흥미로웠습니다. 그렇다면 가상 데스크톱도 꼭 일렬로 배치해야 할까요? 우리가 작업을 구분하고 연결하는 방식에 따라 공간적으로 배치할 수는 없을까요?</span></p>
 </div>
 
 <script>
