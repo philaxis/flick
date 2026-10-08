@@ -24,8 +24,13 @@ use std::{
     time::Instant,
 };
 use windows::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+    Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Security::{GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        StationsAndDesktops::{CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS},
+        Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
+    },
     UI::{
         Input::{
             GetRawInputData,
@@ -34,12 +39,13 @@ use windows::Win32::{
                 KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
             },
             RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
-            RID_INPUT, RIM_TYPEMOUSE,
+            RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, KillTimer,
-            PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx,
-            HC_ACTION, HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+            CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetForegroundWindow,
+            GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, KillTimer, PostMessageW, PostThreadMessageW,
+            RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HC_ACTION, HHOOK,
+            HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
             SM_CYVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
             WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
@@ -60,6 +66,17 @@ pub const WM_CAPTURED: u32 = WM_APP + 4;
 
 /// Thread message telling the hook thread to pick up new settings.
 const WM_RELOAD: u32 = WM_APP + 20;
+/// Thread message telling the hook thread that the PC woke up: whatever was
+/// held when it went to sleep is not any more, and the hooks may be gone.
+const WM_WOKE: u32 = WM_APP + 21;
+/// Two clicks of the trigger closer together than this are one.
+const CLICK_APART_MS: u128 = 300;
+/// While something is held, this often it is checked that letting go of it
+/// could still be seen (`blind`).
+const WATCH_MS: u32 = 100;
+/// The hooks are put in afresh this often while nothing is going on: Windows
+/// drops a hook that was slow to answer, without a word.
+const REHOOK_MS: u32 = 60_000;
 /// Marks key events we replay ourselves, so the hook lets them through. (An
 /// arbitrary number: "KANK" in ASCII.)
 const OWN_INPUT: usize = 0x4B41_4E4B;
@@ -297,6 +314,19 @@ thread_local! {
     static CHORD_TIMER: Cell<usize> = const { Cell::new(0) };
     /// Keys pressed so far while a new trigger is being chosen.
     static CAPTURE_KEYS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// The mouse and the keyboard hook.
+    static HOOKS: RefCell<Vec<HHOOK>> = const { RefCell::new(Vec::new()) };
+    /// The timer that watches over a hold (`watch`), 0 for none.
+    static WATCH_TIMER: Cell<usize> = const { Cell::new(0) };
+    /// How far the mouse got from where it was when the hold began: where it
+    /// is now, and the farthest it was.
+    static STRAYED: Cell<((i32, i32), i32)> = const { Cell::new(((0, 0), 0)) };
+    /// When the trigger was last clicked.
+    static LAST_CLICK: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// When the first key of the chord was held back.
+    static CHORD_BEGAN: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// This process' integrity level, and those found of other processes.
+    static LEVELS: RefCell<(Option<u32>, Vec<(u32, Option<u32>)>)> = const { RefCell::new((None, Vec::new())) };
 }
 
 /// Starts the hook thread (once) and gives it these settings.
@@ -316,6 +346,16 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         thread => unsafe {
             let _ = PostThreadMessageW(thread, WM_RELOAD, WPARAM(0), LPARAM(0));
         },
+    }
+}
+
+/// The PC woke from sleep.
+pub fn woke() {
+    let thread = THREAD.load(Ordering::SeqCst);
+    if thread != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(thread, WM_WOKE, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -345,9 +385,31 @@ fn reload() {
             s.triggers, s.step_x, s.step_y, s.vertical_sticky, s.vertical_bias
         );
     }
+    // What was held under the old settings may not be a trigger any more.
+    end_hold("the settings changed");
     SETTINGS.with(|slot| *slot.borrow_mut() = settings);
-    if HELD.with(|held| held.borrow_mut().clear()) {
-        listen_raw(false);
+}
+
+/// Puts the hooks in, taking out the ones there were.
+fn hook() {
+    unsafe {
+        let module = GetModuleHandleW(None).unwrap_or_default();
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
+        let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
+        if mouse.is_err() || keyboard.is_err() {
+            crate::app::log("installing the input hooks failed");
+        }
+        let old = HOOKS.replace([mouse, keyboard].into_iter().flatten().collect());
+        for hook in old {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
+}
+
+/// Now and then, while nothing is held or held back.
+unsafe extern "system" fn rehook(_: HWND, _: u32, _: usize, _: u32) {
+    if !held() && !CHORD.with(|chord| chord.borrow().waiting()) {
+        hook();
     }
 }
 
@@ -366,21 +428,24 @@ fn hook_thread() {
         let window =
             CreateWindowExW(WINDOW_EX_STYLE(0), class, None, WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, module, None);
         RAW_WINDOW.set(window.0);
-        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
-        let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
-        if mouse.is_err() || keyboard.is_err() {
-            crate::app::log("installing the input hooks failed");
-        }
+        hook();
+        SetTimer(None, 0, REHOOK_MS, Some(rehook));
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             if message.hwnd.0 == 0 && message.message == WM_RELOAD {
                 reload();
+            } else if message.hwnd.0 == 0 && message.message == WM_WOKE {
+                end_hold("the PC had gone to sleep");
+                hook();
             } else {
                 // Timer callbacks arrive here.
                 DispatchMessageW(&message);
             }
         }
-        for hook in [mouse, keyboard].into_iter().flatten() {
+        // Whoever holds a trigger down as the app goes must not find the
+        // cursor still kept in place by it.
+        end_hold("the app is closing");
+        for hook in HOOKS.take() {
             let _ = UnhookWindowsHookEx(hook);
         }
     }
@@ -392,16 +457,19 @@ fn post(s: &Settings, message: u32, wparam: usize) {
     }
 }
 
-/// Starts or stops receiving raw mouse input (only wanted while held).
+/// Starts or stops receiving raw input (only wanted while held): the mouse
+/// for its movement, and both it and the keyboard to see the trigger let go
+/// of even if the hooks do not.
 fn listen_raw(on: bool) {
     let window = HWND(RAW_WINDOW.get());
-    let device = RAWINPUTDEVICE {
-        usUsagePage: 1, // generic desktop
-        usUsage: 2,     // mouse
+    // Generic desktop devices: 2 is the mouse, 6 the keyboard.
+    let devices = [2, 6].map(|usage| RAWINPUTDEVICE {
+        usUsagePage: 1,
+        usUsage: usage,
         dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
         hwndTarget: if on { window } else { HWND(0) },
-    };
-    let registered = unsafe { RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
+    });
+    let registered = unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
     if let (true, Err(e)) = (on, registered) {
         // Without it the held trigger sees no movement at all.
         crate::app::log(&format!("raw mouse input could not be registered: {e}"));
@@ -422,7 +490,118 @@ fn press(source: Source) {
         LAST_MOVE.set(None);
         RECENT.with(|recent| recent.borrow_mut().clear());
         LAST_ABSOLUTE.set(None);
+        STRAYED.set(((0, 0), 0));
         listen_raw(true);
+        WATCH_TIMER.set(unsafe { SetTimer(None, 0, WATCH_MS, Some(watch)) });
+    }
+}
+
+/// Stops what a hold keeps going: the raw input and the watching over it.
+fn stop_listening() {
+    listen_raw(false);
+    let timer = WATCH_TIMER.replace(0);
+    if timer != 0 {
+        unsafe {
+            let _ = KillTimer(None, timer);
+        }
+    }
+}
+
+/// Ends the hold, whatever holds it, without waiting for that to be let go
+/// of: for when letting go could not be seen, or does not matter any more.
+fn end_hold(why: &str) {
+    if HELD.with(|held| held.borrow_mut().clear()) {
+        debug_log!("hold ended by the app: {why}");
+        let _ = why;
+        CHORD.with(|chord| chord.borrow_mut().let_go());
+        stop_listening();
+        // Never as a click: the user did not ask for the board.
+        with_settings(|s| {
+            post(s, WM_RELEASE, 0);
+            false
+        });
+    }
+}
+
+/// The integrity level of a process (whether it runs as administrator).
+unsafe fn level_of(process: HANDLE) -> Option<u32> {
+    let mut token = HANDLE::default();
+    OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+    let mut label = [0u8; 128];
+    let mut len = 0u32;
+    let got = GetTokenInformation(token, TokenIntegrityLevel, Some(label.as_mut_ptr().cast()), label.len() as u32, &mut len);
+    let _ = CloseHandle(token);
+    got.ok()?;
+    let sid = (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+    Some(*GetSidSubAuthority(sid, (*GetSidSubAuthorityCount(sid)).saturating_sub(1) as u32))
+}
+
+/// Whether a window belongs to a process above this one (run as
+/// administrator while this one is not). Windows keeps what is typed and
+/// clicked there from the hooks and the raw input of a process below.
+fn above_us(window: HWND) -> bool {
+    if window.0 == 0 {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut pid));
+    }
+    LEVELS.with(|levels| {
+        let mut levels = levels.borrow_mut();
+        let ours = *levels.0.get_or_insert_with(|| unsafe { level_of(GetCurrentProcess()) }.unwrap_or(u32::MAX));
+        let theirs = match levels.1.iter().find(|(known, _)| *known == pid) {
+            Some((_, level)) => *level,
+            None => {
+                let level = unsafe {
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok().and_then(|process| {
+                        let level = level_of(process);
+                        let _ = CloseHandle(process);
+                        level
+                    })
+                };
+                // Process ids come round again; a short memory is enough.
+                if levels.1.len() >= 32 {
+                    levels.1.clear();
+                }
+                levels.1.push((pid, level));
+                level
+            }
+        };
+        // A process that cannot even be asked is taken to be above.
+        theirs.map_or(true, |theirs| theirs > ours)
+    })
+}
+
+/// Why letting go of the trigger could not be seen right now, if so.
+fn blind() -> Option<&'static str> {
+    unsafe {
+        // Locked, or asked for permission on the secure desktop.
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
+            Ok(desktop) => {
+                let _ = CloseDesktop(desktop);
+            }
+            Err(_) => return Some("the screen is locked or asking for permission"),
+        }
+        if above_us(GetForegroundWindow()) {
+            return Some("a window run as administrator has the keyboard");
+        }
+        let mut cursor = POINT::default();
+        if GetCursorPos(&mut cursor).is_ok() && above_us(WindowFromPoint(cursor)) {
+            return Some("the cursor is on a window run as administrator");
+        }
+    }
+    None
+}
+
+/// Watches over a hold: where its end could not be seen it is ended at
+/// once, or it would go on after the trigger was let go of.
+unsafe extern "system" fn watch(_: HWND, _: u32, _: usize, _: u32) {
+    if !held() {
+        return stop_listening();
+    }
+    if let Some(why) = blind() {
+        end_hold(why);
     }
 }
 
@@ -435,8 +614,47 @@ fn release(s: &Settings, source: Source) {
             if STEPPED.get() { "move" } else { "click" },
             crate::debuglog::take_held_back()
         );
-        listen_raw(false);
-        post(s, if STEPPED.get() { WM_RELEASE } else { WM_CLICK }, 0);
+        stop_listening();
+        // A click is the trigger pressed and let go of where it was. One
+        // that travelled, only not far enough for a step, is a move given
+        // up: it must not open the board.
+        let slack = s.step_x.min(s.step_y) / 3;
+        let stayed = !STEPPED.get() && STRAYED.get().1 < slack;
+        if !stayed && !STEPPED.get() {
+            debug_log!("no click: the mouse had strayed {} (a click stays within {slack})", STRAYED.get().1);
+        }
+        // Nor is a click right upon a click one: nobody opens the board and
+        // answers it that fast, but a button set up to send a key combination
+        // may send it over and over while it is held.
+        let now = Instant::now();
+        let again = stayed && LAST_CLICK.replace(stayed.then_some(now)).is_some_and(|last| now.duration_since(last).as_millis() < CLICK_APART_MS);
+        if again {
+            debug_log!("no click: one was made less than {CLICK_APART_MS} ms ago");
+        }
+        let click = stayed && !again;
+        post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
+    }
+}
+
+/// A trigger seen let go of by raw input, which tells of it as well as the
+/// hook does and often first. Whichever comes second finds nothing held;
+/// this one is what ends the hold when the hook never hears of it.
+fn raw_release(source: Source) {
+    if HELD.with(|held| held.borrow().has(source)) {
+        debug_log!("up {source:?} (told by raw input)");
+        with_settings(|s| {
+            release(s, source);
+            false
+        });
+    }
+}
+
+/// A key seen coming up by raw input.
+fn raw_key_up(key: u32) {
+    raw_release(Source::Key(key));
+    if CHORD.with(|chord| chord.borrow().holds(key)) {
+        CHORD.with(|chord| chord.borrow_mut().let_go());
+        raw_release(Source::Chord);
     }
 }
 
@@ -445,6 +663,10 @@ fn release(s: &Settings, source: Source) {
 fn on_raw_input(handle: HRAWINPUT) {
     const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
     const MOUSE_VIRTUAL_DESKTOP: u16 = 0x02;
+    // Buttons coming up, as raw input flags them.
+    const BUTTONS_UP: [(u16, Source); 3] = [(0x0020, Source::Middle), (0x0080, Source::XButton1), (0x0200, Source::XButton2)];
+    const KEY_UP: u16 = 0x01;
+    const KEY_E0: u16 = 0x02;
     if !held() {
         return;
     }
@@ -452,10 +674,35 @@ fn on_raw_input(handle: HRAWINPUT) {
     let mut size = std::mem::size_of::<RAWINPUT>() as u32;
     let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
     let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(&mut raw as *mut _ as *mut _), &mut size, header) };
-    if read == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE.0 {
+    if read == u32::MAX {
+        return;
+    }
+    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+        let keyboard = unsafe { raw.data.keyboard };
+        if keyboard.Flags & KEY_UP != 0 {
+            // Raw input does not tell right from left Ctrl and Alt by the key.
+            let right = keyboard.Flags & KEY_E0 != 0;
+            raw_key_up(match keyboard.VKey {
+                0x11 => if right { 0xA3 } else { 0xA2 },
+                0x12 => if right { 0xA5 } else { 0xA4 },
+                key => key as u32,
+            });
+        }
+        return;
+    }
+    if raw.header.dwType != RIM_TYPEMOUSE.0 {
         return;
     }
     let mouse = unsafe { raw.data.mouse };
+    let buttons = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
+    for (flag, source) in BUTTONS_UP {
+        if buttons & flag != 0 {
+            raw_release(source);
+        }
+    }
+    if !held() {
+        return;
+    }
     #[cfg(feature = "debug-log")]
     crate::debuglog::device(raw.header.hDevice);
     let (dx, dy) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
@@ -506,6 +753,9 @@ const FLICK_PAUSE_MS: u128 = 70;
 /// hand back for the next flick is too slow to count, so flick, flick is two
 /// rows.
 fn travel(s: &Settings, dx: i32, dy: i32) {
+    let ((x, y), farthest) = STRAYED.get();
+    let (x, y) = (x + dx, y + dy);
+    STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
     if !s.vertical_sticky {
         return travel_linear(s, dx, dy);
     }
@@ -530,12 +780,11 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     });
     let (mut ax, _) = ACCUM.get();
     if s.is_vertical(wx, wy) {
-        // Moving up or down: nothing of it counts sideways.
-        if ax != 0 {
-            debug_log!("sideways travel of {ax} dropped: the last moments count as vertical");
-        }
-        ax = 0;
+        // Moving up or down: nothing of it counts sideways. What was
+        // travelled sideways before is kept, though: the hand wavers up and
+        // down on its way, and only a flick is a change of mind.
         if FLICKED.get() == 0 && wy.abs() >= (s.step_y / 2).max(40) {
+            ax = 0;
             FLICKED.set(wy.signum());
             RECENT.with(|recent| recent.borrow_mut().clear());
             STEPPED.set(true);
@@ -663,6 +912,7 @@ fn watch_chord() {
     let timer = CHORD_TIMER.get();
     if waiting && timer == 0 {
         let window = if keys <= 2 { PAIR_WINDOW_MS } else { CHORD_WINDOW_MS };
+        CHORD_BEGAN.set(Some(Instant::now()));
         CHORD_TIMER.set(unsafe { SetTimer(None, 0, window, Some(chord_timeout)) });
     } else if !waiting && timer != 0 {
         CHORD_TIMER.set(0);
@@ -702,6 +952,13 @@ fn on_key(s: &Settings, key: u32, up: bool) -> bool {
             chord.other_key(key, up)
         }
     });
+    #[cfg(feature = "debug-log")]
+    if !up && verdict == crate::hold::Verdict::default() && CHORD.with(|chord| chord.borrow().has(key)) {
+        // How late the rest of the chord came says whether the wait is too short.
+        if let Some(late) = CHORD_BEGAN.get().map(|began| began.elapsed().as_millis()).filter(|late| *late < 1000) {
+            debug_log!("another key of the chord went down {late} ms after the first: too late, typing");
+        }
+    }
     replay(&verdict.replay);
     watch_chord();
     match verdict.trigger {

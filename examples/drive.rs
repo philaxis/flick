@@ -6,7 +6,7 @@
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
 //!   drive post <class> <message> <wparam> <lparam> | client <class>
-//!   drive key <down|up> <vk hex>... | keystate <vk hex>...
+//!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -166,8 +166,15 @@ fn main() {
             }
             Some("key") => {
                 // key <down|up> <vk hex>...: presses or releases keys by virtual-key code, all at once.
+                // A last word "unseen" marks them as the app's own replayed keys, which its
+                // keyboard hook lets by: a key event the hook misses.
                 let up = args[2] == "up";
-                let events: Vec<_> = args[3..].iter().map(|vk| key_vk(u32::from_str_radix(vk, 16).unwrap(), up)).collect();
+                let unseen = args.last().is_some_and(|word| word == "unseen");
+                let codes = &args[3..args.len() - unseen as usize];
+                let mut events: Vec<_> = codes.iter().map(|vk| key_vk(u32::from_str_radix(vk, 16).unwrap(), up)).collect();
+                for event in events.iter_mut().filter(|_| unseen) {
+                    event.Anonymous.ki.dwExtraInfo = 0x4B41_4E4B;
+                }
                 windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&events, std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32);
             }
             Some("keystate") => {
@@ -177,6 +184,58 @@ fn main() {
                     print!("{vk}:{} ", if down { "down" } else { "up" });
                 }
                 println!();
+            }
+            Some("levels") => {
+                // Lists the visible windows whose process runs at a higher integrity level than
+                // this one (as administrator): input meant for them never reaches the app's hooks.
+                use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HWND};
+                use windows::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY};
+                use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+                use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible};
+                unsafe fn level(process: HANDLE) -> Option<u32> {
+                    let mut token = HANDLE::default();
+                    OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+                    let mut buffer = [0u8; 128];
+                    let mut len = 0u32;
+                    let got = GetTokenInformation(token, TokenIntegrityLevel, Some(buffer.as_mut_ptr().cast()), buffer.len() as u32, &mut len);
+                    let _ = CloseHandle(token);
+                    got.ok()?;
+                    let sid = (*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+                    Some(*GetSidSubAuthority(sid, (*GetSidSubAuthorityCount(sid) - 1) as u32))
+                }
+                unsafe fn of_window(hwnd: HWND) -> Option<u32> {
+                    let mut pid = 0u32;
+                    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                    let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+                    let found = level(process);
+                    let _ = CloseHandle(process);
+                    found
+                }
+                unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> BOOL {
+                    if IsWindowVisible(hwnd).as_bool() {
+                        let mut class = [0u16; 64];
+                        let n = GetClassNameW(hwnd, &mut class).max(0) as usize;
+                        println!("{:x} {:?} {}", hwnd.0, of_window(hwnd), String::from_utf16_lossy(&class[..n]));
+                    }
+                    true.into()
+                }
+                println!("this process: {:?}; foreground: {:?}", level(GetCurrentProcess()), of_window(GetForegroundWindow()));
+                let _ = EnumWindows(Some(each), LPARAM(0));
+            }
+            Some("front") => {
+                // front <class | 0xHWND>: brings a window to the front; prints the one that was.
+                use windows::Win32::Foundation::HWND;
+                use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+                let window = match args[2].strip_prefix("0x") {
+                    Some(hex) => HWND(isize::from_str_radix(hex, 16).unwrap()),
+                    None => FindWindowW(&windows::core::HSTRING::from(args[2].as_str()), None),
+                };
+                let before = GetForegroundWindow();
+                // Input of our own just before makes Windows grant the request.
+                let nudge = key_vk(0x87, true);
+                windows::Win32::UI::Input::KeyboardAndMouse::SendInput(&[nudge], std::mem::size_of_val(&nudge) as i32);
+                let done = SetForegroundWindow(window).as_bool();
+                println!("0x{:x} {done}", before.0);
             }
             Some("typetest") => typetest(),
             Some("idle") => {

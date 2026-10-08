@@ -40,6 +40,10 @@ impl Held {
         before && !self.any()
     }
 
+    pub fn has(&self, source: Source) -> bool {
+        self.0.contains(&source)
+    }
+
     /// Forgets everything; returns whether anything was held.
     pub fn clear(&mut self) -> bool {
         !std::mem::take(&mut self.0).is_empty()
@@ -85,6 +89,17 @@ impl Chord {
 
     pub fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// The chord went down as the trigger and this key of it has not come up.
+    pub fn holds(&self, key: u32) -> bool {
+        self.fired.contains(&key)
+    }
+
+    /// Lets go of the chord without waiting for its keys to come up: when
+    /// they do, they are ordinary keys.
+    pub fn let_go(&mut self) {
+        self.fired.clear();
     }
 
     /// Keys are being held back; `timeout` is due when the wait, counted

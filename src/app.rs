@@ -37,9 +37,9 @@ use windows::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
                 IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
                 RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
-                MB_OK, MB_YESNO, MSG, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_APP, WM_CLOSE,
-                WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-                WS_OVERLAPPED,
+                MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
+                WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_POWERBROADCAST,
+                WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
@@ -64,6 +64,9 @@ const LABEL_TIMER_ID: usize = 4;
 const LABEL_HIDE_MS: u32 = 1600;
 /// Periodic look at the config file, to apply it when the user saves it.
 const CONFIG_TIMER_ID: usize = 5;
+/// One-shot timer that tells the app again that the trigger was let go of,
+/// when it was too busy to hear it.
+const RELEASE_TIMER_ID: usize = 6;
 const CONFIG_CHECK_MS: u32 = 2000;
 /// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
 /// do the same carrying the active window, and this one opens the pin menu.
@@ -1011,11 +1014,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(App::toggle_board);
         }
         WM_RELEASE => {
-            with_app(|app| {
+            let heard = with_app(|app| {
                 app.edge = None;
                 app.finish_gesture();
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });
+            // Not to be lost: the minimap would stay up for good.
+            if heard.is_none() {
+                SetTimer(hwnd, RELEASE_TIMER_ID, 50, None);
+            }
+        }
+        WM_TIMER if wparam.0 == RELEASE_TIMER_ID => {
+            let _ = KillTimer(hwnd, RELEASE_TIMER_ID);
+            let _ = PostMessageW(hwnd, WM_RELEASE, WPARAM(0), LPARAM(0));
+        }
+        WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
+            input::woke();
+            return DefWindowProcW(hwnd, message, wparam, lparam);
         }
         WM_OPEN_SETTINGS => {
             with_app(App::open_settings);
