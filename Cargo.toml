@@ -1,6 +1,6 @@
 [package]
 name = "flick"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "2D grid navigation on top of Windows 11 virtual desktops"
 license = "MIT"
