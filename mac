@@ -80,7 +80,8 @@ sign-setup) # a throwaway signing identity inside ~/borrow, so a rebuilt app kee
 sign-trust) # asks the owner, on the Mac's screen, for the borrowed account's password once; trust is for that account only
   rsh "security add-trusted-cert -r trustRoot -p codeSign -k $R/sign/kc.keychain-db $R/sign/c.pem && security find-identity -v -p codesigning $R/sign/kc.keychain-db | grep borrow-dev" ;;
 sign)     # sign <app path on the Mac>
-  rsh "security unlock-keychain -p borrow $R/sign/kc.keychain-db && codesign --force --deep -s borrow-dev --keychain $R/sign/kc.keychain-db $2 && codesign -dv --verbose=2 $2 2>&1 | grep -E 'Authority|Identifier|Signature'" ;;
+  rsh "security list-keychains -d user | grep -q borrow/sign || security list-keychains -d user -s $R/sign/kc.keychain-db \$(security list-keychains -d user | tr -d '\"')
+    security unlock-keychain -p borrow $R/sign/kc.keychain-db && codesign --force --deep -s borrow-dev --keychain $R/sign/kc.keychain-db $2 && codesign -dv --verbose=2 $2 2>&1 | grep -E 'Authority|Identifier|Signature'" ;;
 open)  shift; rsh "open $*" ;;
 shot)     # shot [local file]: what the Mac's screen shows now (needs the screen session; may ask for Screen Recording once)
   O=${2:-$S/shot-$(date +%H%M%S).png}
@@ -94,6 +95,8 @@ down)     # stop everything we started, erase ~/borrow and app data, disconnect.
     done
     security delete-generic-password -s mulbit >/dev/null 2>&1
     rm -rf ~/Applications/mulbit.app
+    security list-keychains -d user -s \$(security list-keychains -d user | tr -d '\"' | grep -v borrow/sign) 2>/dev/null
+    rmdir ~/.local/share ~/.local 2>/dev/null
     [ -f $R/clt-installed-by-us ] && echo 'LEFT: developer tools were installed today (owner may remove: sudo rm -rf /Library/Developer/CommandLineTools)'
     echo 'LEFT: the account itself (owner deletes it), and any Accessibility / Input Monitoring rows the owner switched on'
     (trap '' HUP; sleep 1; rm -f $R/pid; sleep 4; rm -rf $R) >/dev/null 2>&1 < /dev/null &"

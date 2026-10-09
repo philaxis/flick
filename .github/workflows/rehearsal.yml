@@ -119,4 +119,3 @@ jobs:
         run: |
           sudo sysadminctl -deleteUser borrowtest
           id borrowtest 2>/dev/null && exit 1 || echo "account gone"; test -e /Users/borrowtest && exit 1 || echo "home gone"
-          sudo security remove-trusted-cert -d "$RUNNER_TEMP/c.pem" || true
