@@ -42,13 +42,18 @@ jobs:
         run: |
           TS_KEY=; REMOTE_PUB=; [ "$REMOTE_MIN" != 0 ] && { TS_KEY=$TS_KEY_SECRET; REMOTE_PUB=$REMOTE_PUB_SECRET; }
           sudo install -m 755 friend.sh /usr/local/bin/friend.sh
-          PUB="$(cat "$MAC_STATE/key.pub")"; [ -n "$REMOTE_PUB" ] && PUB="$PUB"$'\n'"$REMOTE_PUB"
-          sudo -u borrowtest -H env BORROW_PUB="$PUB" BORROW_KEY="$TS_KEY" BORROW_TEST_BUILD=1 \
-            BORROW_NAME=borrowed-mac-rehearsal bash -c 'cd; trap "" HUP; /usr/local/bin/friend.sh > /tmp/friend.out 2>&1 < /dev/null &'
-          for i in $(seq 160); do grep -q 'Connected\.' /tmp/friend.out && break; pgrep -u borrowtest -f friend.sh >/dev/null || break; sleep 3; done
+          printf '%s' "$TS_KEY" > "$RUNNER_TEMP/tskey"
+          ./mac link "$RUNNER_TEMP/tskey" file:///usr/local/bin/friend.sh; rm "$RUNNER_TEMP/tskey"
+          # The owner, in their own account, pastes the line they were sent…
+          zsh "$MAC_STATE/link"; ls -l /Users/Shared/borrow.command
+          # …then the new account starts what it left.
+          sudo -u borrowtest -H env BORROW_TEST_BUILD=1 BORROW_NAME=borrowed-mac-rehearsal \
+            bash -c 'cd; trap "" HUP; /Users/Shared/borrow.command > /tmp/friend.out 2>&1 < /dev/null &'
+          for i in $(seq 160); do grep -q 'Connected\.' /tmp/friend.out && break; sleep 3; sudo kill -0 "$(sudo cat /Users/borrowtest/borrow/pid 2>/dev/null)" 2>/dev/null || break; done
           sudo cat /Users/borrowtest/borrow/log/go.log 2>/dev/null | tail -20 || true
           sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /tmp/friend.out
           grep -q 'Connected\.' /tmp/friend.out
+          [ -z "$REMOTE_PUB" ] || echo "$REMOTE_PUB" | sudo tee -a /Users/borrowtest/borrow/ssh/authorized_keys >/dev/null
       - name: Real screens for the owner's guide (best effort)
         continue-on-error: true
         timeout-minutes: 3
@@ -113,7 +118,7 @@ jobs:
           sudo test -e /Users/borrowtest/borrow && { echo "~/borrow still there"; exit 1; } || echo "~/borrow gone"
           sudo find /Users/borrowtest -maxdepth 2 -not -path '*/Library/*' | head -40
           # The account's own system agents (cfprefsd, mdworker…) stay until the account is deleted; nothing of ours may.
-          pgrep -u borrowtest -lf 'borrow/|sshd|tailscale|caffeinate|friend\.sh|cargo|rustc|node' && { echo "processes left"; exit 1; } || echo "none of our processes left"
+          pgrep -u borrowtest -lf 'borrow/|sshd|tailscale|caffeinate|friend\.sh|cargo|rustc|node|^bash$' && { echo "processes left"; exit 1; } || echo "none of our processes left"
           sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out | tail -5
       - name: Owner deletes the account
         run: |

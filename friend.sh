@@ -2,7 +2,7 @@
 # Lends this Mac for a build session. Run it in Terminal, inside a throwaway
 # STANDARD (non-admin) account. Needs no password and changes nothing outside
 # this account's home folder: everything lives in ~/borrow.
-# Closing this window (or Ctrl+C) disconnects at once. Deleting the account removes it all.
+# Started by the line the owner pastes (see README). Closing this window (or Ctrl+C) disconnects at once. Deleting the account removes it all.
 set -euo pipefail
 
 GO_VERSION=go1.27.2

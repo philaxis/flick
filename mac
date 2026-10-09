@@ -21,10 +21,11 @@ case "${1:-help}" in
 keygen)   # a key used for this one session only
   rm -f "$S/key" "$S/key.pub" "$S/known_hosts"
   ssh-keygen -q -t ed25519 -N '' -C mac-borrow -f "$S/key"; cat "$S/key.pub" ;;
-link)     # link <file with the one-time network key> <page url> -> writes the friend's link to $S/link
-  K=$(tr -d '\r\n ' < "$2"); P=$(cat "$S/key.pub")
-  printf '%s#%s\n' "$3" "$(printf '%s\n%s\n%s' "$K" "$P" "${4:-borrow}" | base64 -w0 | tr '+/' '-_')" > "$S/link"
-  chmod 600 "$S/link"; echo "friend link written to $S/link (contains the one-time key: send privately)" ;;
+link)     # link <file with the one-time network key> [friend.sh url]: writes the one line the owner pastes to $S/link
+  K=$(tr -d '\r\n ' < "$2"); P=$(cat "$S/key.pub"); U=${3:-https://raw.githubusercontent.com/philaxis/flick/mac-borrow-rehearsal/friend.sh}
+  # The owner pastes it in their own account; it leaves a file the borrowed account can start (the two accounts share no clipboard).
+  printf '%s\n' "printf '%s\\n' '#!/bin/bash' \"curl -fsSL $U | BORROW_KEY='$K' BORROW_PUB='$P' bash\" > /Users/Shared/borrow.command && chmod 755 /Users/Shared/borrow.command && echo 'Ready. Now switch to the new account.'" > "$S/link"
+  chmod 600 "$S/link"; echo "the owner's one line is in $S/link (contains the one-time key: send privately)" ;;
 wait)     # wait <mac account name>: until the Mac appears on the tailnet and answers
   echo "${2:?account name on the Mac}" > "$S/user"
   for _ in $(seq "${MAC_WAIT:-180}"); do
