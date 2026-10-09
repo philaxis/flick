@@ -36,4 +36,4 @@
 - 새 계정은 표준 계정이라 내 파일·사진·비밀번호에 닿지 못해요.
 - 터미널 창을 닫는 순간 바로 끊겨요.
 - 설치되는 것은 전부 새 계정 안에만. 계정을 지우면 다 사라져요.
-- 실행되는 스크립트는 [friend.sh](friend.sh) 하나예요. 이 과정 전체를 [깨끗한 맥에서 돌려 본 기록](../../actions/workflows/rehearsal.yml)도 있어요.
+- 실행되는 스크립트는 [friend.sh](friend.sh) 하나예요. 이 과정 전체를 [깨끗한 맥에서 돌려 본 기록](https://github.com/philaxis/flick/actions/workflows/rehearsal.yml)도 있어요.

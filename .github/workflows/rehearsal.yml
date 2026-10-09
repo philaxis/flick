@@ -4,6 +4,7 @@ name: Rehearsal on a macOS runner
 on:
   push:
     branches: [mac-borrow-rehearsal]
+    paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
     inputs:
       remote_minutes:
