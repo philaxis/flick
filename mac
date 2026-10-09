@@ -61,7 +61,7 @@ push)     # push <local git dir> [ref]: committed files only, no .git, no token 
   echo "sent $N@$(git -C "$D" rev-parse --short "${3:-HEAD}") -> ~/borrow/src/$N" ;;
 start)    # start <name> <command…>: long work runs on the Mac in the background; we do not sit on it
   N=$2; shift 2
-  rsh "mkdir -p $R/log; cd $R/src 2>/dev/null || cd $R; nohup bash -lc $(printf '%q' "$*") > $R/log/$N.log 2>&1 & echo \$! > $R/log/$N.pid; echo started $N" ;;
+  rsh "mkdir -p $R/log; cd $R/src 2>/dev/null || cd $R; (trap '' HUP; exec bash -lc $(printf '%q' "$*")) > $R/log/$N.log 2>&1 < /dev/null & echo \$! > $R/log/$N.pid; echo started $N" ;;
 tail)     # tail <name> [lines]: is it still running, and the end of its log
   rsh "kill -0 \$(cat $R/log/$2.pid) 2>/dev/null && echo RUNNING || echo FINISHED; tail -n ${3:-25} $R/log/$2.log" ;;
 build-mulbit) # the same steps as the bundle workflow, ad-hoc signed
@@ -93,7 +93,7 @@ down)     # stop everything we started, erase ~/borrow and app data, disconnect.
     rm -rf ~/Applications/mulbit.app
     [ -f $R/clt-installed-by-us ] && echo 'LEFT: developer tools were installed today (owner may remove: sudo rm -rf /Library/Developer/CommandLineTools)'
     echo 'LEFT: the account itself (owner deletes it), and any Accessibility / Input Monitoring rows the owner switched on'
-    nohup sh -c 'sleep 1; rm -f $R/pid; sleep 4; rm -rf $R' >/dev/null 2>&1 &"
+    (trap '' HUP; sleep 1; rm -f $R/pid; sleep 4; rm -rf $R) >/dev/null 2>&1 < /dev/null &"
   sleep 8; sshx true 2>/dev/null && { echo "STILL REACHABLE"; exit 1; } || echo "door closed"
   rm -f "$S/key" "$S/key.pub" "$S/known_hosts" "$S/host" "$S/user" "$S/link"; echo "session key destroyed" ;;
 *) grep -E '^[a-z-]+\)' "$0" | sed 's/).*#/  —/; s/)$//' ;;

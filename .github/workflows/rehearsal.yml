@@ -42,8 +42,9 @@ jobs:
           sudo install -m 755 friend.sh /usr/local/bin/friend.sh
           PUB="$(cat "$MAC_STATE/key.pub")"; [ -n "$REMOTE_PUB" ] && PUB="$PUB"$'\n'"$REMOTE_PUB"
           sudo -u borrowtest -H env BORROW_PUB="$PUB" BORROW_KEY="$TS_KEY" BORROW_TEST_BUILD=1 \
-            BORROW_NAME=borrowed-mac-rehearsal bash -c 'cd; nohup /usr/local/bin/friend.sh > /tmp/friend.out 2>&1 &'
-          for i in $(seq 120); do grep -q 'Connected\.' /tmp/friend.out && break; sleep 3; done
+            BORROW_NAME=borrowed-mac-rehearsal bash -c 'cd; trap "" HUP; /usr/local/bin/friend.sh > /tmp/friend.out 2>&1 < /dev/null &'
+          for i in $(seq 160); do grep -q 'Connected\.' /tmp/friend.out && break; pgrep -u borrowtest -f friend.sh >/dev/null || break; sleep 3; done
+          sudo cat /Users/borrowtest/borrow/log/go.log 2>/dev/null | tail -20 || true
           sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out
           grep -q 'Connected\.' /tmp/friend.out
       - name: Real screens for the owner's guide (best effort)
