@@ -18,12 +18,11 @@ jobs:
     env:
       MAC_HOST: 127.0.0.1
       MAC_USER: borrowtest
-      MAC_STATE: ${{ runner.temp }}/state
       REMOTE_MIN: ${{ inputs.remote_minutes || '0' }}
     steps:
       - uses: actions/checkout@v4
       - name: The Mac
-        run: sw_vers; uname -m; xcode-select -p
+        run: sw_vers; uname -m; xcode-select -p; echo "MAC_STATE=$RUNNER_TEMP/state" >> "$GITHUB_ENV"
       - name: Flick probe compiles (running it needs permissions a hosted runner cannot grant)
         run: |
           swiftc -O probes/flick-probe.swift -o "$RUNNER_TEMP/flick-probe"
