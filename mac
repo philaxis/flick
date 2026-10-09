@@ -69,7 +69,7 @@ build-mulbit) # the same steps as the bundle workflow, ad-hoc signed
 sign-setup) # a throwaway signing identity inside ~/borrow, so a rebuilt app keeps its privacy permissions (ad-hoc builds lose them every rebuild)
   rsh "set -e; K=$R/sign; mkdir -p \$K; cd \$K
     [ -f id.p12 ] || { openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -days 30 -subj /CN=borrow-dev \
-        -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning 2>/dev/null
+        -addext basicConstraints=critical,CA:FALSE -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning
       openssl pkcs12 -export -inkey k.pem -in c.pem -out id.p12 -passout pass:borrow -name borrow-dev; rm k.pem; }
     [ -f kc.keychain-db ] || { security create-keychain -p borrow \$K/kc.keychain-db; security set-keychain-settings \$K/kc.keychain-db
       security unlock-keychain -p borrow \$K/kc.keychain-db

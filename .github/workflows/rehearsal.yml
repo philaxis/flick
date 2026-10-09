@@ -57,10 +57,10 @@ jobs:
           defaults write -g AppleLanguages -array ko-KR en-US; defaults write -g AppleLocale ko_KR
           open "x-apple.systempreferences:com.apple.Users-Groups-Settings.extension"; sleep 12
           screencapture -x shots/1-users.png
-          osascript -e 'tell application "System Settings" to quit' || true
           sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /tmp/friend.out > /tmp/friend.show
-          osascript -e 'tell application "Terminal" to do script "clear; cat /tmp/friend.show"' -e 'tell application "Terminal" to activate' || true
-          sleep 6; screencapture -x shots/3-terminal.png
+          pkill -x "System Settings" || true
+          printf '#!/bin/bash\nclear; cat /tmp/friend.show; sleep 60\n' > /tmp/show.command; chmod +x /tmp/show.command
+          open -a Terminal /tmp/show.command; sleep 10; screencapture -x shots/3-terminal.png
           ls -la shots
       - uses: actions/upload-artifact@v4
         if: always()
@@ -91,8 +91,13 @@ jobs:
           ./mac sign-setup
           sudo cat /Users/borrowtest/borrow/sign/c.pem > "$RUNNER_TEMP/c.pem"
           sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/c.pem"
-          ./mac sign '$HOME/borrow/src/hello/target/release/hello'
-          ./mac sh 'codesign -d -r- $HOME/borrow/src/hello/target/release/hello 2>&1 | tail -1; $HOME/borrow/src/hello/target/release/hello'
+          sleep 3; ./mac sh 'security find-identity -v -p codesigning $HOME/borrow/sign/kc.keychain-db; openssl x509 -in $HOME/borrow/sign/c.pem -noout -text | grep -A1 -E "Basic|Key Usage"' || true
+          if ./mac sign '$HOME/borrow/src/hello/target/release/hello'; then
+            ./mac sh 'codesign -d -r- $HOME/borrow/src/hello/target/release/hello 2>&1 | tail -1; $HOME/borrow/src/hello/target/release/hello'
+            echo "SIGNING IDENTITY: works once trusted"
+          else
+            echo "::warning::SIGNING IDENTITY: does not work yet (builds stay ad-hoc signed; permissions are asked again after each rebuild)"
+          fi
           ./mac pull '$HOME/borrow/src/hello/target/release/hello' "$RUNNER_TEMP/hello.bin"
           ./mac shot "$RUNNER_TEMP/shot.png" || echo "screenshot: not possible without a screen session (expected here)"
       - name: Stay up to be driven from outside
