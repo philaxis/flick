@@ -86,7 +86,13 @@ jobs:
           ./mac start hello 'cd hello && cargo build --release && codesign -s - target/release/hello && target/release/hello && echo BUILD-OK'
           for i in $(seq 60); do ./mac tail hello 3 | grep -q FINISHED && break; sleep 5; done
           ./mac tail hello 10 | tee /tmp/tail.out; grep -q BUILD-OK /tmp/tail.out
-          ./mac sign-setup && ./mac sign '$HOME/borrow/src/hello/target/release/hello' || echo "SELF-SIGNED IDENTITY: did not work here"
+          # Trusting the identity needs one password prompt on the Mac's screen (mac sign-trust). No screen here,
+          # so the runner trusts it system-wide instead: this checks everything about the identity except that prompt.
+          ./mac sign-setup
+          sudo cat /Users/borrowtest/borrow/sign/c.pem > "$RUNNER_TEMP/c.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/c.pem"
+          ./mac sign '$HOME/borrow/src/hello/target/release/hello'
+          ./mac sh 'codesign -d -r- $HOME/borrow/src/hello/target/release/hello 2>&1 | tail -1; $HOME/borrow/src/hello/target/release/hello'
           ./mac pull '$HOME/borrow/src/hello/target/release/hello' "$RUNNER_TEMP/hello.bin"
           ./mac shot "$RUNNER_TEMP/shot.png" || echo "screenshot: not possible without a screen session (expected here)"
       - name: Stay up to be driven from outside
@@ -101,9 +107,11 @@ jobs:
           sleep 5
           sudo test -e /Users/borrowtest/borrow && { echo "~/borrow still there"; exit 1; } || echo "~/borrow gone"
           sudo find /Users/borrowtest -maxdepth 2 -not -path '*/Library/*' | head -40
-          pgrep -u borrowtest -lf . && { echo "processes left"; exit 1; } || echo "no processes left"
+          # The account's own system agents (cfprefsd, mdworker…) stay until the account is deleted; nothing of ours may.
+          pgrep -u borrowtest -lf 'borrow/|sshd|tailscale|caffeinate|friend\.sh|cargo|rustc|node' && { echo "processes left"; exit 1; } || echo "none of our processes left"
           sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out | tail -5
       - name: Owner deletes the account
         run: |
           sudo sysadminctl -deleteUser borrowtest
           id borrowtest 2>/dev/null && exit 1 || echo "account gone"; test -e /Users/borrowtest && exit 1 || echo "home gone"
+          sudo security remove-trusted-cert -d "$RUNNER_TEMP/c.pem" || true

@@ -14,8 +14,8 @@ host() { [ -n "${MAC_HOST:-}" ] && echo "$MAC_HOST" || cat "$S/host"; }
 user() { [ -n "${MAC_USER:-}" ] && echo "$MAC_USER" || cat "$S/user"; }
 sshx() { ssh -i "$S/key" -p "$PORT" -o IdentitiesOnly=yes -o UserKnownHostsFile="$S/known_hosts" \
   -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=20 "$(user)@$(host)" "$@"; }
-# Every remote command gets the in-home toolchain on PATH.
-rsh() { sshx "export PATH=$R/cargo/bin:$R/node/bin:\$PATH CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup npm_config_cache=$R/npm; $*"; }
+# Every remote command runs in bash (the account's own shell is zsh) with the in-home toolchain on PATH.
+rsh() { sshx "bash -c $(printf '%q' "export PATH=$R/cargo/bin:$R/node/bin:\$PATH CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup npm_config_cache=$R/npm; $*")"; }
 
 case "${1:-help}" in
 keygen)   # a key used for this one session only
@@ -75,7 +75,10 @@ sign-setup) # a throwaway signing identity inside ~/borrow, so a rebuilt app kee
       security unlock-keychain -p borrow \$K/kc.keychain-db
       security import id.p12 -k \$K/kc.keychain-db -P borrow -T /usr/bin/codesign >/dev/null
       security set-key-partition-list -S apple-tool:,apple: -s -k borrow \$K/kc.keychain-db >/dev/null; }
-    security find-identity \$K/kc.keychain-db | grep borrow-dev" ;;
+    security find-identity -p codesigning \$K/kc.keychain-db | grep borrow-dev
+    security find-identity -v -p codesigning \$K/kc.keychain-db | grep -q borrow-dev || echo 'NOT TRUSTED YET: run  mac sign-trust  while the owner is at the screen'" ;;
+sign-trust) # asks the owner, on the Mac's screen, for the borrowed account's password once; trust is for that account only
+  rsh "security add-trusted-cert -r trustRoot -p codeSign -k $R/sign/kc.keychain-db $R/sign/c.pem && security find-identity -v -p codesigning $R/sign/kc.keychain-db | grep borrow-dev" ;;
 sign)     # sign <app path on the Mac>
   rsh "security unlock-keychain -p borrow $R/sign/kc.keychain-db && codesign --force --deep -s borrow-dev --keychain $R/sign/kc.keychain-db $2 && codesign -dv --verbose=2 $2 2>&1 | grep -E 'Authority|Identifier|Signature'" ;;
 open)  shift; rsh "open $*" ;;
