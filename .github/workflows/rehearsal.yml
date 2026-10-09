@@ -18,7 +18,8 @@ jobs:
     env:
       MAC_HOST: 127.0.0.1
       MAC_USER: borrowtest
-      REMOTE_MIN: ${{ inputs.remote_minutes || '0' }}
+      # A push whose message contains [remote] also stays up, since only the default branch can be dispatched by hand.
+      REMOTE_MIN: ${{ inputs.remote_minutes || (contains(github.event.head_commit.message, '[remote]') && '12') || '0' }}
     steps:
       - uses: actions/checkout@v4
       - name: The Mac
@@ -36,26 +37,28 @@ jobs:
         run: ./mac keygen
       - name: Owner pastes the one line
         env:
-          TS_KEY: ${{ (inputs.remote_minutes || '0') != '0' && secrets.TS_KEY || '' }}
-          REMOTE_PUB: ${{ (inputs.remote_minutes || '0') != '0' && secrets.REMOTE_PUB || '' }}
+          TS_KEY_SECRET: ${{ secrets.TS_KEY }}
+          REMOTE_PUB_SECRET: ${{ secrets.REMOTE_PUB }}
         run: |
+          TS_KEY=; REMOTE_PUB=; [ "$REMOTE_MIN" != 0 ] && { TS_KEY=$TS_KEY_SECRET; REMOTE_PUB=$REMOTE_PUB_SECRET; }
           sudo install -m 755 friend.sh /usr/local/bin/friend.sh
           PUB="$(cat "$MAC_STATE/key.pub")"; [ -n "$REMOTE_PUB" ] && PUB="$PUB"$'\n'"$REMOTE_PUB"
           sudo -u borrowtest -H env BORROW_PUB="$PUB" BORROW_KEY="$TS_KEY" BORROW_TEST_BUILD=1 \
             BORROW_NAME=borrowed-mac-rehearsal bash -c 'cd; trap "" HUP; /usr/local/bin/friend.sh > /tmp/friend.out 2>&1 < /dev/null &'
           for i in $(seq 160); do grep -q 'Connected\.' /tmp/friend.out && break; pgrep -u borrowtest -f friend.sh >/dev/null || break; sleep 3; done
           sudo cat /Users/borrowtest/borrow/log/go.log 2>/dev/null | tail -20 || true
-          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out
+          sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /tmp/friend.out
           grep -q 'Connected\.' /tmp/friend.out
       - name: Real screens for the owner's guide (best effort)
         continue-on-error: true
+        timeout-minutes: 3
         run: |
           mkdir -p shots
           defaults write -g AppleLanguages -array ko-KR en-US; defaults write -g AppleLocale ko_KR
           open "x-apple.systempreferences:com.apple.Users-Groups-Settings.extension"; sleep 12
           screencapture -x shots/1-users.png
           osascript -e 'tell application "System Settings" to quit' || true
-          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out > /tmp/friend.show
+          sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /tmp/friend.out > /tmp/friend.show
           osascript -e 'tell application "Terminal" to do script "clear; cat /tmp/friend.show"' -e 'tell application "Terminal" to activate' || true
           sleep 6; screencapture -x shots/3-terminal.png
           ls -la shots
@@ -89,6 +92,7 @@ jobs:
       - name: Stay up to be driven from outside
         if: env.REMOTE_MIN != '0'
         run: |
+          echo "devices this Mac can see on the private network: $(sudo -u borrowtest /Users/borrowtest/borrow/bin/tailscale --socket=/Users/borrowtest/borrow/ts/sock status --peers --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("Peer") or {}))') (should be 1: the one PC allowed to reach it)"
           for i in $(seq $(( REMOTE_MIN * 6 ))); do sudo test -d /Users/borrowtest/borrow || break; sleep 10; done
           sudo test -d /Users/borrowtest/borrow && echo "nobody took it down from outside" || echo "taken down from outside"
       - name: Take it all down
