@@ -1,0 +1,105 @@
+name: Rehearsal on a macOS runner
+# Plays both sides on one hosted Mac: a throwaway standard account runs friend.sh,
+# the runner account drives it with ./mac, then everything is removed and checked.
+on:
+  push:
+    branches: [mac-borrow-rehearsal]
+  workflow_dispatch:
+    inputs:
+      remote_minutes:
+        description: 'With the TS_KEY secret set: minutes to stay up so the session can be driven from outside (0 = local only)'
+        default: '0'
+permissions:
+  contents: read
+jobs:
+  rehearse:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      MAC_HOST: 127.0.0.1
+      MAC_USER: borrowtest
+      MAC_STATE: ${{ runner.temp }}/state
+      REMOTE_MIN: ${{ inputs.remote_minutes || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The Mac
+        run: sw_vers; uname -m; xcode-select -p
+      - name: Flick probe compiles (running it needs permissions a hosted runner cannot grant)
+        run: |
+          swiftc -O probes/flick-probe.swift -o "$RUNNER_TEMP/flick-probe"
+          "$RUNNER_TEMP/flick-probe" shot || echo "probe shot: exit $? (not verified here)"
+      - name: Owner makes a standard account
+        run: |
+          sudo sysadminctl -addUser borrowtest -fullName "Borrow test" -password "$(openssl rand -hex 16)"
+          id -Gn borrowtest | tr ' ' '\n' | grep -qx admin && { echo "account is admin"; exit 1; } || echo "standard account"
+          mkdir -p ~/Documents && echo private > ~/Documents/owner-private.txt
+      - name: Our side makes a one-session key
+        run: ./mac keygen
+      - name: Owner pastes the one line
+        env:
+          TS_KEY: ${{ (inputs.remote_minutes || '0') != '0' && secrets.TS_KEY || '' }}
+          REMOTE_PUB: ${{ (inputs.remote_minutes || '0') != '0' && secrets.REMOTE_PUB || '' }}
+        run: |
+          sudo install -m 755 friend.sh /usr/local/bin/friend.sh
+          PUB="$(cat "$MAC_STATE/key.pub")"; [ -n "$REMOTE_PUB" ] && PUB="$PUB"$'\n'"$REMOTE_PUB"
+          sudo -u borrowtest -H env BORROW_PUB="$PUB" BORROW_KEY="$TS_KEY" BORROW_TEST_BUILD=1 \
+            BORROW_NAME=borrowed-mac-rehearsal bash -c 'cd; nohup /usr/local/bin/friend.sh > /tmp/friend.out 2>&1 &'
+          for i in $(seq 120); do grep -q 'Connected\.' /tmp/friend.out && break; sleep 3; done
+          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out
+          grep -q 'Connected\.' /tmp/friend.out
+      - name: Real screens for the owner's guide (best effort)
+        continue-on-error: true
+        run: |
+          mkdir -p shots
+          defaults write -g AppleLanguages -array ko-KR en-US; defaults write -g AppleLocale ko_KR
+          open "x-apple.systempreferences:com.apple.Users-Groups-Settings.extension"; sleep 12
+          screencapture -x shots/1-users.png
+          osascript -e 'tell application "System Settings" to quit' || true
+          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out > /tmp/friend.show
+          osascript -e 'tell application "Terminal" to do script "clear; cat /tmp/friend.show"' -e 'tell application "Terminal" to activate' || true
+          sleep 6; screencapture -x shots/3-terminal.png
+          ls -la shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-screens
+          path: shots
+          if-no-files-found: ignore
+      - name: Reach it, and only it
+        run: |
+          ./mac info
+          ./mac sh 'cat /Users/runner/Documents/owner-private.txt' && { echo "OWNER FILE READABLE"; exit 1; } || echo "owner's Documents: not readable (good)"
+          ./mac sh 'sudo -n true' && { echo "HAS SUDO"; exit 1; } || echo "no sudo (good)"
+          ./mac sh 'ls -la ~/borrow; lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -E "sshd|tailscaled" || true'
+      - name: Toolchain in the borrowed home, send source, build, sign, run
+        run: |
+          ./mac toolchain
+          mkdir -p "$RUNNER_TEMP/hello/src" && cd "$RUNNER_TEMP/hello"
+          printf '[package]\nname="hello"\nversion="0.0.0"\nedition="2021"\n' > Cargo.toml
+          echo 'fn main(){println!("built on the borrowed Mac");}' > src/main.rs
+          git init -q && git add -A && git -c user.name=r -c user.email=r@r commit -qm hello
+          cd "$GITHUB_WORKSPACE"
+          ./mac push "$RUNNER_TEMP/hello"
+          ./mac start hello 'cd hello && cargo build --release && codesign -s - target/release/hello && target/release/hello && echo BUILD-OK'
+          for i in $(seq 60); do ./mac tail hello 3 | grep -q FINISHED && break; sleep 5; done
+          ./mac tail hello 10 | tee /tmp/tail.out; grep -q BUILD-OK /tmp/tail.out
+          ./mac sign-setup && ./mac sign '$HOME/borrow/src/hello/target/release/hello' || echo "SELF-SIGNED IDENTITY: did not work here"
+          ./mac pull '$HOME/borrow/src/hello/target/release/hello' "$RUNNER_TEMP/hello.bin"
+          ./mac shot "$RUNNER_TEMP/shot.png" || echo "screenshot: not possible without a screen session (expected here)"
+      - name: Stay up to be driven from outside
+        if: env.REMOTE_MIN != '0'
+        run: |
+          for i in $(seq $(( REMOTE_MIN * 6 ))); do sudo test -d /Users/borrowtest/borrow || break; sleep 10; done
+          sudo test -d /Users/borrowtest/borrow && echo "nobody took it down from outside" || echo "taken down from outside"
+      - name: Take it all down
+        run: |
+          sudo test -d /Users/borrowtest/borrow && ./mac down || echo "already down"
+          sleep 5
+          sudo test -e /Users/borrowtest/borrow && { echo "~/borrow still there"; exit 1; } || echo "~/borrow gone"
+          sudo find /Users/borrowtest -maxdepth 2 -not -path '*/Library/*' | head -40
+          pgrep -u borrowtest -lf . && { echo "processes left"; exit 1; } || echo "no processes left"
+          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out | tail -5
+      - name: Owner deletes the account
+        run: |
+          sudo sysadminctl -deleteUser borrowtest
+          id borrowtest 2>/dev/null && exit 1 || echo "account gone"; test -e /Users/borrowtest && exit 1 || echo "home gone"

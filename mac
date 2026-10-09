@@ -1,0 +1,100 @@
+#!/bin/bash
+# Our side of a borrowed Mac: one command each to wait, send source, build, look, and remove everything.
+# State (the session's SSH key, the Mac's address) is in ~/.local/state/mac-borrow, never in a repo.
+# No signing key or token is ever sent: source goes over as an archive, builds are ad-hoc signed there.
+set -euo pipefail
+S=${MAC_STATE:-$HOME/.local/state/mac-borrow}
+NAME=${MAC_NAME:-borrowed-mac}
+PORT=${MAC_PORT:-2222}
+TS=${TAILSCALE:-/mnt/c/Program Files/Tailscale/tailscale.exe}
+R='$HOME/borrow'   # expanded on the Mac
+mkdir -p "$S"; chmod 700 "$S"
+
+host() { [ -n "${MAC_HOST:-}" ] && echo "$MAC_HOST" || cat "$S/host"; }
+user() { [ -n "${MAC_USER:-}" ] && echo "$MAC_USER" || cat "$S/user"; }
+sshx() { ssh -i "$S/key" -p "$PORT" -o IdentitiesOnly=yes -o UserKnownHostsFile="$S/known_hosts" \
+  -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=20 "$(user)@$(host)" "$@"; }
+# Every remote command gets the in-home toolchain on PATH.
+rsh() { sshx "export PATH=$R/cargo/bin:$R/node/bin:\$PATH CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup npm_config_cache=$R/npm; $*"; }
+
+case "${1:-help}" in
+keygen)   # a key used for this one session only
+  rm -f "$S/key" "$S/key.pub" "$S/known_hosts"
+  ssh-keygen -q -t ed25519 -N '' -C mac-borrow -f "$S/key"; cat "$S/key.pub" ;;
+link)     # link <file with the one-time network key> <page url> -> writes the friend's link to $S/link
+  K=$(tr -d '\r\n ' < "$2"); P=$(cat "$S/key.pub")
+  printf '%s#%s\n' "$3" "$(printf '%s\n%s\n%s' "$K" "$P" "${4:-borrow}" | base64 -w0 | tr '+/' '-_')" > "$S/link"
+  chmod 600 "$S/link"; echo "friend link written to $S/link (contains the one-time key: send privately)" ;;
+wait)     # wait <mac account name>: until the Mac appears on the tailnet and answers
+  echo "${2:?account name on the Mac}" > "$S/user"
+  for _ in $(seq "${MAC_WAIT:-180}"); do
+    IP=$("$TS" status --json 2>/dev/null | python3 -c "
+import json,sys
+for p in (json.load(sys.stdin).get('Peer') or {}).values():
+    if p.get('HostName','').startswith('$NAME') and p.get('Online'): print(p['TailscaleIPs'][0]); break" || true)
+    [ -n "$IP" ] && { echo "$IP" > "$S/host"; sshx true 2>/dev/null && break; }
+    sleep 5
+  done
+  [ -s "$S/host" ] || { echo "the Mac has not appeared"; exit 1; }
+  "$0" info ;;
+info)
+  rsh 'echo "macOS $(sw_vers -productVersion) $(uname -m) · $(sysctl -n hw.memsize | awk "{print int(\$1/1073741824)}")GB · free $(df -h ~ | awk "NR==2{print \$4}")"
+       id -Gn | tr " " "\n" | grep -qx admin && echo "ACCOUNT IS ADMIN (should be standard)" || echo "account: standard"
+       xcode-select -p >/dev/null 2>&1 && echo "developer tools: present" || echo "developer tools: MISSING (run: mac clt)"
+       launchctl print gui/$(id -u) >/dev/null 2>&1 && echo "screen session: yes" || echo "screen session: no (apps cannot be opened)"' ;;
+sh)  shift; rsh "$*" ;;
+clt)      # pops the system's own installer on the Mac's screen; the owner presses Install
+  rsh "xcode-select -p >/dev/null 2>&1 && echo present || { touch $R/clt-installed-by-us; xcode-select --install; echo 'installer opened on the Mac'; }" ;;
+toolchain) # Rust and Node inside ~/borrow only
+  rsh "set -e; mkdir -p $R/dl
+    [ -x $R/cargo/bin/cargo ] || curl -fsSL https://sh.rustup.rs | sh -s -- -y -q --profile minimal --no-modify-path
+    if [ ! -x $R/node/bin/node ]; then
+      V=${NODE_VERSION:-v22.20.0}; A=\$(uname -m | sed s/x86_64/x64/); F=node-\$V-darwin-\$A.tar.gz
+      curl -fsSL -o $R/dl/\$F https://nodejs.org/dist/\$V/\$F
+      curl -fsSL https://nodejs.org/dist/\$V/SHASUMS256.txt | grep \" \$F\$\" | (cd $R/dl && shasum -a 256 -c - >/dev/null)
+      mkdir -p $R/node && tar -xzf $R/dl/\$F -C $R/node --strip-components 1 && rm $R/dl/\$F
+    fi
+    cargo --version; node --version" ;;
+push)     # push <local git dir> [ref]: committed files only, no .git, no token on the Mac
+  D=$(cd "$2" && pwd); N=$(basename "$D")
+  git -C "$D" archive --format=tar "${3:-HEAD}" | sshx "rm -rf $R/src/$N && mkdir -p $R/src/$N && tar -x -C $R/src/$N"
+  echo "sent $N@$(git -C "$D" rev-parse --short "${3:-HEAD}") -> ~/borrow/src/$N" ;;
+start)    # start <name> <command…>: long work runs on the Mac in the background; we do not sit on it
+  N=$2; shift 2
+  rsh "mkdir -p $R/log; cd $R/src 2>/dev/null || cd $R; nohup bash -lc $(printf '%q' "$*") > $R/log/$N.log 2>&1 & echo \$! > $R/log/$N.pid; echo started $N" ;;
+tail)     # tail <name> [lines]: is it still running, and the end of its log
+  rsh "kill -0 \$(cat $R/log/$2.pid) 2>/dev/null && echo RUNNING || echo FINISHED; tail -n ${3:-25} $R/log/$2.log" ;;
+build-mulbit) # the same steps as the bundle workflow, ad-hoc signed
+  "$0" start mulbit "cd mulbit && node scripts/harden-ui.mjs target/release-ui && cd src-tauri && CARGO_BUILD_JOBS=\${JOBS:-4} MACOSX_DEPLOYMENT_TARGET=12.0 npx --yes @tauri-apps/cli@2 build --config '{\"build\":{\"frontendDist\":\"../target/release-ui\"}}' -- --locked && codesign --verify --deep --strict target/release/bundle/macos/mulbit.app && echo BUILD-OK" ;;
+sign-setup) # a throwaway signing identity inside ~/borrow, so a rebuilt app keeps its privacy permissions (ad-hoc builds lose them every rebuild)
+  rsh "set -e; K=$R/sign; mkdir -p \$K; cd \$K
+    [ -f id.p12 ] || { openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -days 30 -subj /CN=borrow-dev \
+        -addext keyUsage=critical,digitalSignature -addext extendedKeyUsage=critical,codeSigning 2>/dev/null
+      openssl pkcs12 -export -inkey k.pem -in c.pem -out id.p12 -passout pass:borrow -name borrow-dev; rm k.pem; }
+    [ -f kc.keychain-db ] || { security create-keychain -p borrow \$K/kc.keychain-db; security set-keychain-settings \$K/kc.keychain-db
+      security unlock-keychain -p borrow \$K/kc.keychain-db
+      security import id.p12 -k \$K/kc.keychain-db -P borrow -T /usr/bin/codesign >/dev/null
+      security set-key-partition-list -S apple-tool:,apple: -s -k borrow \$K/kc.keychain-db >/dev/null; }
+    security find-identity \$K/kc.keychain-db | grep borrow-dev" ;;
+sign)     # sign <app path on the Mac>
+  rsh "security unlock-keychain -p borrow $R/sign/kc.keychain-db && codesign --force --deep -s borrow-dev --keychain $R/sign/kc.keychain-db $2 && codesign -dv --verbose=2 $2 2>&1 | grep -E 'Authority|Identifier|Signature'" ;;
+open)  shift; rsh "open $*" ;;
+shot)     # shot [local file]: what the Mac's screen shows now (needs the screen session; may ask for Screen Recording once)
+  O=${2:-$S/shot-$(date +%H%M%S).png}
+  rsh "mkdir -p $R/shots && screencapture -x $R/shots/s.png" && sshx "cat $R/shots/s.png" > "$O" && echo "$O" ;;
+pull)  sshx "cat $2" > "$3"; ls -la "$3" ;;
+down)     # stop everything we started, erase ~/borrow and app data, disconnect. Then report what is left.
+  rsh "pkill -u \$(id -u) -x mulbit 2>/dev/null; pkill -u \$(id -u) -x flick 2>/dev/null
+    for id in ${MAC_APP_IDS:-com.mulbit.app com.philaxis.flick}; do
+      tccutil reset All \$id >/dev/null 2>&1
+      rm -rf ~/Library/{'Application Support',Caches,WebKit,'Saved Application State',Preferences,Logs,HTTPStorages}/\$id*
+    done
+    security delete-generic-password -s mulbit >/dev/null 2>&1
+    rm -rf ~/Applications/mulbit.app
+    [ -f $R/clt-installed-by-us ] && echo 'LEFT: developer tools were installed today (owner may remove: sudo rm -rf /Library/Developer/CommandLineTools)'
+    echo 'LEFT: the account itself (owner deletes it), and any Accessibility / Input Monitoring rows the owner switched on'
+    nohup sh -c 'sleep 1; rm -f $R/pid; sleep 4; rm -rf $R' >/dev/null 2>&1 &"
+  sleep 8; sshx true 2>/dev/null && { echo "STILL REACHABLE"; exit 1; } || echo "door closed"
+  rm -f "$S/key" "$S/key.pub" "$S/known_hosts" "$S/host" "$S/user" "$S/link"; echo "session key destroyed" ;;
+*) grep -E '^[a-z-]+\)' "$0" | sed 's/).*#/  —/; s/)$//' ;;
+esac
