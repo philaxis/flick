@@ -6,7 +6,7 @@
 </style>
 <main>
 <nav><a href="/canvas-proto/map/">⌂ 홈</a><a href="friend.html">친구가 볼 안내</a></nav>
-<h1>친구 맥, 내일 바로 쓰기</h1><p class="muted">10/11 오후·저녁 · 물빛 실행·빌드와 Flick 기능 시험</p>
+<h1>친구 맥, 10/11 바로 쓰기</h1><p class="muted">10/11 오후·저녁 · 물빛 실행·빌드와 Flick 기능 시험</p>
 <section class="live" aria-live="polite"><div class="big"><span id="light" class="dot"></span><span id="live">상태 읽는 중</span></div><small id="updated">서버가 연결과 빌드 결과를 확인합니다 · 5초마다 갱신</small></section>
 <div id="prompt" class="prompt" hidden></div>
 <section class="turns"><h2>지금 할 일</h2>
@@ -34,8 +34,9 @@ function render(d){
  const builds=active.some(([k])=>k.endsWith('-build'));
  const failed=Object.values(steps).some(s=>s.status==='failed');
  const finished=['mulbit-build','flick-permissions'].every(k=>steps[k]?.status==='done');
- $('live').textContent=connected?(builds?'연결됨 · 빌드 중':finished?'연결됨 · 빌드·시험 끝남':failed?'연결됨 · 확인할 실패 있음':'연결됨'):d.connected?'연결 상태 다시 확인 중':'연결 대기 · 친구 맥 아직 안 붙음';
- $('light').className='dot '+(connected?(failed?'red':builds?'amber':'green'):'amber');
+ const cleaned=steps.cleanup?.status==='done';
+ $('live').textContent=cleaned?'끝남 · 연결을 닫고 정리했습니다':connected?(builds?'연결됨 · 빌드 중':finished?'연결됨 · 빌드·시험 끝남':failed?'연결됨 · 확인할 실패 있음':'연결됨'):d.connected?'연결 상태 다시 확인 중':'연결 대기 · 친구 맥 아직 안 붙음';
+ $('light').className='dot '+(cleaned?'green':connected?(failed?'red':builds?'amber':'green'):'amber');
  $('updated').textContent='서버 확인 '+new Date(d.serverAt*1000).toLocaleTimeString('ko-KR')+' · 5초마다 갱신';
  $('prompt').textContent=d.friend||'';$('prompt').hidden=!d.friend;
  for(const app of ['mulbit','flick'])for(const [key]of stages){const shared=['connection','tools','debug','cleanup'].includes(key), stateKey=shared?key:app+'-'+key;const s=steps[stateKey]||{};const badge=$(app+'-'+key+'-badge');badge.textContent=labels[s.status]||'아직';badge.className='badge '+(s.status||'idle');$(app+'-'+key+'-line').textContent=s.line||defaultLines[key];$(app+'-'+key+'-reason').textContent=s.reason||'';$(app+'-'+key+'-reason').hidden=!s.reason;$(app+'-'+key+'-command').textContent=s.command||'';$(app+'-'+key+'-command').hidden=!s.command;}
