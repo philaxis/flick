@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<title>친구 맥 · 물빛과 Flick 준비</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6f9;color:#1c2737;font:16px/1.5 system-ui,-apple-system,'Malgun Gothic',sans-serif}main{max-width:1240px;margin:auto;padding:22px 18px 70px}nav{display:flex;justify-content:space-between;gap:12px}a{color:#135fb5}h1{font-size:clamp(25px,4vw,38px);margin:20px 0 4px}h2{font-size:21px;margin:0 0 12px}p{margin:6px 0}small,.muted{color:#55667d}.live{padding:18px 20px;background:#152d46;color:white;border-radius:16px;margin:20px 0}.live small{color:#d4e1ef}.dot{display:inline-block;background:#99a8ba;width:12px;height:12px;border-radius:50%;margin-right:9px}.dot.green{background:#51e1ab}.dot.amber{background:#ffcf69}.dot.red{background:#ff9292}.big{font-size:24px;font-weight:700}.legend{display:flex;gap:12px;margin:14px 0;flex-wrap:wrap}.who{display:inline-block;font-size:13px;padding:3px 9px;border-radius:7px;white-space:nowrap}.me{background:#e5ecff;color:#334c9f}.friend{background:#fff0d5;color:#835200}.auto{background:#daf4e8;color:#1c6f4e}.turns{margin:18px 0;background:white;border-radius:14px;padding:16px}.turns p{display:flex;gap:10px;align-items:baseline;margin:10px 0}.prompt{background:#fff0ce;border:2px solid #e7b94c;padding:20px;border-radius:14px;margin:18px 0;font-size:21px;line-height:1.6}.apps{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:20px 0}.app{background:#fff;border:1px solid #dce3ec;border-radius:16px;overflow:hidden}.app h2{padding:17px 18px;margin:0;background:#edf3fa}.stage{padding:12px 18px;border-top:1px solid #e9edf3}.stagehead{display:flex;justify-content:space-between;gap:10px;font-weight:650}.badge{font-size:13px;font-weight:500;white-space:nowrap;color:#526277}.badge.done{color:#168250}.badge.running{color:#a56600}.badge.failed,.badge.blocked{color:#ad3434}.line{font-size:14px;margin:4px 0;color:#55667d;overflow-wrap:anywhere}.reason{color:#a03527;font-size:14px;margin:4px 0}.command{font:13px/1.5 ui-monospace,monospace;background:#f4f6f9;display:block;padding:5px 8px;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}details{background:white;border-radius:12px;padding:14px 16px;margin:12px 0}summary{cursor:pointer;font-weight:650}button{border:0;border-radius:9px;background:#165eab;color:white;padding:12px 16px;font:inherit;cursor:pointer}button:disabled{background:#7a8da6;cursor:default}.invite{background:#fff;border-radius:14px;padding:18px;margin:18px 0}.invite pre{font:13px/1.5 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:#eff3f8;padding:12px;max-height:150px;overflow:auto}.invite p{font-size:14px}.invite h2{font-size:19px}footer{font-size:14px;color:#53657b}@media(max-width:680px){main{padding:16px 12px 60px}.apps{grid-template-columns:1fr;gap:14px}.big{font-size:20px}.prompt{font-size:19px;padding:16px}.stage{padding:11px 14px}.legend{gap:7px}h1{margin-top:16px}}
+</style>
+<main>
+<nav><a href="/canvas-proto/map/">⌂ 홈</a><a href="friend.html">친구가 볼 안내</a></nav>
+<h1>친구 맥, 내일 바로 쓰기</h1><p class="muted">10/11 오후·저녁 · 물빛 실행·빌드와 Flick 기능 시험</p>
+<section class="live" aria-live="polite"><div class="big"><span id="light" class="dot"></span><span id="live">상태 읽는 중</span></div><small id="updated">서버가 연결과 빌드 결과를 확인합니다 · 5초마다 갱신</small></section>
+<div id="prompt" class="prompt" hidden></div>
+<section class="turns"><h2>지금 할 일</h2>
+<div class="legend"><span class="who me">나</span><span class="who friend">친구</span><span class="who auto">자동</span></div>
+<p><span class="who me">나</span><span>친구에게 안내와 연결 한 줄을 보낸다.</span></p>
+<p><span class="who friend">친구</span><span>표준 borrow 계정을 만들고 받은 한 줄을 실행한다.</span></p>
+<p><span class="who auto">자동</span><span>Connected 뒤, 담당이 <code>./mac day</code>로 연결 → 점검 → 설치 → 빌드를 잇는다.</span></p>
+<p><span class="who friend">친구</span><span>크게 뜨는 안내대로 설치·권한 창에서 누른다.</span></p>
+</section>
+<section id="invite" class="invite"><h2>친구에게 줄 연결 한 줄</h2><p id="keyStatus">열쇠 준비 전 · 10/11 11시 발급 예정</p><button id="show" disabled>한 번 열고 복사하기</button><pre id="secret" hidden></pre><button id="copy" hidden>한 줄 복사</button><p id="secretNote">사용자가 친구에게 직접 보냅니다. 한 번만 열리고 30초 뒤 가려집니다.</p></section>
+<div class="apps" id="apps"></div>
+<details><summary>명령 하나로 이어서 하기</summary><p><code>./mac day</code> · 마친 걸음은 건너뛰고, 멈춘 걸음부터 이어갑니다.</p><p>긴 물빛 빌드는 일 대기열에서 진행합니다. 끝남 알림이 오면 담당이 <code>./mac day</code>를 다시 실행합니다.</p><p>설치 창이 필요한 경우 <code>./mac clt</code>. 로그는 <code>./mac logs mulbit</code> / <code>./mac logs flick</code>, 크래시는 <code>./mac crash</code>, 화면은 <code>./mac shot</code>.</p></details>
+<details><summary>확인한 것과 아직 확인 못 한 것</summary><p>앞선 맥 러너에서 안전한 연결·소스 전송·도구 설치·빌드·회수·정리를 확인했습니다. 이번 추가 명령의 러너 결과는 아래에 갱신합니다.</p><p><b>Flick 앱은 아직 맥판 구현이 없습니다.</b> 현재 build-flick는 실제 Swift 시험 도구를 빌드하고 회수합니다. 입력 훅·창 이동·화면 밖 창 캡처를 친구 맥에서 시험합니다.</p><p>물빛 소스는 공개 러너에 보내지 않습니다. 물빛 앱 빌드, 실제 권한 창·마우스 조작·앱 화면·Intel 맥은 확인 못 했습니다. SSH 권한 조회는 물빛·Terminal의 권한을 대신하지 않습니다.</p><p id="rehearsal">이번 예행연습: 준비 중</p></details>
+<footer>끝나면 담당이 <code>./mac down</code>으로 연결을 닫고, 친구가 borrow 계정과 홈 폴더를 삭제합니다.</footer>
+</main>
+<script>
+const api='./api/', $=id=>document.getElementById(id), labels={done:'마침',running:'진행 중',queued:'줄에서 대기',failed:'실패',blocked:'확인 못 함',awaiting:'친구 확인 대기',idle:'아직'};
+const stages=[['connection','연결','자동'],['tools','도구','자동'],['build','빌드','자동'],['run','실행','자동'],['permissions','권한','친구'],['debug','디버깅','자동'],['cleanup','정리','자동']];
+const defaultLines={connection:'친구가 Connected를 본 뒤 연결합니다.',tools:'개발자 도구와 Rust·Node를 확인합니다.',build:'물빛은 친구 맥에서만 / Flick은 기능 시험 도구.',run:'화면에 로그인한 borrow 계정이 필요합니다.',permissions:'앱마다 권한을 허용해야 합니다.',debug:'로그·크래시·화면을 집 PC로 회수합니다.',cleanup:'연결을 닫고 친구가 계정을 삭제합니다.'};
+for(const [app,title] of [['mulbit','물빛'],['flick','Flick']]){const box=document.createElement('section');box.className='app';const h=document.createElement('h2');h.textContent=title;box.append(h);for(const [key,label,who] of stages){const row=document.createElement('div');row.className='stage';const head=document.createElement('div');head.className='stagehead';const name=document.createElement('span');name.textContent=label;const badge=document.createElement('span');badge.id=app+'-'+key+'-badge';badge.className='badge';badge.textContent='아직';head.append(name,badge);const line=document.createElement('p');line.id=app+'-'+key+'-line';line.className='line';line.textContent=defaultLines[key];const reason=document.createElement('p');reason.id=app+'-'+key+'-reason';reason.className='reason';reason.hidden=true;const command=document.createElement('code');command.id=app+'-'+key+'-command';command.className='command';command.hidden=true;row.append(head,line,reason,command);box.append(row)}$('apps').append(box)}
+let invitationShown=false, secretLine='', hideTimer;
+function render(d){
+ const steps=d.steps||{}, active=Object.entries(steps).filter(([k,v])=>!k.startsWith('command-')&&(v.status==='running'||v.status==='queued'));
+ const fresh=(d.serverAt-(d.checkedAt||0))<35, connected=d.connected&&fresh;
+ const builds=active.some(([k])=>k.endsWith('-build'));
+ const failed=Object.values(steps).some(s=>s.status==='failed');
+ const finished=['mulbit-build','flick-permissions'].every(k=>steps[k]?.status==='done');
+ $('live').textContent=connected?(builds?'연결됨 · 빌드 중':finished?'연결됨 · 빌드·시험 끝남':failed?'연결됨 · 확인할 실패 있음':'연결됨'):d.connected?'연결 상태 다시 확인 중':'연결 대기 · 친구 맥 아직 안 붙음';
+ $('light').className='dot '+(connected?(failed?'red':builds?'amber':'green'):'amber');
+ $('updated').textContent='서버 확인 '+new Date(d.serverAt*1000).toLocaleTimeString('ko-KR')+' · 5초마다 갱신';
+ $('prompt').textContent=d.friend||'';$('prompt').hidden=!d.friend;
+ for(const app of ['mulbit','flick'])for(const [key]of stages){const shared=['connection','tools','debug','cleanup'].includes(key), stateKey=shared?key:app+'-'+key;const s=steps[stateKey]||{};const badge=$(app+'-'+key+'-badge');badge.textContent=labels[s.status]||'아직';badge.className='badge '+(s.status||'idle');$(app+'-'+key+'-line').textContent=s.line||defaultLines[key];$(app+'-'+key+'-reason').textContent=s.reason||'';$(app+'-'+key+'-reason').hidden=!s.reason;$(app+'-'+key+'-command').textContent=s.command||'';$(app+'-'+key+'-command').hidden=!s.command;}
+ const i=d.invitation,ready=i&&!i.consumed&&i.expiresAt>d.serverAt;
+ $('keyStatus').textContent=!i?'열쇠 준비 전 · 10/11 11시 발급 예정':i.expiresAt<=d.serverAt?'열쇠 만료 · 담당이 ./mac newkey로 다시 만듭니다.':i.consumed?'한 번 열었습니다 · 필요하면 담당이 다시 발급합니다.':'열쇠 준비됨 · 만료 '+new Date(i.expiresAt*1000).toLocaleString('ko-KR');
+ $('show').disabled=!ready||invitationShown;
+ if(d.rehearsal){$('rehearsal').textContent='이번 예행연습: '+d.rehearsal.summary;if(d.rehearsal.url){const a=document.createElement('a');a.href=d.rehearsal.url;a.textContent=' · 실행 기록';$('rehearsal').append(a)}}
+}
+async function refresh(){try{const r=await fetch(api+'status',{cache:'no-store'});if(!r.ok)throw Error();render(await r.json())}catch(e){$('live').textContent='상태 서버 확인 못 함';$('light').className='dot red';$('updated').textContent='연결을 다시 확인합니다 · 잠시 뒤 자동 재시도';$('show').disabled=true}}
+function hide(){secretLine='';$('secret').textContent='';$('secret').hidden=true;$('copy').hidden=true;$('secretNote').textContent='가렸습니다. 다시 열려면 담당이 ./mac newkey로 새 열쇠를 만듭니다.'}
+$('show').onclick=async()=>{$('show').disabled=true;try{const r=await fetch(api+'invite',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const d=await r.json();if(!r.ok){$('secretNote').textContent=d.error;return}invitationShown=true;secretLine=d.line;$('secret').textContent=secretLine;$('secret').hidden=false;$('copy').hidden=false;$('secretNote').textContent='30초 안에 복사해 친구에게 보내세요. 화면을 떠나도 바로 가려집니다.';hideTimer=setTimeout(hide,30000)}catch(e){$('secretNote').textContent='초대를 확인하지 못했습니다. 담당에게 화면의 말하기 단추로 알려 주세요.'}};
+$('copy').onclick=async()=>{try{await navigator.clipboard.writeText(secretLine);hide();$('secretNote').textContent='복사했습니다. 친구에게 직접 보내세요.'}catch(e){$('secretNote').textContent='아래 한 줄을 길게 눌러 복사하세요. 30초 뒤 가려집니다.'}};
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&invitationShown)hide()});window.addEventListener('pagehide',hide);
+refresh();setInterval(()=>{if(!document.hidden)refresh()},5000);
+</script>
+<script src="/canvas-proto/askbar.js" data-to="맥 담당" defer></script></html>

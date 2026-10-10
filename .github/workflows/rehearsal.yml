@@ -48,12 +48,13 @@ jobs:
           # The owner, in their own account, pastes the line they were sent…
           zsh "$MAC_STATE/link"; ls -l /Users/Shared/borrow.command
           # …then the new account starts what it left.
+          sudo install -d -m 755 -o borrowtest /Users/Shared/borrow-rehearsal
           sudo -u borrowtest -H env BORROW_TEST_BUILD=1 BORROW_NAME=borrowed-mac-rehearsal \
-            bash -c 'cd; trap "" HUP; /Users/Shared/borrow.command > /tmp/friend.out 2>&1 < /dev/null &'
-          for i in $(seq 160); do grep -q 'Connected\.' /tmp/friend.out && break; sleep 3; sudo kill -0 "$(sudo cat /Users/borrowtest/borrow/pid 2>/dev/null)" 2>/dev/null || break; done
+            bash -c 'cd; trap "" HUP; /Users/Shared/borrow.command > /Users/Shared/borrow-rehearsal/friend.out 2>&1 < /dev/null &'
+          for i in $(seq 160); do grep -q 'Connected\.' /Users/Shared/borrow-rehearsal/friend.out && break; sleep 3; sudo kill -0 "$(sudo cat /Users/borrowtest/borrow/pid 2>/dev/null)" 2>/dev/null || break; done
           sudo cat /Users/borrowtest/borrow/log/go.log 2>/dev/null | tail -20 || true
-          sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /tmp/friend.out
-          grep -q 'Connected\.' /tmp/friend.out
+          sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /Users/Shared/borrow-rehearsal/friend.out
+          grep -q 'Connected\.' /Users/Shared/borrow-rehearsal/friend.out
           [ -z "$REMOTE_PUB" ] || echo "$REMOTE_PUB" | sudo tee -a /Users/borrowtest/borrow/ssh/authorized_keys >/dev/null
       - name: Real screens for the owner's guide (best effort)
         continue-on-error: true
@@ -63,10 +64,10 @@ jobs:
           defaults write -g AppleLanguages -array ko-KR en-US; defaults write -g AppleLocale ko_KR
           open "x-apple.systempreferences:com.apple.Users-Groups-Settings.extension"; sleep 12
           screencapture -x shots/1-users.png
-          sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /tmp/friend.out > /tmp/friend.show
+          sed -E 's/tskey-[A-Za-z0-9-]*/tskey-***/g; s/100\.[0-9]+\.[0-9]+\.[0-9]+/100.x.x.x/g' /Users/Shared/borrow-rehearsal/friend.out > $RUNNER_TEMP/friend.show
           pkill -x "System Settings" || true
-          printf '#!/bin/bash\nclear; cat /tmp/friend.show; sleep 60\n' > /tmp/show.command; chmod +x /tmp/show.command
-          open -a Terminal /tmp/show.command; sleep 10; screencapture -x shots/3-terminal.png
+          printf '#!/bin/bash\nclear; cat %s; sleep 60\n' "$RUNNER_TEMP/friend.show" > $RUNNER_TEMP/show.command; chmod +x $RUNNER_TEMP/show.command
+          open -a Terminal $RUNNER_TEMP/show.command; sleep 10; screencapture -x shots/3-terminal.png
           ls -la shots
       - uses: actions/upload-artifact@v4
         if: always()
@@ -80,6 +81,41 @@ jobs:
           ./mac sh 'cat /Users/runner/Documents/owner-private.txt' && { echo "OWNER FILE READABLE"; exit 1; } || echo "owner's Documents: not readable (good)"
           ./mac sh 'sudo -n true' && { echo "HAS SUDO"; exit 1; } || echo "no sudo (good)"
           ./mac sh 'ls -la ~/borrow; lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -E "sshd|tailscaled" || true'
+      - name: Doctor, Flick build and return, GUI checks distinguished
+        env:
+          MAC_HEADLESS: '1'
+        run: |
+          ./mac doctor
+          ./mac build-flick
+          file "$MAC_STATE/artifacts/flick-probe" | grep Mach-O
+          ./mac run-flick permissions
+          ./mac flick-check
+          python3 - <<'PY'
+          import json, os, pathlib
+          d = json.loads((pathlib.Path(os.environ['MAC_STATE']) / 'status.json').read_text())
+          assert d['steps']['flick-build']['status'] == 'done'
+          assert d['steps']['flick-permissions']['status'] == 'blocked', 'GUI probe must not be reported as verified'
+          print('Probe build/return works; GUI permissions/input/capture remain unverified.')
+          PY
+      - name: Debugging transport, bounded log stream, crash return, LLDB target
+        run: |
+          ./mac sh 'mkdir -p "$HOME/Library/Logs/DiagnosticReports"; printf "practice crash transport\n" > "$HOME/Library/Logs/DiagnosticReports/flick-rehearsal.ips"; echo "practice app log" >> "$HOME/borrow/log/flick.log"'
+          ./mac logs flick 3
+          grep -q 'practice app log' "$MAC_STATE"/logs/flick-*.log
+          ./mac crash
+          tar -tzf "$MAC_STATE"/crashes/*.tar.gz | grep flick-rehearsal.ips
+          ./mac lldb flick --batch
+          ./mac sh 'rm "$HOME/Library/Logs/DiagnosticReports/flick-rehearsal.ips"'
+      - name: Public rehearsal diagnostics (no credentials or private source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debugging-rehearsal
+          path: |
+            ${{ env.MAC_STATE }}/status.json
+            ${{ env.MAC_STATE }}/logs/
+            ${{ env.MAC_STATE }}/crashes/
+          if-no-files-found: ignore
       - name: Toolchain in the borrowed home, send source, build, sign, run
         run: |
           ./mac toolchain
@@ -91,7 +127,7 @@ jobs:
           ./mac push "$RUNNER_TEMP/hello"
           ./mac start hello 'cd hello && cargo build --release && codesign -s - target/release/hello && target/release/hello && echo BUILD-OK'
           for i in $(seq 60); do ./mac tail hello 3 | grep -q FINISHED && break; sleep 5; done
-          ./mac tail hello 10 | tee /tmp/tail.out; grep -q BUILD-OK /tmp/tail.out
+          ./mac tail hello 10 | tee $RUNNER_TEMP/tail.out; grep -q BUILD-OK $RUNNER_TEMP/tail.out
           # Trusting the identity needs one password prompt on the Mac's screen (mac sign-trust). No screen here,
           # so the runner trusts it system-wide instead: this checks everything about the identity except that prompt.
           ./mac sign-setup
@@ -120,8 +156,9 @@ jobs:
           sudo find /Users/borrowtest -maxdepth 2 -not -path '*/Library/*' | head -40
           # The account's own system agents (cfprefsd, mdworker…) stay until the account is deleted; nothing of ours may.
           pgrep -u borrowtest -lf 'borrow/|sshd|tailscale|caffeinate|friend\.sh|cargo|rustc|node|^bash$' && { echo "processes left"; exit 1; } || echo "none of our processes left"
-          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /tmp/friend.out | tail -5
+          sed 's/tskey-[A-Za-z0-9-]*/tskey-***/g' /Users/Shared/borrow-rehearsal/friend.out | tail -5
       - name: Owner deletes the account
         run: |
           sudo sysadminctl -deleteUser borrowtest
+          sudo rm -rf /Users/Shared/borrow-rehearsal /Users/Shared/borrow.command
           id borrowtest 2>/dev/null && exit 1 || echo "account gone"; test -e /Users/borrowtest && exit 1 || echo "home gone"

@@ -3,12 +3,37 @@
 # State (the session's SSH key, the Mac's address) is in ~/.local/state/mac-borrow, never in a repo.
 # No signing key or token is ever sent: source goes over as an archive, builds are ad-hoc signed there.
 set -euo pipefail
+ROOT=$(cd "$(dirname "$0")" && pwd)
 S=${MAC_STATE:-$HOME/.local/state/mac-borrow}
 NAME=${MAC_NAME:-borrowed-mac}
 PORT=${MAC_PORT:-2222}
 TS=${TAILSCALE:-/mnt/c/Program Files/Tailscale/tailscale.exe}
 R='$HOME/borrow'   # expanded on the Mac
 mkdir -p "$S"; chmod 700 "$S"
+st() { python3 "$ROOT/scripts/state.py" "$@"; }
+CMD=${1:-help}; DEFERRED=0
+case "$CMD" in
+ wait|info|doctor) STEP=connection ;; clt|toolchain) STEP=tools ;;
+ push) STEP=source ;; build-mulbit) STEP=mulbit-build ;; build-flick) STEP=flick-build ;;
+ run-flick) STEP=flick-run ;; preview) STEP=mulbit-run ;;
+ flick-check) STEP=flick-permissions ;; logs|crash|shot|lldb) STEP=debug ;; down) STEP=cleanup ;;
+ *) STEP=command-$CMD ;;
+esac
+# Record command names, never arguments (link and sh may carry credentials).
+if [ "$CMD" != sync ]; then
+  st command "$CMD" running
+  st step "$STEP" running "명령 시작: $CMD"
+  finish() {
+    rc=$?
+    st command "$CMD" "$([ "$rc" = 0 ] && echo done || echo failed)"
+    if [ "$DEFERRED" = 0 ]; then
+      if [ "$rc" = 0 ]; then st step "$STEP" done "명령 끝: $CMD";
+      else st step "$STEP" failed "명령 실패: $CMD" "종료 코드 $rc. 이 명령의 터미널 로그를 확인하세요." "./mac $CMD"; fi
+    fi
+    exit "$rc"
+  }
+  trap finish EXIT
+fi
 
 host() { [ -n "${MAC_HOST:-}" ] && echo "$MAC_HOST" || cat "$S/host"; }
 user() { [ -n "${MAC_USER:-}" ] && echo "$MAC_USER" || cat "$S/user"; }
@@ -16,8 +41,20 @@ sshx() { ssh -i "$S/key" -p "$PORT" -o IdentitiesOnly=yes -o UserKnownHostsFile=
   -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=20 "$(user)@$(host)" "$@"; }
 # Every remote command runs in bash (the account's own shell is zsh) with the in-home toolchain on PATH.
 rsh() { sshx "bash -c $(printf '%q' "export PATH=$R/cargo/bin:$R/node/bin:\$PATH CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup npm_config_cache=$R/npm; $*")"; }
+source "$ROOT/scripts/session.sh"
 
 case "${1:-help}" in
+newkey) bash "$ROOT/scripts/newkey.sh" ;;
+doctor) doctor ;;
+build-flick) build_flick ;;
+run-flick) run_flick "${2:-permissions}" ;;
+flick-check) flick_check ;;
+logs) logs "${2:?mulbit 또는 flick}" "${3:-0}" ;;
+crash) crash ;;
+lldb) lldb_app "${2:?mulbit 또는 flick 또는 실행 파일 경로}" "${3:-}" ;;
+preview) preview ;;
+day) DEFERRED=1; day "${2:-borrow}" ;;
+sync) sync_state ;;
 keygen)   # a key used for this one session only
   rm -f "$S/key" "$S/key.pub" "$S/known_hosts"
   ssh-keygen -q -t ed25519 -N '' -C mac-borrow -f "$S/key"; cat "$S/key.pub" ;;
@@ -28,15 +65,18 @@ link)     # link <file with the one-time network key> [friend.sh url]: writes th
   chmod 600 "$S/link"; echo "the owner's one line is in $S/link (contains the one-time key: send privately)" ;;
 wait)     # wait <mac account name>: until the Mac appears on the tailnet and answers
   echo "${2:?account name on the Mac}" > "$S/user"
-  for _ in $(seq "${MAC_WAIT:-180}"); do
+  rm -f "$S/host"
+  FOUND=0
+  for _ in $(seq "${MAC_WAIT:-12}"); do
     IP=$("$TS" status --json 2>/dev/null | python3 -c "
 import json,sys
 for p in (json.load(sys.stdin).get('Peer') or {}).values():
     if p.get('HostName','').startswith('$NAME') and p.get('Online'): print(p['TailscaleIPs'][0]); break" || true)
-    [ -n "$IP" ] && { echo "$IP" > "$S/host"; sshx true 2>/dev/null && break; }
+    [ -n "$IP" ] && { echo "$IP" > "$S/host"; if sshx true 2>/dev/null; then FOUND=1; break; fi; }
     sleep 5
   done
-  [ -s "$S/host" ] || { echo "the Mac has not appeared"; exit 1; }
+  [ "$FOUND" = 1 ] || { rm -f "$S/host"; st connection no; echo '맥 연결 대기 중. 친구가 Connected를 본 뒤 ./mac day'; exit 1; }
+  st connection yes
   "$0" info ;;
 info)
   rsh 'echo "macOS $(sw_vers -productVersion) $(uname -m) · $(sysctl -n hw.memsize | awk "{print int(\$1/1073741824)}")GB · free $(df -h ~ | awk "NR==2{print \$4}")"
@@ -45,6 +85,7 @@ info)
        launchctl print gui/$(id -u) >/dev/null 2>&1 && echo "screen session: yes" || echo "screen session: no (apps cannot be opened)"' ;;
 sh)  shift; rsh "$*" ;;
 clt)      # pops the system's own installer on the Mac's screen; the owner presses Install
+  st prompt '친구: 개발자 도구 설치 창에서 설치를 눌러 주세요.'
   rsh "xcode-select -p >/dev/null 2>&1 && echo present || { touch $R/clt-installed-by-us; xcode-select --install; echo 'installer opened on the Mac'; }" ;;
 toolchain) # Rust and Node inside ~/borrow only
   rsh "set -e; mkdir -p $R/dl
@@ -57,16 +98,19 @@ toolchain) # Rust and Node inside ~/borrow only
     fi
     cargo --version; node --version" ;;
 push)     # push <local git dir> [ref]: committed files only, no .git, no token on the Mac
-  D=$(cd "$2" && pwd); N=$(basename "$D")
+  D=$(cd "$2" && pwd); N=${4:-$(basename "$D")}; valid_name "$N"
   git -C "$D" archive --format=tar "${3:-HEAD}" | sshx "rm -rf $R/src/$N && mkdir -p $R/src/$N && tar -x -C $R/src/$N"
   echo "sent $N@$(git -C "$D" rev-parse --short "${3:-HEAD}") -> ~/borrow/src/$N" ;;
 start)    # start <name> <command…>: long work runs on the Mac in the background; we do not sit on it
-  N=$2; shift 2
-  rsh "mkdir -p $R/log; cd $R/src 2>/dev/null || cd $R; (trap '' HUP; exec bash -lc $(printf '%q' "$*")) > $R/log/$N.log 2>&1 < /dev/null & echo \$! > $R/log/$N.pid; echo started $N" ;;
+  N=$2; shift 2; valid_name "$N"
+  rsh "mkdir -p $R/log; cd $R/src 2>/dev/null || cd $R
+    [ ! -f $R/log/$N.pid ] || ! kill -0 \$(cat $R/log/$N.pid) 2>/dev/null || { echo 'already running'; exit 1; }
+    rm -f $R/log/$N.exit
+    (trap '' HUP; bash -c $(printf '%q' "$*"); code=\$?; echo \$code > $R/log/$N.exit) > $R/log/$N.log 2>&1 < /dev/null & echo \$! > $R/log/$N.pid; echo started $N"
+  st job "$N" ;;
 tail)     # tail <name> [lines]: is it still running, and the end of its log
   rsh "kill -0 \$(cat $R/log/$2.pid) 2>/dev/null && echo RUNNING || echo FINISHED; tail -n ${3:-25} $R/log/$2.log" ;;
-build-mulbit) # the same steps as the bundle workflow, ad-hoc signed
-  "$0" start mulbit "cd mulbit && node scripts/harden-ui.mjs target/release-ui && cd src-tauri && CARGO_BUILD_JOBS=\${JOBS:-4} MACOSX_DEPLOYMENT_TARGET=12.0 npx --yes @tauri-apps/cli@2 build --config '{\"build\":{\"frontendDist\":\"../target/release-ui\"}}' -- --locked && codesign --verify --deep --strict target/release/bundle/macos/mulbit.app && echo BUILD-OK" ;;
+build-mulbit) build_mulbit "${2:-}" ;;
 sign-setup) # a throwaway signing identity inside ~/borrow, so a rebuilt app keeps its privacy permissions (ad-hoc builds lose them every rebuild)
   rsh "set -e; K=$R/sign; mkdir -p \$K; cd \$K
     [ -f id.p12 ] || { openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -days 30 -subj /CN=borrow-dev \
@@ -89,19 +133,21 @@ shot)     # shot [local file]: what the Mac's screen shows now (needs the screen
   rsh "mkdir -p $R/shots && screencapture -x $R/shots/s.png" && sshx "cat $R/shots/s.png" > "$O" && echo "$O" ;;
 pull)  sshx "cat $2" > "$3"; ls -la "$3" ;;
 down)     # stop everything we started, erase ~/borrow and app data, disconnect. Then report what is left.
+  st prompt '친구: 연결이 끊기면 창을 닫고 원래 계정에서 borrow 계정과 홈 폴더를 삭제해 주세요.'
   rsh "pkill -u \$(id -u) -x mulbit 2>/dev/null; pkill -u \$(id -u) -x flick 2>/dev/null
     for id in ${MAC_APP_IDS:-com.mulbit.app com.philaxis.flick}; do
       tccutil reset All \$id >/dev/null 2>&1
       rm -rf ~/Library/{'Application Support',Caches,WebKit,'Saved Application State',Preferences,Logs,HTTPStorages}/\$id*
     done
     security delete-generic-password -s mulbit >/dev/null 2>&1
-    rm -rf ~/Applications/mulbit.app
+    rm -rf ~/Applications/mulbit.app ~/Applications/Flick.app
     security list-keychains -d user -s \$(security list-keychains -d user | tr -d '\"' | grep -v borrow/sign) 2>/dev/null
     rmdir ~/.local/share ~/.local 2>/dev/null
     [ -f $R/clt-installed-by-us ] && echo 'LEFT: developer tools were installed today (owner may remove: sudo rm -rf /Library/Developer/CommandLineTools)'
     echo 'LEFT: the account itself (owner deletes it), and any Accessibility / Input Monitoring rows the owner switched on'
     (trap '' HUP; sleep 1; rm -f $R/pid; sleep 4; rm -rf $R) >/dev/null 2>&1 < /dev/null &"
   sleep 8; sshx true 2>/dev/null && { echo "STILL REACHABLE"; exit 1; } || echo "door closed"
-  rm -f "$S/key" "$S/key.pub" "$S/known_hosts" "$S/host" "$S/user" "$S/link"; echo "session key destroyed" ;;
+  rm -f "$S/key" "$S/key.pub" "$S/known_hosts" "$S/host" "$S/user" "$S/link" "$S/invitation.json" "$S/day.json"
+  st connection no; echo "session key destroyed" ;;
 *) grep -E '^[a-z-]+\)' "$0" | sed 's/).*#/  —/; s/)$//' ;;
 esac
