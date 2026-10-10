@@ -19,6 +19,8 @@ def change(d):
             step['reason'] = '' if row[2] == '0' else '종료 코드 ' + clean(row[2]) + '. 권한·앱 로그를 확인하세요.'
             step['command'] = './mac logs ' + app
             d.setdefault('remoteJobs', {}).pop(app, None)
+            if app == 'flick':
+                d['steps']['flick-run'] = dict(step)
         elif kind == 'RUN':
             step['status'] = 'running'
         elif kind == 'LOG':

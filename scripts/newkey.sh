@@ -12,6 +12,8 @@ trap 'rm -f "$S/ts.key"' EXIT
 flock /tmp/aside.lock "$S/mkkey.sh" "borrowed-mac $(date +%m%d-%H%M)" "$S/ts.key"
 "$ROOT/mac" keygen >/dev/null
 "$ROOT/mac" link "$S/ts.key" >/dev/null
+rm -f "$S/day.json"
+python3 "$ROOT/scripts/state.py" reset
 python3 - "$S" <<'PY'
 import datetime, json, os, pathlib, sys, time
 s = pathlib.Path(sys.argv[1]); now = int(time.time())

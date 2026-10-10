@@ -62,6 +62,7 @@ run_flick() {
   fi
   if ! rsh 'launchctl print gui/$(id -u) >/dev/null 2>&1'; then
     st step flick-run blocked '실제 맥에서 확인 못 함' '화면에 로그인한 borrow 계정이 없습니다.' './mac flick-check'
+    st step flick-permissions blocked '실제 맥에서 확인 못 함' 'borrow 계정의 화면 로그인이 필요합니다.' './mac flick-check'
     DEFERRED=1; return 2
   fi
   # Terminal, rather than sshd, is the GUI privacy client. Its stable probe path is reused.
@@ -83,6 +84,7 @@ echo '시험 끝. 결과는 집 PC로 전달됩니다.'
 EOF
   rsh "chmod 700 $R/flick.command; rm -f $R/log/flick.exit; open -a Terminal $R/flick.command"
   st job flick
+  st step flick-run running '친구 맥 Terminal에서 시험 도구 실행 중'
   st step flick-permissions running '친구 맥 Terminal에서 시험 중'
   st prompt '친구: Terminal의 손쉬운 사용·입력 모니터링·화면 기록을 켜 주세요. 마우스 옆 단추를 누르고 움직여 주세요. 결과가 부족하면 ./mac flick-check로 다시 시험합니다.'
   DEFERRED=1
@@ -145,11 +147,17 @@ preview() {
     curl -fL --retry 2 -o $R/dl/mulbit-preview.dmg https://github.com/philaxis/mulbit/releases/download/v0.1.2-preview-mac-linux/mulbit-mac-apple-silicon-preview.dmg
     open $R/dl/mulbit-preview.dmg"
   st prompt '친구: 열린 물빛 미리보기에서 앱을 borrow 계정의 응용 프로그램 폴더로 옮겨 실행해 주세요. 마이크·손쉬운 사용·입력 모니터링을 허용해 주세요.'
+  st step mulbit-run awaiting '미리보기 dmg 열림 · 친구의 앱 실행을 기다립니다.'
+  st step mulbit-permissions awaiting '친구: 물빛 앱의 마이크·손쉬운 사용·입력 모니터링을 허용해 주세요.'
+  DEFERRED=1
 }
 
 build_mulbit() {
   DEFERRED=1
   if [ "$1" != --worker ]; then
+    case "${PREVIOUS_PHASE:-}" in
+      running|queued) st step mulbit-build "$PREVIOUS_PHASE" '이미 빌드가 진행 중입니다.'; echo '이미 빌드가 진행 중입니다. ./mac tail mulbit'; return 0 ;;
+    esac
     [ -x "$HOME/.local/bin/job" ] || { echo '일 대기열 도구가 없음. 총괄에게 알리고 --worker를 일 대기열에서 실행하세요.'; return 1; }
     local phase
     # The day lock prevents duplicate queued builds in the normal day flow.
@@ -157,7 +165,7 @@ build_mulbit() {
     st step mulbit-build queued '일 대기열에 넣음. 끝남 알림 뒤 ./mac day로 이어갑니다.'
     return
   fi
-  "$ROOT/mac" start mulbit "cd mulbit && node scripts/harden-ui.mjs target/release-ui && cd src-tauri && CARGO_BUILD_JOBS=\${JOBS:-2} MACOSX_DEPLOYMENT_TARGET=12.0 npx --yes @tauri-apps/cli@2 build --config '{\"build\":{\"frontendDist\":\"../target/release-ui\"}}' -- --locked && codesign --verify --deep --strict target/release/bundle/macos/mulbit.app && echo BUILD-OK"
+  "$ROOT/mac" start mulbit "cd mulbit && node scripts/harden-ui.mjs target/release-ui && cd src-tauri && CARGO_BUILD_JOBS=\${JOBS:-2} MACOSX_DEPLOYMENT_TARGET=12.0 npx --yes @tauri-apps/cli@2 build --config '{\"build\":{\"frontendDist\":\"../target/release-ui\"},\"bundle\":{\"targets\":[\"app\",\"dmg\"]}}' -- --locked && codesign --verify --deep --strict target/release/bundle/macos/mulbit.app && echo BUILD-OK"
   st step mulbit-build running '친구 맥에서 물빛 빌드 중'
   while true; do
     sync_state

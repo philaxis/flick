@@ -21,6 +21,12 @@ case "$CMD" in
 esac
 # Record command names, never arguments (link and sh may carry credentials).
 if [ "$CMD" != sync ]; then
+  PREVIOUS_PHASE=$(python3 - "$S" "$STEP" <<'PY'
+import json,pathlib,sys
+try: print(json.loads((pathlib.Path(sys.argv[1])/'status.json').read_text()).get('steps',{}).get(sys.argv[2],{}).get('status',''))
+except (OSError,ValueError): print('')
+PY
+)
   st command "$CMD" running
   st step "$STEP" running "명령 시작: $CMD"
   finish() {
@@ -62,6 +68,13 @@ link)     # link <file with the one-time network key> [friend.sh url]: writes th
   K=$(tr -d '\r\n ' < "$2"); P=$(cat "$S/key.pub"); U=${3:-https://raw.githubusercontent.com/philaxis/flick/mac-borrow-rehearsal/friend.sh}
   # The owner pastes it in their own account; it leaves a file the borrowed account can start (the two accounts share no clipboard).
   printf '%s\n' "printf '%s\\n' '#!/bin/bash' \"curl -fsSL $U | BORROW_KEY='$K' BORROW_PUB='$P' bash\" > /Users/Shared/borrow.command && chmod 755 /Users/Shared/borrow.command && echo 'Ready. Now switch to the new account.'" > "$S/link"
+  # Only the two accounts may read the invitation file. The standard account cannot overwrite it.
+  python3 - "$S/link" "${MAC_USER:-borrow}" <<'PY'
+import pathlib,re,sys
+p=pathlib.Path(sys.argv[1]); user=sys.argv[2]
+if not re.fullmatch(r'[a-zA-Z0-9_-]+',user): raise SystemExit('잘못된 계정 이름')
+p.write_text(p.read_text().replace('chmod 755 /Users/Shared/borrow.command', 'chmod 700 /Users/Shared/borrow.command && chmod +a "'+user+' allow read,execute" /Users/Shared/borrow.command'))
+PY
   chmod 600 "$S/link"; echo "the owner's one line is in $S/link (contains the one-time key: send privately)" ;;
 wait)     # wait <mac account name>: until the Mac appears on the tailnet and answers
   echo "${2:?account name on the Mac}" > "$S/user"
@@ -99,7 +112,8 @@ toolchain) # Rust and Node inside ~/borrow only
     cargo --version; node --version" ;;
 push)     # push <local git dir> [ref]: committed files only, no .git, no token on the Mac
   D=$(cd "$2" && pwd); N=${4:-$(basename "$D")}; valid_name "$N"
-  git -C "$D" archive --format=tar "${3:-HEAD}" | sshx "rm -rf $R/src/$N && mkdir -p $R/src/$N && tar -x -C $R/src/$N"
+  # Extract before replacing: an interrupted transfer leaves the old source usable.
+  git -C "$D" archive --format=tar "${3:-HEAD}" | sshx "mkdir -p $R/src; rm -rf $R/src/$N.new; mkdir $R/src/$N.new; tar -x -C $R/src/$N.new && rm -rf $R/src/$N && mv $R/src/$N.new $R/src/$N"
   echo "sent $N@$(git -C "$D" rev-parse --short "${3:-HEAD}") -> ~/borrow/src/$N" ;;
 start)    # start <name> <command…>: long work runs on the Mac in the background; we do not sit on it
   N=$2; shift 2; valid_name "$N"
@@ -133,6 +147,7 @@ shot)     # shot [local file]: what the Mac's screen shows now (needs the screen
   rsh "mkdir -p $R/shots && screencapture -x $R/shots/s.png" && sshx "cat $R/shots/s.png" > "$O" && echo "$O" ;;
 pull)  sshx "cat $2" > "$3"; ls -la "$3" ;;
 down)     # stop everything we started, erase ~/borrow and app data, disconnect. Then report what is left.
+  rsh '[ "$(uname -s)" = Darwin ] && [ "$(id -u)" != 0 ] && ! id -Gn | tr " " "\n" | grep -qx admin' || { echo 'borrow 표준 macOS 계정이 아니라 정리를 멈춥니다.'; exit 1; }
   st prompt '친구: 연결이 끊기면 창을 닫고 원래 계정에서 borrow 계정과 홈 폴더를 삭제해 주세요.'
   rsh "pkill -u \$(id -u) -x mulbit 2>/dev/null; pkill -u \$(id -u) -x flick 2>/dev/null
     for id in ${MAC_APP_IDS:-com.mulbit.app com.philaxis.flick}; do

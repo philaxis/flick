@@ -62,6 +62,10 @@ class Handler(BaseHTTPRequestHandler):
         # A proxy with --set-path may strip its prefix.
         if path in (PREFIX + '/status', '/status'):
             d = read(); d['invitation'] = invitation(); d['serverAt'] = int(time.time())
+            try:
+                d['rehearsal'] = json.loads((STATE / 'rehearsal.json').read_text())
+            except (FileNotFoundError, ValueError):
+                pass
             self.reply(200, d)
         elif path in (PREFIX + '/health', '/health'):
             self.reply(200, {'ok': True})

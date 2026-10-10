@@ -27,7 +27,7 @@ const api='./api/', $=id=>document.getElementById(id), labels={done:'마침',run
 const stages=[['connection','연결','자동'],['tools','도구','자동'],['build','빌드','자동'],['run','실행','자동'],['permissions','권한','친구'],['debug','디버깅','자동'],['cleanup','정리','자동']];
 const defaultLines={connection:'친구가 Connected를 본 뒤 연결합니다.',tools:'개발자 도구와 Rust·Node를 확인합니다.',build:'물빛은 친구 맥에서만 / Flick은 기능 시험 도구.',run:'화면에 로그인한 borrow 계정이 필요합니다.',permissions:'앱마다 권한을 허용해야 합니다.',debug:'로그·크래시·화면을 집 PC로 회수합니다.',cleanup:'연결을 닫고 친구가 계정을 삭제합니다.'};
 for(const [app,title] of [['mulbit','물빛'],['flick','Flick']]){const box=document.createElement('section');box.className='app';const h=document.createElement('h2');h.textContent=title;box.append(h);for(const [key,label,who] of stages){const row=document.createElement('div');row.className='stage';const head=document.createElement('div');head.className='stagehead';const name=document.createElement('span');name.textContent=label;const badge=document.createElement('span');badge.id=app+'-'+key+'-badge';badge.className='badge';badge.textContent='아직';head.append(name,badge);const line=document.createElement('p');line.id=app+'-'+key+'-line';line.className='line';line.textContent=defaultLines[key];const reason=document.createElement('p');reason.id=app+'-'+key+'-reason';reason.className='reason';reason.hidden=true;const command=document.createElement('code');command.id=app+'-'+key+'-command';command.className='command';command.hidden=true;row.append(head,line,reason,command);box.append(row)}$('apps').append(box)}
-let invitationShown=false, secretLine='', hideTimer;
+let invitationShown=false, secretLine='', hideTimer, lastGeneration=0;
 function render(d){
  const steps=d.steps||{}, active=Object.entries(steps).filter(([k,v])=>!k.startsWith('command-')&&(v.status==='running'||v.status==='queued'));
  const fresh=(d.serverAt-(d.checkedAt||0))<35, connected=d.connected&&fresh;
@@ -40,6 +40,7 @@ function render(d){
  $('prompt').textContent=d.friend||'';$('prompt').hidden=!d.friend;
  for(const app of ['mulbit','flick'])for(const [key]of stages){const shared=['connection','tools','debug','cleanup'].includes(key), stateKey=shared?key:app+'-'+key;const s=steps[stateKey]||{};const badge=$(app+'-'+key+'-badge');badge.textContent=labels[s.status]||'아직';badge.className='badge '+(s.status||'idle');$(app+'-'+key+'-line').textContent=s.line||defaultLines[key];$(app+'-'+key+'-reason').textContent=s.reason||'';$(app+'-'+key+'-reason').hidden=!s.reason;$(app+'-'+key+'-command').textContent=s.command||'';$(app+'-'+key+'-command').hidden=!s.command;}
  const i=d.invitation,ready=i&&!i.consumed&&i.expiresAt>d.serverAt;
+ if(i && i.createdAt!==lastGeneration){if(invitationShown)hide();invitationShown=false;lastGeneration=i.createdAt;}
  $('keyStatus').textContent=!i?'열쇠 준비 전 · 10/11 11시 발급 예정':i.expiresAt<=d.serverAt?'열쇠 만료 · 담당이 ./mac newkey로 다시 만듭니다.':i.consumed?'한 번 열었습니다 · 필요하면 담당이 다시 발급합니다.':'열쇠 준비됨 · 만료 '+new Date(i.expiresAt*1000).toLocaleString('ko-KR');
  $('show').disabled=!ready||invitationShown;
  if(d.rehearsal){$('rehearsal').textContent='이번 예행연습: '+d.rehearsal.summary;if(d.rehearsal.url){const a=document.createElement('a');a.href=d.rehearsal.url;a.textContent=' · 실행 기록';$('rehearsal').append(a)}}
