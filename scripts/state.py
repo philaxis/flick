@@ -11,10 +11,12 @@ import time
 STATE = Path(os.environ.get('MAC_STATE', Path.home() / '.local/state/mac-borrow'))
 
 
-def clean(text):
+def clean(text, limit=300):
     text = re.sub(r'(?:tskey-[\w-]+|gh[pousr]_[\w]+|github_pat_[\w]+|sk-[\w-]+)', '[가림]', str(text))
+    text = re.sub(r'AIza[\w-]{25,}', '[가림]', text)
     text = re.sub(r'(?i)(bearer\s+|(?:password|token|api[_-]?key|secret)\s*[:=]\s*)\S+', r'\1[가림]', text)
-    return text[-300:]
+    text = re.sub(r'(?i)(["\'](?:password|token|api[_-]?key|secret)["\']\s*:\s*["\'])[^"\']*', r'\1[가림]', text)
+    return text[-limit:] if limit else text
 
 
 def read():

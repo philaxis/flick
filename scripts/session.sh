@@ -105,15 +105,27 @@ logs() {
   [[ "$2" =~ ^[0-9]+$ ]] || return 1
   mkdir -p "$S/logs"; chmod 700 "$S/logs"
   local file="$S/logs/$1-$(date +%Y%m%d-%H%M%S).log" duration="$2"
+  local extra=''
+  if [ "$1" = mulbit ]; then
+    # Native app error/trigger files, rather than only the build's stdout.
+    extra='mkdir -p "$HOME/Library/Application Support/mulbit";
+      touch "$HOME/Library/Application Support/mulbit/last-error.log" "$HOME/Library/Application Support/mulbit/trigger.log";
+      set -- "$HOME/Library/Application Support/mulbit/last-error.log" "$HOME/Library/Application Support/mulbit/trigger.log";'
+  fi
+  # A rejected system stream must stay visible while the working app stream continues.
+  DEFERRED=1
   echo "앱·macOS 통합 로그 → $file (Ctrl+C로 멈춤)"
   # Unified logs can contain private app data. They stay in the private state directory.
   # Both remote processes are children of this SSH session and are stopped on exit.
-  rsh "mkdir -p $R/log; touch $R/log/$1.log
+  rsh "mkdir -p $R/log; touch $R/log/$1.log; set --; $extra
     children=''; trap 'kill \$children 2>/dev/null || true' EXIT HUP INT TERM
-    tail -n 30 -F $R/log/$1.log & children=\$!
+    tail -n 30 -F $R/log/$1.log \"\$@\" & children=\$!
     /usr/bin/log stream --style compact --level debug --predicate 'process == \"$1\" OR process == \"Flick\" OR process == \"flick-probe\" OR senderImagePath CONTAINS[c] \"$1\"' & children=\"\$children \$!\"
-    if [ $duration -gt 0 ]; then sleep $duration; else wait; fi" 2>&1 | python3 "$ROOT/scripts/redact.py" | tee "$file"
+    if [ $duration -gt 0 ]; then sleep $duration; else wait; fi" 2>&1 | python3 "$ROOT/scripts/redact.py" "$1" | tee "$file"
   chmod 600 "$file"
+  if ! grep -qE 'Must be admin|not permitted' "$file"; then
+    st step debug done '앱 로그·허용된 통합 로그 회수 완료'
+  fi
 }
 
 crash() {

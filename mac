@@ -155,6 +155,7 @@ down)     # stop everything we started, erase ~/borrow and app data, disconnect.
       rm -rf ~/Library/{'Application Support',Caches,WebKit,'Saved Application State',Preferences,Logs,HTTPStorages}/\$id*
     done
     security delete-generic-password -s mulbit >/dev/null 2>&1
+    rm -rf ~/Library/'Application Support'/mulbit ~/Library/'Application Support'/mulbit-profiles
     rm -rf ~/Applications/mulbit.app ~/Applications/Flick.app
     security list-keychains -d user -s \$(security list-keychains -d user | tr -d '\"' | grep -v borrow/sign) 2>/dev/null
     rmdir ~/.local/share ~/.local 2>/dev/null

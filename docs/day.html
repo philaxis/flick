@@ -19,7 +19,7 @@
 <section id="invite" class="invite"><h2>친구에게 줄 연결 한 줄</h2><p id="keyStatus">열쇠 준비 전 · 10/11 11시 발급 예정</p><button id="show" disabled>한 번 열고 복사하기</button><pre id="secret" hidden></pre><button id="copy" hidden>한 줄 복사</button><p id="secretNote">사용자가 친구에게 직접 보냅니다. 한 번만 열리고 30초 뒤 가려집니다.</p></section>
 <div class="apps" id="apps"></div>
 <details><summary>명령 하나로 이어서 하기</summary><p><code>./mac day</code> · 마친 걸음은 건너뛰고, 멈춘 걸음부터 이어갑니다.</p><p>긴 물빛 빌드는 일 대기열에서 진행합니다. 끝남 알림이 오면 담당이 <code>./mac day</code>를 다시 실행합니다.</p><p>설치 창이 필요한 경우 <code>./mac clt</code>. 로그는 <code>./mac logs mulbit</code> / <code>./mac logs flick</code>, 크래시는 <code>./mac crash</code>, 화면은 <code>./mac shot</code>.</p></details>
-<details><summary>확인한 것과 아직 확인 못 한 것</summary><p>앞선 맥 러너에서 안전한 연결·소스 전송·도구 설치·빌드·회수·정리를 확인했습니다. 이번 추가 명령의 러너 결과는 아래에 갱신합니다.</p><p><b>Flick 앱은 아직 맥판 구현이 없습니다.</b> 현재 build-flick는 실제 Swift 시험 도구를 빌드하고 회수합니다. 입력 훅·창 이동·화면 밖 창 캡처를 친구 맥에서 시험합니다.</p><p>물빛 소스는 공개 러너에 보내지 않습니다. 물빛 앱 빌드, 실제 권한 창·마우스 조작·앱 화면·Intel 맥은 확인 못 했습니다. SSH 권한 조회는 물빛·Terminal의 권한을 대신하지 않습니다.</p><p id="rehearsal">이번 예행연습: 준비 중</p></details>
+<details><summary>확인한 것과 아직 확인 못 한 것</summary><p>앞선 맥 러너에서 안전한 연결·소스 전송·도구 설치·빌드·회수·정리를 확인했습니다. 이번 추가 명령의 러너 결과는 아래에 갱신합니다.</p><p><b>Flick 앱은 아직 맥판 구현이 없습니다.</b> 현재 build-flick는 실제 Swift 시험 도구를 빌드하고 회수합니다. 입력 훅·창 이동·화면 밖 창 캡처를 친구 맥에서 시험합니다.</p><p><b>macOS 통합 로그는 표준 계정에서 권한 부족으로 거부됩니다.</b> 앱 로그·크래시 회수는 됩니다. 관리자 권한을 올리지 않았습니다.</p><p>물빛 소스는 공개 러너에 보내지 않습니다. 물빛 앱 빌드, 실제 권한 창·마우스 조작·앱 화면·Intel 맥은 확인 못 했습니다. SSH 권한 조회는 물빛·Terminal의 권한을 대신하지 않습니다.</p><p id="rehearsal">이번 예행연습: 준비 중</p></details>
 <footer>끝나면 담당이 <code>./mac down</code>으로 연결을 닫고, 친구가 borrow 계정과 홈 폴더를 삭제합니다.</footer>
 </main>
 <script>

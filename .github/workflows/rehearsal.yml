@@ -102,6 +102,16 @@ jobs:
           ./mac sh 'mkdir -p "$HOME/Library/Logs/DiagnosticReports"; printf "practice crash transport\n" > "$HOME/Library/Logs/DiagnosticReports/flick-rehearsal.ips"; echo "practice app log" >> "$HOME/borrow/log/flick.log"'
           ./mac logs flick 3
           grep -q 'practice app log' "$MAC_STATE"/logs/flick-*.log
+          ./mac sh 'mkdir -p "$HOME/Library/Application Support/mulbit"; echo "practice native app log" > "$HOME/Library/Application Support/mulbit/last-error.log"'
+          ./mac logs mulbit 3
+          grep -q 'practice native app log' "$MAC_STATE"/logs/mulbit-*.log
+          python3 - <<'PY'
+          import json, os, pathlib
+          state = pathlib.Path(os.environ['MAC_STATE'])
+          if any('Must be admin' in p.read_text() for p in (state/'logs').glob('*.log')):
+              assert json.loads((state/'status.json').read_text())['steps']['debug']['status'] == 'blocked', 'Admin-only system stream must not be reported as verified'
+          print('Working app logs and restricted system logs distinguished.')
+          PY
           ./mac crash
           tar -tzf "$MAC_STATE"/crashes/*.tar.gz | grep flick-rehearsal.ips
           ./mac lldb flick --batch
