@@ -253,7 +253,9 @@ impl Overlay {
                 self.logged = self.highlight.0;
                 debug_log!("minimap: cell {} of {}, highlight drawn at {:.2}", cur.col, last as usize + 1, self.highlight.0 - self.view.shift(cur.row));
             }
-            self.highlight.1 += (cur.row as f32 - self.highlight.1) * k;
+            let rows = self.view.rows.len().saturating_sub(1) as f32;
+            let row = (cur.row as f32 + crate::input::row_offset()).clamp(-EDGE_GIVE, rows + EDGE_GIVE);
+            self.highlight.1 += (row - self.highlight.1) * k;
         }
 
         if hiding && self.alpha < 0.02 {

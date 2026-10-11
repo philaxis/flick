@@ -6,7 +6,7 @@ use crate::{
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
     grid::{self, Dir, Grid, Pos, Row},
-    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_SLIDE, WM_STEP},
+    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
     stack::{self, Kind},
@@ -122,6 +122,8 @@ struct App {
     /// stretch of it) and the cell it began on: the hand is followed along
     /// the row from there (`slide`).
     sliding: Option<((u32, u8), String)>,
+    /// The hold going up and down, and the row it began on.
+    rowing: Option<(u32, usize)>,
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
     following: HashSet<isize>,
@@ -234,6 +236,7 @@ impl App {
             in_gesture: false,
             unsettled: None,
             sliding: None,
+            rowing: None,
             following: HashSet::new(),
             pending_menu: None,
             pending_row_menu: None,
@@ -639,6 +642,42 @@ impl App {
         };
         self.sliding = Some((key, origin));
         Some((on.col as i32 - room.0 as i32, room))
+    }
+
+    /// The held trigger has come to row `to`, counted from the one the hold
+    /// began on: the app goes there, to the cell a move there lands on, in
+    /// one go however many rows away it is, or to the first or last row.
+    /// Returns the row the app is on, counted likewise, and how many rows
+    /// there are above and below the first.
+    fn rows(&mut self, hold: u32, to: i32, carry: bool) -> Option<(i32, (usize, usize))> {
+        let began = self.rowing.take().filter(|(of, _)| *of == hold).map(|(_, row)| row);
+        let (on, room) = if self.board.is_open() {
+            let origin = began.or_else(|| self.board.selected_row())?;
+            debug_log!("app: the selection goes to row {to:+}, the board being open");
+            self.board.select_across(origin, to)?
+        } else {
+            let desktops = self.sync()?;
+            let from = self.grid.find(&desktops.current)?;
+            let origin = began.unwrap_or(from.row);
+            let (on, room) = self.grid.across(origin, to)?;
+            match self.grid.id_at(on).cloned() {
+                Some(id) if on.row != from.row => {
+                    debug_log!("app: rows to {to:+}: from row {} to row {} cell {}", from.row, on.row, on.col);
+                    self.go(&desktops, from, &id, carry);
+                }
+                // Above the first row or below the last: the minimap shows
+                // where one is.
+                _ => {
+                    debug_log!("app: rows to {to:+}: staying on row {}", from.row);
+                    let view = self.view(&desktops.current);
+                    self.minimap.show(view, None);
+                }
+            }
+            (on, room)
+        };
+        // The row it began on, as found in the grid (`Grid::across`).
+        self.rowing = Some((hold, room.0));
+        Some((on.row as i32 - room.0 as i32, room))
     }
 
     /// Switches from the cell at `from` to cell `to` and shows the minimap.
@@ -1305,6 +1344,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 input::slide_shown(hold, stretch, on, Some(room));
             }
             debug_log!("app: slide {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
+        }
+        WM_ROWS => {
+            let hold = lparam.0 as u32;
+            let mut row = input::row_of(wparam.0);
+            // As sideways: only where the hand is by now matters, as long as
+            // nothing else came in between.
+            let mut next = MSG::default();
+            while PeekMessageW(&mut next, hwnd, 0, 0, PM_NOREMOVE).as_bool()
+                && next.message == WM_ROWS
+                && next.lParam.0 as u32 == hold
+                && PeekMessageW(&mut next, hwnd, WM_ROWS, WM_ROWS, PM_REMOVE).as_bool()
+            {
+                row = input::row_of(next.wParam.0);
+            }
+            #[cfg(feature = "debug-log")]
+            let started = Instant::now();
+            let on = with_app(|app| {
+                app.in_gesture = true;
+                app.rows(hold, row, app.carry_held())
+            });
+            if let Some((on, room)) = on.flatten() {
+                input::rows_shown(hold, on, room);
+            }
+            debug_log!("app: rows {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
         }
         WM_CLICK => {
             #[cfg(feature = "debug-log")]

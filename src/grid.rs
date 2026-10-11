@@ -107,6 +107,17 @@ impl Grid {
         Some((Pos { row: from.row, col }, (from.col, last - from.col)))
     }
 
+    /// The row `by` rows below row `origin` (above when negative), or the
+    /// first or last row where there are not that many, at the cell a move
+    /// there lands on (`Row::anchor`); and how many rows there are above and
+    /// below `origin`.
+    pub fn across(&self, origin: usize, by: i32) -> Option<(Pos, (usize, usize))> {
+        let last = self.rows.len().checked_sub(1)?;
+        let origin = origin.min(last);
+        let row = (origin as i32).saturating_add(by).clamp(0, last as i32) as usize;
+        Some((Pos { row, col: self.rows[row].anchor() }, (origin, last - origin)))
+    }
+
     pub fn visit(&mut self, id: &str) {
         if let Some(pos) = self.find(id) {
             self.rows[pos.row].last = Some(id.to_owned());

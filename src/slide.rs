@@ -1,4 +1,5 @@
-//! Where the hand is along a row: sideways travel, and the cell it comes to.
+//! Where the hand is along a row, or from row to row: travel one way, and
+//! the cell (or row) it comes to.
 //!
 //! Plain arithmetic with no Windows in it. The cell is read off where the
 //! hand is, counted from the cell it set out from, so the same travel is the

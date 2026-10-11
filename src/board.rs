@@ -656,6 +656,22 @@ impl Board {
         Some(along)
     }
 
+    /// The row of the selected cell.
+    pub fn selected_row(&self) -> Option<usize> {
+        self.nav.find(&self.selected).map(|pos| pos.row)
+    }
+
+    /// Moves the selection `by` rows from row `origin` (`Grid::across`), and
+    /// returns what that says.
+    pub fn select_across(&mut self, origin: usize, by: i32) -> Option<(crate::grid::Pos, (usize, usize))> {
+        let across = self.nav.across(origin, by)?;
+        let id = self.nav.id_at(across.0)?.clone();
+        if id != self.selected {
+            self.select(id, true);
+        }
+        Some(across)
+    }
+
     /// Turns the board to a cell: its windows are shown. With `line_up` the
     /// rows slide to stay lined up on it, as they will be once it is gone
     /// to; without, the map stays as it is, for the mouse to go on from

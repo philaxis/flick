@@ -44,7 +44,14 @@ use windows::{
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
-const SIZE: (f32, f32) = (400.0, 704.0);
+const SIZE: (f32, f32) = (400.0, if UP_AND_DOWN_OF_ITS_OWN { 704.0 } else { 704.0 - 2.0 * ROWS.1 });
+/// Whether up and down has settings of its own (a flick or a distance, and
+/// how much). Not now: rows go by distance, as far apart as cells. Kept
+/// hidden, and the keys in config.toml read and left alone, should that
+/// change back.
+const UP_AND_DOWN_OF_ITS_OWN: bool = false;
+/// The rows below them move up into their place while they are hidden.
+const BELOW_UP_AND_DOWN: f32 = if UP_AND_DOWN_OF_ITS_OWN { 0.0 } else { 2.0 };
 /// The dial: its centre and its radius.
 const DIAL: ((f32, f32), f32) = ((200.0, 146.0), 104.0);
 /// Top of the first row and the height of each.
@@ -127,18 +134,20 @@ impl Layout {
         // A control `w` wide and `h` high at the right of row `i`.
         let right = |i: f32, w: f32, h: f32| rect((EDGES.1 - w) * s, (row(i) + (ROWS.1 - h) / 2.0) * s, w * s, h * s);
         let slider = |i: f32| rect(150.0 * s, row(i) * s, 166.0 * s, ROWS.1 * s);
-        let mode = right(2.0, 160.0, 30.0);
+        let hidden = |r: Rect| if UP_AND_DOWN_OF_ITS_OWN { r } else { Rect::default() };
+        let mode = hidden(right(2.0, 160.0, 30.0));
         let half = (mode.right - mode.left) / 2.0;
+        let up = BELOW_UP_AND_DOWN;
         Layout {
             dial: ((DIAL.0 .0 * s, DIAL.0 .1 * s), DIAL.1 * s),
             trigger: right(0.0, 64.0, 30.0),
             step_x: slider(1.0),
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
-            step_y: slider(3.0),
-            dwell: slider(4.0),
-            autostart: right(5.0, 44.0, 24.0),
-            admin: right(6.0, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(7.0) + 8.0) * s, 190.0 * s, 26.0 * s),
+            step_y: hidden(slider(3.0)),
+            dwell: slider(4.0 - up),
+            autostart: right(5.0 - up, 44.0, 24.0),
+            admin: right(6.0 - up, 44.0, 24.0),
+            file: rect(EDGES.0 * s, (row(7.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -545,9 +554,10 @@ impl Settings {
         p.text(words, &fonts.value, &Rect { right: layout.trigger.left - 12.0 * s, ..row(0.0) }, colour);
         self.draw_button(&p, fonts, &layout.trigger, if view.capturing { "Cancel" } else { "Change" }, Hit::Trigger);
 
-        label(1.0, "Sideways distance");
+        label(1.0, if UP_AND_DOWN_OF_ITS_OWN { "Sideways distance" } else { "Distance" });
         self.draw_slider(&p, fonts, &layout.step_x, view.step_x, DISTANCES, &view.step_x.to_string(), Hit::StepX);
 
+        if UP_AND_DOWN_OF_ITS_OWN {
         label(2.0, "Up and down");
         // One switch with two halves; the half in use is lit.
         p.fill(&Rect { right: layout.mode[1].right, ..layout.mode[0] }, 7.0 * s, white(0.08));
@@ -563,20 +573,22 @@ impl Settings {
         // number sets how hard it must be.
         label(3.0, if view.sticky { "Flick strength" } else { "Vertical distance" });
         self.draw_slider(&p, fonts, &layout.step_y, view.step_y, DISTANCES, &view.step_y.to_string(), Hit::StepY);
+        }
+        let up = BELOW_UP_AND_DOWN;
 
         // In the board: resting the cursor on a cell of the map shows it.
-        label(4.0, "Hover preview");
+        label(4.0 - up, "Hover preview");
         let rest = match view.dwell_ms {
             0 => "Off".to_owned(),
             ms => format!("{:.1} s", ms as f32 / 1000.0),
         };
         self.draw_slider(&p, fonts, &layout.dwell, view.dwell_ms, RESTS, &rest, Hit::Dwell);
 
-        label(5.0, "Start with Windows");
+        label(5.0 - up, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
         // For the trigger to work on windows run as administrator, and to
         // close them from the board.
-        label(6.0, "Run as administrator");
+        label(6.0 - up, "Run as administrator");
         self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
 
         let hot = self.hover == Hit::File;

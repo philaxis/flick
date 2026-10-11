@@ -54,7 +54,8 @@ use windows::Win32::{
     },
 };
 
-/// A flick up or down. wparam: direction index (see `dir_from_index`).
+/// One step in a direction, as a hotkey takes it; sent by the test driver
+/// (examples/drive.rs). wparam: direction index (see `dir_from_index`).
 pub const WM_STEP: u32 = WM_APP + 1;
 /// The trigger was pressed and released without travelling a step.
 pub const WM_CLICK: u32 = WM_APP + 2;
@@ -71,6 +72,10 @@ pub const WM_DRAG: u32 = WM_APP + 5;
 /// hold it is of and the cell, counted from the one the stretch began on
 /// (`slide_of`); lparam: which hold. To be answered with `slide_shown`.
 pub const WM_SLIDE: u32 = WM_APP + 6;
+/// The hand came to another row, the same way: wparam the row, counted from
+/// the one the hold began on (`row_of`); lparam: which hold. To be answered
+/// with `rows_shown`.
+pub const WM_ROWS: u32 = WM_APP + 7;
 
 /// Thread message telling the hook thread to pick up new settings.
 const WM_RELOAD: u32 = WM_APP + 20;
@@ -118,6 +123,13 @@ static FRACTION: AtomicI32 = AtomicI32::new(0);
 static SHOWN: AtomicU64 = AtomicU64::new(0);
 /// In place of the cells to either side, when the app could not say.
 const NO_ROOM: i32 = 0xFF;
+/// The same up and down, for the whole hold: the row the hand has come to,
+/// counted from the one the hold began on, how far it is from that row, and
+/// what the app last said (hold << 32 | row << 16 | rows above << 8 | rows
+/// below).
+static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
+static ROW_FRACTION: AtomicI32 = AtomicI32::new(0);
+static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
 
 /// The wparam of `WM_SLIDE` and `WM_DRAG`.
 fn slide_wparam(stretch: u32, cell: i32) -> usize {
@@ -155,6 +167,37 @@ pub fn drag_offset() -> f32 {
     }
     let at = shown().map_or(0, |(cell, _)| cell);
     (ASKED.load(Ordering::SeqCst) - at) as f32 + FRACTION.load(Ordering::SeqCst) as f32 / 1000.0
+}
+
+/// The row in the wparam of `WM_ROWS`.
+pub fn row_of(wparam: usize) -> i32 {
+    wparam as u16 as i16 as i32
+}
+
+/// The app got to `row` of `hold`, counted from the row the hold began on,
+/// which has `room` rows above it and below it.
+pub fn rows_shown(hold: u32, row: i32, room: (usize, usize)) {
+    let (up, down) = (room.0.min(0xFE) as u64, room.1.min(0xFE) as u64);
+    let row = row.clamp(i8::MIN as i32, i8::MAX as i32) as i8 as u8 as u64;
+    ROWS_SHOWN.store((hold as u64) << 32 | row << 16 | up << 8 | down, Ordering::SeqCst);
+}
+
+/// What the app said of the rows in the hold going on, if it has: the row it
+/// is showing, and the rows above and below the first.
+fn rows_seen() -> Option<(i32, (i32, i32))> {
+    let shown = ROWS_SHOWN.load(Ordering::SeqCst);
+    ((shown >> 32) as u32 == HOLD_ID.load(Ordering::SeqCst))
+        .then(|| ((shown >> 16) as u8 as i8 as i32, ((shown >> 8) as u8 as i32, shown as u8 as i32)))
+}
+
+/// How far the hand is from the row the app is showing, in rows (positive
+/// downwards), as `drag_offset` is along the row.
+pub fn row_offset() -> f32 {
+    if !HOLDING.load(Ordering::SeqCst) {
+        return 0.0;
+    }
+    let at = rows_seen().map_or(0, |(row, _)| row);
+    (ROW_ASKED.load(Ordering::SeqCst) - at) as f32 + ROW_FRACTION.load(Ordering::SeqCst) as f32 / 1000.0
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -261,15 +304,6 @@ impl Trigger {
     }
 }
 
-pub fn dir_index(dir: Dir) -> usize {
-    match dir {
-        Dir::Left => 0,
-        Dir::Right => 1,
-        Dir::Up => 2,
-        Dir::Down => 3,
-    }
-}
-
 pub fn dir_from_index(index: usize) -> Option<Dir> {
     [Dir::Left, Dir::Right, Dir::Up, Dir::Down].get(index).copied()
 }
@@ -279,10 +313,9 @@ struct Settings {
     /// The app window, as a plain number so it can cross threads.
     target: isize,
     triggers: Vec<Trigger>,
+    /// How far the hand goes from one cell to the next, and from one row to
+    /// the next alike.
     step_x: i32,
-    step_y: i32,
-    /// Rows change on a quick flick rather than by distance (see `travel`).
-    vertical_sticky: bool,
     /// A movement counts as vertical only when it is this many times more
     /// vertical than horizontal. Everything else is sideways.
     vertical_bias: f32,
@@ -371,12 +404,8 @@ thread_local! {
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     /// Where the hand is along the row, in this stretch of the hold.
     static SLIDE: Cell<Slide> = const { Cell::new(Slide::new()) };
-    /// Vertical travel not yet converted into steps (only where rows change
-    /// by distance, `travel_linear`).
-    static ACCUM_Y: Cell<i32> = const { Cell::new(0) };
-    /// Direction (-1 up, 1 down) of the flick the hand is still carrying
-    /// through, 0 when a new flick may be taken.
-    static FLICKED: Cell<i32> = const { Cell::new(0) };
+    /// Where the hand is up and down, in this hold.
+    static ROWS: Cell<Slide> = const { Cell::new(Slide::new()) };
     static LAST_MOVE: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The last moments of travel: (when, dx, dy).
     static RECENT: RefCell<VecDeque<(Instant, i32, i32)>> = const { RefCell::new(VecDeque::new()) };
@@ -413,8 +442,6 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         target: target.0,
         triggers,
         step_x: config.step_x.max(20),
-        step_y: config.step_y.max(20),
-        vertical_sticky: config.vertical_sticky,
         vertical_bias: config.vertical_bias(),
     });
     match THREAD.load(Ordering::SeqCst) {
@@ -459,8 +486,8 @@ fn reload() {
     #[cfg(feature = "debug-log")]
     if let Some(s) = &settings {
         debug_log!(
-            "settings: triggers {:?}, step_x {}, step_y {}, flick {}, vertical when dy >= {:.2} dx",
-            s.triggers, s.step_x, s.step_y, s.vertical_sticky, s.vertical_bias
+            "settings: triggers {:?}, step {}, vertical when dy >= {:.2} dx",
+            s.triggers, s.step_x, s.vertical_bias
         );
     }
     // What was held under the old settings may not be a trigger any more.
@@ -573,8 +600,9 @@ fn press(source: Source) {
         new_stretch();
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
-        ACCUM_Y.set(0);
-        FLICKED.set(0);
+        ROWS.set(Slide::new());
+        ROW_ASKED.store(0, Ordering::SeqCst);
+        ROW_FRACTION.store(0, Ordering::SeqCst);
         LAST_MOVE.set(None);
         RECENT.with(|recent| recent.borrow_mut().clear());
         LAST_ABSOLUTE.set(None);
@@ -707,7 +735,7 @@ fn release(s: &Settings, source: Source) {
         // A click is the trigger pressed and let go of where it was. One
         // that travelled, only not far enough for a step, is a move given
         // up: it must not open the board.
-        let slack = s.step_x.min(s.step_y) / 3;
+        let slack = s.step_x / 3;
         let stayed = !STEPPED.get() && STRAYED.get().1 < slack;
         if !stayed && !STEPPED.get() {
             debug_log!("no click: the mouse had strayed {} (a click stays within {slack})", STRAYED.get().1);
@@ -838,7 +866,8 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-/// Vertical flicks are judged over the last this-many milliseconds of travel.
+/// Which way the hand goes is judged over the last this-many milliseconds of
+/// travel.
 const FLICK_WINDOW_MS: u128 = 150;
 /// With no movement for this long the hand has stopped.
 const FLICK_PAUSE_MS: u128 = 70;
@@ -870,7 +899,6 @@ fn sideways(s: &Settings, dx: i32, may_step: bool) {
     FRACTION.store(slide.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
     let stretch = STRETCH.load(Ordering::SeqCst);
     if slide.cell() != before {
-        FLICKED.set(0);
         STEPPED.set(true);
         debug_log!("slide: cell {} of stretch {stretch}", slide.cell());
         post(s, WM_SLIDE, slide_wparam(stretch, slide.cell()));
@@ -881,22 +909,40 @@ fn sideways(s: &Settings, dx: i32, may_step: bool) {
     }
 }
 
+/// The hand moved `dy` up or down: as `sideways`, but from row to row, over
+/// the whole hold. Coming to another row begins a new stretch sideways.
+fn vertical(s: &Settings, dy: i32) {
+    let mut rows = ROWS.get();
+    if let Some((_, (up, down))) = rows_seen() {
+        rows.set_room(up, down, s.step_x);
+    }
+    let before = rows.cell();
+    rows.travel(dy, s.step_x, true);
+    ROWS.set(rows);
+    ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
+    ROW_FRACTION.store(rows.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
+    if rows.cell() != before {
+        new_stretch();
+        STEPPED.set(true);
+        debug_log!("rows: row {}", rows.cell());
+        post(s, WM_ROWS, rows.cell() as i16 as u16 as usize);
+    }
+    if !DRAGGING.get() && (STEPPED.get() || rows.rest(s.step_x).abs() >= DRAG_SHOWS) {
+        DRAGGING.set(true);
+        post(s, WM_DRAG, slide_wparam(STRETCH.load(Ordering::SeqCst), 0));
+    }
+}
+
 /// Adds mouse travel and emits steps.
 ///
-/// Sideways it is linear: one cell per `step_x` of travel, as far as the
-/// hand goes (`sideways`). Vertically (unless the user asked for linear there too) a row
-/// changes only on a flick: half the vertical threshold covered within
-/// `FLICK_WINDOW_MS`. One flick is one row however far it carries on; a flick
-/// the other way goes back at once; and the slow movement of bringing the
-/// hand back for the next flick is too slow to count, so flick, flick is two
-/// rows.
+/// Both ways alike: one cell or one row per `step_x` of travel, as far as
+/// the hand goes (`sideways`, `vertical`). Each movement counts one way only,
+/// the way the last moments of travel went: the hand wavers on its way, and
+/// that does not move it to another row or cell.
 fn travel(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
-    if !s.vertical_sticky {
-        return travel_linear(s, dx, dy);
-    }
     let now = Instant::now();
     let paused = LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > FLICK_PAUSE_MS);
     if paused {
@@ -904,11 +950,9 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     }
     let (wx, wy) = RECENT.with(|recent| {
         let mut recent = recent.borrow_mut();
-        // A stop, or turning round after a flick, starts a fresh stroke.
-        let turned = FLICKED.get() != 0 && dy != 0 && dy.signum() != FLICKED.get();
-        if paused || turned {
+        // A stop starts a fresh stroke, which may go another way.
+        if paused {
             recent.clear();
-            FLICKED.set(0);
         }
         recent.push_back((now, dx, dy));
         while recent.front().is_some_and(|(at, _, _)| now.duration_since(*at).as_millis() > FLICK_WINDOW_MS) {
@@ -916,50 +960,19 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
         }
         recent.iter().fold((0, 0), |(x, y), (_, dx, dy)| (x + dx, y + dy))
     });
-    if s.is_vertical(wx, wy) {
-        // Moving up or down: nothing of it counts sideways. What was
-        // travelled sideways before is kept, though: the hand wavers up and
-        // down on its way, and only a flick is a change of mind.
-        if FLICKED.get() == 0 && wy.abs() >= (s.step_y / 2).max(40) {
-            new_stretch();
-            FLICKED.set(wy.signum());
-            RECENT.with(|recent| recent.borrow_mut().clear());
-            STEPPED.set(true);
-            debug_log!("step {}", if wy > 0 { "down" } else { "up" });
-            post(s, WM_STEP, dir_index(if wy > 0 { Dir::Down } else { Dir::Up }));
-        }
+    let up_down = s.is_vertical(wx, wy);
+    if up_down {
+        vertical(s, dy);
     } else {
         sideways(s, dx, true);
     }
     debug_log!(
-        "move {dx} {dy}: last moments {wx} {wy} ({}), sideways so far {} of {}",
-        if s.is_vertical(wx, wy) { "vertical" } else { "sideways" },
+        "move {dx} {dy}: last moments {wx} {wy} ({}), sideways {} and up and down {} of {}",
+        if up_down { "vertical" } else { "sideways" },
         SLIDE.get().rest(s.step_x),
+        ROWS.get().rest(s.step_x),
         s.step_x
     );
-}
-
-/// Both axes by distance alone: one step per threshold of travel. The other
-/// axis is cleared on a step so that drift does not leak into the next one.
-fn travel_linear(s: &Settings, dx: i32, dy: i32) {
-    let rest = || SLIDE.get().rest(s.step_x);
-    let mut ay = ACCUM_Y.get() + dy;
-    while s.is_vertical(rest() + dx, ay) && ay.abs() >= s.step_y {
-        let dir = if ay > 0 { Dir::Down } else { Dir::Up };
-        ay -= ay.signum() * s.step_y;
-        new_stretch();
-        STEPPED.set(true);
-        debug_log!("step {dir:?}");
-        post(s, WM_STEP, dir_index(dir));
-    }
-    // Going up or down, what drifts sideways is kept but comes to no cell.
-    let cell = SLIDE.get().cell();
-    sideways(s, dx, !s.is_vertical(rest() + dx, ay));
-    if SLIDE.get().cell() != cell {
-        ay = 0;
-    }
-    debug_log!("move {dx} {dy}: so far {} of {}, {ay} of {}", rest(), s.step_x, s.step_y);
-    ACCUM_Y.set(ay);
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.
