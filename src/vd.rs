@@ -159,7 +159,35 @@ pub fn set_topmost(hwnd: HWND, on: bool) -> bool {
     unsafe { SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) }.is_ok() && is_topmost(hwnd) == on
 }
 
-fn pinned_everywhere(hwnd: HWND) -> bool {
+/// Visible windows kept above the others, in Z order, topmost first.
+pub fn topmost_windows() -> Vec<HWND> {
+    unsafe extern "system" fn each(hwnd: HWND, out: LPARAM) -> BOOL {
+        if IsWindowVisible(hwnd).as_bool() && is_topmost(hwnd) && !cloaked(hwnd) {
+            (*(out.0 as *mut Vec<HWND>)).push(hwnd);
+        }
+        TRUE
+    }
+    let mut out: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut out as *mut _ as isize));
+    }
+    out
+}
+
+/// Puts windows kept above the others in this order, topmost first, without
+/// moving, sizing or activating any: the first over all of them, each next
+/// one right under the one before.
+pub fn stack(order: &[HWND]) {
+    let mut after = HWND_TOPMOST;
+    for &hwnd in order {
+        unsafe {
+            let _ = SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        after = hwnd;
+    }
+}
+
+pub fn pinned_everywhere(hwnd: HWND) -> bool {
     vdapi::is_pinned_window(hwnd).unwrap_or(false) || vdapi::is_pinned_app(hwnd).unwrap_or(false)
 }
 

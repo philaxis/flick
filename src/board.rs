@@ -400,20 +400,16 @@ pub struct Board {
     /// did moves other things under the cursor, and a second click made in
     /// the same breath must not land on those.
     changed_at: Option<(Instant, f32, f32)>,
-    /// Where pinned windows are placed (`split_area`). Not settled yet: the
-    /// environment variable FLICK_PINS (1 or 2) tries the other ways out.
-    pin_layout: u8,
     /// The headings of the parts the tiles are placed in, when pinned
     /// windows have a part of their own.
     sections: Vec<(Rect, &'static str)>,
 }
 
-/// The parts of `area` the tiles go into: all in one (layout 0), or pinned
-/// windows in parts of their own, where they stay whichever cell is looked
-/// at: columns side by side (1), or a shelf along the top (2). Each part has
-/// a heading, or none.
+/// The parts of `area` the tiles go into: all in one, or when some windows
+/// are pinned, those in parts of their own at the left, where they stay
+/// whichever cell is looked at (`tiles::pin_parts`). Each part has a
+/// heading, or none.
 fn split_area<'a>(
-    layout: u8,
     here: &[(&'a WindowModel, bool)],
     area: &Rect,
     s: f32,
@@ -422,39 +418,20 @@ fn split_area<'a>(
     let all = pick(|_, everywhere| everywhere);
     let row = pick(|w, everywhere| !everywhere && w.follows);
     let rest = pick(|w, everywhere| !everywhere && !w.follows);
-    if layout == 0 || (all.is_empty() && row.is_empty()) {
+    if all.is_empty() && row.is_empty() {
         return vec![(*area, None, here.to_vec())];
     }
-    let (w, h) = size(area);
     let (head, gap) = (24.0 * s, 20.0 * s);
-    let under = |r: Rect| Rect { top: r.top + head, ..r };
-    let mut parts = Vec::new();
-    if layout == 1 {
-        // Columns: each kind of pinned window a narrow one at the left.
-        let column = w * 0.22;
-        let mut x = area.left;
-        for (name, group) in [("All rows", all), ("This row", row)] {
-            if !group.is_empty() {
-                parts.push((under(rect(x, area.top, column, h)), Some(name), group));
-                x += column + gap;
-            }
+    let parts = tiles::pin_parts(all.len(), row.len(), size(area), gap, head, tile_least(s));
+    let place = |(x, y, w, h): tiles::Part| Rect { top: area.top + y + head, ..rect(area.left + x, area.top + y, w, h) };
+    let mut out = Vec::new();
+    for (part, name, group) in [(parts.all, "All rows", all), (parts.row, "This row", row)] {
+        if let Some(part) = part {
+            out.push((place(part), Some(name), group));
         }
-        parts.push((under(Rect { left: x, ..*area }), Some("This cell"), rest));
-    } else {
-        // A shelf along the top, shared by the two kinds by how many each has.
-        let shelf = h * 0.30;
-        let share = all.len() as f32 / (all.len() + row.len()) as f32;
-        let split = area.left + (w - gap) * share;
-        if !all.is_empty() {
-            parts.push((under(Rect { right: if row.is_empty() { area.right } else { split }, bottom: area.top + shelf, ..*area }), Some("All rows"), all));
-        }
-        if !row.is_empty() {
-            let left = if parts.is_empty() { area.left } else { split + gap };
-            parts.push((under(Rect { left, bottom: area.top + shelf, ..*area }), Some("This row"), row));
-        }
-        parts.push((Rect { top: area.top + shelf + gap, ..*area }, None, rest));
     }
-    parts
+    out.push((place(parts.rest), Some("This cell"), rest));
+    out
 }
 
 impl Board {
@@ -521,7 +498,6 @@ impl Board {
                 rested_at: None,
                 refused: None,
                 changed_at: None,
-                pin_layout: std::env::var("FLICK_PINS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                 sections: Vec::new(),
             })
         }
@@ -748,7 +724,18 @@ impl Board {
     /// always appear in the same places.
     fn tile_windows(&self) -> Vec<(&WindowModel, bool)> {
         let cell = self.model.cell(&self.selected).into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
-        let mut windows: Vec<(&WindowModel, bool)> = cell.chain(self.model.pinned.iter().map(|w| (w, true))).collect();
+        // Windows pinned to their row are shown in every cell of it: going
+        // there brings them along. So their part stays put within the row.
+        let row = self.model.rows.iter().find(|row| row.cells.iter().any(|cell| cell.id == self.selected));
+        let followers = row
+            .into_iter()
+            .flat_map(|row| &row.cells)
+            .filter(|cell| cell.id != self.selected)
+            .flat_map(|cell| &cell.windows)
+            .filter(|w| w.follows)
+            .map(|w| (w, false));
+        let mut windows: Vec<(&WindowModel, bool)> =
+            cell.chain(followers).chain(self.model.pinned.iter().map(|w| (w, true))).collect();
         windows.sort_by_cached_key(|(w, _)| (w.app_name.to_lowercase(), w.app.clone(), w.hwnd.0));
         windows
     }
@@ -806,7 +793,7 @@ impl Board {
                 bottom: monitor.top + layout.top - 26.0 * s,
             };
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
-            for (part, name, group) in split_area(self.pin_layout, &here, &area, s) {
+            for (part, name, group) in split_area(&here, &area, s) {
                 if let Some(name) = name {
                     sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, name));
                 }
@@ -1862,6 +1849,11 @@ const TILE_MAX: (f32, f32) = (0.6, 430.0);
 /// The lowest a preview may be, unscaled.
 const TILE_MIN_HEIGHT: f32 = 60.0;
 
+/// Not narrower than the title bar of a tile needs for its buttons and a few letters.
+fn tile_least(s: f32) -> f32 {
+    (124.0 + Pin::WIDTH + Pin::TOP_WIDTH) * s
+}
+
 /// Lays out windows as rows of titled previews, all at one scale so that
 /// each is as large among the others as its window is (see `tiles`), centred
 /// in `area`.
@@ -1870,8 +1862,7 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
     let (title_h, gap) = (46.0 * s, 26.0 * s);
     let sizes: Vec<(f32, f32)> =
         windows.iter().map(|(w, _)| ((w.rect.right - w.rect.left).max(1) as f32, (w.rect.bottom - w.rect.top).max(1) as f32)).collect();
-    // Not narrower than the title bar needs for its buttons and a few letters.
-    let min_widths: Vec<f32> = vec![(124.0 + Pin::WIDTH + Pin::TOP_WIDTH) * s; windows.len()];
+    let min_widths: Vec<f32> = vec![tile_least(s); windows.len()];
     let space = Space {
         area: (aw, ah),
         title: title_h,

@@ -9,6 +9,7 @@ use crate::{
     input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
+    stack::{self, Kind},
     tray::{self, Command, PinCommand, PinState, RowCommand},
     vd::{self, Desktops},
     vdapi,
@@ -26,8 +27,10 @@ use windows::{
         System::{
             Com::{CoInitializeEx, COINIT_MULTITHREADED},
             LibraryLoader::GetModuleHandleW,
+            Threading::GetCurrentProcessId,
         },
         UI::{
+            Accessibility::{SetWinEventHook, HWINEVENTHOOK},
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
@@ -36,6 +39,7 @@ use windows::{
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
+                GetWindowThreadProcessId, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
                 IsIconic, IsWindow, KillTimer, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
                 RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
                 MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
@@ -50,6 +54,9 @@ const WM_TRAY: u32 = WM_APP + 10;
 const WM_DESKTOP_EVENT: u32 = WM_APP + 11;
 /// Opens the settings window; for the test driver (examples/drive.rs).
 const WM_OPEN_SETTINGS: u32 = WM_APP + 12;
+/// Another window came to the front: the windows kept on top are put back
+/// in their order (`App::restack`).
+const WM_RESTACK: u32 = WM_APP + 13;
 
 /// How long the minimap stays after the trigger is released and after a
 /// hotkey (which has no release to wait for).
@@ -70,6 +77,9 @@ const CONFIG_TIMER_ID: usize = 5;
 const RELEASE_TIMER_ID: usize = 6;
 /// One-shot timer that gives the board the keyboard back (`Action::Dismiss`).
 const RECLAIM_TIMER_ID: usize = 7;
+/// One-shot timer that sorts the windows kept on top once more, after Windows
+/// has finished raising the one just clicked.
+const RESTACK_TIMER_ID: usize = 8;
 /// For this long after the board opened, or a cell was added or removed in
 /// it, Windows may still hand the keyboard to a window of its own choosing.
 const BOARD_SETTLES_MS: u64 = 1500;
@@ -138,6 +148,23 @@ thread_local! {
     /// borrowing the app.
     static BOARD_HWND: Cell<isize> = const { Cell::new(0) };
     static SETTINGS_HWND: Cell<isize> = const { Cell::new(0) };
+    /// The app's message window, for the hook told of windows coming to the front.
+    static MAIN_HWND: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Told by Windows of each window that comes to the front. It brings that
+/// window above the others kept on top whatever kind it is, so the order is
+/// put back once the app is free.
+unsafe extern "system" fn foreground_changed(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    let _ = PostMessageW(HWND(MAIN_HWND.get()), WM_RESTACK, WPARAM(hwnd.0 as usize), LPARAM(0));
 }
 
 /// Runs `f` on the app unless it is already borrowed, which happens when a
@@ -406,6 +433,56 @@ impl App {
         if let Err(e) = result {
             log(&format!("pin change failed: {e:?}"));
         }
+        self.restack();
+    }
+
+    /// Puts the windows kept on top in their order: the board while it is up
+    /// over all, then the ones pinned to every desktop, the ones pinned to
+    /// their row, and the ones only kept on top (`stack`). Windows kept on
+    /// top by other means, and pinned ones whose tile turned that off, are
+    /// left where they are.
+    fn restack(&self) {
+        self.restack_clicked(HWND::default());
+    }
+
+    /// The same, with `clicked` counted as the last one clicked: Windows tells
+    /// of a new foreground window before it has raised it.
+    fn restack_clicked(&self, clicked: HWND) {
+        let me = unsafe { GetCurrentProcessId() };
+        let mut now: Vec<(HWND, Kind)> = vd::topmost_windows()
+            .into_iter()
+            .filter_map(|hwnd| {
+                let mut pid = 0;
+                unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+                let kind = if pid == me {
+                    Kind::Flick
+                } else if !vd::is_app_window(hwnd) {
+                    return None;
+                } else if vd::pinned_everywhere(hwnd) {
+                    Kind::All
+                } else if self.following.contains(&hwnd.0)
+                    || (!self.grid.follow_apps.is_empty()
+                        && vd::exe_name(pid).is_some_and(|exe| self.grid.follow_apps.contains(&exe)))
+                {
+                    Kind::Row
+                } else if self.grid.kept_on_top.iter().any(|(kept, _)| *kept == hwnd.0) {
+                    Kind::Top
+                } else {
+                    return None;
+                };
+                Some((hwnd, kind))
+            })
+            .collect();
+        let seen = now.clone();
+        if let Some(at) = now.iter().position(|(hwnd, _)| *hwnd == clicked) {
+            let it = now.remove(at);
+            now.insert(0, it);
+        }
+        let order = stack::stacked(&now);
+        if order.iter().ne(seen.iter().map(|(hwnd, _)| hwnd)) {
+            debug_log!("restack: {:x?}", order.iter().map(|h| h.0).collect::<Vec<_>>());
+            vd::stack(&order);
+        }
     }
 
     /// Puts a window above the others or takes it down again, and keeps
@@ -419,6 +496,7 @@ impl App {
         if on {
             self.grid.kept_on_top.push((window.0, vd::exe_of_window(window).unwrap_or_default()));
         }
+        self.restack();
     }
 
     /// Forgets the windows put above the others that are gone (a handle may
@@ -1300,6 +1378,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_TIMER if wparam.0 == CONFIG_TIMER_ID => {
             with_app(App::apply_saved_config);
         }
+        WM_RESTACK => {
+            with_app(|app| app.restack_clicked(HWND(wparam.0 as _)));
+            let _ = SetTimer(hwnd, RESTACK_TIMER_ID, 120, None);
+        }
+        WM_TIMER if wparam.0 == RESTACK_TIMER_ID => {
+            let _ = KillTimer(hwnd, RESTACK_TIMER_ID);
+            with_app(|app| app.restack());
+        }
         WM_DESKTOP_EVENT => {
             with_app(|app| {
                 while let Ok((_, new)) = app.events.try_recv() {
@@ -1455,6 +1541,18 @@ pub fn run(first_run: bool) {
         vd::monitors().iter().map(|m| (m.bounds.right - m.bounds.left, m.bounds.bottom - m.bounds.top, m.scale)).collect::<Vec<_>>()
     );
     let (events, listener) = listen(hwnd);
+    MAIN_HWND.set(hwnd.0);
+    unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(foreground_changed),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+    }
     let mut app = App::new(hwnd, board, settings, events, listener);
     if let Some(desktops) = app.sync() {
         app.visit(&desktops.current);
@@ -1555,15 +1653,21 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
         });
         let mut made_up: Vec<WindowModel> = made_up.collect();
         model.pinned.clear();
-        // For pictures of how pinned windows are placed: the first made-up
-        // window is pinned everywhere, the second to its workspace.
-        if std::env::var_os("FLICK_PINS").is_some() && made_up.len() > 2 {
-            made_up[1].follows = true;
-            made_up[1].topmost = true;
-            let mut everywhere = made_up.remove(0);
-            everywhere.topmost = true;
-            model.pinned.push(everywhere);
+        // For pictures of how pinned windows are placed: FLICK_PINS=a,r pins
+        // the first a made-up windows everywhere and the next r to their row.
+        let pins = std::env::var("FLICK_PINS").ok();
+        let (all, row) = pins
+            .as_deref()
+            .and_then(|v| v.split_once(','))
+            .and_then(|(a, r)| Some((a.trim().parse::<usize>().ok()?, r.trim().parse::<usize>().ok()?)))
+            .unwrap_or((0, 0));
+        for window in made_up.iter_mut().take(all + row) {
+            window.topmost = true;
         }
+        for window in made_up.iter_mut().skip(all).take(row) {
+            window.follows = true;
+        }
+        model.pinned.extend(made_up.drain(..all.min(made_up.len())));
         if let Some(cell) = model.rows.iter_mut().flat_map(|row| &mut row.cells).find(|cell| cell.id == desktops.current) {
             cell.windows = made_up;
         }

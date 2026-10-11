@@ -28,6 +28,8 @@ mod settings;
 #[cfg(any(windows, test))]
 mod slide;
 #[cfg(any(windows, test))]
+mod stack;
+#[cfg(any(windows, test))]
 mod tiles;
 #[cfg(windows)]
 mod tray;

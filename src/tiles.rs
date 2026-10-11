@@ -116,6 +116,71 @@ fn place(sizes: &[(f32, f32)], rows: usize, space: &Space) -> Option<Vec<Placed>
     Some(placed)
 }
 
+/// A part of an area: left, top, width and height, from the area's corner.
+pub type Part = (f32, f32, f32, f32);
+
+/// Where the windows go when some are pinned: those pinned to every desktop
+/// at the left, those pinned to their row right of them or under them, and
+/// the others in what is left at the right. A kind with no windows has no
+/// part. Each part includes room for its heading.
+#[derive(Debug, PartialEq)]
+pub struct PinParts {
+    pub all: Option<Part>,
+    pub row: Option<Part>,
+    pub rest: Part,
+}
+
+/// The share of the width the pinned windows take: about this much more
+/// for each, and never less or more than these.
+const PINNED_EACH: f32 = 0.07;
+const PINNED_SHARE: (f32, f32) = (0.18, 0.45);
+/// Width per height of a window as it usually is, for telling how large
+/// tiles come out before the windows are known.
+const USUAL_ASPECT: f32 = 1.6;
+
+/// Splits an area of size `area` for `all` windows pinned to every desktop
+/// and `row` pinned to their row. How wide the pinned part is depends on how
+/// many of them there are and on nothing else, so it stays where it is
+/// whichever cell is looked at. The two kinds share it side by side or one
+/// over the other, whichever gives their tiles more room. No part is made
+/// narrower than `least`, the narrowest a tile can be with its buttons.
+pub fn pin_parts(all: usize, row: usize, area: (f32, f32), gap: f32, head: f32, least: f32) -> PinParts {
+    let (w, h) = area;
+    let pinned = all + row;
+    if pinned == 0 {
+        return PinParts { all: None, row: None, rest: (0.0, 0.0, w, h) };
+    }
+    let share = (0.1 + PINNED_EACH * pinned as f32).clamp(PINNED_SHARE.0, PINNED_SHARE.1);
+    let width = ((w - gap) * share).max(least).min((w - gap) * PINNED_SHARE.1.max(0.5));
+    let rest = (width + gap, 0.0, w - width - gap, h);
+    let whole = (0.0, 0.0, width, h);
+    if all == 0 || row == 0 {
+        let (all_part, row_part) = if row == 0 { (Some(whole), None) } else { (None, Some(whole)) };
+        return PinParts { all: all_part, row: row_part, rest };
+    }
+    // How wide each tile of `n` windows comes out in a part, at best.
+    let tile = |n: usize, (_, _, pw, ph): Part| {
+        (1..=n)
+            .map(|rows| {
+                let columns = n.div_ceil(rows) as f32;
+                let across = (pw - gap * (columns - 1.0)) / columns;
+                let down = (ph - head - gap * (rows as f32 - 1.0)) / rows as f32;
+                across.min(down * USUAL_ASPECT)
+            })
+            .fold(0.0, f32::max)
+    };
+    let first = all as f32 / pinned as f32;
+    let over = ((0.0, 0.0, width, (h - gap) * first), (0.0, (h - gap) * first + gap, width, (h - gap) * (1.0 - first)));
+    if width - gap < 2.0 * least {
+        return PinParts { all: Some(over.0), row: Some(over.1), rest };
+    }
+    let left = ((width - gap) * first).clamp(least, width - gap - least);
+    let side = ((0.0, 0.0, left, h), (left + gap, 0.0, width - gap - left, h));
+    let smaller = |(a, r): (Part, Part)| tile(all, a).min(tile(row, r));
+    let (a, r) = if smaller(side) >= smaller(over) { side } else { over };
+    PinParts { all: Some(a), row: Some(r), rest }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +219,27 @@ mod tests {
                 assert!(apart, "{a:?} on {b:?}");
             }
         }
+    }
+    /// Pinned windows are kept at the left, those pinned everywhere first,
+    /// with no part on another, and the others keep at least half the width.
+    #[test]
+    fn pinned_windows_go_left_of_the_others() {
+        let (area, gap) = ((2400.0, 900.0), 30.0);
+        let apart = |a: Part, b: Part| a.0 + a.2 <= b.0 + 0.5 || b.0 + b.2 <= a.0 + 0.5 || a.1 + a.3 <= b.1 + 0.5 || b.1 + b.3 <= a.1 + 0.5;
+        for (all, row, rest) in [(1, 0, 6), (4, 3, 2)] {
+            let parts = pin_parts(all, row, area, gap, 36.0, 0.0);
+            let a = parts.all.expect("a part for those pinned everywhere");
+            assert_eq!((a.0, a.1), (0.0, 0.0), "{all} {row} {rest}: {parts:?}");
+            assert!(parts.rest.2 >= area.0 / 2.0 && parts.rest.0 > a.0, "{parts:?}");
+            assert!(apart(a, parts.rest), "{parts:?}");
+            if let Some(r) = parts.row {
+                assert!(apart(a, r) && apart(r, parts.rest) && (r.0 > a.0 || r.1 > a.1), "{parts:?}");
+            }
+        }
+        // Fewer pinned windows, a narrower part.
+        assert!(pin_parts(1, 0, area, gap, 36.0, 0.0).rest.2 > pin_parts(4, 3, area, gap, 36.0, 0.0).rest.2);
+        // On a small screen no part is made narrower than a tile with its buttons.
+        let parts = pin_parts(1, 2, (1000.0, 600.0), 20.0, 24.0, 244.0);
+        assert!(parts.all.unwrap().2 >= 244.0 && parts.row.unwrap().2 >= 244.0, "{parts:?}");
     }
 }
