@@ -128,6 +128,18 @@ pub fn focus_top_window() {
     force_foreground(top.unwrap_or_else(|| unsafe { GetShellWindow() }));
 }
 
+/// The same for desktop `id`, which Windows may not be showing yet: it puts
+/// a switch asked of it off while an earlier one is still under way.
+pub fn focus_top_window_of(id: &str) {
+    let top = app_windows().into_iter().find(|hwnd| unsafe {
+        !IsIconic(*hwnd).as_bool()
+            && !is_shell_surface(*hwnd)
+            && (pinned_everywhere(*hwnd) || vdapi::get_desktop_by_window(*hwnd).is_ok_and(|desktop| desktop.id() == id))
+    });
+    debug_log!("vd: focus goes to {:x?}", top.map(|h| h.0));
+    force_foreground(top.unwrap_or_else(|| unsafe { GetShellWindow() }));
+}
+
 /// Asks a window to close, as its own close button would.
 /// False when Windows would not pass the request on, as it does not to a
 /// window run as administrator from an app that is not.

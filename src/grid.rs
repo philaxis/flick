@@ -97,6 +97,16 @@ impl Grid {
         }
     }
 
+    /// The cell `by` cells to the right of `origin` in its row (to the left
+    /// when negative), or the end of the row where it is not that long; and
+    /// how many cells the row has to the left and to the right of `origin`.
+    pub fn along(&self, origin: &str, by: i32) -> Option<(Pos, (usize, usize))> {
+        let from = self.find(origin)?;
+        let last = self.rows[from.row].cells.len() - 1;
+        let col = (from.col as i32).saturating_add(by).clamp(0, last as i32) as usize;
+        Some((Pos { row: from.row, col }, (from.col, last - from.col)))
+    }
+
     pub fn visit(&mut self, id: &str) {
         if let Some(pos) = self.find(id) {
             self.rows[pos.row].last = Some(id.to_owned());

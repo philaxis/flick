@@ -6,7 +6,7 @@ use crate::{
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
     grid::{self, Dir, Grid, Pos, Row},
-    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_STEP},
+    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
     tray::{self, Command, PinCommand, PinState, RowCommand},
@@ -36,9 +36,9 @@ use windows::{
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
-                IsIconic, IsWindow, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+                IsIconic, IsWindow, KillTimer, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
                 RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
-                MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
+                MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
                 WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_POWERBROADCAST,
                 WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
             },
@@ -73,8 +73,8 @@ const RECLAIM_TIMER_ID: usize = 7;
 /// For this long after the board opened, or a cell was added or removed in
 /// it, Windows may still hand the keyboard to a window of its own choosing.
 const BOARD_SETTLES_MS: u64 = 1500;
-/// For this long after going to a cell from the board, Windows may go back
-/// to the cell left.
+/// For this long after going to a cell from the board, or letting go of the
+/// trigger on one, Windows may go back to the cell left.
 const GOING_SETTLES_MS: u64 = 700;
 const CONFIG_CHECK_MS: u32 = 2000;
 /// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
@@ -104,10 +104,14 @@ struct App {
     autostart: bool,
     /// When the config file that is in use was written.
     config_seen: Option<SystemTime>,
-    /// Steps are arriving from a held trigger; `unsettled` when one of them
-    /// left keyboard focus behind on the desktop it came from.
+    /// Steps are arriving from a held trigger; `unsettled` is the desktop gone
+    /// to when one of them left keyboard focus behind on the one it came from.
     in_gesture: bool,
-    unsettled: bool,
+    unsettled: Option<String>,
+    /// The stretch of sideways travel going on (which hold, and which
+    /// stretch of it) and the cell it began on: the hand is followed along
+    /// the row from there (`slide`).
+    sliding: Option<((u32, u8), String)>,
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
     following: HashSet<isize>,
@@ -201,7 +205,8 @@ impl App {
             autostart: false,
             config_seen: None,
             in_gesture: false,
-            unsettled: false,
+            unsettled: None,
+            sliding: None,
             following: HashSet::new(),
             pending_menu: None,
             pending_row_menu: None,
@@ -511,21 +516,57 @@ impl App {
         }
     }
 
-    /// The held trigger is travelling sideways: the minimap comes up at once
-    /// and follows the hand, before any step is taken.
-    fn show_drag(&mut self) {
-        if self.board.is_open() {
-            return;
-        }
-        if let Some(desktops) = self.sync() {
-            let view = self.view(&desktops.current);
-            self.minimap.show(view, None);
-        }
+    /// The held trigger is travelling sideways, and with `to` the hand has
+    /// come to that cell, counted from the one this stretch of the hold
+    /// (`key`) began on: the app goes there, in one go however many cells
+    /// away it is, or to the end of the row where the row is shorter.
+    /// Without `to` the minimap comes up, to follow the hand before any cell
+    /// is come to. Returns the cell the app is on, counted likewise, and how
+    /// many cells the row has to the left and to the right of the first.
+    fn slide(&mut self, key: (u32, u8), to: Option<i32>, carry: bool) -> Option<(i32, (usize, usize))> {
+        let began = self.sliding.take().filter(|(of, _)| *of == key).map(|(_, origin)| origin);
+        let (origin, on, room) = if self.board.is_open() {
+            // With the board open the gesture only moves the selection; the
+            // desktop changes once, when the board is confirmed.
+            let origin = began.unwrap_or_else(|| self.board.selected());
+            let (on, room) = match to {
+                Some(to) => self.board.select_along(&origin, to)?,
+                None => self.grid.along(&origin, 0)?,
+            };
+            debug_log!("app: the selection slides to {to:?}, the board being open");
+            (origin, on, room)
+        } else {
+            let desktops = self.sync()?;
+            let from = self.grid.find(&desktops.current)?;
+            let origin = began.filter(|origin| self.grid.find(origin).is_some()).unwrap_or_else(|| desktops.current.clone());
+            let (on, room) = match to {
+                Some(to) => self.grid.along(&origin, to)?,
+                None => (from, self.grid.along(&origin, 0)?.1),
+            };
+            match self.grid.id_at(on).cloned() {
+                Some(id) if on != from => {
+                    debug_log!("app: slide to {to:?}: from row {} cell {} to cell {}", from.row, from.col, on.col);
+                    self.go(&desktops, from, &id, carry);
+                }
+                // Nothing to go to: before the first cell, or pushing at the
+                // end of the row. The minimap shows where one is. Cells are
+                // only ever added in the board, with its + buttons.
+                _ => {
+                    debug_log!("app: slide to {to:?}: staying on row {} cell {}", from.row, from.col);
+                    let view = self.view(&desktops.current);
+                    self.minimap.show(view, None);
+                }
+            }
+            (origin, on, room)
+        };
+        self.sliding = Some((key, origin));
+        Some((on.col as i32 - room.0 as i32, room))
     }
 
     /// Switches from the cell at `from` to cell `to` and shows the minimap.
     fn go(&mut self, desktops: &Desktops, from: Pos, to: &str, carry: bool) {
         let Some(target) = desktops.get(to) else { return };
+        self.going = None;
         let window = unsafe { GetForegroundWindow() };
         let carried = carry
             && vd::is_app_window(window)
@@ -541,7 +582,7 @@ impl App {
         } else if self.in_gesture {
             // Mid-gesture more steps may follow at once; handing focus over
             // and saving wait until the trigger is let go (`finish_gesture`).
-            self.unsettled = true;
+            self.unsettled = Some(to.to_owned());
         } else {
             vd::focus_top_window();
         }
@@ -555,8 +596,11 @@ impl App {
     /// The trigger was released: do what the steps of the gesture put off.
     fn finish_gesture(&mut self) {
         if std::mem::take(&mut self.in_gesture) {
-            if std::mem::take(&mut self.unsettled) {
-                vd::focus_top_window();
+            // Windows may still be on its way there, a slow switch behind:
+            // a window of the desktop it shows yet would take it back.
+            if let Some(to) = self.unsettled.take() {
+                vd::focus_top_window_of(&to);
+                self.going = Some((to, Instant::now()));
             }
             self.save();
         }
@@ -565,20 +609,21 @@ impl App {
     /// The current desktop changed, by us or by Windows' own shortcuts.
     fn desktop_changed(&mut self, new: &str) {
         debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
-        // Windows went back on a cell just gone to from the board: it had
-        // given the keyboard to a window of the cell left. Go once more.
+        // Windows went back on a cell just gone to: it had given the keyboard
+        // to a window of the cell left, or was still on its way through the
+        // cells before it. Go there again.
         if let Some((target, when)) = self.going.take() {
-            if new != target && when.elapsed() < Duration::from_millis(GOING_SETTLES_MS) {
-                debug_log!("app: Windows went back, going to {} again", &target[..4.min(target.len())]);
-                if let Some(desktop) = Desktops::read().and_then(|d| d.get(&target)) {
-                    if self.switch(desktop) {
-                        vd::focus_top_window();
+            if when.elapsed() < Duration::from_millis(GOING_SETTLES_MS) {
+                self.going = Some((target.clone(), when));
+                if new != target {
+                    debug_log!("app: Windows went back, going to {} again", &target[..4.min(target.len())]);
+                    if let Some(desktop) = Desktops::read().and_then(|d| d.get(&target)) {
+                        if self.switch(desktop) {
+                            vd::focus_top_window_of(&target);
+                        }
                     }
+                    return;
                 }
-                return;
-            }
-            if new == target {
-                self.going = Some((target, when));
             }
         }
         let Some(desktops) = self.sync() else { return };
@@ -1153,15 +1198,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     app.in_gesture = true;
                     app.step(dir, app.carry_held())
                 });
-                // Dropped steps count as gone: the hand is not to be shown
-                // ahead of the cell for the rest of the hold.
-                input::step_taken(lparam.0 as u32, dir, taken.unwrap_or(true));
                 debug_log!("app: {dir:?} {} in {:?}", if taken.is_some() { "done" } else { "dropped, the app being busy" }, started.elapsed());
                 let _ = taken;
             }
         }
-        WM_DRAG => {
-            with_app(App::show_drag);
+        WM_SLIDE | WM_DRAG => {
+            let hold = lparam.0 as u32;
+            let (stretch, mut cell) = input::slide_of(wparam.0);
+            // Only where the hand is by now matters: of the cells it came to
+            // while the app was busy with one, the last is gone to, at once.
+            let mut next = MSG::default();
+            while message == WM_SLIDE
+                && PeekMessageW(&mut next, hwnd, WM_SLIDE, WM_SLIDE, PM_NOREMOVE).as_bool()
+                && (next.lParam.0 as u32, input::slide_of(next.wParam.0).0) == (hold, stretch)
+                && PeekMessageW(&mut next, hwnd, WM_SLIDE, WM_SLIDE, PM_REMOVE).as_bool()
+            {
+                cell = input::slide_of(next.wParam.0).1;
+            }
+            #[cfg(feature = "debug-log")]
+            let started = Instant::now();
+            let on = with_app(|app| {
+                app.in_gesture |= message == WM_SLIDE;
+                app.slide((hold, stretch), (message == WM_SLIDE).then_some(cell), app.carry_held())
+            });
+            // An app too busy to hear of it (a menu is up) is not asked
+            // again: it goes to where the hand is on hearing of the next cell.
+            if let Some((on, room)) = on.flatten() {
+                input::slide_shown(hold, stretch, on, Some(room));
+            }
+            debug_log!("app: slide {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
         }
         WM_CLICK => {
             #[cfg(feature = "debug-log")]

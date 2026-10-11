@@ -26,6 +26,8 @@ mod paint;
 #[cfg(windows)]
 mod settings;
 #[cfg(any(windows, test))]
+mod slide;
+#[cfg(any(windows, test))]
 mod tiles;
 #[cfg(windows)]
 mod tray;
