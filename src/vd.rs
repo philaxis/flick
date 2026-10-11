@@ -103,6 +103,20 @@ pub fn app_windows() -> Vec<HWND> {
 /// input state with the thread that currently owns the foreground.
 pub fn force_foreground(hwnd: HWND) {
     unsafe {
+        // Done again, Windows may take it for a window of the desktop left
+        // being given the keyboard, and go back there.
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        #[cfg(feature = "debug-log")]
+        {
+            let fg = GetForegroundWindow();
+            debug_log!(
+                "vd: foreground before {:x} on {:?}",
+                fg.0,
+                vdapi::get_desktop_by_window(fg).map(|d| d.id()[..4].to_owned()).ok()
+            );
+        }
         let me = GetCurrentThreadId();
         let other = GetWindowThreadProcessId(GetForegroundWindow(), None);
         let attach = other != 0 && other != me;

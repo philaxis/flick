@@ -83,6 +83,30 @@ const RECLAIM_TIMER_ID: usize = 7;
 /// One-shot timer that sorts the windows kept on top once more, after Windows
 /// has finished raising the one just clicked.
 const RESTACK_TIMER_ID: usize = 8;
+/// One-shot timer for a switch Windows never told of (`FLIGHT_MS`).
+const FLIGHT_TIMER_ID: usize = 9;
+/// A switch asked of Windows is taken as made after this long even when
+/// Windows has not told of it, so a cell waiting behind it is not kept waiting.
+const FLIGHT_MS: u32 = 1000;
+/// One-shot timer that goes on from a cell passed by (`App::go_on`).
+const ONWARD_TIMER_ID: usize = 10;
+/// How long Windows goes on showing a cell after telling it is there
+/// (250 was not always enough on a 23H2 PC with a busy CPU, 400 was).
+const ONWARD_MS: u32 = 400;
+
+/// Whether a window of desktop `id` has the keyboard.
+fn keyboard_held_on(id: &str) -> bool {
+    let window = unsafe { GetForegroundWindow() };
+    vdapi::get_desktop_by_window(window).is_ok_and(|desktop| desktop.id() == id)
+}
+
+fn onward_ms() -> u32 {
+    #[cfg(feature = "debug-log")]
+    if let Some(ms) = std::env::var("FLICK_T533_WAIT").ok().and_then(|v| v.parse().ok()) {
+        return ms;
+    }
+    ONWARD_MS
+}
 /// For this long after the board opened, or a cell was added or removed in
 /// it, Windows may still hand the keyboard to a window of its own choosing.
 const BOARD_SETTLES_MS: u64 = 1500;
@@ -123,6 +147,15 @@ struct App {
     /// to when one of them left keyboard focus behind on the one it came from.
     in_gesture: bool,
     unsettled: Option<String>,
+    /// The desktop Windows was last asked to switch to, until it tells of
+    /// having done so, and the cell to go to after it. A switch asked for
+    /// while another is under way makes Windows show the one before again
+    /// once it is there (a fast flick past a cell): so one at a time.
+    in_flight: Option<String>,
+    queued: Option<String>,
+    /// The trigger was let go of with a switch under way: the keyboard goes
+    /// to this cell once Windows is there.
+    focus_on_arrival: Option<String>,
     /// The stretch of sideways travel going on (which hold, and which
     /// stretch of it) and the cell it began on: the hand is followed along
     /// the row from there (`slide`).
@@ -242,6 +275,9 @@ impl App {
             config_seen: None,
             in_gesture: false,
             unsettled: None,
+            in_flight: None,
+            queued: None,
+            focus_on_arrival: None,
             sliding: None,
             rowing: None,
             following: HashSet::new(),
@@ -585,7 +621,8 @@ impl App {
             return true;
         }
         let Some(desktops) = self.sync() else { return true };
-        let Some(from) = self.grid.find(&desktops.current) else { return true };
+        let heading = self.heading(&desktops);
+        let Some(from) = self.grid.find(&heading) else { return true };
         match self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
             Some(to) => {
                 debug_log!("app: {dir:?} from row {} cell {}", from.row, from.col);
@@ -597,7 +634,7 @@ impl App {
                 // nothing else happens. Cells are only ever added in the
                 // board, with its + buttons.
                 debug_log!("app: {dir:?} from row {} cell {}: nothing that way", from.row, from.col);
-                let view = self.view(&desktops.current);
+                let view = self.view(&heading);
                 self.minimap.show(view, None);
                 false
             }
@@ -625,8 +662,9 @@ impl App {
             (origin, on, room)
         } else {
             let desktops = self.sync()?;
-            let from = self.grid.find(&desktops.current)?;
-            let origin = began.filter(|origin| self.grid.find(origin).is_some()).unwrap_or_else(|| desktops.current.clone());
+            let heading = self.heading(&desktops);
+            let from = self.grid.find(&heading)?;
+            let origin = began.filter(|origin| self.grid.find(origin).is_some()).unwrap_or_else(|| heading.clone());
             let (on, room) = match to {
                 Some(to) => self.grid.along(&origin, to)?,
                 None => (from, self.grid.along(&origin, 0)?.1),
@@ -641,7 +679,7 @@ impl App {
                 // only ever added in the board, with its + buttons.
                 _ => {
                     debug_log!("app: slide to {to:?}: staying on row {} cell {}", from.row, from.col);
-                    let view = self.view(&desktops.current);
+                    let view = self.view(&heading);
                     self.minimap.show(view, None);
                 }
             }
@@ -664,7 +702,8 @@ impl App {
             self.board.select_across(origin, to)?
         } else {
             let desktops = self.sync()?;
-            let from = self.grid.find(&desktops.current)?;
+            let heading = self.heading(&desktops);
+            let from = self.grid.find(&heading)?;
             let origin = began.unwrap_or(from.row);
             let (on, room) = self.grid.across(origin, to)?;
             match self.grid.id_at(on).cloned() {
@@ -676,7 +715,7 @@ impl App {
                 // where one is.
                 _ => {
                     debug_log!("app: rows to {to:+}: staying on row {}", from.row);
-                    let view = self.view(&desktops.current);
+                    let view = self.view(&heading);
                     self.minimap.show(view, None);
                 }
             }
@@ -697,16 +736,26 @@ impl App {
             && vdapi::is_window_on_current_desktop(window).unwrap_or(false)
             && vdapi::move_window_to_desktop(target, window).is_ok();
         self.bring_followers(desktops, to);
-        if !self.switch(target) {
+        if self.in_flight.is_some() {
+            debug_log!("app: {} waits for the switch under way", &to[..4.min(to.len())]);
+            self.queued = Some(to.to_owned());
+        } else if self.switch(target) {
+            self.take_off(to);
+        } else {
             return;
         }
         self.visit(to);
-        if carried {
+        // While Windows is still on its way elsewhere, focusing a window of
+        // this cell would be a switch of its own: that waits until it is here.
+        let waiting = self.queued.as_deref() == Some(to);
+        if carried && !waiting {
             vd::force_foreground(window);
         } else if self.in_gesture {
             // Mid-gesture more steps may follow at once; handing focus over
             // and saving wait until the trigger is let go (`finish_gesture`).
             self.unsettled = Some(to.to_owned());
+        } else if waiting {
+            self.focus_on_arrival = Some(to.to_owned());
         } else {
             vd::focus_top_window();
         }
@@ -717,14 +766,103 @@ impl App {
         self.minimap.show(view, Some(from));
     }
 
+    /// The cell the app is on or on its way to: moves are counted from there.
+    fn heading(&self, desktops: &Desktops) -> String {
+        self.queued.clone().or_else(|| self.in_flight.clone()).unwrap_or_else(|| desktops.current.clone())
+    }
+
+    /// Windows was just asked to switch to `to`.
+    fn take_off(&mut self, to: &str) {
+        self.in_flight = Some(to.to_owned());
+        unsafe {
+            SetTimer(self.hwnd, FLIGHT_TIMER_ID, FLIGHT_MS, None);
+        }
+    }
+
+    /// Windows is on `new` (or is taken to be, `FLIGHT_MS` having passed):
+    /// the switch under way is over, and the cell waiting behind it is
+    /// switched to. True when that is under way, the cell come to only
+    /// being passed by.
+    fn land(&mut self, new: &str) -> bool {
+        if self.in_flight.take().is_none() {
+            return false;
+        }
+        unsafe {
+            let _ = KillTimer(self.hwnd, FLIGHT_TIMER_ID);
+        }
+        if self.queued.as_deref().is_some_and(|next| next != new) {
+            // Windows tells of a switch as it starts it. With a window of
+            // this cell holding the keyboard (one of Chromium's, as Orca's
+            // and the browsers' are), the next asked for before it is done
+            // showing this one brings it back here after.
+            self.in_flight = Some(new.to_owned());
+            let wait = if keyboard_held_on(new) { onward_ms() } else { 0 };
+            debug_log!("app: passing {}, on in {wait}ms", &new[..4.min(new.len())]);
+            if wait == 0 {
+                self.go_on();
+            } else {
+                unsafe {
+                    SetTimer(self.hwnd, ONWARD_TIMER_ID, wait, None);
+                }
+            }
+            return true;
+        }
+        self.queued = None;
+        if let Some(to) = self.focus_on_arrival.take() {
+            if to == new {
+                vd::focus_top_window_of(&to);
+            }
+            // Windows may yet go back, or be elsewhere: `desktop_changed`
+            // goes there again.
+            self.going = Some((to, Instant::now()));
+        }
+        false
+    }
+
+    /// Windows is done showing the cell passed by (`land`): on to the one
+    /// waiting behind it.
+    fn go_on(&mut self) {
+        let Some(passed) = self.in_flight.clone() else { return };
+        if self.queued.as_deref().map_or(true, |next| next == passed) {
+            // The hand came back meanwhile: this is where it stays.
+            self.land(&passed);
+            return;
+        }
+        self.in_flight = None;
+        let Some(next) = self.queued.take() else { return };
+        if let Some(desktop) = Desktops::read().and_then(|d| d.get(&next)) {
+            debug_log!("app: on to {}", &next[..4.min(next.len())]);
+            if self.switch(desktop) {
+                return self.take_off(&next);
+            }
+        }
+        self.land_failed(&passed);
+    }
+
+    /// The switch on from a cell passed by was not made: the app stays there.
+    fn land_failed(&mut self, passed: &str) {
+        self.focus_on_arrival = None;
+        if let Some(desktops) = self.sync() {
+            self.visit(passed);
+            let view = self.view(&desktops.current);
+            self.minimap.update(view);
+        }
+    }
+
     /// The trigger was released: do what the steps of the gesture put off.
     fn finish_gesture(&mut self) {
         if std::mem::take(&mut self.in_gesture) {
             // Windows may still be on its way there, a slow switch behind:
             // a window of the desktop it shows yet would take it back.
             if let Some(to) = self.unsettled.take() {
-                vd::focus_top_window_of(&to);
-                self.going = Some((to, Instant::now()));
+                if self.in_flight.is_some() {
+                    // Focusing a window of a cell Windows is not on yet
+                    // would be one more switch on top of the one under way.
+                    self.focus_on_arrival = Some(to);
+                } else {
+                    vd::focus_top_window_of(&to);
+                    self.going = Some((to, Instant::now()));
+                }
             }
             self.save();
         }
@@ -733,6 +871,14 @@ impl App {
     /// The current desktop changed, by us or by Windows' own shortcuts.
     fn desktop_changed(&mut self, new: &str) {
         debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
+        #[cfg(feature = "debug-log")]
+        {
+            let fg = unsafe { GetForegroundWindow() };
+            debug_log!("app: foreground {:x} on {:?}", fg.0, vdapi::get_desktop_by_window(fg).map(|d| d.id()[..4].to_owned()).ok());
+        }
+        if self.land(new) {
+            return;
+        }
         // Windows went back on a cell just gone to: it had given the keyboard
         // to a window of the cell left, or was still on its way through the
         // cells before it. Go there again.
@@ -1475,6 +1621,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(|app| {
                 if app.board.is_open() {
                     vd::force_foreground(app.board.hwnd());
+                }
+            });
+        }
+        WM_TIMER if wparam.0 == ONWARD_TIMER_ID => {
+            let _ = KillTimer(hwnd, ONWARD_TIMER_ID);
+            with_app(App::go_on);
+        }
+        WM_TIMER if wparam.0 == FLIGHT_TIMER_ID => {
+            let _ = KillTimer(hwnd, FLIGHT_TIMER_ID);
+            with_app(|app| {
+                debug_log!("app: Windows did not tell of the switch, taken as made");
+                if let Some(now) = Desktops::read().map(|d| d.current) {
+                    if !app.land(&now) {
+                        app.desktop_changed(&now);
+                    }
                 }
             });
         }
