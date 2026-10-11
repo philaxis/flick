@@ -29,6 +29,8 @@ pub const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Ru
 pub enum Command {
     Peek = 1,
     Settings,
+    /// Opens the window showing how Flick is used (`guide`).
+    Guide,
     /// Shows where the record of a debug build is (see `debuglog`).
     DebugLog,
     Exit,
@@ -125,6 +127,8 @@ pub fn menu(hwnd: HWND) -> Option<Command> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     add_item(menu, Command::Peek as usize, w!("Overview"), false);
     add_item(menu, Command::Settings as usize, w!("Settings…"), false);
+    let guide = HSTRING::from(crate::guide::words().menu);
+    add_item(menu, Command::Guide as usize, PCWSTR(guide.as_ptr()), false);
     if crate::debuglog::ON {
         add_item(menu, Command::DebugLog as usize, w!("Show the debug log file"), false);
     }
@@ -134,7 +138,9 @@ pub fn menu(hwnd: HWND) -> Option<Command> {
         let _ = SetForegroundWindow(hwnd);
     }
     let picked = pick(menu, hwnd);
-    [Command::Peek, Command::Settings, Command::DebugLog, Command::Exit].into_iter().find(|c| *c as usize == picked)
+    [Command::Peek, Command::Settings, Command::Guide, Command::DebugLog, Command::Exit]
+        .into_iter()
+        .find(|c| *c as usize == picked)
 }
 
 pub fn autostart_enabled() -> bool {

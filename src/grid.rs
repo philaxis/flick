@@ -70,6 +70,10 @@ pub struct Grid {
     /// so that it takes back only what it did itself, also after a restart.
     #[serde(default)]
     pub kept_on_top: Vec<(isize, String)>,
+    /// The window showing how Flick is used was closed once: it is not
+    /// shown by itself again.
+    #[serde(default)]
+    pub guide_seen: bool,
 }
 
 impl Grid {

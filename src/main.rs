@@ -13,6 +13,8 @@ mod admin;
 mod app;
 #[cfg(windows)]
 mod board;
+#[cfg(windows)]
+mod guide;
 #[cfg(any(windows, test))]
 mod hold;
 #[cfg(windows)]
@@ -67,6 +69,13 @@ fn main() {
             return app::render_settings(path);
         }
     }
+    // `--render-guide <file> <seconds>`: the first-run window that far into
+    // its playing.
+    if let [_, flag, path, seconds] = args.as_slice() {
+        if flag == "--render-guide" {
+            return app::render_guide(path, seconds.parse().unwrap_or(0.0));
+        }
+    }
     let flag = args.get(1).map(String::as_str);
     admin::set_portable(args.iter().any(|arg| arg == "--portable"));
     // What the settings run, as administrator, to turn that setting on or off.
@@ -100,11 +109,16 @@ fn main() {
     // One instance only: two sets of hooks would step twice per gesture. One
     // that is just quitting to let this one take over (the setting to run
     // as administrator was changed) is waited for a moment.
+    // Started again while it runs (as people do when nothing seems to have
+    // happened): the one running shows how it is used.
     let mut tries = 0;
     let _mutex = loop {
         let mutex = unsafe { CreateMutexW(None, true, w!("flick.single-instance")) };
         if unsafe { GetLastError() } != Err(ERROR_ALREADY_EXISTS.into()) {
             break mutex;
+        }
+        if tries == 0 {
+            app::show_guide_of_running();
         }
         tries += 1;
         if tries > 30 {

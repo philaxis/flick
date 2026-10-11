@@ -5,6 +5,7 @@ use crate::{
     admin,
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
+    guide::{self, Guide},
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
@@ -57,6 +58,8 @@ const WM_OPEN_SETTINGS: u32 = WM_APP + 12;
 /// Another window came to the front: the windows kept on top are put back
 /// in their order (`App::restack`).
 const WM_RESTACK: u32 = WM_APP + 13;
+/// Opens the window showing how Flick is used; sent by a second start.
+const WM_OPEN_GUIDE: u32 = WM_APP + 14;
 
 /// How long the minimap stays after the trigger is released and after a
 /// hotkey (which has no release to wait for).
@@ -106,6 +109,8 @@ struct App {
     /// still go back on it.
     going: Option<(String, Instant)>,
     settings: Settings,
+    /// The window showing how Flick is used; none in pictures drawn offscreen.
+    guide: Option<Guide>,
     /// The settings window is waiting for the new trigger to be pressed.
     capturing: bool,
     /// Set to run as administrator (`admin`), and to start with Windows.
@@ -150,6 +155,7 @@ thread_local! {
     /// borrowing the app.
     static BOARD_HWND: Cell<isize> = const { Cell::new(0) };
     static SETTINGS_HWND: Cell<isize> = const { Cell::new(0) };
+    static GUIDE_HWND: Cell<isize> = const { Cell::new(0) };
     /// The app's message window, for the hook told of windows coming to the front.
     static MAIN_HWND: Cell<isize> = const { Cell::new(0) };
 }
@@ -229,6 +235,7 @@ impl App {
             focus_before_board: HWND(0),
             going: None,
             settings,
+            guide: None,
             capturing: false,
             admin: false,
             autostart: false,
@@ -1155,6 +1162,34 @@ impl App {
         self.settings.close();
     }
 
+    fn open_guide(&mut self) {
+        if let Some(guide) = &mut self.guide {
+            guide.open();
+            vd::force_foreground(guide.hwnd());
+        }
+    }
+
+    /// Puts the guide away, for good unless asked for again, and points at
+    /// the tray icon it told of.
+    fn close_guide(&mut self) {
+        let Some(guide) = &mut self.guide else { return };
+        guide.close();
+        let (title, text) = guide.words().balloon;
+        tray::notify(self.hwnd, title, text);
+        if !self.grid.guide_seen {
+            self.grid.guide_seen = true;
+            self.save();
+        }
+    }
+
+    fn guide_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        match self.guide.as_mut()?.handle(message, wparam, lparam)? {
+            guide::Action::None => {}
+            guide::Action::Close => self.close_guide(),
+        }
+        Some(LRESULT(0))
+    }
+
     /// Starts or stops waiting for the user to press the new trigger.
     fn capture_trigger(&mut self, on: bool) {
         self.capturing = on;
@@ -1277,6 +1312,9 @@ fn on_tray_command(hwnd: HWND, command: Command) {
         Command::Settings => {
             with_app(App::open_settings);
         }
+        Command::Guide => {
+            with_app(App::open_guide);
+        }
         Command::DebugLog => unsafe {
             let select = HSTRING::from(format!("/select,\"{}\"", crate::debuglog::path().display()));
             ShellExecuteW(None, w!("open"), w!("explorer.exe"), &select, PCWSTR::null(), SW_SHOWNORMAL);
@@ -1299,6 +1337,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             return LRESULT(0);
         }
         let handled = with_app(|app| app.settings_message(message, wparam, lparam)).flatten();
+        return handled.unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam));
+    }
+    if hwnd.0 == GUIDE_HWND.get() {
+        if message == WM_CLOSE {
+            if with_app(App::close_guide).is_none() {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+            return LRESULT(0);
+        }
+        let handled = with_app(|app| app.guide_message(message, wparam, lparam)).flatten();
         return handled.unwrap_or_else(|| DefWindowProcW(hwnd, message, wparam, lparam));
     }
     if hwnd.0 == BOARD_HWND.get() {
@@ -1396,6 +1444,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_OPEN_SETTINGS => {
             with_app(App::open_settings);
+        }
+        WM_OPEN_GUIDE => {
+            with_app(App::open_guide);
         }
         WM_CAPTURED => {
             with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.capture_trigger(false) });
@@ -1572,7 +1623,7 @@ fn init() -> windows::core::Result<HWND> {
         }
         // Also when run as administrator: an installer of a newer version
         // closes it, and the test driver opens its settings.
-        admin::let_in(hwnd, &[WM_CLOSE, WM_OPEN_SETTINGS]);
+        admin::let_in(hwnd, &[WM_CLOSE, WM_OPEN_SETTINGS, WM_OPEN_GUIDE]);
         Ok(hwnd)
     }
 }
@@ -1593,6 +1644,11 @@ pub fn run(first_run: bool) {
         Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
     };
     SETTINGS_HWND.set(settings.hwnd().0);
+    let guide = match Guide::new(wndproc, tray::app_icon()) {
+        Ok(guide) => guide,
+        Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
+    };
+    GUIDE_HWND.set(guide.hwnd().0);
     if Desktops::read().is_none() {
         return warn("Flick could not reach the virtual desktops. This build of Windows may not be supported.");
     }
@@ -1617,6 +1673,7 @@ pub fn run(first_run: bool) {
         );
     }
     let mut app = App::new(hwnd, board, settings, events, listener);
+    app.guide = Some(guide);
     if let Some(desktops) = app.sync() {
         app.visit(&desktops.current);
         app.commit();
@@ -1628,7 +1685,10 @@ pub fn run(first_run: bool) {
     tray::add(hwnd, WM_TRAY);
     if first_run {
         tray::set_autostart(true);
-        tray::notify(hwnd, "Flick is running", "Hold the mouse forward button and move to go to the next cell; click it for the overview. Right-click this icon → Settings to change the button.");
+    }
+    // Until it has been seen once: how Flick is used, and where it is.
+    if !app.grid.guide_seen {
+        app.open_guide();
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
 
@@ -1743,6 +1803,25 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
 
 /// Renders the settings window showing the default settings into `path`
 /// (see `write_raw`), without showing it.
+/// Asks the Flick already running to show how it is used.
+pub fn show_guide_of_running() {
+    unsafe {
+        let running = windows::Win32::UI::WindowsAndMessaging::FindWindowW(crate::install::MAIN_CLASS, None);
+        if running.0 != 0 {
+            let _ = PostMessageW(running, WM_OPEN_GUIDE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Renders the guide `seconds` into its playing into `path` (see
+/// `write_raw`), without showing it.
+pub fn render_guide(path: &str, seconds: f32) {
+    let Ok(mut window) = Guide::new(wndproc, Default::default()) else { return };
+    if let Some((size, pixels)) = window.render_to_pixels(seconds, 1.5) {
+        write_raw(path, size, &pixels);
+    }
+}
+
 pub fn render_settings(path: &str) {
     let Ok(mut window) = Settings::new(wndproc, Default::default()) else { return };
     let config = Config::default();
