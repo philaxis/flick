@@ -60,6 +60,23 @@ windows = { version = "0.52", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Only for examples/spaces.rs (a sliding desktop-switch prototype); with
+# resolver 2 these features do not reach the app's own build.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+] }
+
 [profile.release]
 opt-level = "s"
 lto = true
