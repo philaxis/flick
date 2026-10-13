@@ -1828,7 +1828,8 @@ fn init() -> windows::core::Result<HWND> {
     }
 }
 
-pub fn run(first_run: bool) {
+/// `fresh`: installed just now for the first time, not updated.
+pub fn run(first_run: bool, fresh: bool) {
     std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     let hwnd = match init() {
         Ok(hwnd) => hwnd,
@@ -1886,11 +1887,23 @@ pub fn run(first_run: bool) {
     if first_run {
         tray::set_autostart(true);
     }
-    // Until it has been seen once: how Flick is used, and where it is.
-    if !app.grid.guide_seen {
-        app.open_guide();
-    }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
+    // A new install runs as administrator from the start (Windows asks
+    // once): run as the user, the trigger is not heard at all while a window
+    // run as administrator is in front. Declined, Flick goes on as it is.
+    if fresh && !admin::elevated() && !admin::enabled() {
+        with_app(|app| {
+            app.read_startup();
+            app.set_admin(true);
+        });
+    }
+    // Until it has been seen once: how Flick is used, and where it is. Not
+    // by one that has just handed over to the one run as administrator.
+    with_app(|app| {
+        if !app.grid.guide_seen && unsafe { IsWindow(app.hwnd) }.as_bool() {
+            app.open_guide();
+        }
+    });
 
     unsafe {
         let mut message = MSG::default();

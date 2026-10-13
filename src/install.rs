@@ -109,6 +109,8 @@ fn create_shortcut(exe: &Path) -> windows::core::Result<()> {
 pub fn install() -> std::io::Result<()> {
     stop_running();
     let exe = installed_exe();
+    // Not there before: a new install rather than an update.
+    let fresh = !exe.exists();
     fs::create_dir_all(install_dir(APP_NAME))?;
     // The old copy stays locked for a moment after its process has gone.
     let mut copied = fs::copy(std::env::current_exe()?, &exe);
@@ -145,7 +147,12 @@ pub fn install() -> std::io::Result<()> {
         let _ = fs::remove_dir_all(install_dir(old));
     }
 
-    Command::new(&exe).arg("--first-run").spawn()?;
+    let mut command = Command::new(&exe);
+    command.arg("--first-run");
+    if fresh {
+        command.arg("--fresh");
+    }
+    command.spawn()?;
     Ok(())
 }
 
