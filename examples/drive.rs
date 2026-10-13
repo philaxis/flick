@@ -311,6 +311,21 @@ fn main() {
                 }
                 let _ = EnumWindows(Some(each), LPARAM(0));
             }
+            Some("under") => {
+                // under: the window under the cursor, and who has the keyboard and the mouse capture.
+                use windows::Win32::Foundation::{HWND, POINT};
+                use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetCursorPos, GetGUIThreadInfo, WindowFromPoint, GUITHREADINFO};
+                let class = |h: HWND| {
+                    let mut c = [0u16; 64];
+                    let n = GetClassNameW(h, &mut c).max(0) as usize;
+                    format!("{:x}:{}", h.0, String::from_utf16_lossy(&c[..n]))
+                };
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let mut g = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+                let _ = GetGUIThreadInfo(0, &mut g);
+                println!("at {},{} under {} active {} focus {} capture {} flags {:x}", p.x, p.y, class(WindowFromPoint(p)), class(g.hwndActive), class(g.hwndFocus), class(g.hwndCapture), g.flags.0);
+            }
             Some("cursor") => {
                 let mut p = windows::Win32::Foundation::POINT::default();
                 let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);

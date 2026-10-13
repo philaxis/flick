@@ -51,7 +51,7 @@ use windows::{
             WindowsAndMessaging::{
                 CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
-                GetCursorPos, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
+                GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -152,6 +152,9 @@ const FOOTER: f32 = 44.0;
 /// The timer that runs while the cursor rests on a cell of the map, and how
 /// often it redraws the bar that shows how long it has.
 const DWELL_TIMER_ID: usize = 1;
+/// While the board is up, how often it checks that nothing came over it.
+const ON_TOP_TIMER_ID: usize = 2;
+const ON_TOP_MS: u32 = 250;
 const DWELL_TICK_MS: u32 = 30;
 /// The longest name a workspace can be given, in characters.
 const NAME_LENGTH: usize = 24;
@@ -408,6 +411,9 @@ pub struct Board {
     /// The headings of the parts the tiles are placed in, when pinned
     /// windows have a part of their own.
     sections: Vec<(Rect, &'static str)>,
+    /// Shell windows put out of the way while the board is open
+    /// (`keep_on_top`), to be given back when it closes.
+    pushed_aside: Vec<HWND>,
 }
 
 /// The parts of `area` the tiles go into: all in one, or when some windows
@@ -504,6 +510,7 @@ impl Board {
                 refused: None,
                 changed_at: None,
                 sections: Vec::new(),
+                pushed_aside: Vec::new(),
             })
         }
     }
@@ -580,6 +587,7 @@ impl Board {
         self.open = true;
         unsafe {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_SHOWWINDOW);
+            SetTimer(self.hwnd, ON_TOP_TIMER_ID, ON_TOP_MS, None);
         }
         self.set_model(model, grid);
     }
@@ -638,7 +646,11 @@ impl Board {
         self.press = None;
         unsafe {
             let _ = ReleaseCapture();
+            let _ = KillTimer(self.hwnd, ON_TOP_TIMER_ID);
             ShowWindow(self.hwnd, SW_HIDE);
+            for window in self.pushed_aside.drain(..) {
+                ShowWindow(window, SW_SHOWNOACTIVATE);
+            }
         }
     }
 
@@ -730,6 +742,51 @@ impl Board {
             self.hover = self.hit_test(self.cursor.0, self.cursor.1);
         }
         self.invalidate();
+    }
+
+    /// Puts the board back above a window that came up over it while it is
+    /// open. A few seconds after a desktop is made, the shell's window for
+    /// its little notices above the taskbar (a `XamlExplorerHostIslandWindow`,
+    /// the one of the desktop's name and the volume) comes over everything,
+    /// unseen, and takes the clicks and the hovering there: the lower rows of
+    /// the map and their + buttons stopped answering, and a click there
+    /// closed the board. Being the shell's, it stays above whatever is
+    /// raised; minimized it is out of the way (`vd::set_switch_label_hidden`).
+    fn keep_on_top(&mut self) {
+        unsafe {
+            let mut at = POINT::default();
+            if GetCursorPos(&mut at).is_err() {
+                return;
+            }
+            let under = WindowFromPoint(at);
+            if under == self.hwnd || GetAncestor(under, GA_ROOT) == self.hwnd {
+                return;
+            }
+            // Our own menus, questions and windows are over it on purpose.
+            let mut pid = 0;
+            GetWindowThreadProcessId(under, Some(&mut pid));
+            if self.modal || pid == windows::Win32::System::Threading::GetCurrentProcessId() {
+                return;
+            }
+            // Only what is over the board: a point off every screen has nothing of it.
+            let (x, y) = ((at.x - self.origin.0) as f32, (at.y - self.origin.1) as f32);
+            if !self.monitors.iter().any(|m| contains(m, x, y)) {
+                return;
+            }
+            let mut class = [0u16; 64];
+            let n = GetClassNameW(under, &mut class).max(0) as usize;
+            let class = String::from_utf16_lossy(&class[..n]);
+            debug_log!("board: {:x} {class} came over the board at {},{}", under.0, at.x, at.y);
+            if class == "XamlExplorerHostIslandWindow" {
+                // Without taking the keyboard from the board, nor giving it back.
+                ShowWindow(under, SW_SHOWMINNOACTIVE);
+                if !self.pushed_aside.contains(&under) {
+                    self.pushed_aside.push(under);
+                }
+            } else {
+                let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
     }
 
     fn invalidate(&self) {
@@ -1109,7 +1166,17 @@ impl Board {
             }
             WM_ERASEBKGND => return None,
             // Losing focus closes the board, except to its own confirmation box.
-            WM_ACTIVATE if wparam.0 & 0xFFFF == 0 && !self.modal => Action::Dismiss,
+            WM_ACTIVATE if wparam.0 & 0xFFFF == 0 && !self.modal => {
+                #[cfg(feature = "debug-log")]
+                {
+                    // Who took the keyboard: its class and program, never its title.
+                    let to = HWND(lparam.0);
+                    let mut class = [0u16; 64];
+                    let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(to, &mut class) }.max(0) as usize;
+                    debug_log!("board: keyboard taken by {:x} {} {:?}", to.0, String::from_utf16_lossy(&class[..n]), vd::exe_of_window(to));
+                }
+                Action::Dismiss
+            }
             WM_LBUTTONDOWN => self.mouse_down(x, y),
             WM_LBUTTONDBLCLK => {
                 if let Hit::RowName(r) = self.hit_test(x, y) {
@@ -1127,6 +1194,10 @@ impl Board {
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
+            WM_TIMER if wparam.0 == ON_TOP_TIMER_ID => {
+                self.keep_on_top();
+                Action::None
+            }
             WM_TIMER if wparam.0 == DWELL_TIMER_ID => {
                 self.rest_tick();
                 Action::None
@@ -1228,6 +1299,7 @@ impl Board {
 
     fn mouse_down(&mut self, x: f32, y: f32) -> Action {
         let hit = self.hit_test(x, y);
+        debug_log!("board: down on {:?} at {x:.0},{y:.0}", hit);
         self.cursor = (x, y);
         self.rest_on(None);
         self.press = Some(Press { hit, x, y, dragging: false });
@@ -1280,6 +1352,13 @@ impl Board {
             Hit::Cell(id) if *id != self.selected && self.dwell_ms > 0 && self.rested_at.is_none() && self.editing.is_none() => Some(id.clone()),
             _ => None,
         };
+        #[cfg(feature = "debug-log")]
+        if let (Hit::Cell(id), None, true) = (&hover, &resting, hover != self.hover) {
+            debug_log!(
+                "board: no rest on {}: selected {}, just turned {}, editing {}, dwell {}",
+                &id[..4.min(id.len())], *id == self.selected, self.rested_at.is_some(), self.editing.is_some(), self.dwell_ms
+            );
+        }
         self.rest_on(resting);
         if hover != self.hover {
             self.hover = hover;
@@ -2092,4 +2171,43 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     layout.spine = rect(spine_x - gap / 2.0, rows_top - gap / 2.0, pitch, (y - rows_top).max(0.0));
     layout.add_row = rect(spine_x + (cell_w - plus) / 2.0, y - gap / 2.0 + 2.0 * s, plus, plus);
     layout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(cells: &[&str]) -> RowModel {
+        RowModel {
+            name: String::new(),
+            memory: 0,
+            asleep: false,
+            cells: cells.iter().map(|id| CellModel { id: id.to_string(), emphasised: false, windows: Vec::new() }).collect(),
+        }
+    }
+
+    fn overlaps(a: &Rect, b: &Rect) -> bool {
+        a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+    }
+
+    /// Every + of the map is on the screen and clear of every cell, so that
+    /// it can be seen and pointed at, whatever the rows' lengths and the
+    /// cells they are lined up on.
+    #[test]
+    fn plus_buttons_are_on_screen_and_off_the_cells() {
+        let rows = vec![row(&["a"]), row(&["b"]), row(&["c", "d", "e"]), row(&["f"]), row(&["g", "h"])];
+        let model = Model { rows, pinned: Vec::new(), current: "d".into() };
+        let size = (1920.0, 1200.0 - FOOTER);
+        for anchors in [vec![0, 0, 1, 0, 1], vec![0, 0, 2, 0, 0], vec![0, 0, 0, 0, 1]] {
+            let layout = layout_map(&model, &anchors, size, 1.0);
+            let screen = rect(0.0, 0.0, size.0, size.1);
+            let cells: Vec<&Rect> = layout.rows.iter().flat_map(|r| &r.cells).map(|c| &c.body).collect();
+            let pluses = layout.rows.iter().flat_map(|r| [&r.plus, &r.plus_left]).chain([&layout.add_row, &layout.add_row_top]);
+            for plus in pluses {
+                let inside = plus.left >= screen.left && plus.right <= screen.right && plus.top >= screen.top && plus.bottom <= screen.bottom;
+                assert!(inside, "a + off the screen with anchors {anchors:?}");
+                assert!(cells.iter().all(|c| !overlaps(c, plus)), "a + on a cell with anchors {anchors:?}");
+            }
+        }
+    }
 }
