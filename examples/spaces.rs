@@ -7,6 +7,8 @@
 //! such a slide would cost.
 //!   spaces info                  monitors, refresh rates, GPU
 //!   spaces capture [n]           cost of one picture of the screen, n times
+//!   spaces bench [frames]        the slide's per-frame GPU work into an
+//!                                off-screen texture: nothing is shown
 //!   spaces slide [ms] [switch <dir>] [shots <prefix>]
 //!       shows the slide for `ms` (default 3000) along a made-up hand path,
 //!       primary monitor only. `switch right|left|up|down` (up/down are a
@@ -30,6 +32,7 @@ fn main() {
             Some("info") => proto::info(),
             Some("capture") => proto::capture(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20)),
             Some("slide") => proto::slide(&args[2..]),
+            Some("bench") => proto::bench(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(600)),
             _ => {
                 println!("spaces info | capture [n] | slide [ms] [switch <dir>] [shots <prefix>]");
                 Ok(())
@@ -463,6 +466,41 @@ mod proto {
         let _ = DeleteDC(dc);
         ReleaseDC(None, screen);
         stats("GDI BitBlt to system memory", &mut gdi);
+        Ok(())
+    }
+
+    /// The per-frame work of the slide (two region copies of the whole
+    /// screen) into a texture no one sees, waited out each frame.
+    pub unsafe fn bench(n: usize) -> Result<()> {
+        let mem0 = private_mb();
+        let g = gpu()?;
+        let vid0 = g.video_mb();
+        let (now, next, back) = (g.texture(false)?, g.texture(false)?, g.texture(false)?);
+        g.gdi_snap(&now)?;
+        g.ctx.CopyResource(&next, &now);
+        g.finish()?;
+        let vid1 = g.video_mb();
+        let mem1 = private_mb();
+        let (w, h) = (g.width, g.height);
+        let me = GetCurrentProcess();
+        let cpu0 = cpu_ms(me);
+        let start = Instant::now();
+        let mut frames = vec![];
+        for i in 0..n {
+            let t = Instant::now();
+            let o = ((i as f64 / n as f64) * w as f64) as u32;
+            let b = |l: u32, r: u32| D3D11_BOX { left: l, top: 0, front: 0, right: r, bottom: h, back: 1 };
+            if o < w { g.ctx.CopySubresourceRegion(&back, 0, 0, 0, 0, &now, 0, Some(&b(o, w))); }
+            if o > 0 { g.ctx.CopySubresourceRegion(&back, 0, w - o, 0, 0, &next, 0, Some(&b(0, o))); }
+            g.finish()?;
+            frames.push(ms(t.elapsed()));
+        }
+        let total = ms(start.elapsed());
+        let cpu = cpu_ms(me) - cpu0;
+        println!("primary {w}x{h}, {n} frames back to back in {total:.0} ms");
+        stats("GPU work per frame (submit + wait)", &mut frames);
+        println!("CPU of this process while doing so: {:.1}% of one core (busy-waits on the GPU)", cpu / total * 100.0);
+        println!("memory for two pictures + a frame: private +{:.1} MB, video {vid0:.1} -> {vid1:.1} MB", mem1 - mem0);
         Ok(())
     }
 
