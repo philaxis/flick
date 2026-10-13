@@ -30,9 +30,9 @@ use windows::{
             WindowsAndMessaging::{
                 EnumWindows, FindWindowExW, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-                IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
+                IsIconic, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
                 ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-                SWP_NOSIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_CLOSE,
+                SWP_NOSIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SMTO_ABORTIFHUNG, WINDOWPLACEMENT, WM_CLOSE, WM_NULL,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
@@ -47,9 +47,24 @@ pub struct Desktops {
 
 impl Desktops {
     pub fn read() -> Option<Self> {
-        let list = vdapi::get_desktops().ok()?.into_iter().map(|d| (d.id(), d)).collect();
-        let current = vdapi::get_current_desktop().ok()?.id();
-        Some(Desktops { list, current })
+        let read = || -> vdapi::Result<Self> {
+            let list = vdapi::get_desktops()?.into_iter().map(|d| (d.id(), d)).collect();
+            let current = vdapi::get_current_desktop()?.id();
+            Ok(Desktops { list, current })
+        };
+        read()
+            .map_err(|e| {
+                // Every move and the board start here: when this fails, the
+                // trigger does nothing at all. Said once a minute at most.
+                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                if now >= SAID.load(std::sync::atomic::Ordering::Relaxed) + 60 {
+                    SAID.store(now, std::sync::atomic::Ordering::Relaxed);
+                    crate::app::log(&format!("reading the virtual desktops failed: {e:?}"));
+                }
+                debug_log!("vd: reading the desktops failed: {e:?}");
+            })
+            .ok()
     }
 
     pub fn ids(&self) -> Vec<String> {
@@ -118,8 +133,13 @@ pub fn force_foreground(hwnd: HWND) {
             );
         }
         let me = GetCurrentThreadId();
-        let other = GetWindowThreadProcessId(GetForegroundWindow(), None);
-        let attach = other != 0 && other != me;
+        let foreground = GetForegroundWindow();
+        let other = GetWindowThreadProcessId(foreground, None);
+        // Sharing input with a thread that is not answering (a window still
+        // being opened, or hung) makes the focus change wait on it: the app
+        // would stand still, every trigger with it, until that thread answers.
+        let answering = SendMessageTimeoutW(foreground, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 100, None).0 != 0;
+        let attach = other != 0 && other != me && answering;
         if attach {
             let _ = AttachThreadInput(me, other, true);
         }

@@ -434,6 +434,9 @@ thread_local! {
     static CHORD_BEGAN: Cell<Option<Instant>> = const { Cell::new(None) };
     /// This process' integrity level, and those found of other processes.
     static LEVELS: RefCell<(Option<u32>, Vec<(u32, Option<u32>)>)> = const { RefCell::new((None, Vec::new())) };
+    /// The window that had the keyboard and the one under the cursor when
+    /// the hold began.
+    static PRESSED_OVER: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
 }
 
 /// Starts the hook thread (once) and gives it these settings.
@@ -607,6 +610,10 @@ fn press(source: Source) {
         RECENT.with(|recent| recent.borrow_mut().clear());
         LAST_ABSOLUTE.set(None);
         STRAYED.set(((0, 0), 0));
+        // Process ids come round again: a process found run as administrator
+        // in an earlier hold may be gone, and its id another's by now.
+        LEVELS.with(|levels| levels.borrow_mut().1.clear());
+        PRESSED_OVER.set(unsafe { (GetForegroundWindow().0, under_cursor().map_or(0, |window| window.0)) });
         listen_raw(true);
         WATCH_TIMER.set(unsafe { SetTimer(None, 0, WATCH_MS, Some(watch)) });
     }
@@ -664,6 +671,10 @@ pub fn above_us(window: HWND) -> bool {
     unsafe {
         GetWindowThreadProcessId(window, Some(&mut pid));
     }
+    // The window is gone.
+    if pid == 0 {
+        return false;
+    }
     LEVELS.with(|levels| {
         let mut levels = levels.borrow_mut();
         let ours = *levels.0.get_or_insert_with(|| unsafe { level_of(GetCurrentProcess()) }.unwrap_or(u32::MAX));
@@ -690,6 +701,22 @@ pub fn above_us(window: HWND) -> bool {
     })
 }
 
+fn under_cursor() -> Option<HWND> {
+    let mut cursor = POINT::default();
+    unsafe { GetCursorPos(&mut cursor).is_ok().then(|| WindowFromPoint(cursor)) }
+}
+
+/// Whether a window can keep the trigger's letting go from us: one run as
+/// administrator (`above`) that came there after the trigger went down.
+/// The window the trigger went down over, or with the keyboard, cannot: the
+/// hook saw it go down, so it sees it come up too. Taken for blind as well,
+/// a window run as administrator anywhere about, or one whose process cannot
+/// be asked (as a window just being opened), ended every hold at once: the
+/// trigger did nothing until a click elsewhere gave the keyboard away.
+fn hidden_by(now: isize, at_press: isize, above: impl FnOnce(isize) -> bool) -> bool {
+    now != at_press && above(now)
+}
+
 /// Why letting go of the trigger could not be seen right now, if so.
 fn blind() -> Option<&'static str> {
     unsafe {
@@ -700,13 +727,14 @@ fn blind() -> Option<&'static str> {
             }
             Err(_) => return Some("the screen is locked or asking for permission"),
         }
-        if above_us(GetForegroundWindow()) {
-            return Some("a window run as administrator has the keyboard");
-        }
-        let mut cursor = POINT::default();
-        if GetCursorPos(&mut cursor).is_ok() && above_us(WindowFromPoint(cursor)) {
-            return Some("the cursor is on a window run as administrator");
-        }
+    }
+    let (keyboard, cursor) = PRESSED_OVER.get();
+    let above = |window: isize| above_us(HWND(window));
+    if hidden_by(unsafe { GetForegroundWindow() }.0, keyboard, above) {
+        return Some("a window run as administrator has the keyboard");
+    }
+    if under_cursor().is_some_and(|window| hidden_by(window.0, cursor, above)) {
+        return Some("the cursor is on a window run as administrator");
     }
     None
 }
@@ -1131,4 +1159,23 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hidden_by;
+
+    /// A window run as administrator that already had the keyboard, or was
+    /// under the cursor, as the trigger went down must not end the hold: the
+    /// hook saw it go down there. One that came there since must.
+    #[test]
+    fn only_a_window_come_since_the_press_hides_the_letting_go() {
+        let admin = |_| true;
+        assert!(!hidden_by(7, 7, admin));
+        assert!(hidden_by(8, 7, admin));
+        assert!(!hidden_by(8, 7, |_| false));
+        // No window has the keyboard at the press, then one run as
+        // administrator gets it.
+        assert!(hidden_by(8, 0, admin));
+    }
 }

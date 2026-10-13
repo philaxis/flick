@@ -167,6 +167,15 @@ pub struct ComObjects {
     view_collection: RefCell<Option<Rc<IApplicationViewCollection>>>,
 }
 
+/// The shell (explorer.exe) that served the cached objects has gone, as on
+/// a restart of explorer: they must be made anew from the one there is now.
+fn shell_went_away(er: &Error) -> bool {
+    // RPC_E_DISCONNECTED, RPC_E_SERVER_DIED, RPC_E_SERVER_DIED_DNE,
+    // RPC_S_CALL_FAILED, RPC_S_CALL_FAILED_DNE
+    const GONE: [u32; 5] = [0x80010108, 0x80010007, 0x80010012, 0x800706BE, 0x800706BF];
+    matches!(er, Error::ComError(code) if GONE.contains(&(code.0 as u32)))
+}
+
 fn retry_function<F, R>(com_objects: &ComObjects, f: F) -> Result<R>
 where
     F: Fn() -> Result<R>,
@@ -179,7 +188,8 @@ where
                     || er == &Error::RpcServerNotAvailable
                     || er == &Error::ComObjectNotConnected
                     || er == &Error::ComAllocatedNullPtr
-                    || er == &Error::ComNotInitialized =>
+                    || er == &Error::ComNotInitialized
+                    || shell_went_away(er) =>
             {
                 #[cfg(debug_assertions)]
                 log_output(&format!("Retry the function after {:?}", er));
