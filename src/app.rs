@@ -394,30 +394,12 @@ impl App {
                 .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id) }).collect())
                 .collect(),
             anchors: self.grid.rows.iter().map(Row::anchor).collect(),
-            pinned: self.pinned_to_rows(current),
             cur,
             title: cur.map_or(String::new(), |pos| grid::row_title(&self.grid.rows[pos.row].name, pos.row)),
         }
     }
 
     // ---- windows that follow --------------------------------------------------
-
-    /// Per row, the windows pinned to it, one for each app, for the minimap.
-    fn pinned_to_rows(&self, current: &str) -> Vec<Vec<isize>> {
-        let mut rows = vec![Vec::new(); self.grid.rows.len()];
-        if self.following.is_empty() && self.grid.follow_apps.is_empty() {
-            return rows;
-        }
-        let mut apps: Vec<(usize, u32)> = Vec::new();
-        for window in vd::windows(current) {
-            let Some(pos) = self.grid.find(&window.desktop) else { continue };
-            if self.follows(&window) && !apps.contains(&(pos.row, window.pid)) {
-                apps.push((pos.row, window.pid));
-                rows[pos.row].push(window.hwnd.0);
-            }
-        }
-        rows
-    }
 
     fn follows(&self, window: &vd::WindowInfo) -> bool {
         self.following.contains(&window.hwnd.0)
@@ -1936,32 +1918,12 @@ pub fn render_sample(path: &str) {
             vec![CellView::default(); 3],
         ],
         anchors: vec![2, 1, 0],
-        pinned: made_up_pins(&[vec![], vec![0, 1], vec![2]]),
         title: "Workspace 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
     };
     if let Some((size, pixels)) = overlay.render_to_pixels(view, (0.0, 0.0), 2.0) {
         write_raw(path, size, &pixels);
     }
-}
-
-/// For pictures of the minimap: per row, some of the open windows (picked
-/// by their place among them, one per app) as if pinned to it.
-fn made_up_pins(picks: &[Vec<usize>]) -> Vec<Vec<isize>> {
-    // Reading the windows' desktops needs a backend.
-    if vdapi::select(false).is_none() {
-        return Vec::new();
-    }
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-    let mut apps = Vec::new();
-    let windows: Vec<isize> = vd::windows("")
-        .into_iter()
-        .filter(|w| !apps.contains(&w.pid) && { apps.push(w.pid); true })
-        .map(|w| w.hwnd.0)
-        .collect();
-    picks.iter().map(|row| row.iter().filter_map(|&i| windows.get(i).copied()).collect()).collect()
 }
 
 /// Plays a made-up hold through the minimap at 60 frames a second: one cell
@@ -1976,7 +1938,6 @@ pub fn render_minimap_strip(path: &str) {
     let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true }], cells(4), cells(2)];
     let smooth = |u: f32| u * u * (3.0 - 2.0 * u);
     let (dt, scale, gap) = (1.0 / 60.0, 1.5, 6);
-    let pins = made_up_pins(&[vec![], vec![0, 1], vec![], vec![2]]);
     let (mut came_col, mut came_row) = (None, None);
     let mut strip: Vec<((i32, i32), Vec<u8>)> = Vec::new();
     let mut record = String::new();
@@ -2004,7 +1965,6 @@ pub fn render_minimap_strip(path: &str) {
         let view = View {
             rows: rows.clone(),
             anchors: vec![1, view_col, 2, 1],
-            pinned: pins.clone(),
             cur: Some(cur),
             title: format!("Workspace {}", cur.row + 1),
         };

@@ -12,7 +12,6 @@ use crate::{
     vd,
 };
 use std::{
-    collections::HashMap,
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -21,7 +20,7 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
-            Direct2D::{Common::D2D1_ALPHA_MODE_PREMULTIPLIED, ID2D1Bitmap},
+            Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
             DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER},
             Dwm::DwmFlush,
             Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION},
@@ -50,11 +49,6 @@ const SETTLE_TAU: f32 = 0.045;
 const FADE_TAU: f32 = 0.025;
 /// How far past the end of its row the highlight is pushed, in cells.
 const EDGE_GIVE: f32 = 0.16;
-/// Size of the icons of the windows pinned to a row, and the room between them.
-const ICON: f32 = 16.0;
-const ICON_GAP: f32 = 3.0;
-/// Icons shown at most before a row; any more are left out.
-const ICONS: usize = 4;
 /// Cells shown either side of the highlight at most, sideways and up and
 /// down; the ones beyond fade out at the edge of the minimap.
 const REACH: usize = 3;
@@ -74,9 +68,6 @@ pub struct View {
     /// sideways so that these line up in one column.
     pub anchors: Vec<usize>,
     pub cur: Option<Pos>,
-    /// Per row, the windows pinned to it (one per app), shown as their icons
-    /// before its first cell. Windows pinned to every desktop are not shown.
-    pub pinned: Vec<Vec<isize>>,
     /// Name of the current workspace, shown under the grid.
     pub title: String,
 }
@@ -89,9 +80,7 @@ impl View {
     /// Cells shown either side of the highlight, sideways and up and down.
     fn reach(&self) -> (usize, usize) {
         let longest = self.rows.iter().map(Vec::len).max().unwrap_or(1);
-        // Room for the icons before the first cell, too.
-        let icons = self.pinned.iter().any(|row| !row.is_empty()) as usize;
-        (longest.saturating_sub(1).min(REACH).max(icons), self.rows.len().saturating_sub(1).min(REACH))
+        (longest.saturating_sub(1).min(REACH), self.rows.len().saturating_sub(1).min(REACH))
     }
 }
 
@@ -226,9 +215,6 @@ pub struct Overlay {
     /// Text format for the workspace name, made for `text_scale`.
     text: Option<IDWriteTextFormat>,
     text_scale: f32,
-    /// Icons of the windows pinned to rows, made at `text_scale`; `None` for
-    /// a window that has none.
-    icons: HashMap<isize, Option<ID2D1Bitmap>>,
     /// The bitmap the minimap is drawn into, remade when its size changes.
     canvas: Option<Dib>,
     view: View,
@@ -266,7 +252,6 @@ impl Overlay {
             target: DcTarget::new(&paint::d2d_factory()?, D2D1_ALPHA_MODE_PREMULTIPLIED)?,
             text: None,
             text_scale: 0.0,
-            icons: HashMap::new(),
             canvas: None,
             view: View::default(),
             views: 0,
@@ -401,9 +386,7 @@ impl Overlay {
         if self.text.is_none() || self.text_scale != self.scale {
             self.text = text_format(self.scale).ok();
             self.text_scale = self.scale;
-            self.icons.clear();
         }
-        self.load_icons();
         let size = self.wanted_size();
         if !self.canvas.as_ref().is_some_and(|canvas| canvas.size == size) {
             self.canvas = Dib::new(size).ok();
@@ -411,20 +394,6 @@ impl Overlay {
         let canvas = self.canvas.as_ref()?;
         self.draw(canvas).ok()?;
         Some(canvas)
-    }
-
-    /// Makes the icons of the windows pinned to rows that are not made yet,
-    /// and forgets those of windows no longer pinned.
-    fn load_icons(&mut self) {
-        let wanted: Vec<isize> = self.view.pinned.iter().flatten().copied().collect();
-        self.icons.retain(|hwnd, _| wanted.contains(hwnd));
-        let size = (ICON * self.scale).round() as i32;
-        for hwnd in wanted {
-            if !self.icons.contains_key(&hwnd) {
-                let icon = crate::board::icon_bitmap(&self.target.target, HWND(hwnd), size);
-                self.icons.insert(hwnd, icon);
-            }
-        }
     }
 
     /// Redraws the minimap and hands the picture to its windows.
@@ -497,19 +466,6 @@ impl Overlay {
                     emphasised.push((cell, shown));
                 } else {
                     p.fill(&cell, radius, white((0.08 + 0.09 * near) * shown));
-                }
-            }
-            // The windows pinned to the row, before its first cell.
-            let first = cell_at((x, down));
-            let (size, gap) = (ICON * s, ICON_GAP * s);
-            let icons = self.view.pinned.get(r).into_iter().flatten().filter_map(|hwnd| self.icons.get(hwnd)?.as_ref());
-            for (i, icon) in icons.take(ICONS).enumerate() {
-                let right = first.left - 2.0 * gap - i as f32 * (size + gap);
-                let middle = (right - size / 2.0 - mx) / ((CELL_W + GAP) * s);
-                let shown = fade(middle, reach_x) * fade(down, reach_y);
-                if shown > 0.0 {
-                    let area = rect(right - size, first.top + (ch - size) / 2.0, size, size);
-                    p.bitmap(icon, &area, (0.55 + 0.45 * near) * shown);
                 }
             }
         }
@@ -672,7 +628,6 @@ mod tests {
             rows: vec![vec![CellView::default(); 3], vec![CellView::default(); 2], vec![CellView::default(); 4]],
             anchors,
             cur: Some(cur),
-            pinned: Vec::new(),
             title: String::new(),
         };
         let mut camera = Camera::default();
