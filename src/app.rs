@@ -215,6 +215,26 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|app| app.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
+/// While a window run as administrator has the keyboard, Windows gives
+/// Flick's hook, and its raw input as well, nothing of the trigger: it does
+/// nothing until another window is clicked. Unless Flick runs as
+/// administrator itself, that is logged each time and told once a run.
+fn admin_in_front(window: HWND) {
+    thread_local! {
+        static TOLD: Cell<bool> = const { Cell::new(false) };
+    }
+    if crate::admin::elevated() || !input::above_us(window) {
+        return;
+    }
+    // One whose program cannot even be named is likely the system's own.
+    let Some(program) = vd::exe_of_window(window) else { return };
+    log(&format!("a window run as administrator ({program}) is in front: the trigger cannot be heard until another window has the keyboard"));
+    if !TOLD.replace(true) {
+        let (title, text) = crate::guide::words().admin_front;
+        tray::notify(HWND(MAIN_HWND.get()), title, text);
+    }
+}
+
 pub fn log(message: &str) {
     use std::io::Write;
     let path = config::config_path().with_file_name("log.txt");
@@ -1673,6 +1693,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_RESTACK => {
             with_app(|app| app.restack_clicked(HWND(wparam.0 as _)));
+            admin_in_front(HWND(wparam.0 as _));
             let _ = SetTimer(hwnd, RESTACK_TIMER_ID, 120, None);
         }
         WM_TIMER if wparam.0 == RESTACK_TIMER_ID => {
