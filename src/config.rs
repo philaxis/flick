@@ -13,7 +13,7 @@ pub const APP_NAME: &str = "Flick";
 const OLD_DIRS: [&str; 2] = ["KanKan", "desk2d"];
 
 const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them at once.
-# Trigger, angle and distances can also be changed in the window at tray icon → "Settings…".
+# Trigger and distances can also be changed in the window at tray icon → "Settings…".
 
 # The button to hold while moving the mouse to go from cell to cell. Several can be listed with commas.
 #   Mouse: "xbutton1" (back), "xbutton2" (forward), "middle" (wheel button)
@@ -29,9 +29,6 @@ step_y = 320
 # Up and down, each quick flick goes one workspace (two flicks go two; slowly bringing the hand back is ignored).
 # With false it keeps going by the distance moved, like sideways.
 vertical_sticky = true
-
-# The angle that counts as up or down: within this many degrees of straight up (or down). The rest is sideways.
-vertical_angle = 26.6
 
 # In the overview, resting the cursor on a cell of the map for this long (milliseconds) shows that cell's windows. 0 turns it off.
 dwell_ms = 500
@@ -56,9 +53,6 @@ pub struct Config {
     pub step_x: i32,
     pub step_y: i32,
     pub vertical_sticky: bool,
-    /// Degrees either side of straight up or down within which a movement
-    /// counts as vertical.
-    pub vertical_angle: f32,
     /// How long the cursor must rest on a cell of the board's map for the
     /// board to turn to that cell, in milliseconds; 0 for never.
     pub dwell_ms: u32,
@@ -74,8 +68,6 @@ impl Default for Config {
             step_x: 260,
             step_y: 320,
             vertical_sticky: true,
-            // 2:1, vertical to horizontal.
-            vertical_angle: 26.6,
             // Long enough that a cell passed over on the way to another is
             // not taken, short enough not to feel like waiting: about what
             // Windows waits before showing a taskbar preview or a tooltip.
@@ -86,9 +78,6 @@ impl Default for Config {
         }
     }
 }
-
-/// The narrowest and the widest `vertical_angle` made use of.
-pub const VERTICAL_ANGLES: (f32, f32) = (10.0, 70.0);
 
 /// The settings folder. One left by a version under an earlier name is taken
 /// over the first time this is asked for.
@@ -178,15 +167,16 @@ mod tests {
     /// Changing a setting from the settings window rewrites the user's file:
     /// their comments and other values must survive, a key that only starts
     /// like the one being set must not be mistaken for it, and a key missing
-    /// from an older file must be added.
+    /// from an older file must be added. A key no longer used, left in an
+    /// older file, must not stop the file from being read.
     #[test]
     fn setting_a_value_keeps_the_rest_of_the_file() {
         let file = "# mine\ntrigger_note = 1\ntrigger = \"xbutton2\"  # forward\n\nstep_x = 260\n";
         let changed = with_value(file, "trigger", "\"f13\"");
         assert_eq!(changed, "# mine\ntrigger_note = 1\ntrigger = \"f13\"\n\nstep_x = 260\n");
-        let added = with_value(&changed, "vertical_angle", "30");
-        assert_eq!(added, format!("{changed}vertical_angle = 30\n"));
-        let config: Config = toml::from_str(&added).unwrap();
-        assert_eq!((config.trigger.as_str(), config.step_x, config.vertical_angle), ("f13", 260, 30.0));
+        let added = with_value(&changed, "dwell_ms", "300");
+        assert_eq!(added, format!("{changed}dwell_ms = 300\n"));
+        let config: Config = toml::from_str(&format!("{added}vertical_angle = 26.6\n")).unwrap();
+        assert_eq!((config.trigger.as_str(), config.step_x, config.dwell_ms), ("f13", 260, 300));
     }
 }

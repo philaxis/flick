@@ -1,13 +1,12 @@
-//! The settings window: the directions of the gesture drawn as a dial, the
-//! trigger, the distances and whether to start with Windows.
+//! The settings window: the trigger, the distance, the hover preview and
+//! whether to start with Windows.
 //!
 //! It owns layout, hit-testing and drawing, in the look of the board. It
 //! changes nothing itself; what the user does is turned into an `Action` for
 //! the app, which answers with a new `View`.
 
 use crate::{
-    config::VERTICAL_ANGLES,
-    paint::{self, accent, on_circle, rect, rgba, white, Canvas, Painter, Rect},
+    paint::{self, accent, rect, white, Canvas, Painter, Rect},
     vd,
 };
 use windows::{
@@ -15,7 +14,7 @@ use windows::{
     Win32::{
         Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::{
-            Direct2D::{Common::D2D1_COLOR_F, ID2D1Factory, ID2D1RenderTarget},
+            Direct2D::{ID2D1Factory, ID2D1RenderTarget},
             DirectWrite::{
                 IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_TEXT_ALIGNMENT_TRAILING,
@@ -44,7 +43,8 @@ use windows::{
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
-const SIZE: (f32, f32) = (400.0, if UP_AND_DOWN_OF_ITS_OWN { 704.0 - ROWS.1 } else { 704.0 - 3.0 * ROWS.1 });
+/// Below the last row, the link to the file and a margin.
+const SIZE: (f32, f32) = (400.0, ROWS.0 + (6.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
 /// Whether up and down has settings of its own (a flick or a distance, and
 /// how much). Not now: rows go by distance, as far apart as cells. Kept
 /// hidden, and the keys in config.toml read and left alone, should that
@@ -52,10 +52,8 @@ const SIZE: (f32, f32) = (400.0, if UP_AND_DOWN_OF_ITS_OWN { 704.0 - ROWS.1 } el
 const UP_AND_DOWN_OF_ITS_OWN: bool = false;
 /// The rows below them move up into their place while they are hidden.
 const BELOW_UP_AND_DOWN: f32 = if UP_AND_DOWN_OF_ITS_OWN { 0.0 } else { 2.0 };
-/// The dial: its centre and its radius.
-const DIAL: ((f32, f32), f32) = ((200.0, 146.0), 104.0);
 /// Top of the first row and the height of each.
-const ROWS: (f32, f32) = (330.0, 46.0);
+const ROWS: (f32, f32) = (14.0, 46.0);
 /// Left edge of the labels and right edge of the controls.
 const EDGES: (f32, f32) = (28.0, 372.0);
 /// What the distance sliders span, and the step they move in.
@@ -70,8 +68,7 @@ pub struct View {
     pub trigger: String,
     /// Waiting for the user to press what the trigger should become.
     pub capturing: bool,
-    /// See `Config::vertical_angle`, `step_x`, `step_y`, `vertical_sticky`.
-    pub angle: f32,
+    /// See `Config::step_x`, `step_y`, `vertical_sticky`.
     pub step_x: i32,
     pub step_y: i32,
     pub sticky: bool,
@@ -84,7 +81,7 @@ pub struct View {
 pub enum Action {
     None,
     /// Use these for the gesture right away; a control is being dragged.
-    Try { angle: f32, step_x: i32, step_y: i32 },
+    Try { step_x: i32, step_y: i32 },
     /// Write a value to the config file: its key and the value as TOML.
     Set(&'static str, String),
     /// Start (or give up) waiting for a new trigger to be pressed.
@@ -99,7 +96,6 @@ pub enum Action {
 enum Hit {
     #[default]
     Nothing,
-    Dial,
     Trigger,
     StepX,
     /// One half of the vertical mode switch: flick (true) or distance.
@@ -112,7 +108,6 @@ enum Hit {
 
 /// Where the controls are, in pixels.
 struct Layout {
-    dial: ((f32, f32), f32),
     trigger: Rect,
     step_x: Rect,
     mode: [Rect; 2],
@@ -133,7 +128,6 @@ impl Layout {
         let half = (mode.right - mode.left) / 2.0;
         let up = BELOW_UP_AND_DOWN;
         Layout {
-            dial: ((DIAL.0 .0 * s, DIAL.0 .1 * s), DIAL.1 * s),
             trigger: right(0.0, 64.0, 30.0),
             step_x: slider(1.0),
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
@@ -144,15 +138,8 @@ impl Layout {
         }
     }
 
-    fn hit(&self, x: f32, y: f32, s: f32) -> Hit {
+    fn hit(&self, x: f32, y: f32) -> Hit {
         let inside = |r: &Rect| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
-        let (centre, radius) = self.dial;
-        // A little past the rim, where the handles stick out; not the very
-        // middle, where the direction of the cursor means nothing.
-        let out = (x - centre.0).hypot(y - centre.1);
-        if out >= 14.0 * s && out <= radius + 12.0 * s {
-            return Hit::Dial;
-        }
         [
             (&self.trigger, Hit::Trigger),
             (&self.step_x, Hit::StepX),
@@ -173,8 +160,6 @@ struct Fonts {
     label: IDWriteTextFormat,
     value: IDWriteTextFormat,
     button: IDWriteTextFormat,
-    heading: IDWriteTextFormat,
-    hint: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -184,15 +169,8 @@ impl Fonts {
             label: paint::text_format(&factory, 13.5 * s, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             value: paint::text_format(&factory, 13.5 * s, 600, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             button: paint::text_format(&factory, 12.5 * s, 600, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-            heading: paint::text_format(&factory, 17.0 * s, 600, DWRITE_TEXT_ALIGNMENT_CENTER)?,
-            hint: paint::text_format(&factory, 12.0 * s, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
         })
     }
-}
-
-/// The colour of the up and down slices of the dial.
-fn vertical(a: f32) -> D2D1_COLOR_F {
-    rgba(0.62, 0.45, 1.0, a)
 }
 
 pub struct Settings {
@@ -213,9 +191,6 @@ struct Press {
     hit: Hit,
     /// For a control that is dragged, its value when the button went down.
     before: f32,
-    /// For the dial, how far its angle was from the cursor's then: it is
-    /// dragged from wherever it is taken hold of, without jumping there.
-    offset: f32,
 }
 
 impl Settings {
@@ -373,7 +348,6 @@ impl Settings {
     /// The value of the control `hit` stands for, if it is one that is dragged.
     fn value(&self, hit: Hit) -> Option<f32> {
         match hit {
-            Hit::Dial => Some(self.view.angle),
             Hit::StepX => Some(self.view.step_x as f32),
             Hit::StepY => Some(self.view.step_y as f32),
             Hit::Dwell => Some(self.view.dwell_ms as f32),
@@ -381,16 +355,9 @@ impl Settings {
         }
     }
 
-    /// How many degrees the point is from straight up or down, as seen from
-    /// the middle of the dial.
-    fn degrees_at(&self, x: f32, y: f32) -> f32 {
-        let (centre, _) = Layout::new(self.scale).dial;
-        (x - centre.0).abs().atan2((y - centre.1).abs()).to_degrees()
-    }
-
     /// Moves the control that is being dragged along with the cursor.
-    fn drag(&mut self, x: f32, y: f32) -> Action {
-        let Some(Press { hit, offset, .. }) = self.press else { return Action::None };
+    fn drag(&mut self, x: f32) -> Action {
+        let Some(Press { hit, .. }) = self.press else { return Action::None };
         let layout = Layout::new(self.scale);
         let along = |track: &Rect, (low, high, step): (i32, i32, i32)| {
             let (from, to) = slider_ends(track, self.scale);
@@ -399,10 +366,6 @@ impl Settings {
         };
         let distance = |track: &Rect| along(track, DISTANCES);
         match hit {
-            Hit::Dial => {
-                let degrees = (self.degrees_at(x, y) + offset).round();
-                self.view.angle = degrees.clamp(VERTICAL_ANGLES.0, VERTICAL_ANGLES.1);
-            }
             Hit::StepX => self.view.step_x = distance(&layout.step_x),
             Hit::StepY => self.view.step_y = distance(&layout.step_y),
             Hit::Dwell => {
@@ -414,26 +377,26 @@ impl Settings {
             _ => return Action::None,
         }
         self.invalidate();
-        Action::Try { angle: self.view.angle, step_x: self.view.step_x, step_y: self.view.step_y }
+        Action::Try { step_x: self.view.step_x, step_y: self.view.step_y }
     }
 
     fn mouse_down(&mut self, x: f32, y: f32) -> Action {
-        let hit = Layout::new(self.scale).hit(x, y, self.scale);
+        let hit = Layout::new(self.scale).hit(x, y);
         let before = self.value(hit).unwrap_or(0.0);
-        self.press = Some(Press { hit, before, offset: self.view.angle - self.degrees_at(x, y) });
+        self.press = Some(Press { hit, before });
         unsafe {
             SetCapture(self.hwnd);
         }
         self.invalidate();
         // A slider's knob comes to where its track was pressed.
-        if hit == Hit::Dial { Action::None } else { self.drag(x, y) }
+        self.drag(x)
     }
 
     fn mouse_move(&mut self, x: f32, y: f32) -> Action {
         if self.press.is_some() {
-            return self.drag(x, y);
+            return self.drag(x);
         }
-        let hover = Layout::new(self.scale).hit(x, y, self.scale);
+        let hover = Layout::new(self.scale).hit(x, y);
         if hover != self.hover {
             self.hover = hover;
             self.invalidate();
@@ -460,14 +423,13 @@ impl Settings {
         if let Some(now) = self.value(hit) {
             // A drag ended: what it arrived at is kept.
             let key = match hit {
-                Hit::Dial => "vertical_angle",
                 Hit::StepX => "step_x",
                 Hit::Dwell => "dwell_ms",
                 _ => "step_y",
             };
             return if now == before { Action::None } else { Action::Set(key, format!("{now}")) };
         }
-        if Layout::new(self.scale).hit(x, y, self.scale) != hit {
+        if Layout::new(self.scale).hit(x, y) != hit {
             return Action::None;
         }
         match hit {
@@ -532,7 +494,6 @@ impl Settings {
         let s = self.scale;
         let layout = Layout::new(s);
         let view = &self.view;
-        self.draw_dial(&p, fonts, &layout)?;
 
         let row = |i: f32| rect(EDGES.0 * s, (ROWS.0 + i * ROWS.1) * s, (EDGES.1 - EDGES.0) * s, ROWS.1 * s);
         let label = |i: f32, text: &str| p.text(text, &fonts.label, &row(i), white(0.62));
@@ -580,44 +541,6 @@ impl Settings {
 
         let hot = self.hover == Hit::File;
         p.text("More settings: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
-        Ok(())
-    }
-
-    /// The directions of the gesture as the hooks tell them apart: up and
-    /// down are the slices `angle` degrees either side of vertical, sideways
-    /// is the rest. Dragging in the dial moves the boundaries.
-    fn draw_dial(&self, p: &Painter, fonts: &Fonts, layout: &Layout) -> Result<()> {
-        let s = self.scale;
-        let (centre, radius) = layout.dial;
-        let a = self.view.angle;
-        let active = self.hover == Hit::Dial || matches!(self.press, Some(Press { hit: Hit::Dial, .. }));
-        let slices = [(-a, a, true), (a, 180.0 - a, false), (180.0 - a, 180.0 + a, true), (180.0 + a, 360.0 - a, false)];
-        for (from, to, up_or_down) in slices {
-            let slice = paint::pie(&self.factory, centre, radius, from, to)?;
-            p.fill_shape(&slice, if up_or_down { vertical(0.80) } else { accent(0.30) });
-        }
-        // The four boundaries, each with a handle on the rim.
-        for degrees in [a, 180.0 - a, 180.0 + a, 360.0 - a] {
-            let rim = on_circle(centre, radius, degrees);
-            p.line(centre, rim, 2.0 * s, paint::backdrop());
-            p.disc(rim, if active { 7.0 } else { 5.5 } * s, paint::backdrop());
-            p.disc(rim, if active { 5.0 } else { 3.5 } * s, white(if active { 1.0 } else { 0.80 }));
-        }
-        p.disc(centre, 5.0 * s, paint::backdrop());
-        p.disc(centre, 2.5 * s, white(0.90));
-
-        let name = |text: &str, degrees: f32, out: f32| {
-            let at = on_circle(centre, radius * out, degrees);
-            p.text(text, &fonts.button, &rect(at.0 - 40.0 * s, at.1 - 12.0 * s, 80.0 * s, 24.0 * s), white(0.95));
-        };
-        name("Up", 0.0, 0.66);
-        name("Down", 180.0, 0.66);
-        name("Left", 270.0, 0.56);
-        name("Right", 90.0, 0.56);
-
-        let below = |top: f32, height: f32| rect(0.0, (DIAL.0 .1 + DIAL.1 + top) * s, SIZE.0 * s, height * s);
-        p.text(&format!("Up and down ±{a:.0}°"), &fonts.heading, &below(18.0, 26.0), white(0.92));
-        p.text("Drag an edge to change how wide up and down are", &fonts.hint, &below(44.0, 20.0), white(0.40));
         Ok(())
     }
 

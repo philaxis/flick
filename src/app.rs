@@ -1253,7 +1253,6 @@ impl App {
         settings::View {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
             capturing: self.capturing,
-            angle: self.config.vertical_angle,
             step_x: self.config.step_x,
             step_y: self.config.step_y,
             sticky: self.config.vertical_sticky,
@@ -1362,9 +1361,9 @@ impl App {
     fn settings_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match self.settings.handle(message, wparam, lparam)? {
             settings::Action::None => {}
-            settings::Action::Try { angle, step_x, step_y } => {
+            settings::Action::Try { step_x, step_y } => {
                 // Felt at once while dragging; written when the drag ends.
-                let config = Config { vertical_angle: angle, step_x, step_y, ..self.config.clone() };
+                let config = Config { step_x, step_y, ..self.config.clone() };
                 input::install(self.hwnd, triggers(&config).0, &config);
             }
             settings::Action::Set(key, value) => self.set_config(key, &value),
@@ -2065,7 +2064,6 @@ pub fn render_settings(path: &str) {
     let view = settings::View {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
-        angle: config.vertical_angle,
         step_x: config.step_x,
         step_y: config.step_y,
         sticky: config.vertical_sticky,
