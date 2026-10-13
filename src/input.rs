@@ -106,7 +106,7 @@ const PAIR_WINDOW_MS: u32 = 40;
 const DRAG_SHOWS: i32 = 24;
 
 // Where the hand is along the row, for the app to go there and for the
-// minimap to follow it between cells (`drag_offset`). Written by the hook
+// minimap to follow it between cells (`hand`). Written by the hook
 // thread, but for `SHOWN`, which the app writes as it gets there.
 /// A hold is going on, and which one it is (they are counted).
 static HOLDING: AtomicBool = AtomicBool::new(false);
@@ -159,16 +159,6 @@ fn shown() -> Option<(i32, Option<(i32, i32)>)> {
     (shown >> 24 == now).then(|| ((shown >> 16) as u8 as i8 as i32, (left != NO_ROOM).then_some((left, right))))
 }
 
-/// How far the hand is from the cell the app is showing, in cells (positive
-/// rightwards): cells not gone to yet and the way towards the next one.
-pub fn drag_offset() -> f32 {
-    if !HOLDING.load(Ordering::SeqCst) {
-        return 0.0;
-    }
-    let at = shown().map_or(0, |(cell, _)| cell);
-    (ASKED.load(Ordering::SeqCst) - at) as f32 + FRACTION.load(Ordering::SeqCst) as f32 / 1000.0
-}
-
 /// The row in the wparam of `WM_ROWS`.
 pub fn row_of(wparam: usize) -> i32 {
     wparam as u16 as i16 as i32
@@ -190,14 +180,55 @@ fn rows_seen() -> Option<(i32, (i32, i32))> {
         .then(|| ((shown >> 16) as u8 as i8 as i32, ((shown >> 8) as u8 as i32, shown as u8 as i32)))
 }
 
-/// How far the hand is from the row the app is showing, in rows (positive
-/// downwards), as `drag_offset` is along the row.
-pub fn row_offset() -> f32 {
-    if !HOLDING.load(Ordering::SeqCst) {
-        return 0.0;
+/// Bumped by the hook thread before and after it writes where the hand is,
+/// so that `hand` reads it whole: odd while a write is under way.
+static WRITING: AtomicU32 = AtomicU32::new(0);
+
+/// Writes where the hand is, as one piece for `hand`.
+fn writing(write: impl FnOnce()) {
+    WRITING.fetch_add(1, Ordering::SeqCst);
+    write();
+    WRITING.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Where the hand is, for the minimap to follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Hand {
+    /// How far the hand is from the cell the app is showing, in cells
+    /// (positive rightwards): cells not gone to yet and the way towards the
+    /// next one.
+    pub along: f32,
+    /// The same from row to row (positive downwards).
+    pub across: f32,
+    /// Changes whenever what `along` and `across` are counted from does (a
+    /// new hold or stretch, the app getting to a cell or a row): they may
+    /// jump then, with the hand itself still.
+    pub counted_from: u64,
+}
+
+/// Where the hand is now; nothing while no hold is going on.
+pub fn hand() -> Hand {
+    loop {
+        let before = WRITING.load(Ordering::SeqCst);
+        if before % 2 == 1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let holding = HOLDING.load(Ordering::SeqCst);
+        let (hold, stretch) = (HOLD_ID.load(Ordering::SeqCst), STRETCH.load(Ordering::SeqCst));
+        let (shown_raw, rows_raw) = (SHOWN.load(Ordering::SeqCst), ROWS_SHOWN.load(Ordering::SeqCst));
+        let along = (ASKED.load(Ordering::SeqCst) - shown().map_or(0, |(cell, _)| cell)) as f32 + FRACTION.load(Ordering::SeqCst) as f32 / 1000.0;
+        let across = (ROW_ASKED.load(Ordering::SeqCst) - rows_seen().map_or(0, |(row, _)| row)) as f32
+            + ROW_FRACTION.load(Ordering::SeqCst) as f32 / 1000.0;
+        if WRITING.load(Ordering::SeqCst) != before {
+            continue;
+        }
+        let mut counted_from = holding as u64 ^ (hold as u64) << 1 ^ (stretch as u64) << 33;
+        for part in [shown_raw, rows_raw] {
+            counted_from = counted_from.rotate_left(17) ^ part.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        return if holding { Hand { along, across, counted_from } } else { Hand { counted_from, ..Hand::default() } };
     }
-    let at = rows_seen().map_or(0, |(row, _)| row);
-    (ROW_ASKED.load(Ordering::SeqCst) - at) as f32 + ROW_FRACTION.load(Ordering::SeqCst) as f32 / 1000.0
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -598,14 +629,16 @@ fn press(source: Source) {
     let began = HELD.with(|held| held.borrow_mut().press(source));
     debug_log!("down {source:?}{}", if began { ": hold begins" } else { "" });
     if began {
-        HOLD_ID.fetch_add(1, Ordering::SeqCst);
-        STRETCH.store(0, Ordering::SeqCst);
+        writing(|| {
+            HOLD_ID.fetch_add(1, Ordering::SeqCst);
+            STRETCH.store(0, Ordering::SeqCst);
+            ROW_ASKED.store(0, Ordering::SeqCst);
+            ROW_FRACTION.store(0, Ordering::SeqCst);
+        });
         new_stretch();
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
         ROWS.set(Slide::new());
-        ROW_ASKED.store(0, Ordering::SeqCst);
-        ROW_FRACTION.store(0, Ordering::SeqCst);
         LAST_MOVE.set(None);
         RECENT.with(|recent| recent.borrow_mut().clear());
         LAST_ABSOLUTE.set(None);
@@ -903,10 +936,12 @@ const FLICK_PAUSE_MS: u128 = 70;
 /// Sideways travel begins anew, from the cell the app is on by then: at the
 /// start of a hold, and when the row changes.
 fn new_stretch() {
-    STRETCH.fetch_add(1, Ordering::SeqCst);
+    writing(|| {
+        STRETCH.fetch_add(1, Ordering::SeqCst);
+        ASKED.store(0, Ordering::SeqCst);
+        FRACTION.store(0, Ordering::SeqCst);
+    });
     SLIDE.set(Slide::new());
-    ASKED.store(0, Ordering::SeqCst);
-    FRACTION.store(0, Ordering::SeqCst);
     DRAGGING.set(false);
 }
 
@@ -923,8 +958,10 @@ fn sideways(s: &Settings, dx: i32, may_step: bool) {
     let before = slide.cell();
     slide.travel(dx, s.step_x, may_step);
     SLIDE.set(slide);
-    ASKED.store(slide.cell(), Ordering::SeqCst);
-    FRACTION.store(slide.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
+    writing(|| {
+        ASKED.store(slide.cell(), Ordering::SeqCst);
+        FRACTION.store(slide.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
+    });
     let stretch = STRETCH.load(Ordering::SeqCst);
     if slide.cell() != before {
         STEPPED.set(true);
@@ -947,8 +984,10 @@ fn vertical(s: &Settings, dy: i32) {
     let before = rows.cell();
     rows.travel(dy, s.step_x, true);
     ROWS.set(rows);
-    ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
-    ROW_FRACTION.store(rows.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
+    writing(|| {
+        ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
+        ROW_FRACTION.store(rows.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
+    });
     if rows.cell() != before {
         new_stretch();
         STEPPED.set(true);

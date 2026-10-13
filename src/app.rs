@@ -7,7 +7,7 @@ use crate::{
     config::{self, Config},
     guide::{self, Guide},
     grid::{self, Dir, Grid, Pos, Row},
-    input::{self, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
+    input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
     stack::{self, Kind},
@@ -374,12 +374,30 @@ impl App {
                 .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id) }).collect())
                 .collect(),
             anchors: self.grid.rows.iter().map(Row::anchor).collect(),
+            pinned: self.pinned_to_rows(current),
             cur,
             title: cur.map_or(String::new(), |pos| grid::row_title(&self.grid.rows[pos.row].name, pos.row)),
         }
     }
 
     // ---- windows that follow --------------------------------------------------
+
+    /// Per row, the windows pinned to it, one for each app, for the minimap.
+    fn pinned_to_rows(&self, current: &str) -> Vec<Vec<isize>> {
+        let mut rows = vec![Vec::new(); self.grid.rows.len()];
+        if self.following.is_empty() && self.grid.follow_apps.is_empty() {
+            return rows;
+        }
+        let mut apps: Vec<(usize, u32)> = Vec::new();
+        for window in vd::windows(current) {
+            let Some(pos) = self.grid.find(&window.desktop) else { continue };
+            if self.follows(&window) && !apps.contains(&(pos.row, window.pid)) {
+                apps.push((pos.row, window.pid));
+                rows[pos.row].push(window.hwnd.0);
+            }
+        }
+        rows
+    }
 
     fn follows(&self, window: &vd::WindowInfo) -> bool {
         self.following.contains(&window.hwnd.0)
@@ -1884,12 +1902,98 @@ pub fn render_sample(path: &str) {
             vec![CellView::default(); 3],
         ],
         anchors: vec![2, 1, 0],
+        pinned: made_up_pins(&[vec![], vec![0, 1], vec![2]]),
         title: "Workspace 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
     };
-    if let Some((size, pixels)) = overlay.render_to_pixels(view, (1.0, 1.0), 2.0) {
+    if let Some((size, pixels)) = overlay.render_to_pixels(view, (0.0, 0.0), 2.0) {
         write_raw(path, size, &pixels);
     }
+}
+
+/// For pictures of the minimap: per row, some of the open windows (picked
+/// by their place among them, one per app) as if pinned to it.
+fn made_up_pins(picks: &[Vec<usize>]) -> Vec<Vec<isize>> {
+    // Reading the windows' desktops needs a backend.
+    if vdapi::select(false).is_none() {
+        return Vec::new();
+    }
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let mut apps = Vec::new();
+    let windows: Vec<isize> = vd::windows("")
+        .into_iter()
+        .filter(|w| !apps.contains(&w.pid) && { apps.push(w.pid); true })
+        .map(|w| w.hwnd.0)
+        .collect();
+    picks.iter().map(|row| row.iter().filter_map(|&i| windows.get(i).copied()).collect()).collect()
+}
+
+/// Plays a made-up hold through the minimap at 60 frames a second: one cell
+/// right, then one row down, the app getting to each 3 frames after the hand
+/// and the count of the hand catching up a frame after that. Every fourth
+/// frame goes side by side into `path` (see `write_raw`), and each frame's
+/// place of the grid into `path`.txt: the rows' first cells sideways and the
+/// first row down, in cells from the highlight.
+pub fn render_minimap_strip(path: &str) {
+    let Ok(mut overlay) = Overlay::new() else { return };
+    let cells = |n: usize| vec![CellView::default(); n];
+    let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true }], cells(4), cells(2)];
+    let smooth = |u: f32| u * u * (3.0 - 2.0 * u);
+    let (dt, scale, gap) = (1.0 / 60.0, 1.5, 6);
+    let pins = made_up_pins(&[vec![], vec![0, 1], vec![], vec![2]]);
+    let (mut came_col, mut came_row) = (None, None);
+    let mut strip: Vec<((i32, i32), Vec<u8>)> = Vec::new();
+    let mut record = String::new();
+    for frame in 0..60 {
+        let t = frame as f32;
+        // The hand, in the grid's cells: along row 1, a rest, down to row 2.
+        let col = 1.15 * smooth((t / 18.0).min(1.0));
+        let row = 1.0 + smooth(((t - 24.0) / 18.0).clamp(0.0, 1.0));
+        if col >= 0.6 && came_col.is_none() {
+            came_col = Some(frame);
+        }
+        if row >= 1.6 && came_row.is_none() {
+            came_row = Some(frame);
+        }
+        let after = |came: Option<i32>, by: i32| came.is_some_and(|at| frame >= at + by);
+        let (view_col, told_col) = (after(came_col, 3) as usize, after(came_col, 4) as usize);
+        let (view_row, told_row) = (1 + after(came_row, 3) as usize, 1 + after(came_row, 4) as usize);
+        let stretch = came_row.is_some() as u64;
+        let hand = Hand {
+            along: if stretch == 1 { 0.0 } else { col - told_col as f32 },
+            across: row - told_row as f32,
+            counted_from: stretch << 8 | (told_col as u64) << 4 | told_row as u64,
+        };
+        let cur = if view_row == 2 { Pos { row: 2, col: 2 } } else { Pos { row: 1, col: view_col } };
+        let view = View {
+            rows: rows.clone(),
+            anchors: vec![1, view_col, 2, 1],
+            pinned: pins.clone(),
+            cur: Some(cur),
+            title: format!("Workspace {}", cur.row + 1),
+        };
+        let Some((size, pixels, (xs, y))) = overlay.frame_to_pixels(view, hand, dt, scale) else { return };
+        let xs: Vec<String> = xs.iter().map(|x| format!("{x:+.3}")).collect();
+        record += &format!("frame {frame:2} cur {},{} hand {:+.3},{:+.3} rows x [{}] y {y:+.3}\n", cur.row, cur.col, hand.along, hand.across, xs.join(" "));
+        if frame % 4 == 2 && strip.len() < 12 {
+            strip.push((size, pixels));
+        }
+    }
+    let _ = std::fs::write(format!("{path}.txt"), record);
+    let Some(&((w, h), _)) = strip.first() else { return };
+    let width = strip.len() as i32 * (w + gap) - gap;
+    let mut out = vec![0u8; (width * h * 4) as usize];
+    for (i, (_, pixels)) in strip.iter().enumerate() {
+        let left = i as i32 * (w + gap);
+        for y in 0..h {
+            let from = (y * w * 4) as usize;
+            let to = ((y * width + left) * 4) as usize;
+            out[to..to + (w * 4) as usize].copy_from_slice(&pixels[from..from + (w * 4) as usize]);
+        }
+    }
+    write_raw(path, (width, h), &out);
 }
 
 /// Renders the board for the real desktops and windows into `path` (see

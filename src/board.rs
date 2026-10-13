@@ -1904,7 +1904,7 @@ fn make_fonts(scale: f32) -> Result<Fonts> {
 }
 
 /// The window's icon as a Direct2D bitmap of `size` pixels.
-fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D1Bitmap> {
+pub fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D1Bitmap> {
     unsafe {
         let mut icon = 0usize;
         SendMessageTimeoutW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0), SMTO_ABORTIFHUNG, 40, Some(&mut icon));

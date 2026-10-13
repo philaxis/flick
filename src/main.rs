@@ -65,6 +65,9 @@ fn main() {
         if flag == "--render-board" {
             return app::render_board(path, None);
         }
+        if flag == "--render-minimap-strip" {
+            return app::render_minimap_strip(path);
+        }
         if flag == "--render-settings" {
             return app::render_settings(path);
         }
