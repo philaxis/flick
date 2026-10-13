@@ -27,8 +27,9 @@ use windows::{
             Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN},
             WindowsAndMessaging::{
                 CreateWindowExW, GetClientRect, IsWindowVisible, KillTimer, LoadCursorW, RegisterClassW, SetTimer,
-                SetWindowPos, ShowWindow, HICON, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-                SW_HIDE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER,
+                SetWindowPos, ShowWindow, HICON, HWND_TOPMOST, IDC_ARROW, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
+                SWP_SHOWWINDOW, SW_HIDE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MOUSEMOVE, WM_PAINT, WM_TIMER,
                 WNDCLASSW, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
             },
         },
@@ -197,6 +198,9 @@ pub struct Guide {
     /// Seconds into the playing, when drawn for a picture instead.
     frozen: Option<f32>,
     hover: bool,
+    /// The button was pressed and not let go yet: only a click that both
+    /// starts and ends on it puts the window away.
+    pressed: bool,
 }
 
 impl Guide {
@@ -247,6 +251,7 @@ impl Guide {
                 started: Instant::now(),
                 frozen: None,
                 hover: false,
+                pressed: false,
             })
         }
     }
@@ -264,10 +269,12 @@ impl Guide {
     }
 
     /// Shows the window in the middle of the primary monitor, playing from
-    /// the start.
-    pub fn open(&mut self) {
+    /// the start. Not `activate`d it leaves the keyboard where it is, so that
+    /// keys meant for another window (Enter, Esc) do not put it away unseen.
+    pub fn open(&mut self, activate: bool) {
         self.started = Instant::now();
         self.hover = false;
+        self.pressed = false;
         if self.is_open() {
             return self.invalidate();
         }
@@ -280,7 +287,8 @@ impl Guide {
             let _ = AdjustWindowRectExForDpi(&mut frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, false, WS_EX_TOPMOST, dpi);
             let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
             let (x, y) = ((home.work.left + home.work.right - w) / 2, (home.work.top + home.work.bottom - h) / 2);
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+            let quiet = if activate { SET_WINDOW_POS_FLAGS(0) } else { SWP_NOACTIVATE };
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW | quiet);
             SetTimer(self.hwnd, TIMER_ID, FRAME_MS, None);
         }
     }
@@ -331,7 +339,14 @@ impl Guide {
                 self.hover = on_button(&self.button());
                 Action::None
             }
-            WM_LBUTTONUP if on_button(&self.button()) => Action::Close,
+            WM_LBUTTONDOWN => {
+                self.pressed = on_button(&self.button());
+                Action::None
+            }
+            WM_LBUTTONUP => {
+                let clicked = std::mem::take(&mut self.pressed) && on_button(&self.button());
+                if clicked { Action::Close } else { Action::None }
+            }
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 || wparam.0 as u16 == VK_RETURN.0 => Action::Close,
             WM_DPICHANGED => {
                 self.set_scale((wparam.0 & 0xFFFF) as f32 / 96.0);

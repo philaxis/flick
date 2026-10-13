@@ -1328,10 +1328,15 @@ impl App {
         self.settings.close();
     }
 
-    fn open_guide(&mut self) {
+    /// Shows how Flick is used. `asked`: the user asked for it just now, and
+    /// it takes the keyboard; shown unasked (the first run), it does not, or
+    /// the Enter or Esc of what they were typing would put it away unseen.
+    fn open_guide(&mut self, asked: bool) {
         if let Some(guide) = &mut self.guide {
-            guide.open();
-            vd::force_foreground(guide.hwnd());
+            guide.open(asked);
+            if asked {
+                vd::force_foreground(guide.hwnd());
+            }
         }
     }
 
@@ -1479,7 +1484,7 @@ fn on_tray_command(hwnd: HWND, command: Command) {
             with_app(App::open_settings);
         }
         Command::Guide => {
-            with_app(App::open_guide);
+            with_app(|app| app.open_guide(true));
         }
         Command::DebugLog => unsafe {
             let select = HSTRING::from(format!("/select,\"{}\"", crate::debuglog::path().display()));
@@ -1612,7 +1617,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(App::open_settings);
         }
         WM_OPEN_GUIDE => {
-            with_app(App::open_guide);
+            with_app(|app| app.open_guide(true));
         }
         WM_CAPTURED => {
             with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.capture_trigger(false) });
@@ -1883,7 +1888,7 @@ pub fn run(first_run: bool, fresh: bool) {
     // by one that has just handed over to the one run as administrator.
     with_app(|app| {
         if !app.grid.guide_seen && unsafe { IsWindow(app.hwnd) }.as_bool() {
-            app.open_guide();
+            app.open_guide(false);
         }
     });
 
