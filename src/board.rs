@@ -253,6 +253,11 @@ struct RowLayout {
     /// The "add a cell" buttons after and before the row.
     plus: Rect,
     plus_left: Rect,
+    /// The apps of the windows pinned to the row, at the right of its label:
+    /// they are in whichever of its cells the user is, so no cell shows them.
+    pins: Vec<AppBadge>,
+    pins_more: usize,
+    pins_more_label: Rect,
 }
 
 /// One window of the selected cell, shown large with its title.
@@ -292,7 +297,7 @@ struct Map {
     layout: MapLayout,
 }
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default, Debug)]
 enum Hit {
     #[default]
     Nothing,
@@ -692,6 +697,7 @@ impl Board {
         if self.dwell.as_ref().map(|(id, _)| id) == cell.as_ref() {
             return;
         }
+        debug_log!("board: rest on {:?}", cell.as_deref().map(|id| &id[..4.min(id.len())]));
         self.dwell = cell.map(|id| (id, Instant::now()));
         unsafe {
             match self.dwell {
@@ -717,6 +723,7 @@ impl Board {
     fn rest_tick(&mut self) {
         let Some((id, _)) = self.dwell.clone() else { return self.rest_on(None) };
         if self.rested(&id).is_some_and(|share| share >= 1.0) {
+            debug_log!("board: rested on {}, turning to it", &id[..4.min(id.len())]);
             self.rest_on(None);
             self.rested_at = Some(self.cursor);
             self.select(id, false);
@@ -1259,6 +1266,10 @@ impl Board {
             return;
         }
         let hover = self.hit_test(x, y);
+        #[cfg(feature = "debug-log")]
+        if hover != self.hover {
+            debug_log!("board: hover {:?} at {x:.0},{y:.0}", hover);
+        }
         // Resting on a cell other than the one shown turns the board to it;
         // not on the cell the map put under the cursor by turning, though,
         // until the cursor has been moved.
@@ -1301,6 +1312,7 @@ impl Board {
             return action;
         }
         if self.hit_test(x, y) != press.hit {
+            debug_log!("board: click dropped, released on {:?} after pressing {:?}", self.hit_test(x, y), press.hit);
             return Action::None;
         }
         let near = |(at, cx, cy): (Instant, f32, f32)| at.elapsed().as_millis() < SECOND_CLICK_MS && (x - cx).hypot(y - cy) < 12.0 * self.scale;
@@ -1617,6 +1629,10 @@ impl Board {
         for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
             let in_selected_row = selected_row == Some(r);
             self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
+            self.draw_badges(p, fonts, &row.pins, 1.0);
+            if row.pins_more > 0 {
+                p.text(&format!("+{}", row.pins_more), &fonts.small, &row.pins_more_label, white(0.50));
+            }
             for cell in &row.cells {
                 self.draw_cell(p, fonts, cell, in_selected_row, drop_cell == Some(cell.id.as_str()));
             }
@@ -1648,7 +1664,8 @@ impl Board {
             let area = Rect { right: row.name.left + width.max(size(&row.name).0), ..row.name };
             p.fill(&grow(&area, 4.0 * s), 5.0 * s, white(if editing.is_some() { 0.12 } else { 0.06 }));
         }
-        let wide = Rect { right: row.header.right, ..row.name };
+        let right = row.pins.first().map_or(row.header.right, |b| b.icon.left - 8.0 * s);
+        let wide = Rect { right, ..row.name };
         p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 }));
     }
 
@@ -1691,15 +1708,7 @@ impl Board {
             let dot = rect(cell.body.left + 7.0 * s, cell.body.top + 7.0 * s, 6.0 * s, 6.0 * s);
             p.fill(&dot, 3.0 * s, accent(dim));
         }
-        for badge in &cell.apps {
-            match self.icons.get(&badge.hwnd.0) {
-                Some(bitmap) => p.bitmap(bitmap, &badge.icon, dim),
-                None => p.fill(&badge.icon, 4.0 * s, white(0.25 * dim)),
-            }
-            if badge.count > 1 {
-                p.text(&badge.count.to_string(), &fonts.small, &badge.label, white(0.75 * dim));
-            }
-        }
+        self.draw_badges(p, fonts, &cell.apps, dim);
         if cell.more > 0 {
             p.text(&format!("+{}", cell.more), &fonts.centered, &cell.more_label, white(0.50 * dim));
         }
@@ -1707,6 +1716,19 @@ impl Board {
             let hot = self.hover == Hit::CellClose(cell.id.clone());
             p.fill(&cell.close, 4.0 * s, if hot { danger(0.90) } else { rgba(0.2, 0.21, 0.25, 1.0) });
             p.text("✕", &fonts.centered, &cell.close, white(if hot { 1.0 } else { 0.75 }));
+        }
+    }
+
+    /// App icons, each with how many windows it has when more than one.
+    fn draw_badges(&self, p: &Painter, fonts: &Fonts, badges: &[AppBadge], dim: f32) {
+        for badge in badges {
+            match self.icons.get(&badge.hwnd.0) {
+                Some(bitmap) => p.bitmap(bitmap, &badge.icon, dim),
+                None => p.fill(&badge.icon, 4.0 * self.scale, white(0.25 * dim)),
+            }
+            if badge.count > 1 {
+                p.text(&badge.count.to_string(), &fonts.small, &badge.label, white(0.75 * dim));
+            }
         }
     }
 
@@ -1917,13 +1939,8 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
 /// app in the order its windows are stacked, centred in the cell: as many as
 /// fit, and how many did not.
 fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32) -> (Vec<AppBadge>, usize) {
-    let mut apps: Vec<(HWND, &str, usize)> = Vec::new();
-    for window in &cell.windows {
-        match apps.iter_mut().find(|(_, app, _)| *app == window.app.as_str() && !window.app.is_empty()) {
-            Some(entry) => entry.2 += 1,
-            None => apps.push((window.hwnd, window.app.as_str(), 1)),
-        }
-    }
+    // Windows pinned to the row are shown by the row (`layout_pins`).
+    let apps = group_apps(cell.windows.iter().filter(|w| !w.follows));
     let count_w = icon * 0.62;
     let width = |count: usize| icon + if count > 1 { count_w } else { 0.0 };
     let room = cell_w - 16.0 * s;
@@ -1949,6 +1966,53 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
         })
         .collect();
     (badges, apps.len() - shown)
+}
+
+/// One entry per app, in the order first met: a window of it, and how many.
+fn group_apps<'a>(windows: impl Iterator<Item = &'a WindowModel>) -> Vec<(HWND, &'a str, usize)> {
+    let mut apps: Vec<(HWND, &str, usize)> = Vec::new();
+    for window in windows {
+        match apps.iter_mut().find(|(_, app, _)| *app == window.app.as_str() && !window.app.is_empty()) {
+            Some(entry) => entry.2 += 1,
+            None => apps.push((window.hwnd, window.app.as_str(), 1)),
+        }
+    }
+    apps
+}
+
+/// The apps of the windows pinned to a row, lined up from the right end of
+/// its label leftwards, in at most `room`: the badges, how many did not fit,
+/// and where that number goes.
+fn layout_pins(row: &RowModel, header: &Rect, room: f32, icon: f32, s: f32) -> (Vec<AppBadge>, usize, Rect) {
+    let apps = group_apps(row.cells.iter().flat_map(|c| &c.windows).filter(|w| w.follows));
+    let count_w = icon * 0.62;
+    let between = 5.0 * s;
+    let more_w = 22.0 * s;
+    let width = |count: usize| icon + if count > 1 { count_w } else { 0.0 };
+    let y = header.top + (size(header).1 - icon) / 2.0;
+    let mut used = 0.0;
+    let mut shown = 0;
+    for (i, (_, _, count)) in apps.iter().enumerate() {
+        let reserve = if i + 1 < apps.len() { more_w } else { 0.0 };
+        let next = used + width(*count) + if shown > 0 { between } else { 0.0 };
+        if next + reserve > room {
+            break;
+        }
+        used = next;
+        shown += 1;
+    }
+    let more = apps.len() - shown;
+    let right = header.right - 8.0 * s - if more > 0 { more_w } else { 0.0 };
+    let mut x = right - used;
+    let badges = apps[..shown]
+        .iter()
+        .map(|&(hwnd, _, count)| {
+            let badge = AppBadge { hwnd, icon: rect(x, y, icon, icon), count, label: rect(x + icon + 1.0 * s, y, count_w, icon) };
+            x += width(count) + between;
+            badge
+        })
+        .collect();
+    (badges, more, rect(right + 2.0 * s, y, more_w, icon))
 }
 
 /// Lays out the map at the bottom of a monitor: rows top to bottom, each
@@ -2005,16 +2069,23 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
             });
             x += pitch;
         }
+        let header = rect(x0, y, header_w, cell_h);
+        // The pinned apps take at most half the label area, from its right.
+        let (pins, pins_more, pins_more_label) = layout_pins(row, &header, header_w / 2.0, icon, s);
+        let name_room = pins.first().map_or(header_w - 12.0 * s, |b| b.icon.left - x0 - 8.0 * s);
         // As wide as the name itself, so the clickable box matches what is read.
-        let name_w = (text_width(&grid::row_title(&row.name, r), 12.0 * s) + 4.0 * s).min(header_w - 12.0 * s);
+        let name_w = (text_width(&grid::row_title(&row.name, r), 12.0 * s) + 4.0 * s).min(name_room);
         layout.rows.push(RowLayout {
-            header: rect(x0, y, header_w, cell_h),
+            header,
             name: rect(x0, y + (cell_h - 20.0 * s) / 2.0, name_w, 20.0 * s),
             top: y - gap / 2.0,
             bottom: y + cell_h + gap / 2.0,
             cells,
             plus: rect(x, y + (cell_h - plus) / 2.0, plus, plus),
             plus_left: rect(first_x - gap - plus, y + (cell_h - plus) / 2.0, plus, plus),
+            pins,
+            pins_more,
+            pins_more_label,
         });
         y += row_pitch;
     }
