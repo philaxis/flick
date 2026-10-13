@@ -90,14 +90,6 @@ impl Default for Config {
 /// The narrowest and the widest `vertical_angle` made use of.
 pub const VERTICAL_ANGLES: (f32, f32) = (10.0, 70.0);
 
-impl Config {
-    /// How many times more vertical than horizontal a movement must be to
-    /// count as vertical.
-    pub fn vertical_bias(&self) -> f32 {
-        1.0 / self.vertical_angle.clamp(VERTICAL_ANGLES.0, VERTICAL_ANGLES.1).to_radians().tan()
-    }
-}
-
 /// The settings folder. One left by a version under an earlier name is taken
 /// over the first time this is asked for.
 fn dir() -> PathBuf {

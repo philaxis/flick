@@ -75,6 +75,50 @@ impl Slide {
             self.cell += self.rest(step).signum();
         }
     }
+
+    /// A new stretch from the cell this one has come to, the hand as far
+    /// on from it as it is now from this one: what it went towards the next
+    /// cell is not lost, and no cell come to here is come to again.
+    pub fn carried_on(&self, step: i32) -> Slide {
+        Slide { x: self.rest(step), cell: 0, room: None }
+    }
+}
+
+/// Where the hand is both ways in a hold: each way on its own, sideways
+/// counting only the hand's sideways travel and up and down only its up and
+/// down travel, so a hand going slantwise goes along the row and from row to
+/// row at once. A new row begins a new stretch along it (`Slide::carried_on`).
+#[derive(Clone, Copy, Debug)]
+pub struct Plane {
+    pub cols: Slide,
+    pub rows: Slide,
+}
+
+/// What one movement came to: another row, another cell along the row.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Moved {
+    pub row: bool,
+    pub cell: bool,
+}
+
+impl Plane {
+    pub const fn new() -> Plane {
+        Plane { cols: Slide::new(), rows: Slide::new() }
+    }
+
+    /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
+    /// sideways travel coming with a change of row goes on in the new row.
+    pub fn travel(&mut self, dx: i32, dy: i32, step: i32) -> Moved {
+        let row_before = self.rows.cell();
+        self.rows.travel(dy, step, true);
+        let row = self.rows.cell() != row_before;
+        if row {
+            self.cols = self.cols.carried_on(step);
+        }
+        let cell_before = self.cols.cell();
+        self.cols.travel(dx, step, true);
+        Moved { row, cell: self.cols.cell() != cell_before }
+    }
 }
 
 #[cfg(test)]
@@ -132,5 +176,40 @@ mod tests {
         turned.travel(-200, 260, true);
         turned.set_room(0, 1, 260);
         assert_eq!(turned.cell(), 1);
+    }
+
+    /// A hand going slantwise goes from row to row and along the row at
+    /// once, each as far as it would going that way alone; a hand going one
+    /// way, wavering a little, moves the other way not at all.
+    #[test]
+    fn each_way_follows_the_hand_on_its_own() {
+        // Two cells right and two rows down, in small slantwise movements.
+        let mut slant = Plane::new();
+        let (mut rows, mut cells) = (0, 0);
+        for _ in 0..104 {
+            let moved = slant.travel(5, 5, 260);
+            rows += moved.row as i32;
+            cells += moved.cell as i32;
+        }
+        assert_eq!(slant.rows.cell(), 2);
+        assert_eq!(rows, 2);
+        // The new rows began new stretches; what was gone along each one and
+        // towards the next cell was kept, so the cells add up to the travel.
+        assert_eq!(cells, 2);
+        // The last row was come to with the hand past the first cell: the
+        // stretch along it began one cell on.
+        assert_eq!((slant.cols.cell(), slant.cols.rest(260)), (1, 0));
+        // Straight down, wavering sideways: rows only.
+        let mut down = Plane::new();
+        for i in 0..70 {
+            assert!(!down.travel(if i % 2 == 0 { 30 } else { -30 }, 10, 260).cell);
+        }
+        assert_eq!((down.rows.cell(), down.cols.cell()), (3, 0));
+        // Straight across: cells only.
+        let mut across = Plane::new();
+        for _ in 0..70 {
+            assert!(!across.travel(10, 0, 260).row);
+        }
+        assert_eq!((across.rows.cell(), across.cols.cell()), (0, 3));
     }
 }

@@ -13,11 +13,10 @@ use crate::{
     config::Config,
     grid::Dir,
     hold::{Chord, Held, Source},
-    slide::Slide,
+    slide::Plane,
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
         Mutex,
@@ -102,7 +101,7 @@ const OWN_INPUT: usize = 0x4B41_4E4B;
 /// "type"), so a two-key chord has to be much more simultaneous than that.
 const CHORD_WINDOW_MS: u32 = 100;
 const PAIR_WINDOW_MS: u32 = 40;
-/// Sideways travel this far (pixels) into a hold brings the minimap up.
+/// Travel this far (pixels) either way into a hold brings the minimap up.
 const DRAG_SHOWS: i32 = 24;
 
 // Where the hand is along the row, for the app to go there and for the
@@ -347,9 +346,6 @@ struct Settings {
     /// How far the hand goes from one cell to the next, and from one row to
     /// the next alike.
     step_x: i32,
-    /// A movement counts as vertical only when it is this many times more
-    /// vertical than horizontal. Everything else is sideways.
-    vertical_bias: f32,
 }
 
 impl Settings {
@@ -362,10 +358,6 @@ impl Settings {
                 _ => None,
             })
             .unwrap_or_default()
-    }
-
-    fn is_vertical(&self, dx: i32, dy: i32) -> bool {
-        dy.abs() as f32 >= self.vertical_bias * dx.abs() as f32
     }
 }
 
@@ -433,13 +425,9 @@ thread_local! {
     static STEPPED: Cell<bool> = const { Cell::new(false) };
     /// The app was told of this hold travelling sideways (`WM_DRAG`).
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
-    /// Where the hand is along the row, in this stretch of the hold.
-    static SLIDE: Cell<Slide> = const { Cell::new(Slide::new()) };
-    /// Where the hand is up and down, in this hold.
-    static ROWS: Cell<Slide> = const { Cell::new(Slide::new()) };
-    static LAST_MOVE: Cell<Option<Instant>> = const { Cell::new(None) };
-    /// The last moments of travel: (when, dx, dy).
-    static RECENT: RefCell<VecDeque<(Instant, i32, i32)>> = const { RefCell::new(VecDeque::new()) };
+    /// Where the hand is up and down in this hold, and along the row in this
+    /// stretch of it.
+    static PLANE: Cell<Plane> = const { Cell::new(Plane::new()) };
     /// The hook thread's hidden window, which receives raw mouse input.
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
@@ -476,7 +464,6 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         target: target.0,
         triggers,
         step_x: config.step_x.max(20),
-        vertical_bias: config.vertical_bias(),
     });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
@@ -520,8 +507,8 @@ fn reload() {
     #[cfg(feature = "debug-log")]
     if let Some(s) = &settings {
         debug_log!(
-            "settings: triggers {:?}, step {}, vertical when dy >= {:.2} dx",
-            s.triggers, s.step_x, s.vertical_bias
+            "settings: triggers {:?}, step {}",
+            s.triggers, s.step_x
         );
     }
     // What was held under the old settings may not be a trigger any more.
@@ -631,16 +618,16 @@ fn press(source: Source) {
     if began {
         writing(|| {
             HOLD_ID.fetch_add(1, Ordering::SeqCst);
-            STRETCH.store(0, Ordering::SeqCst);
+            STRETCH.store(1, Ordering::SeqCst);
+            ASKED.store(0, Ordering::SeqCst);
+            FRACTION.store(0, Ordering::SeqCst);
             ROW_ASKED.store(0, Ordering::SeqCst);
             ROW_FRACTION.store(0, Ordering::SeqCst);
         });
-        new_stretch();
+        PLANE.set(Plane::new());
+        DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
-        ROWS.set(Slide::new());
-        LAST_MOVE.set(None);
-        RECENT.with(|recent| recent.borrow_mut().clear());
         LAST_ABSOLUTE.set(None);
         STRAYED.set(((0, 0), 0));
         // Process ids come round again: a process found run as administrator
@@ -927,119 +914,61 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-/// Which way the hand goes is judged over the last this-many milliseconds of
-/// travel.
-const FLICK_WINDOW_MS: u128 = 150;
-/// With no movement for this long the hand has stopped.
-const FLICK_PAUSE_MS: u128 = 70;
-
-/// Sideways travel begins anew, from the cell the app is on by then: at the
-/// start of a hold, and when the row changes.
-fn new_stretch() {
-    writing(|| {
-        STRETCH.fetch_add(1, Ordering::SeqCst);
-        ASKED.store(0, Ordering::SeqCst);
-        FRACTION.store(0, Ordering::SeqCst);
-    });
-    SLIDE.set(Slide::new());
-    DRAGGING.set(false);
-}
-
-/// The hand moved `dx` sideways. The app is told of the cell it has come to
-/// (`WM_SLIDE`) whenever that is another one: where the hand is, not that it
-/// took a step, so an app that was busy meanwhile goes straight to where the
-/// hand is by then rather than through every cell it passed. Without
-/// `may_step` the travel is kept but comes to no cell yet.
-fn sideways(s: &Settings, dx: i32, may_step: bool) {
-    let mut slide = SLIDE.get();
-    if let Some((_, Some((left, right)))) = shown() {
-        slide.set_room(left, right, s.step_x);
-    }
-    let before = slide.cell();
-    slide.travel(dx, s.step_x, may_step);
-    SLIDE.set(slide);
-    writing(|| {
-        ASKED.store(slide.cell(), Ordering::SeqCst);
-        FRACTION.store(slide.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
-    });
-    let stretch = STRETCH.load(Ordering::SeqCst);
-    if slide.cell() != before {
-        STEPPED.set(true);
-        debug_log!("slide: cell {} of stretch {stretch}", slide.cell());
-        post(s, WM_SLIDE, slide_wparam(stretch, slide.cell()));
-    }
-    if may_step && !DRAGGING.get() && (STEPPED.get() || slide.rest(s.step_x).abs() >= DRAG_SHOWS) {
-        DRAGGING.set(true);
-        post(s, WM_DRAG, slide_wparam(stretch, 0));
-    }
-}
-
-/// The hand moved `dy` up or down: as `sideways`, but from row to row, over
-/// the whole hold. Coming to another row begins a new stretch sideways.
-fn vertical(s: &Settings, dy: i32) {
-    let mut rows = ROWS.get();
-    if let Some((_, (up, down))) = rows_seen() {
-        rows.set_room(up, down, s.step_x);
-    }
-    let before = rows.cell();
-    rows.travel(dy, s.step_x, true);
-    ROWS.set(rows);
-    writing(|| {
-        ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
-        ROW_FRACTION.store(rows.rest(s.step_x) * 1000 / s.step_x, Ordering::SeqCst);
-    });
-    if rows.cell() != before {
-        new_stretch();
-        STEPPED.set(true);
-        debug_log!("rows: row {}", rows.cell());
-        post(s, WM_ROWS, rows.cell() as i16 as u16 as usize);
-    }
-    if !DRAGGING.get() && (STEPPED.get() || rows.rest(s.step_x).abs() >= DRAG_SHOWS) {
-        DRAGGING.set(true);
-        post(s, WM_DRAG, slide_wparam(STRETCH.load(Ordering::SeqCst), 0));
-    }
-}
-
 /// Adds mouse travel and emits steps.
 ///
-/// Both ways alike: one cell or one row per `step_x` of travel, as far as
-/// the hand goes (`sideways`, `vertical`). Each movement counts one way only,
-/// the way the last moments of travel went: the hand wavers on its way, and
-/// that does not move it to another row or cell.
+/// Both ways alike and each on its own (`Plane`): one cell or one row per
+/// `step_x` of travel, as far as the hand goes, sideways travel moving the
+/// hand along the row only and up and down travel from row to row only, so a
+/// hand going slantwise does both at once. The app is told of the row or the
+/// cell the hand has come to whenever that is another one (`WM_ROWS`,
+/// `WM_SLIDE`): where the hand is, not that it took a step, so an app that
+/// was busy meanwhile goes straight to where the hand is by then rather than
+/// through every cell it passed. Coming to another row begins a new stretch
+/// along the row, from the cell the app lands on there, with what the hand
+/// went towards the next cell kept.
 fn travel(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
-    let now = Instant::now();
-    let paused = LAST_MOVE.replace(Some(now)).is_some_and(|before| now.duration_since(before).as_millis() > FLICK_PAUSE_MS);
-    if paused {
-        debug_log!("(a pause)");
+    let step = s.step_x;
+    let mut plane = PLANE.get();
+    if let Some((_, (up, down))) = rows_seen() {
+        plane.rows.set_room(up, down, step);
     }
-    let (wx, wy) = RECENT.with(|recent| {
-        let mut recent = recent.borrow_mut();
-        // A stop starts a fresh stroke, which may go another way.
-        if paused {
-            recent.clear();
+    if let Some((_, Some((left, right)))) = shown() {
+        plane.cols.set_room(left, right, step);
+    }
+    let moved = plane.travel(dx, dy, step);
+    PLANE.set(plane);
+    let (rows, cols) = (plane.rows, plane.cols);
+    // In one piece for `hand`: a new stretch and where the hand is in it.
+    writing(|| {
+        if moved.row {
+            STRETCH.fetch_add(1, Ordering::SeqCst);
         }
-        recent.push_back((now, dx, dy));
-        while recent.front().is_some_and(|(at, _, _)| now.duration_since(*at).as_millis() > FLICK_WINDOW_MS) {
-            recent.pop_front();
-        }
-        recent.iter().fold((0, 0), |(x, y), (_, dx, dy)| (x + dx, y + dy))
+        ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
+        ROW_FRACTION.store(rows.rest(step) * 1000 / step, Ordering::SeqCst);
+        ASKED.store(cols.cell(), Ordering::SeqCst);
+        FRACTION.store(cols.rest(step) * 1000 / step, Ordering::SeqCst);
     });
-    let up_down = s.is_vertical(wx, wy);
-    if up_down {
-        vertical(s, dy);
-    } else {
-        sideways(s, dx, true);
+    let stretch = STRETCH.load(Ordering::SeqCst);
+    if moved.row {
+        // The app is told of the new stretch below, once it is on the row.
+        DRAGGING.set(false);
+        STEPPED.set(true);
+        debug_log!("rows: row {}", rows.cell());
+        post(s, WM_ROWS, rows.cell() as i16 as u16 as usize);
     }
-    debug_log!(
-        "move {dx} {dy}: last moments {wx} {wy} ({}), sideways {} and up and down {} of {}",
-        if up_down { "vertical" } else { "sideways" },
-        SLIDE.get().rest(s.step_x),
-        ROWS.get().rest(s.step_x),
-        s.step_x
-    );
+    if moved.cell {
+        STEPPED.set(true);
+        debug_log!("slide: cell {} of stretch {stretch}", cols.cell());
+        post(s, WM_SLIDE, slide_wparam(stretch, cols.cell()));
+    }
+    if !DRAGGING.get() && (STEPPED.get() || cols.rest(step).abs() >= DRAG_SHOWS || rows.rest(step).abs() >= DRAG_SHOWS) {
+        DRAGGING.set(true);
+        post(s, WM_DRAG, slide_wparam(stretch, 0));
+    }
+    debug_log!("move {dx} {dy}: sideways {} and up and down {} of {step}", cols.rest(step), rows.rest(step));
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.
