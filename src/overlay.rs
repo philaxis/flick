@@ -87,7 +87,9 @@ impl View {
 /// Where the grid is drawn: the highlight stays in the middle and the grid
 /// moves under it. The current row follows the hand sideways; the others
 /// stand with the cell a move up or down lands on (`View::anchors`) in line
-/// with the highlight. Up and down, the whole grid follows the hand.
+/// with the highlight. Up and down, the grid leans a little the way the hand
+/// is going and goes over to the next row in one quick move once it is come
+/// to (the row is a whole step in the goal, eased away).
 ///
 /// The hand's place is counted from the cell the app is on, which changes
 /// in a step, sometimes a frame or more apart from the count itself. What
@@ -104,6 +106,12 @@ struct Camera {
     /// What is left to ease away of jumps in the goal.
     rest_x: Vec<f32>,
     rest_y: f32,
+    /// Jumps put by in frames where what the goal is counted from changed,
+    /// to be eased from the next frame on: a frame drawn while the app's
+    /// view and the count of the hand disagree is taken back in the next,
+    /// and what is easing meanwhile goes on easing.
+    put_x: Vec<f32>,
+    put_y: f32,
     /// How fast the goal went, in cells a second, when last it went with
     /// nothing changing in a step.
     pace_x: Vec<f32>,
@@ -129,8 +137,8 @@ impl Camera {
         let Some(from) = from else { return Camera::default() };
         let was = View { cur: Some(from), ..view.clone() };
         let (goal_x, goal_y) = Camera::goals(&was, (0.0, 0.0));
-        let (rest_x, pace_x) = (vec![0.0; goal_x.len()], vec![0.0; goal_x.len()]);
-        Camera { goal_x, goal_y, rest_x, rest_y: 0.0, pace_x, pace_y: 0.0, counted_from: None }
+        let zeros = vec![0.0; goal_x.len()];
+        Camera { goal_x, goal_y, rest_x: zeros.clone(), rest_y: 0.0, put_x: zeros.clone(), put_y: 0.0, pace_x: zeros, pace_y: 0.0, counted_from: None }
     }
 
     /// One frame, `dt` seconds after the last. `counted_from` changes
@@ -140,18 +148,28 @@ impl Camera {
         if goal_x.len() != self.goal_x.len() {
             // Rows came or went: nothing to ease from.
             self.rest_x = vec![0.0; goal_x.len()];
+            self.put_x = vec![0.0; goal_x.len()];
             self.pace_x = vec![0.0; goal_x.len()];
-            (self.rest_y, self.pace_y) = (0.0, 0.0);
+            (self.rest_y, self.put_y, self.pace_y) = (0.0, 0.0, 0.0);
         } else if self.counted_from != Some(counted_from) {
             // The jump is put by, less the way the hand went meanwhile. Not
             // eased yet in this frame: the app tells the minimap of the cell
             // it got to a moment before it tells the count of the hand, and a
             // frame drawn in between is taken back in the next.
-            for (((rest, before), now), pace) in self.rest_x.iter_mut().zip(&self.goal_x).zip(&goal_x).zip(&self.pace_x) {
-                *rest += before + pace * dt - now;
+            for (((put, before), now), pace) in self.put_x.iter_mut().zip(&self.goal_x).zip(&goal_x).zip(&self.pace_x) {
+                *put += before + pace * dt - now;
             }
-            self.rest_y += self.goal_y + self.pace_y * dt - goal_y;
+            self.put_y += self.goal_y + self.pace_y * dt - goal_y;
+            let keep = (-dt / SETTLE_TAU).exp();
+            for rest in &mut self.rest_x {
+                *rest *= keep;
+            }
+            self.rest_y *= keep;
         } else {
+            for (rest, put) in self.rest_x.iter_mut().zip(&mut self.put_x) {
+                *rest += std::mem::take(put);
+            }
+            self.rest_y += std::mem::take(&mut self.put_y);
             if dt > 0.0 {
                 for ((pace, before), now) in self.pace_x.iter_mut().zip(&self.goal_x).zip(&goal_x) {
                     *pace = (now - before) / dt;
@@ -169,12 +187,13 @@ impl Camera {
 
     /// Where the first cell of `row` is drawn, in cells right of the highlight.
     fn x(&self, row: usize) -> f32 {
-        self.goal_x.get(row).copied().unwrap_or(0.0) + self.rest_x.get(row).copied().unwrap_or(0.0)
+        let at = |v: &Vec<f32>| v.get(row).copied().unwrap_or(0.0);
+        at(&self.goal_x) + at(&self.rest_x) + at(&self.put_x)
     }
 
     /// Where the first row is drawn, in rows below the highlight.
     fn y(&self) -> f32 {
-        self.goal_y + self.rest_y
+        self.goal_y + self.rest_y + self.put_y
     }
 }
 

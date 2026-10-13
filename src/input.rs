@@ -123,7 +123,8 @@ static SHOWN: AtomicU64 = AtomicU64::new(0);
 /// In place of the cells to either side, when the app could not say.
 const NO_ROOM: i32 = 0xFF;
 /// The same up and down, for the whole hold: the row the hand has come to,
-/// counted from the one the hold began on, how far it is from that row, and
+/// counted from the one the hold began on, how far the minimap leans towards
+/// the next one (`Detent::lean`) in thousandths of a row, and
 /// what the app last said (hold << 32 | row << 16 | rows above << 8 | rows
 /// below).
 static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
@@ -197,7 +198,9 @@ pub struct Hand {
     /// (positive rightwards): cells not gone to yet and the way towards the
     /// next one.
     pub along: f32,
-    /// The same from row to row (positive downwards).
+    /// From row to row (positive downwards): rows not gone to yet, and the
+    /// little the minimap leans towards the next one before the hand gets
+    /// there (`Detent::lean`).
     pub across: f32,
     /// Changes whenever what `along` and `across` are counted from does (a
     /// new hold or stretch, the app getting to a cell or a row): they may
@@ -918,8 +921,9 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
 
 /// Adds mouse travel and emits steps.
 ///
-/// Both ways alike and each on its own (`Plane`): one cell or one row per
-/// `step_x` of travel, as far as the hand goes, sideways travel moving the
+/// Each way on its own (`Plane`): one cell per `step_x` of travel as far as
+/// the hand goes, and one row each time up and down travel gathers `step_y`
+/// (by notches, `Detent`), sideways travel moving the
 /// hand along the row only and up and down travel from row to row only, so a
 /// hand going slantwise does both at once. The app is told of the row or the
 /// cell the hand has come to whenever that is another one (`WM_ROWS`,
@@ -935,7 +939,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     let (step, step_y) = (s.step_x, s.step_y);
     let mut plane = PLANE.get();
     if let Some((_, (up, down))) = rows_seen() {
-        plane.rows.set_room(up, down, step_y);
+        plane.rows.set_room(up, down);
     }
     if let Some((_, Some((left, right)))) = shown() {
         plane.cols.set_room(left, right, step);
@@ -949,7 +953,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
             STRETCH.fetch_add(1, Ordering::SeqCst);
         }
         ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
-        ROW_FRACTION.store(rows.rest(step_y) * 1000 / step_y, Ordering::SeqCst);
+        ROW_FRACTION.store((rows.lean(step_y) * 1000.0) as i32, Ordering::SeqCst);
         ASKED.store(cols.cell(), Ordering::SeqCst);
         FRACTION.store(cols.rest(step) * 1000 / step, Ordering::SeqCst);
     });
@@ -966,11 +970,11 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
         debug_log!("slide: cell {} of stretch {stretch}", cols.cell());
         post(s, WM_SLIDE, slide_wparam(stretch, cols.cell()));
     }
-    if !DRAGGING.get() && (STEPPED.get() || cols.rest(step).abs() >= DRAG_SHOWS || rows.rest(step).abs() >= DRAG_SHOWS) {
+    if !DRAGGING.get() && (STEPPED.get() || cols.rest(step).abs() >= DRAG_SHOWS || rows.gathered().abs() >= DRAG_SHOWS) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(stretch, 0));
     }
-    debug_log!("move {dx} {dy}: sideways {} and up and down {} of {step}", cols.rest(step), rows.rest(step));
+    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.rest(step), rows.gathered());
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.

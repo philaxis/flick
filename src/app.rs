@@ -1903,55 +1903,79 @@ pub fn render_sample(path: &str) {
     }
 }
 
-/// Plays a made-up hold through the minimap at 60 frames a second: one cell
-/// right, then one row down, the app getting to each 3 frames after the hand
-/// and the count of the hand catching up a frame after that. Every fourth
-/// frame goes side by side into `path` (see `write_raw`), and each frame's
-/// place of the grid into `path`.txt: the rows' first cells sideways and the
-/// first row down, in cells from the highlight.
+/// Plays a made-up hold through the minimap at 60 frames a second, the
+/// hand's mouse counts going through the same `Plane` a real hold does
+/// (sideways 260 to a cell, up and down 400 to a row): 300 right, then 450
+/// down, the app getting to each cell or row 3 frames after the hand and the
+/// count of the hand catching up a frame after that. Frames going sideways,
+/// leaning towards the next row, and every frame of going over to it go side
+/// by side into `path` (see `write_raw`), and each frame's place of the grid
+/// into `path`.txt: the rows' first cells sideways and the first row down, in
+/// cells from the highlight.
 pub fn render_minimap_strip(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let cells = |n: usize| vec![CellView::default(); n];
     let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true }], cells(4), cells(2)];
     let smooth = |u: f32| u * u * (3.0 - 2.0 * u);
-    let (dt, scale, gap) = (1.0 / 60.0, 1.5, 6);
+    let (dt, scale, gap, steps) = (1.0 / 60.0, 1.5, 6, (260, 400));
+    let mut plane = crate::slide::Plane::new();
+    // The hold begins on row 1, cell 0, with a row above and two below.
+    plane.rows.set_room(1, 2);
+    plane.cols.set_room(0, 1, steps.0);
+    let (mut counts, mut stretch) = ((0, 0), 0u64);
     let (mut came_col, mut came_row) = (None, None);
-    let mut strip: Vec<((i32, i32), Vec<u8>)> = Vec::new();
+    let mut frames: Vec<((i32, i32), Vec<u8>)> = Vec::new();
     let mut record = String::new();
-    for frame in 0..60 {
+    for frame in 0..64 {
         let t = frame as f32;
-        // The hand, in the grid's cells: along row 1, a rest, down to row 2.
-        let col = 1.15 * smooth((t / 18.0).min(1.0));
-        let row = 1.0 + smooth(((t - 24.0) / 18.0).clamp(0.0, 1.0));
-        if col >= 0.6 && came_col.is_none() {
+        // The hand, in mouse counts: 300 right, a rest, then 450 down.
+        let x = (300.0 * smooth((t / 14.0).min(1.0))) as i32;
+        let y = (450.0 * smooth(((t - 18.0) / 30.0).clamp(0.0, 1.0))) as i32;
+        let moved = plane.travel(x - counts.0, y - counts.1, steps);
+        counts = (x, y);
+        if moved.cell && came_col.is_none() {
             came_col = Some(frame);
         }
-        if row >= 1.6 && came_row.is_none() {
+        if moved.row {
             came_row = Some(frame);
+            stretch += 1;
         }
         let after = |came: Option<i32>, by: i32| came.is_some_and(|at| frame >= at + by);
-        let (view_col, told_col) = (after(came_col, 3) as usize, after(came_col, 4) as usize);
-        let (view_row, told_row) = (1 + after(came_row, 3) as usize, 1 + after(came_row, 4) as usize);
-        let stretch = came_row.is_some() as u64;
+        let (view_col, told_col) = (after(came_col, 3) as i32, after(came_col, 4) as i32);
+        let (view_row, told_row) = (1 + after(came_row, 3) as usize, after(came_row, 4) as i32);
         let hand = Hand {
-            along: if stretch == 1 { 0.0 } else { col - told_col as f32 },
-            across: row - told_row as f32,
+            along: if stretch == 1 { plane.cols.cell() as f32 } else { (plane.cols.cell() - told_col) as f32 }
+                + plane.cols.rest(steps.0) as f32 / steps.0 as f32,
+            across: (plane.rows.cell() - told_row) as f32 + plane.rows.lean(steps.1),
             counted_from: stretch << 8 | (told_col as u64) << 4 | told_row as u64,
         };
-        let cur = if view_row == 2 { Pos { row: 2, col: 2 } } else { Pos { row: 1, col: view_col } };
+        let cur = if view_row == 2 { Pos { row: 2, col: 2 } } else { Pos { row: 1, col: view_col as usize } };
         let view = View {
             rows: rows.clone(),
-            anchors: vec![1, view_col, 2, 1],
+            anchors: vec![1, view_col as usize, 2, 1],
             cur: Some(cur),
             title: format!("Workspace {}", cur.row + 1),
         };
-        let Some((size, pixels, (xs, y))) = overlay.frame_to_pixels(view, hand, dt, scale) else { return };
+        let Some((size, pixels, (xs, y_drawn))) = overlay.frame_to_pixels(view, hand, dt, scale) else { return };
         let xs: Vec<String> = xs.iter().map(|x| format!("{x:+.3}")).collect();
-        record += &format!("frame {frame:2} cur {},{} hand {:+.3},{:+.3} rows x [{}] y {y:+.3}\n", cur.row, cur.col, hand.along, hand.across, xs.join(" "));
-        if frame % 4 == 2 && strip.len() < 12 {
-            strip.push((size, pixels));
-        }
+        record += &format!(
+            "frame {frame:2} counts {x},{y} gathered {} cur {},{} hand {:+.3},{:+.3} rows x [{}] y {y_drawn:+.3}\n",
+            plane.rows.gathered(),
+            cur.row,
+            cur.col,
+            hand.along,
+            hand.across,
+            xs.join(" ")
+        );
+        frames.push((size, pixels));
     }
+    // Sideways; leaning down; then every frame of going over to the row.
+    let snap = came_row.unwrap_or(40) as usize;
+    let mut picked: Vec<usize> = vec![0, 6, 12, 18];
+    picked.extend((1..=4).map(|q| 18 + (snap - 18) * q / 4 - (q == 4) as usize));
+    picked.extend(snap..(snap + 9).min(frames.len()));
+    let strip: Vec<((i32, i32), Vec<u8>)> = picked.iter().filter_map(|&f| frames.get(f).cloned()).collect();
+    record += &format!("picked frames {picked:?}\n");
     let _ = std::fs::write(format!("{path}.txt"), record);
     let Some(&((w, h), _)) = strip.first() else { return };
     let width = strip.len() as i32 * (w + gap) - gap;

@@ -1,10 +1,11 @@
 //! Where the hand is along a row, or from row to row: travel one way, and
 //! the cell (or row) it comes to.
 //!
-//! Plain arithmetic with no Windows in it. The cell is read off where the
-//! hand is, counted from the cell it set out from, so the same travel is the
-//! same cell whatever the pace it came at and however long the app took over
-//! the cells before: nothing is counted up to be let go of later.
+//! Plain arithmetic with no Windows in it. Sideways the cell is read off
+//! where the hand is, counted from the cell it set out from, so the same
+//! travel is the same cell whatever the pace it came at and however long the
+//! app took over the cells before. Up and down goes by notches instead, as a
+//! mouse wheel does (`Detent`).
 
 /// A cell is come to once the hand is this much nearer it than the one
 /// before, in tenths of the way between them: a little past halfway, so that
@@ -84,14 +85,107 @@ impl Slide {
     }
 }
 
+/// Opposite travel, in tenths of a row's distance, that lets go of what was
+/// gathered towards the next row: less is a hand wavering, and only takes
+/// that much back.
+const TURN_TENTHS: i32 = 1;
+/// How much of what goes past a row is kept towards the next, at most, in
+/// tenths of a row's distance: enough that a steady hand's rows come evenly
+/// spaced, never so much that one fling goes two rows.
+const CARRY_TENTHS: i32 = 5;
+/// How far the minimap leans towards the next row, at most, before the hand
+/// gets there, in rows.
+pub const LEAN: f32 = 0.12;
+
+/// Up and down in a hold, the way a mouse wheel goes by its notches: travel
+/// is gathered, and a row is come to each time it reaches a whole `step`, no
+/// sooner. A row at a time: what went past it is kept towards the next, but
+/// never a whole row's worth. Turning back lets go of what was gathered, so a
+/// hand going back and forth does not take the row to and fro; at the first
+/// or the last row nothing is gathered towards the wall.
+#[derive(Clone, Copy, Debug)]
+pub struct Detent {
+    /// Travel gathered towards the next row, downwards.
+    gathered: i32,
+    /// Travel since against what was gathered.
+    back: i32,
+    /// The row come to, counted from the one the hold began on.
+    row: i32,
+    /// Rows above and below the first, once the app has said.
+    room: Option<(i32, i32)>,
+}
+
+impl Detent {
+    pub const fn new() -> Detent {
+        Detent { gathered: 0, back: 0, row: 0, room: None }
+    }
+
+    pub fn cell(&self) -> i32 {
+        self.row
+    }
+
+    /// Travel gathered towards the next row (negative upwards).
+    pub fn gathered(&self) -> i32 {
+        self.gathered
+    }
+
+    /// How far the minimap leans towards the next row, in rows.
+    pub fn lean(&self, step: i32) -> f32 {
+        self.gathered as f32 / step.max(1) as f32 * LEAN
+    }
+
+    pub fn set_room(&mut self, up: i32, down: i32) {
+        self.room = Some((up, down));
+        self.row = self.row.clamp(-up, down);
+        self.keep_off_walls();
+    }
+
+    fn keep_off_walls(&mut self) {
+        let Some((up, down)) = self.room else { return };
+        if (self.gathered < 0 && self.row <= -up) || (self.gathered > 0 && self.row >= down) {
+            self.gathered = 0;
+        }
+    }
+
+    /// The hand moved `dy` (downwards). True when that came to another row.
+    pub fn travel(&mut self, dy: i32, step: i32) -> bool {
+        let step = step.max(1);
+        if self.gathered != 0 && dy.signum() == -self.gathered.signum() {
+            self.back = self.back.saturating_add(dy.abs());
+            if self.back * 10 >= step * TURN_TENTHS {
+                (self.gathered, self.back) = (0, 0);
+            } else if dy.abs() >= self.gathered.abs() {
+                self.gathered = 0;
+            } else {
+                self.gathered += dy;
+            }
+            return false;
+        }
+        self.back = 0;
+        self.gathered = self.gathered.saturating_add(dy);
+        self.keep_off_walls();
+        if self.gathered.abs() < step {
+            return false;
+        }
+        let way = self.gathered.signum();
+        self.row += way;
+        let carry = step * CARRY_TENTHS / 10;
+        self.gathered = way * (self.gathered.abs() - step).min(carry);
+        self.keep_off_walls();
+        true
+    }
+}
+
 /// Where the hand is both ways in a hold: each way on its own, sideways
 /// counting only the hand's sideways travel and up and down only its up and
 /// down travel, so a hand going slantwise goes along the row and from row to
-/// row at once. A new row begins a new stretch along it (`Slide::carried_on`).
+/// row at once. Sideways the cell follows the hand (`Slide`); up and down
+/// goes by notches (`Detent`). A new row begins a new stretch along it
+/// (`Slide::carried_on`).
 #[derive(Clone, Copy, Debug)]
 pub struct Plane {
     pub cols: Slide,
-    pub rows: Slide,
+    pub rows: Detent,
 }
 
 /// What one movement came to: another row, another cell along the row.
@@ -103,16 +197,14 @@ pub struct Moved {
 
 impl Plane {
     pub const fn new() -> Plane {
-        Plane { cols: Slide::new(), rows: Slide::new() }
+        Plane { cols: Slide::new(), rows: Detent::new() }
     }
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
     /// sideways travel coming with a change of row goes on in the new row.
     /// `step`: how far the hand goes for one cell, and for one row.
     pub fn travel(&mut self, dx: i32, dy: i32, (step_x, step_y): (i32, i32)) -> Moved {
-        let row_before = self.rows.cell();
-        self.rows.travel(dy, step_y, true);
-        let row = self.rows.cell() != row_before;
+        let row = self.rows.travel(dy, step_y);
         if row {
             self.cols = self.cols.carried_on(step_x);
         }
@@ -179,49 +271,57 @@ mod tests {
         assert_eq!(turned.cell(), 1);
     }
 
-    /// A hand going slantwise goes from row to row and along the row at
-    /// once, each as far as it would going that way alone; a hand going one
-    /// way, wavering a little, moves the other way not at all.
+    /// Up and down goes by notches: short of a whole row's distance the row
+    /// stays, at it exactly one row comes, and one fling, however far, is
+    /// one row. Turning back lets go of what was gathered; sideways is not
+    /// touched by any of it.
     #[test]
-    fn each_way_follows_the_hand_on_its_own() {
-        // Two cells right and two rows down, in small slantwise movements.
+    fn rows_come_by_notches() {
+        let steps = (260, 400);
+        let mut plane = Plane::new();
+        assert_eq!(plane.travel(0, 399, steps), Moved::default());
+        assert!(plane.travel(0, 1, steps).row);
+        assert_eq!(plane.rows.cell(), 1);
+        let mut flung = Detent::new();
+        assert!(flung.travel(5000, 400));
+        assert_eq!(flung.cell(), 1);
+        assert!(!flung.travel(199, 400), "what a fling went past one row is not a second");
+        // Back and forth short of a row: back to the gathering from nothing.
+        let mut turned = Detent::new();
+        turned.travel(350, 400);
+        turned.travel(-40, 400);
+        assert_eq!(turned.gathered(), 0);
+        assert!(!turned.travel(350, 400));
+        // A waver smaller than that only takes itself back.
+        turned.travel(-20, 400);
+        assert_eq!(turned.gathered(), 330);
+        // No gathering towards a wall, nor past it.
+        let mut wall = Detent::new();
+        wall.set_room(0, 1);
+        assert!(!wall.travel(-900, 400));
+        assert_eq!((wall.cell(), wall.gathered()), (0, 0));
+        assert!(wall.travel(900, 400));
+        assert_eq!((wall.cell(), wall.gathered()), (1, 0));
+        // Slantwise: rows by notches, cells along each row as the hand goes.
         let mut slant = Plane::new();
         let (mut rows, mut cells) = (0, 0);
-        for _ in 0..104 {
-            let moved = slant.travel(5, 5, (260, 260));
+        for _ in 0..160 {
+            let moved = slant.travel(5, 5, steps);
             rows += moved.row as i32;
             cells += moved.cell as i32;
         }
-        assert_eq!(slant.rows.cell(), 2);
-        assert_eq!(rows, 2);
-        // The new rows began new stretches; what was gone along each one and
-        // towards the next cell was kept, so the cells add up to the travel.
-        assert_eq!(cells, 2);
-        // The last row was come to with the hand past the first cell: the
-        // stretch along it began one cell on.
-        assert_eq!((slant.cols.cell(), slant.cols.rest(260)), (1, 0));
-        // Straight down, wavering sideways: rows only.
+        assert_eq!((rows, slant.rows.gathered()), (2, 0));
+        assert_eq!(cells, 3);
+        // Straight down wavering sideways: rows only; straight across: cells only.
         let mut down = Plane::new();
-        for i in 0..70 {
-            assert!(!down.travel(if i % 2 == 0 { 30 } else { -30 }, 10, (260, 260)).cell);
+        for i in 0..90 {
+            assert!(!down.travel(if i % 2 == 0 { 30 } else { -30 }, 10, steps).cell);
         }
-        assert_eq!((down.rows.cell(), down.cols.cell()), (3, 0));
-        // Straight across: cells only.
+        assert_eq!((down.rows.cell(), down.cols.cell()), (2, 0));
         let mut across = Plane::new();
         for _ in 0..70 {
-            assert!(!across.travel(10, 0, (260, 260)).row);
+            assert!(!across.travel(10, 0, steps).row);
         }
         assert_eq!((across.rows.cell(), across.cols.cell()), (0, 3));
-    }
-
-    /// Rows go by their own, longer distance: as far down as a cell is
-    /// across is not yet a row.
-    #[test]
-    fn rows_take_their_own_distance() {
-        let mut plane = Plane::new();
-        // The first of either comes at 60% of its distance: 156 across, 240 down.
-        assert!(!plane.travel(200, 200, (260, 400)).row);
-        assert_eq!(plane.cols.cell(), 1);
-        assert!(plane.travel(0, 60, (260, 400)).row);
     }
 }
