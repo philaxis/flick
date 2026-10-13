@@ -78,7 +78,7 @@ const ENGLISH: Words = Words {
     button: "Got it",
     balloon: ("Flick is running here", "Right-click this icon for Settings and How to use."),
     menu: "How to use",
-    admin_front: ("Flick can't hear its button now", "A window run as administrator is in front. Click another window, or turn on Run as administrator in Settings."),
+    admin_front: ("Flick can't hear its button now", "A window run as administrator is in front. Click another window, or start Flick again and let it run as administrator."),
 };
 
 const KOREAN: Words = Words {
@@ -96,7 +96,7 @@ const KOREAN: Words = Words {
     button: "알겠어요",
     balloon: ("Flick 이 여기서 돌고 있어요", "이 아이콘을 오른쪽 클릭하면 설정과 쓰는 법이 있어요."),
     menu: "쓰는 법",
-    admin_front: ("지금은 Flick 버튼이 안 들려요", "관리자 권한 창이 앞에 있어요. 다른 창을 누르거나, 설정에서 '관리자 권한으로 실행'을 켜세요."),
+    admin_front: ("지금은 Flick 버튼이 안 들려요", "관리자 권한 창이 앞에 있어요. 다른 창을 누르거나, Flick 을 다시 켜고 관리자 권한을 허용하세요."),
 };
 
 const CHINESE: Words = Words {
@@ -109,7 +109,7 @@ const CHINESE: Words = Words {
     button: "知道了",
     balloon: ("Flick 正在这里运行", "右键点击此图标可打开设置和使用方法。"),
     menu: "使用方法",
-    admin_front: ("Flick 现在听不到按键", "前面是以管理员身份运行的窗口。点一下别的窗口，或在设置中打开“以管理员身份运行”。"),
+    admin_front: ("Flick 现在听不到按键", "前面是以管理员身份运行的窗口。点一下别的窗口，或重新启动 Flick 并允许它以管理员身份运行。"),
 };
 
 /// The words for the language Windows is shown in: Korean, Chinese, or

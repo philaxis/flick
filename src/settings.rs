@@ -44,7 +44,7 @@ use windows::{
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
-const SIZE: (f32, f32) = (400.0, if UP_AND_DOWN_OF_ITS_OWN { 704.0 } else { 704.0 - 2.0 * ROWS.1 });
+const SIZE: (f32, f32) = (400.0, if UP_AND_DOWN_OF_ITS_OWN { 704.0 - ROWS.1 } else { 704.0 - 3.0 * ROWS.1 });
 /// Whether up and down has settings of its own (a flick or a distance, and
 /// how much). Not now: rows go by distance, as far apart as cells. Kept
 /// hidden, and the keys in config.toml read and left alone, should that
@@ -78,8 +78,6 @@ pub struct View {
     /// See `Config::dwell_ms`.
     pub dwell_ms: i32,
     pub autostart: bool,
-    /// Flick is set to run as administrator (`admin`).
-    pub admin: bool,
 }
 
 /// What the user asked for; carried out by the app.
@@ -92,8 +90,6 @@ pub enum Action {
     /// Start (or give up) waiting for a new trigger to be pressed.
     Capture(bool),
     Autostart(bool),
-    /// Run as administrator from now on, or no longer.
-    Admin(bool),
     /// Open the config file, which has the settings not shown here.
     OpenFile,
     Close,
@@ -111,7 +107,6 @@ enum Hit {
     StepY,
     Dwell,
     Autostart,
-    Admin,
     File,
 }
 
@@ -124,7 +119,6 @@ struct Layout {
     step_y: Rect,
     dwell: Rect,
     autostart: Rect,
-    admin: Rect,
     file: Rect,
 }
 
@@ -146,8 +140,7 @@ impl Layout {
             step_y: hidden(slider(3.0)),
             dwell: slider(4.0 - up),
             autostart: right(5.0 - up, 44.0, 24.0),
-            admin: right(6.0 - up, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(7.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
+            file: rect(EDGES.0 * s, (row(6.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -168,7 +161,6 @@ impl Layout {
             (&self.step_y, Hit::StepY),
             (&self.dwell, Hit::Dwell),
             (&self.autostart, Hit::Autostart),
-            (&self.admin, Hit::Admin),
             (&self.file, Hit::File),
         ]
         .into_iter()
@@ -482,7 +474,6 @@ impl Settings {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Mode(sticky) if sticky != self.view.sticky => Action::Set("vertical_sticky", sticky.to_string()),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
-            Hit::Admin => Action::Admin(!self.view.admin),
             Hit::File => Action::OpenFile,
             _ => Action::None,
         }
@@ -586,10 +577,6 @@ impl Settings {
 
         label(5.0 - up, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
-        // For the trigger to work on windows run as administrator, and to
-        // close them from the board.
-        label(6.0 - up, "Run as administrator");
-        self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
 
         let hot = self.hover == Hit::File;
         p.text("More settings: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));

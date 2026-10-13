@@ -1,13 +1,13 @@
-//! Running as administrator, for those who ask for it in the settings.
+//! Running as administrator, which the installed Flick always asks for.
 //!
 //! Windows keeps what is typed and clicked on a window run as administrator
 //! from the hooks of a process that is not, and lets such a process neither
-//! close that window nor move it. With this setting on, Flick is started by
-//! a scheduled task that runs it with the highest privileges: Windows asks
-//! for permission once, when the task is made, and never again after.
+//! close that window nor move it. So Flick is started by a scheduled task
+//! that runs it with the highest privileges: Windows asks for permission
+//! once, when the task is made (`turn_on`, at each start until it is).
 //!
-//! The task is the setting: Flick runs as administrator while there is one.
-//! Started in any other way it hands over to the task (`hand_over`).
+//! Flick runs as administrator while there is a task. Started in any other
+//! way it hands over to the task (`hand_over`).
 
 use crate::config::APP_NAME;
 use std::{
@@ -18,19 +18,14 @@ use std::{
     time::Duration,
 };
 use windows::{
-    core::{w, HSTRING, PCWSTR, PWSTR},
+    core::{w, HSTRING, PCWSTR},
     Win32::{
         Foundation::{CloseHandle, HANDLE, HWND},
         Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY},
-        System::Threading::{
-            CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-            InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken, UpdateProcThreadAttribute,
-            WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROCESS_CREATE_PROCESS, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTUPINFOEXW,
-        },
+        System::Threading::{GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE},
         UI::{
             Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
-            WindowsAndMessaging::{FindWindowW, GetShellWindow, GetWindowThreadProcessId, SW_HIDE},
+            WindowsAndMessaging::{FindWindowW, SW_HIDE},
         },
     },
 };
@@ -43,6 +38,10 @@ static PORTABLE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_portable(portable: bool) {
     PORTABLE.store(portable, Ordering::SeqCst);
+}
+
+pub fn portable() -> bool {
+    PORTABLE.load(Ordering::SeqCst)
 }
 
 /// The name of the scheduled task, and of the entry in the registry that
@@ -186,11 +185,10 @@ fn run_elevated(arguments: &str) -> bool {
 }
 
 /// What `run_elevated` runs: `--admin on <at sign-in: 0 or 1> <user>` makes
-/// the task, `--admin off` removes it. Returns the exit code.
+/// the task. Returns the exit code.
 pub fn helper(arguments: &[String]) -> i32 {
     let done = match arguments {
         [on, at_sign_in, user] if on == "on" => write_task(user, at_sign_in == "1"),
-        [off] if off == "off" => remove_task(),
         _ => false,
     };
     !done as i32
@@ -219,7 +217,7 @@ fn run_task() -> bool {
     })
 }
 
-/// Turns the setting on. Windows asks for permission once. `at_sign_in`:
+/// Turns running as administrator on. Windows asks for permission once. `at_sign_in`:
 /// whether Flick is to start with Windows, which the task does from now on.
 /// Returns true when the caller must quit now, another Flick, run as
 /// administrator, being about to take over.
@@ -237,30 +235,6 @@ pub fn turn_on(at_sign_in: bool) -> bool {
     }
     // The other one waits for this one to go (`main`).
     schtasks(&["/Run", "/TN", &task_name()]).is_some()
-}
-
-/// Turns the setting off. Returns true when the caller must quit now, a
-/// Flick not run as administrator having been started to take over.
-pub fn turn_off() -> bool {
-    if !elevated() {
-        // Not run by the task for some reason; removing it takes permission.
-        run_elevated(&format!("--admin off{}", portable_flag()));
-        return false;
-    }
-    if !remove_task() {
-        crate::app::log("the task that runs the app as administrator could not be removed");
-        return false;
-    }
-    let Ok(exe) = std::env::current_exe() else { return false };
-    let command = format!("\"{}\"{}", exe.display(), portable_flag());
-    match unsafe { spawn_as_shell(&command) } {
-        Ok(()) => true,
-        Err(e) => {
-            // Better run as administrator until the next start than not at all.
-            crate::app::log(&format!("starting again without administrator rights failed: {e}"));
-            false
-        }
-    }
 }
 
 /// Sets whether the task starts Flick at sign-in, keeping whom it is for.
@@ -292,54 +266,6 @@ pub fn uninstall() -> bool {
         return false;
     }
     run_elevated("--uninstall")
-}
-
-/// Starts a program as the desktop shell would: without administrator
-/// rights, also when this process has them. The new process is made a child
-/// of the shell's, whose rights it gets.
-unsafe fn spawn_as_shell(command: &str) -> windows::core::Result<()> {
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid));
-    let shell = OpenProcess(PROCESS_CREATE_PROCESS, false, pid)?;
-    let mut size = 0usize;
-    let _ = InitializeProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST::default(), 1, 0, &mut size);
-    let mut buffer = vec![0u8; size];
-    let list = LPPROC_THREAD_ATTRIBUTE_LIST(buffer.as_mut_ptr().cast());
-    InitializeProcThreadAttributeList(list, 1, 0, &mut size)?;
-    let parent = UpdateProcThreadAttribute(
-        list,
-        0,
-        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
-        Some(&shell as *const HANDLE as *const _),
-        std::mem::size_of::<HANDLE>(),
-        None,
-        None,
-    );
-    let mut startup = STARTUPINFOEXW::default();
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    startup.lpAttributeList = list;
-    let mut info = PROCESS_INFORMATION::default();
-    let mut line: Vec<u16> = command.encode_utf16().chain([0]).collect();
-    let made = parent.and_then(|()| {
-        CreateProcessW(
-            None,
-            PWSTR(line.as_mut_ptr()),
-            None,
-            None,
-            false,
-            EXTENDED_STARTUPINFO_PRESENT,
-            None,
-            None,
-            &startup.StartupInfo,
-            &mut info,
-        )
-    });
-    DeleteProcThreadAttributeList(list);
-    let _ = CloseHandle(shell);
-    made?;
-    let _ = CloseHandle(info.hProcess);
-    let _ = CloseHandle(info.hThread);
-    Ok(())
 }
 
 /// Lets processes not run as administrator send `messages` to `window` of

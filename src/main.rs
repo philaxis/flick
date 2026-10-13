@@ -134,7 +134,7 @@ fn main() {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    app::run(flag == Some("--first-run"), args.iter().any(|arg| arg == "--fresh"));
+    app::run(flag == Some("--first-run"));
 }
 
 #[cfg(not(windows))]

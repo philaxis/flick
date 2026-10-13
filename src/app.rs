@@ -1259,7 +1259,6 @@ impl App {
             sticky: self.config.vertical_sticky,
             dwell_ms: self.config.dwell_ms as i32,
             autostart: self.autostart,
-            admin: self.admin,
         }
     }
 
@@ -1276,34 +1275,6 @@ impl App {
             admin::set_at_sign_in(on);
         } else {
             tray::set_autostart(on);
-        }
-        self.read_startup();
-        self.refresh_settings();
-    }
-
-    /// Turns running as administrator on or off. Either way another Flick
-    /// takes over when it worked, and this one quits.
-    fn set_admin(&mut self, on: bool) {
-        let quit = if on {
-            let taken_over = admin::turn_on(self.autostart);
-            // The task starts it with Windows from here on.
-            if admin::enabled() && self.autostart {
-                tray::set_autostart(false);
-            }
-            taken_over
-        } else {
-            let at_sign_in = self.autostart;
-            let taken_over = admin::turn_off();
-            if !admin::enabled() && at_sign_in {
-                tray::set_autostart(true);
-            }
-            taken_over
-        };
-        if quit {
-            unsafe {
-                let _ = DestroyWindow(self.hwnd);
-            }
-            return;
         }
         self.read_startup();
         self.refresh_settings();
@@ -1399,7 +1370,6 @@ impl App {
             settings::Action::Set(key, value) => self.set_config(key, &value),
             settings::Action::Capture(on) => self.capture_trigger(on),
             settings::Action::Autostart(on) => self.set_autostart(on),
-            settings::Action::Admin(on) => self.set_admin(on),
             settings::Action::OpenFile => unsafe {
                 let path = HSTRING::from(config::config_path().as_os_str());
                 ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
@@ -1815,13 +1785,31 @@ fn init() -> windows::core::Result<HWND> {
     }
 }
 
-/// `fresh`: installed just now for the first time, not updated.
-pub fn run(first_run: bool, fresh: bool) {
+pub fn run(first_run: bool) {
     std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
     let hwnd = match init() {
         Ok(hwnd) => hwnd,
         Err(e) => return warn(&format!("Flick could not start: {e}")),
     };
+    if first_run {
+        tray::set_autostart(true);
+    }
+    // Flick runs as administrator: run as the user, it hears nothing of its
+    // trigger while a window run as administrator is in front. Each start
+    // that is not, Windows asks once to make the task that runs it so, which
+    // then takes over; declined, Flick goes on as it is this time. Not for
+    // a copy tried out (`--portable`, debug builds).
+    if !admin::portable() && !cfg!(debug_assertions) && !admin::elevated() && !admin::enabled() {
+        let autostart = tray::autostart_enabled();
+        let taken_over = admin::turn_on(autostart);
+        // The task starts it with Windows from here on.
+        if admin::enabled() && autostart {
+            tray::set_autostart(false);
+        }
+        if taken_over {
+            return;
+        }
+    }
     let board = match Board::new(wndproc) {
         Ok(board) => board,
         Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
@@ -1871,26 +1859,11 @@ pub fn run(first_run: bool, fresh: bool) {
         SetTimer(hwnd, CONFIG_TIMER_ID, CONFIG_CHECK_MS, None);
     }
     tray::add(hwnd, WM_TRAY);
-    if first_run {
-        tray::set_autostart(true);
+    // Until it has been seen once: how Flick is used, and where it is.
+    if !app.grid.guide_seen {
+        app.open_guide(false);
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
-    // A new install runs as administrator from the start (Windows asks
-    // once): run as the user, the trigger is not heard at all while a window
-    // run as administrator is in front. Declined, Flick goes on as it is.
-    if fresh && !admin::elevated() && !admin::enabled() {
-        with_app(|app| {
-            app.read_startup();
-            app.set_admin(true);
-        });
-    }
-    // Until it has been seen once: how Flick is used, and where it is. Not
-    // by one that has just handed over to the one run as administrator.
-    with_app(|app| {
-        if !app.grid.guide_seen && unsafe { IsWindow(app.hwnd) }.as_bool() {
-            app.open_guide(false);
-        }
-    });
 
     unsafe {
         let mut message = MSG::default();
@@ -2098,7 +2071,6 @@ pub fn render_settings(path: &str) {
         sticky: config.vertical_sticky,
         dwell_ms: config.dwell_ms as i32,
         autostart: true,
-        admin: false,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
         write_raw(path, size, &pixels);
