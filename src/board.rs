@@ -1743,8 +1743,7 @@ impl Board {
             let area = Rect { right: row.name.left + width.max(size(&row.name).0), ..row.name };
             p.fill(&grow(&area, 4.0 * s), 5.0 * s, white(if editing.is_some() { 0.12 } else { 0.06 }));
         }
-        let right = row.pins.first().map_or(row.header.right, |b| b.icon.left - 8.0 * s);
-        let wide = Rect { right, ..row.name };
+        let wide = Rect { right: row.header.right, ..row.name };
         p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 }));
     }
 
@@ -2059,10 +2058,10 @@ fn group_apps<'a>(windows: impl Iterator<Item = &'a WindowModel>) -> Vec<(HWND, 
     apps
 }
 
-/// The apps of the windows pinned to a row, lined up from the right end of
-/// its label leftwards, in at most `room`: the badges, how many did not fit,
-/// and where that number goes.
-fn layout_pins(row: &RowModel, header: &Rect, room: f32, icon: f32, s: f32) -> (Vec<AppBadge>, usize, Rect) {
+/// The apps of the windows pinned to a row, lined up rightwards from `left`
+/// in its label, in at most `room`: the badges, how many did not fit, where
+/// that number goes, and where they end.
+fn layout_pins(row: &RowModel, header: &Rect, left: f32, room: f32, icon: f32, s: f32) -> (Vec<AppBadge>, usize, Rect, f32) {
     let apps = group_apps(row.cells.iter().flat_map(|c| &c.windows).filter(|w| w.follows));
     let count_w = icon * 0.62;
     let between = 5.0 * s;
@@ -2081,8 +2080,7 @@ fn layout_pins(row: &RowModel, header: &Rect, room: f32, icon: f32, s: f32) -> (
         shown += 1;
     }
     let more = apps.len() - shown;
-    let right = header.right - 8.0 * s - if more > 0 { more_w } else { 0.0 };
-    let mut x = right - used;
+    let mut x = left;
     let badges = apps[..shown]
         .iter()
         .map(|&(hwnd, _, count)| {
@@ -2091,7 +2089,8 @@ fn layout_pins(row: &RowModel, header: &Rect, room: f32, icon: f32, s: f32) -> (
             badge
         })
         .collect();
-    (badges, more, rect(right + 2.0 * s, y, more_w, icon))
+    let more_label = rect(left + used + 2.0 * s, y, more_w, icon);
+    (badges, more, more_label, left + used + if more > 0 { 2.0 * s + more_w } else { 0.0 })
 }
 
 /// Lays out the map at the bottom of a monitor: rows top to bottom, each
@@ -2126,6 +2125,13 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     let spine_x = cells_x + lead as f32 * pitch;
     let icon = (cell_h * 0.36).min(22.0 * s);
 
+    // The apps pinned to a row stand before its name, in a column as wide
+    // as the most of them (at most half the label area), each row's against
+    // the names, which stay in line.
+    let pins_w = |row: &RowModel| layout_pins(row, &rect(0.0, 0.0, header_w, cell_h), 0.0, header_w / 2.0, icon, s).3;
+    let pins_column = model.rows.iter().map(pins_w).fold(0.0, f32::max);
+    let name_x = x0 + if pins_column > 0.0 { pins_column + 10.0 * s } else { 0.0 };
+
     let mut layout = MapLayout { top: y, ..MapLayout::default() };
     layout.add_row_top = rect(spine_x + (cell_w - plus) / 2.0, y, plus, plus);
     y += plus + gap;
@@ -2149,14 +2155,13 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
             x += pitch;
         }
         let header = rect(x0, y, header_w, cell_h);
-        // The pinned apps take at most half the label area, from its right.
-        let (pins, pins_more, pins_more_label) = layout_pins(row, &header, header_w / 2.0, icon, s);
-        let name_room = pins.first().map_or(header_w - 12.0 * s, |b| b.icon.left - x0 - 8.0 * s);
+        let (pins, pins_more, pins_more_label, _) = layout_pins(row, &header, x0 + pins_column - pins_w(row), header_w / 2.0, icon, s);
+        let name_room = header.right - name_x - 12.0 * s;
         // As wide as the name itself, so the clickable box matches what is read.
         let name_w = (text_width(&grid::row_title(&row.name, r), 12.0 * s) + 4.0 * s).min(name_room);
         layout.rows.push(RowLayout {
             header,
-            name: rect(x0, y + (cell_h - 20.0 * s) / 2.0, name_w, 20.0 * s),
+            name: rect(name_x, y + (cell_h - 20.0 * s) / 2.0, name_w, 20.0 * s),
             top: y - gap / 2.0,
             bottom: y + cell_h + gap / 2.0,
             cells,
