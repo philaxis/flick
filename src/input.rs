@@ -344,8 +344,9 @@ struct Settings {
     target: isize,
     triggers: Vec<Trigger>,
     /// How far the hand goes from one cell to the next, and from one row to
-    /// the next alike.
+    /// the next: farther, so that rows are not changed by the way.
     step_x: i32,
+    step_y: i32,
 }
 
 impl Settings {
@@ -464,6 +465,7 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         target: target.0,
         triggers,
         step_x: config.step_x.max(20),
+        step_y: config.step_y.max(20),
     });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
@@ -930,15 +932,15 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
-    let step = s.step_x;
+    let (step, step_y) = (s.step_x, s.step_y);
     let mut plane = PLANE.get();
     if let Some((_, (up, down))) = rows_seen() {
-        plane.rows.set_room(up, down, step);
+        plane.rows.set_room(up, down, step_y);
     }
     if let Some((_, Some((left, right)))) = shown() {
         plane.cols.set_room(left, right, step);
     }
-    let moved = plane.travel(dx, dy, step);
+    let moved = plane.travel(dx, dy, (step, step_y));
     PLANE.set(plane);
     let (rows, cols) = (plane.rows, plane.cols);
     // In one piece for `hand`: a new stretch and where the hand is in it.
@@ -947,7 +949,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
             STRETCH.fetch_add(1, Ordering::SeqCst);
         }
         ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
-        ROW_FRACTION.store(rows.rest(step) * 1000 / step, Ordering::SeqCst);
+        ROW_FRACTION.store(rows.rest(step_y) * 1000 / step_y, Ordering::SeqCst);
         ASKED.store(cols.cell(), Ordering::SeqCst);
         FRACTION.store(cols.rest(step) * 1000 / step, Ordering::SeqCst);
     });

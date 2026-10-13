@@ -108,15 +108,16 @@ impl Plane {
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
     /// sideways travel coming with a change of row goes on in the new row.
-    pub fn travel(&mut self, dx: i32, dy: i32, step: i32) -> Moved {
+    /// `step`: how far the hand goes for one cell, and for one row.
+    pub fn travel(&mut self, dx: i32, dy: i32, (step_x, step_y): (i32, i32)) -> Moved {
         let row_before = self.rows.cell();
-        self.rows.travel(dy, step, true);
+        self.rows.travel(dy, step_y, true);
         let row = self.rows.cell() != row_before;
         if row {
-            self.cols = self.cols.carried_on(step);
+            self.cols = self.cols.carried_on(step_x);
         }
         let cell_before = self.cols.cell();
-        self.cols.travel(dx, step, true);
+        self.cols.travel(dx, step_x, true);
         Moved { row, cell: self.cols.cell() != cell_before }
     }
 }
@@ -187,7 +188,7 @@ mod tests {
         let mut slant = Plane::new();
         let (mut rows, mut cells) = (0, 0);
         for _ in 0..104 {
-            let moved = slant.travel(5, 5, 260);
+            let moved = slant.travel(5, 5, (260, 260));
             rows += moved.row as i32;
             cells += moved.cell as i32;
         }
@@ -202,14 +203,25 @@ mod tests {
         // Straight down, wavering sideways: rows only.
         let mut down = Plane::new();
         for i in 0..70 {
-            assert!(!down.travel(if i % 2 == 0 { 30 } else { -30 }, 10, 260).cell);
+            assert!(!down.travel(if i % 2 == 0 { 30 } else { -30 }, 10, (260, 260)).cell);
         }
         assert_eq!((down.rows.cell(), down.cols.cell()), (3, 0));
         // Straight across: cells only.
         let mut across = Plane::new();
         for _ in 0..70 {
-            assert!(!across.travel(10, 0, 260).row);
+            assert!(!across.travel(10, 0, (260, 260)).row);
         }
         assert_eq!((across.rows.cell(), across.cols.cell()), (0, 3));
+    }
+
+    /// Rows go by their own, longer distance: as far down as a cell is
+    /// across is not yet a row.
+    #[test]
+    fn rows_take_their_own_distance() {
+        let mut plane = Plane::new();
+        // The first of either comes at 60% of its distance: 156 across, 240 down.
+        assert!(!plane.travel(200, 200, (260, 400)).row);
+        assert_eq!(plane.cols.cell(), 1);
+        assert!(plane.travel(0, 60, (260, 400)).row);
     }
 }

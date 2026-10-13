@@ -22,9 +22,9 @@ const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them 
 #   Example: trigger = "xbutton2, w+e+r"
 trigger = "xbutton2"
 
-# How far to move (pixels) to go one cell. A longer vertical distance keeps you from changing workspace by accident.
+# How far to move (pixels) to go one cell sideways (step_x) and one workspace up or down (step_y). The longer vertical distance keeps you from changing workspace by accident.
 step_x = 260
-step_y = 320
+step_y = 400
 
 # Up and down, each quick flick goes one workspace (two flicks go two; slowly bringing the hand back is ignored).
 # With false it keeps going by the distance moved, like sideways.
@@ -66,7 +66,7 @@ impl Default for Config {
         Config {
             trigger: "xbutton2".into(),
             step_x: 260,
-            step_y: 320,
+            step_y: 400,
             vertical_sticky: true,
             // Long enough that a cell passed over on the way to another is
             // not taken, short enough not to feel like waiting: about what

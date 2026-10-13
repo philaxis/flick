@@ -46,12 +46,12 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Below the last row, the link to the file and a margin.
 const SIZE: (f32, f32) = (400.0, ROWS.0 + (6.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
 /// Whether up and down has settings of its own (a flick or a distance, and
-/// how much). Not now: rows go by distance, as far apart as cells. Kept
-/// hidden, and the keys in config.toml read and left alone, should that
-/// change back.
+/// how much). Not now: rows go by distance, a distance of their own. The
+/// switch is kept hidden, and its key in config.toml read and left alone,
+/// should that change back.
 const UP_AND_DOWN_OF_ITS_OWN: bool = false;
 /// The rows below them move up into their place while they are hidden.
-const BELOW_UP_AND_DOWN: f32 = if UP_AND_DOWN_OF_ITS_OWN { 0.0 } else { 2.0 };
+const BELOW_UP_AND_DOWN: f32 = if UP_AND_DOWN_OF_ITS_OWN { 0.0 } else { 1.0 };
 /// Top of the first row and the height of each.
 const ROWS: (f32, f32) = (14.0, 46.0);
 /// Left edge of the labels and right edge of the controls.
@@ -131,7 +131,7 @@ impl Layout {
             trigger: right(0.0, 64.0, 30.0),
             step_x: slider(1.0),
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
-            step_y: hidden(slider(3.0)),
+            step_y: slider(if UP_AND_DOWN_OF_ITS_OWN { 3.0 } else { 2.0 }),
             dwell: slider(4.0 - up),
             autostart: right(5.0 - up, 44.0, 24.0),
             file: rect(EDGES.0 * s, (row(6.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
@@ -506,7 +506,7 @@ impl Settings {
         p.text(words, &fonts.value, &Rect { right: layout.trigger.left - 12.0 * s, ..row(0.0) }, colour);
         self.draw_button(&p, fonts, &layout.trigger, if view.capturing { "Cancel" } else { "Change" }, Hit::Trigger);
 
-        label(1.0, if UP_AND_DOWN_OF_ITS_OWN { "Sideways distance" } else { "Distance" });
+        label(1.0, "Sideways");
         self.draw_slider(&p, fonts, &layout.step_x, view.step_x, DISTANCES, &view.step_x.to_string(), Hit::StepX);
 
         if UP_AND_DOWN_OF_ITS_OWN {
@@ -525,6 +525,10 @@ impl Settings {
         // number sets how hard it must be.
         label(3.0, if view.sticky { "Flick strength" } else { "Vertical distance" });
         self.draw_slider(&p, fonts, &layout.step_y, view.step_y, DISTANCES, &view.step_y.to_string(), Hit::StepY);
+        }
+        if !UP_AND_DOWN_OF_ITS_OWN {
+            label(2.0, "Up and down");
+            self.draw_slider(&p, fonts, &layout.step_y, view.step_y, DISTANCES, &view.step_y.to_string(), Hit::StepY);
         }
         let up = BELOW_UP_AND_DOWN;
 
