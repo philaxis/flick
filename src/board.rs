@@ -410,7 +410,8 @@ pub struct Board {
     changed_at: Option<(Instant, f32, f32)>,
     /// The headings of the parts the tiles are placed in, when pinned
     /// windows have a part of their own.
-    sections: Vec<(Rect, &'static str)>,
+    /// Each part's heading, the part itself, and its name.
+    sections: Vec<(Rect, Rect, &'static str)>,
     /// Shell windows put out of the way while the board is open
     /// (`keep_on_top`), to be given back when it closes.
     pushed_aside: Vec<HWND>,
@@ -877,7 +878,7 @@ impl Board {
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
             for (part, name, group) in split_area(&here, &area, s) {
                 if let Some(name) = name {
-                    sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, name));
+                    sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, part, name));
                 }
                 // The part of the cell's own windows comes last.
                 if is_home {
@@ -1610,9 +1611,30 @@ impl Board {
         if if in_parts { !windows.iter().any(|(w, everywhere)| !everywhere && !w.follows) } else { self.tiles.is_empty() } {
             p.text("No windows in this cell", &fonts.centered, &self.tiles_area, white(0.28));
         }
-        for (area, name) in &self.sections {
-            p.text(name, &fonts.small, area, white(0.45));
-            p.fill_square(&Rect { top: area.bottom - 5.0 * self.scale, bottom: area.bottom - 4.0 * self.scale, ..*area }, white(0.08));
+        let s = self.scale;
+        for (head, part, name) in &self.sections {
+            let panel = Rect { left: part.left - 10.0 * s, top: head.top - 6.0 * s, right: part.right + 10.0 * s, bottom: part.bottom + 8.0 * s };
+            match *name {
+                // What stays on every desktop is on screen wherever the user
+                // goes: its part stands out from the rest, in the accent.
+                "All rows" => {
+                    p.fill(&panel, 12.0 * s, accent(0.08));
+                    p.stroke(&panel, 12.0 * s, 1.2 * s, accent(0.55));
+                    let (_, cy) = centre(&Rect { bottom: head.bottom - 4.0 * s, ..*head });
+                    p.disc((head.left + 4.0 * s, cy), 4.0 * s, accent(1.0));
+                    let text = Rect { left: head.left + 14.0 * s, ..*head };
+                    p.text("All rows · on every desktop", &fonts.title, &text, accent(1.0));
+                }
+                "This row" => {
+                    p.fill(&panel, 12.0 * s, white(0.035));
+                    p.stroke(&panel, 12.0 * s, 1.0 * s, white(0.14));
+                    p.text("This row · on every cell of it", &fonts.small, head, white(0.62));
+                }
+                _ => {
+                    p.text(name, &fonts.small, head, white(0.45));
+                    p.fill_square(&Rect { top: head.bottom - 5.0 * s, bottom: head.bottom - 4.0 * s, ..*head }, white(0.08));
+                }
+            }
         }
         for tile in &self.tiles {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
@@ -1818,13 +1840,20 @@ impl Board {
         let s = self.scale;
         let (cx, cy) = centre(area);
         let half = size(area).0.min(size(area).1) / 2.0;
-        // A small round button with the sign as two bars: to be seen at a
-        // glance, being the only way to add a cell, and not to be taken for
-        // a cell, as a box of a cell's size was.
-        let (arm, colour) = (half * 0.30, white(if hot { 1.0 } else { 0.80 }));
-        p.disc((cx, cy), half * 0.72, white(if hot { 0.24 } else { 0.10 }));
-        p.line((cx - arm, cy), (cx + arm, cy), 1.8 * s, colour);
-        p.line((cx, cy - arm), (cx, cy + arm), 1.8 * s, colour);
+        // A faint sign, out of the way of the cells, that comes up as a
+        // round button under the cursor: it is there to be found, not to
+        // draw the eye from the map. Not to be taken for a cell either, as a
+        // box of a cell's size was.
+        if hot {
+            let arm = half * 0.30;
+            p.disc((cx, cy), half * 0.72, white(0.22));
+            p.line((cx - arm, cy), (cx + arm, cy), 1.8 * s, white(1.0));
+            p.line((cx, cy - arm), (cx, cy + arm), 1.8 * s, white(1.0));
+        } else {
+            let arm = half * 0.20;
+            p.line((cx - arm, cy), (cx + arm, cy), 1.3 * s, white(0.26));
+            p.line((cx, cy - arm), (cx, cy + arm), 1.3 * s, white(0.26));
+        }
     }
 
     /// Drag feedback on the map under the cursor: where a dragged cell would
@@ -2021,31 +2050,68 @@ fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<Ti
 fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32) -> (Vec<AppBadge>, usize) {
     // Windows pinned to the row are shown by the row (`layout_pins`).
     let apps = group_apps(cell.windows.iter().filter(|w| !w.follows));
-    let count_w = icon * 0.62;
-    let width = |count: usize| icon + if count > 1 { count_w } else { 0.0 };
     let room = cell_w - 16.0 * s;
-    let between = 5.0 * s;
-    let mut shown = 0;
-    let mut used = 0.0;
-    for (_, _, count) in &apps {
-        let next = used + width(*count) + if shown > 0 { between } else { 0.0 };
-        if next > room {
+    let line_gap = 3.0 * s;
+    let count_w = |size: f32| (size * 0.62).max(8.0 * s);
+    let width = |size: f32, count: usize| size + if count > 1 { count_w(size) } else { 0.0 };
+    let between = |size: f32| (5.0 * s * size / icon).max(3.0 * s);
+    // The apps on each of `lines` lines of `size` icons, as many as fit; the
+    // last line keeps clear of the "+N" in the corner when not all do.
+    let pack = |size: f32, lines: usize| -> Vec<(usize, f32)> {
+        let mut out: Vec<(usize, f32)> = Vec::new();
+        let mut i = 0;
+        for line in 0..lines {
+            let last = line + 1 == lines;
+            let (mut n, mut used) = (0, 0.0);
+            while i + n < apps.len() {
+                let next = used + width(size, apps[i + n].2) + if n > 0 { between(size) } else { 0.0 };
+                let room = if last && i + n + 1 < apps.len() { room - 26.0 * s } else { room };
+                if next > room {
+                    break;
+                }
+                (n, used) = (n + 1, next);
+            }
+            if n == 0 {
+                break;
+            }
+            out.push((n, used));
+            i += n;
+        }
+        out
+    };
+    let lines_fit = |size: f32, lines: usize| lines as f32 * size + (lines - 1) as f32 * line_gap <= cell_h - 12.0 * s;
+    // Rather than leave apps out, smaller icons, then a second line: what is
+    // in a cell is told by its apps, so as many of them as can be seen are.
+    let least = (icon * 0.55).max(11.0 * s).min(icon);
+    let tries = [(1.0, 1), (0.8, 1), (0.65, 1), (0.8, 2), (0.65, 2), (0.0, 2)];
+    let mut chosen = None;
+    for (share, lines) in tries {
+        let size = if share == 0.0 { least } else { (icon * share).max(least) };
+        if !lines_fit(size, lines) {
+            continue;
+        }
+        let packed = pack(size, lines);
+        let shown: usize = packed.iter().map(|(n, _)| n).sum();
+        chosen = Some((size, packed));
+        if shown == apps.len() {
             break;
         }
-        used = next;
-        shown += 1;
     }
-    let mut x = body.left + (cell_w - used) / 2.0;
-    let y = body.top + (cell_h - icon) / 2.0;
-    let badges = apps[..shown]
-        .iter()
-        .map(|&(hwnd, _, count)| {
-            let badge = AppBadge { hwnd, icon: rect(x, y, icon, icon), count, label: rect(x + icon + 1.0 * s, y, count_w, icon) };
-            x += width(count) + between;
-            badge
-        })
-        .collect();
-    (badges, apps.len() - shown)
+    let (size, packed) = chosen.unwrap_or_else(|| (icon, pack(icon, 1)));
+    let block_h = packed.len() as f32 * size + packed.len().saturating_sub(1) as f32 * line_gap;
+    let mut y = body.top + (cell_h - block_h) / 2.0;
+    let mut badges = Vec::new();
+    let mut i = 0;
+    for (n, used) in &packed {
+        let mut x = body.left + (cell_w - used) / 2.0;
+        for &(hwnd, _, count) in &apps[i..i + n] {
+            badges.push(AppBadge { hwnd, icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
+            x += width(size, count) + between(size);
+        }
+        i += n;
+        y += size + line_gap;
+    }
+    (badges, apps.len() - i)
 }
 
 /// One entry per app, in the order first met: a window of it, and how many.
