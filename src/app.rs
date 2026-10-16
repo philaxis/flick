@@ -261,6 +261,7 @@ fn window_model(follows: bool, window: vd::WindowInfo) -> WindowModel {
     WindowModel {
         follows,
         app: vd::exe_name(window.pid).unwrap_or_default(),
+        icon_key: crate::board::icon_key(window.hwnd),
         app_name: vd::app_label(window.pid),
         hwnd: window.hwnd,
         rect: window.rect,
@@ -2065,6 +2066,7 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             Some(WindowModel {
                 follows: false,
                 app: format!("sample{i}"),
+                icon_key: 0,
                 app_name: String::new(),
                 // No window has such a handle; it only tells the tiles apart.
                 hwnd: HWND(-1 - i as isize),

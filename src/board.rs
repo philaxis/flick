@@ -11,7 +11,12 @@ use crate::{
     tiles::{self, Space},
     vd,
 };
-use std::{collections::HashMap, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    time::Instant,
+};
 use windows::{
     core::{w, Error, Result},
     Foundation::Numerics::Matrix3x2,
@@ -34,7 +39,7 @@ use windows::{
                 DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
+            Gdi::{BitBlt, GdiFlush, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -66,8 +71,10 @@ pub struct WindowModel {
     pub rect: RECT,
     pub minimized: bool,
     pub title: String,
-    /// Executable name; windows of one app are counted together in the map.
+    /// Executable name; used for grouping when the window has no icon.
     pub app: String,
+    /// A hash of the pixels of the window's own icon; 0 when it has none.
+    pub icon_key: u64,
     /// The app's name as people know it; may be empty.
     pub app_name: String,
     /// Follows the user from cell to cell inside its row.
@@ -1938,19 +1945,54 @@ fn make_fonts(scale: f32) -> Result<Fonts> {
     })
 }
 
-/// The window's icon as a Direct2D bitmap of `size` pixels.
-pub fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D1Bitmap> {
+/// The window's own icon, falling back to its class icon.
+fn window_icon(hwnd: HWND) -> Option<HICON> {
     unsafe {
         let mut icon = 0usize;
         SendMessageTimeoutW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0), SMTO_ABORTIFHUNG, 40, Some(&mut icon));
         if icon == 0 {
             icon = GetClassLongPtrW(hwnd, GCLP_HICON);
         }
-        if icon == 0 {
-            return None;
+        (icon != 0).then_some(HICON(icon as isize))
+    }
+}
+
+/// A hash of the window's icon pixels, or 0 if it cannot be drawn.
+pub fn icon_key(hwnd: HWND) -> u64 {
+    thread_local! {
+        // Keyed by icon handle: an app that redraws an icon in place keeps
+        // its old key until Flick restarts.
+        static KEYS: RefCell<HashMap<isize, u64>> = RefCell::new(HashMap::new());
+    }
+    let Some(icon) = window_icon(hwnd) else { return 0 };
+    KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        if let Some(&key) = keys.get(&icon.0) {
+            return key;
         }
+        let Ok(mut dib) = Dib::new((16, 16)) else { return 0 };
+        dib.pixels_mut().fill(0);
+        if unsafe { DrawIconEx(dib.dc, 0, 0, icon, 16, 16, 0, None, DI_NORMAL) }.is_err() {
+            return 0;
+        }
+        // Finish GDI drawing before reading the bitmap's memory.
+        if !unsafe { GdiFlush() }.as_bool() {
+            return 0;
+        }
+        let mut hasher = DefaultHasher::new();
+        dib.pixels().hash(&mut hasher);
+        let key = hasher.finish().max(1);
+        keys.insert(icon.0, key);
+        key
+    })
+}
+
+/// The window's icon as a Direct2D bitmap of `size` pixels.
+pub fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D1Bitmap> {
+    let icon = window_icon(hwnd)?;
+    unsafe {
         let mut dib = Dib::new((size, size)).ok()?;
-        DrawIconEx(dib.dc, 0, 0, HICON(icon as isize), size, size, 0, None, DI_NORMAL).ok()?;
+        DrawIconEx(dib.dc, 0, 0, icon, size, size, 0, None, DI_NORMAL).ok()?;
         // Icons without an alpha channel leave alpha at zero; make what they drew opaque.
         let pixels = dib.pixels_mut();
         if pixels.chunks_exact(4).all(|p| p[3] == 0) {
@@ -2069,7 +2111,7 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
             let last = line + 1 == lines;
             let (mut n, mut used) = (0, 0.0);
             while i + n < apps.len() {
-                let next = used + width(size, apps[i + n].2) + if n > 0 { between(size) } else { 0.0 };
+                let next = used + width(size, apps[i + n].1) + if n > 0 { between(size) } else { 0.0 };
                 let room = if last && i + n + 1 < apps.len() { room - 26.0 * s } else { room };
                 if next > room {
                     break;
@@ -2112,8 +2154,8 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
     let mut i = 0;
     for (n, used) in &packed {
         let mut x = body.left + (cell_w - used) / 2.0;
-        for &(hwnd, _, count) in &apps[i..i + n] {
-            badges.push(AppBadge { hwnd, icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
+        for &(window, count) in &apps[i..i + n] {
+            badges.push(AppBadge { hwnd: window.hwnd, icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
             x += width(size, count) + between(size);
         }
         i += n;
@@ -2122,13 +2164,19 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
     (badges, apps.len() - i)
 }
 
-/// One entry per app, in the order first met: a window of it, and how many.
-fn group_apps<'a>(windows: impl Iterator<Item = &'a WindowModel>) -> Vec<(HWND, &'a str, usize)> {
-    let mut apps: Vec<(HWND, &str, usize)> = Vec::new();
+/// Groups by icon, or executable when there is none, in the order first met.
+fn group_apps<'a>(windows: impl Iterator<Item = &'a WindowModel>) -> Vec<(&'a WindowModel, usize)> {
+    let mut apps: Vec<(&WindowModel, usize)> = Vec::new();
     for window in windows {
-        match apps.iter_mut().find(|(_, app, _)| *app == window.app.as_str() && !window.app.is_empty()) {
-            Some(entry) => entry.2 += 1,
-            None => apps.push((window.hwnd, window.app.as_str(), 1)),
+        match apps.iter_mut().find(|(first, _)| {
+            if window.icon_key != 0 {
+                first.icon_key == window.icon_key
+            } else {
+                first.icon_key == 0 && !window.app.is_empty() && first.app == window.app
+            }
+        }) {
+            Some(entry) => entry.1 += 1,
+            None => apps.push((window, 1)),
         }
     }
     apps
@@ -2146,7 +2194,7 @@ fn layout_pins(row: &RowModel, header: &Rect, left: f32, room: f32, icon: f32, s
     let y = header.top + (size(header).1 - icon) / 2.0;
     let mut used = 0.0;
     let mut shown = 0;
-    for (i, (_, _, count)) in apps.iter().enumerate() {
+    for (i, (_, count)) in apps.iter().enumerate() {
         let reserve = if i + 1 < apps.len() { more_w } else { 0.0 };
         let next = used + width(*count) + if shown > 0 { between } else { 0.0 };
         if next + reserve > room {
@@ -2159,8 +2207,8 @@ fn layout_pins(row: &RowModel, header: &Rect, left: f32, room: f32, icon: f32, s
     let mut x = left;
     let badges = apps[..shown]
         .iter()
-        .map(|&(hwnd, _, count)| {
-            let badge = AppBadge { hwnd, icon: rect(x, y, icon, icon), count, label: rect(x + icon + 1.0 * s, y, count_w, icon) };
+        .map(|&(window, count)| {
+            let badge = AppBadge { hwnd: window.hwnd, icon: rect(x, y, icon, icon), count, label: rect(x + icon + 1.0 * s, y, count_w, icon) };
             x += width(count) + between;
             badge
         })
@@ -2257,6 +2305,39 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apps_are_grouped_by_icon_with_executable_fallback() {
+        let cases = [
+            (vec![("brave.exe", 1), ("brave.exe", 2)], vec![(1, 1), (2, 1)]),
+            (vec![("brave.exe", 1), ("brave.exe", 1)], vec![(1, 2)]),
+            (vec![("brave.exe", 1), ("brave.exe", 2), ("brave.exe", 1)], vec![(1, 2), (2, 1)]),
+            (vec![("brave.exe", 1), ("other.exe", 1)], vec![(1, 2)]),
+            (vec![("brave.exe", 0), ("brave.exe", 0), ("other.exe", 0)], vec![(1, 2), (3, 1)]),
+            (vec![("brave.exe", 1), ("brave.exe", 0)], vec![(1, 1), (2, 1)]),
+            (vec![("brave.exe", 0), ("brave.exe", 1)], vec![(1, 1), (2, 1)]),
+            (vec![("", 0), ("", 0)], vec![(1, 1), (2, 1)]),
+        ];
+        for (entries, expected) in cases {
+            let windows: Vec<WindowModel> = entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (app, icon_key))| WindowModel {
+                    hwnd: HWND((i + 1) as isize),
+                    rect: RECT::default(),
+                    minimized: false,
+                    title: String::new(),
+                    app: app.into(),
+                    icon_key,
+                    app_name: String::new(),
+                    follows: false,
+                    topmost: false,
+                })
+                .collect();
+            let groups: Vec<_> = group_apps(windows.iter()).into_iter().map(|(window, count)| (window.hwnd.0, count)).collect();
+            assert_eq!(groups, expected);
+        }
+    }
 
     fn row(cells: &[&str]) -> RowModel {
         RowModel {
