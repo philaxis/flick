@@ -45,7 +45,7 @@ use windows::{
                 RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
                 MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
                 WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_POWERBROADCAST,
-                WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+                WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
@@ -114,6 +114,10 @@ const BOARD_SETTLES_MS: u64 = 1500;
 /// trigger on one, Windows may go back to the cell left.
 const GOING_SETTLES_MS: u64 = 700;
 const CONFIG_CHECK_MS: u32 = 2000;
+/// Started with Windows, Flick can come up before Explorer has its virtual
+/// desktops ready: it asks again this often, for this long, before giving up.
+const DESKTOPS_POLL_MS: u64 = 500;
+const DESKTOPS_WAIT_MS: u64 = 180_000;
 /// Hotkey ids 0..=3 move in the direction of `input::dir_from_index`, 4..=7
 /// do the same carrying the active window, and this one opens the pin menu.
 const PIN_HOTKEY_ID: i32 = 8;
@@ -1824,8 +1828,12 @@ pub fn run(first_run: bool) {
         Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
     };
     GUIDE_HWND.set(guide.hwnd().0);
-    if Desktops::read().is_none() {
-        return warn("Flick could not reach the virtual desktops. This build of Windows may not be supported.");
+    match wait_for_desktops() {
+        Some(true) => {}
+        Some(false) => {
+            return warn("Flick could not reach the virtual desktops. This build of Windows may not be supported.");
+        }
+        None => return,
     }
 
     debug_log!(
@@ -1872,6 +1880,38 @@ pub fn run(first_run: bool) {
         }
     }
     APP.with(|slot| slot.borrow_mut().take());
+}
+
+/// Waits until the virtual desktops can be read, handling this thread's
+/// messages meanwhile: `Some(false)` when they never could, `None` when the
+/// app was told to quit.
+fn wait_for_desktops() -> Option<bool> {
+    let start = std::time::Instant::now();
+    loop {
+        if Desktops::read().is_some() {
+            if start.elapsed().as_millis() >= DESKTOPS_POLL_MS as u128 {
+                log(&format!("the virtual desktops answered after {} ms", start.elapsed().as_millis()));
+            }
+            return Some(true);
+        }
+        if start.elapsed().as_millis() >= DESKTOPS_WAIT_MS as u128 {
+            return Some(false);
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(DESKTOPS_POLL_MS);
+        while std::time::Instant::now() < until {
+            unsafe {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    if message.message == WM_QUIT {
+                        return None;
+                    }
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 }
 
 /// Writes a picture as a raw file: width and height as i32 LE, then the
