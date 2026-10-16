@@ -130,6 +130,14 @@ const NO_ROOM: i32 = 0xFF;
 static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
 static ROW_FRACTION: AtomicI32 = AtomicI32::new(0);
 static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
+/// The board is open: a hold begun now goes from row to row as the hand
+/// goes, not by notches (`Plane::linear`).
+static BOARD_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// The app says when the board opens and closes.
+pub fn set_board_open(open: bool) {
+    BOARD_OPEN.store(open, Ordering::SeqCst);
+}
 
 /// The wparam of `WM_SLIDE` and `WM_DRAG`.
 fn slide_wparam(stretch: u32, cell: i32) -> usize {
@@ -629,7 +637,7 @@ fn press(source: Source) {
             ROW_ASKED.store(0, Ordering::SeqCst);
             ROW_FRACTION.store(0, Ordering::SeqCst);
         });
-        PLANE.set(Plane::new());
+        PLANE.set(if BOARD_OPEN.load(Ordering::SeqCst) { Plane::linear() } else { Plane::new() });
         DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
@@ -923,7 +931,8 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
 ///
 /// Each way on its own (`Plane`): one cell per `step_x` of travel as far as
 /// the hand goes, and one row each time up and down travel gathers `step_y`
-/// (by notches, `Detent`), sideways travel moving the
+/// (by notches, `Detent`; on the board one per `step_y` as the hand goes),
+/// sideways travel moving the
 /// hand along the row only and up and down travel from row to row only, so a
 /// hand going slantwise does both at once. The app is told of the row or the
 /// cell the hand has come to whenever that is another one (`WM_ROWS`,
@@ -939,7 +948,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     let (step, step_y) = (s.step_x, s.step_y);
     let mut plane = PLANE.get();
     if let Some((_, (up, down))) = rows_seen() {
-        plane.rows.set_room(up, down);
+        plane.rows.set_room(up, down, step_y);
     }
     if let Some((_, Some((left, right)))) = shown() {
         plane.cols.set_room(left, right, step);
@@ -970,11 +979,11 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
         debug_log!("slide: cell {} of stretch {stretch}", cols.cell());
         post(s, WM_SLIDE, slide_wparam(stretch, cols.cell()));
     }
-    if !DRAGGING.get() && (STEPPED.get() || cols.rest(step).abs() >= DRAG_SHOWS || rows.gathered().abs() >= DRAG_SHOWS) {
+    if !DRAGGING.get() && (STEPPED.get() || cols.rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(stretch, 0));
     }
-    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.rest(step), rows.gathered());
+    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.rest(step), rows.gathered(step_y));
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.

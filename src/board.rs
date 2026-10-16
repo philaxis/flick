@@ -585,6 +585,7 @@ impl Board {
         self.refused = None;
         self.stop_editing();
         self.open = true;
+        crate::input::set_board_open(true);
         unsafe {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_SHOWWINDOW);
             SetTimer(self.hwnd, ON_TOP_TIMER_ID, ON_TOP_MS, None);
@@ -637,6 +638,7 @@ impl Board {
             return;
         }
         self.open = false;
+        crate::input::set_board_open(false);
         self.rest_on(None);
         self.clear_thumbnails();
         self.icons.clear();

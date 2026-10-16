@@ -1960,7 +1960,7 @@ pub fn render_minimap_strip(path: &str) {
     let (dt, scale, gap, steps) = (1.0 / 60.0, 1.5, 6, (260, 400));
     let mut plane = crate::slide::Plane::new();
     // The hold begins on row 1, cell 0, with a row above and two below.
-    plane.rows.set_room(1, 2);
+    plane.rows.set_room(1, 2, steps.1);
     plane.cols.set_room(0, 1, steps.0);
     let (mut counts, mut stretch) = ((0, 0), 0u64);
     let (mut came_col, mut came_row) = (None, None);
@@ -2000,7 +2000,7 @@ pub fn render_minimap_strip(path: &str) {
         let xs: Vec<String> = xs.iter().map(|x| format!("{x:+.3}")).collect();
         record += &format!(
             "frame {frame:2} counts {x},{y} gathered {} cur {},{} hand {:+.3},{:+.3} rows x [{}] y {y_drawn:+.3}\n",
-            plane.rows.gathered(),
+            plane.rows.gathered(steps.1),
             cur.row,
             cur.col,
             hand.along,

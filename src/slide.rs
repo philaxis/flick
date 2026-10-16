@@ -5,7 +5,8 @@
 //! where the hand is, counted from the cell it set out from, so the same
 //! travel is the same cell whatever the pace it came at and however long the
 //! app took over the cells before. Up and down goes by notches instead, as a
-//! mouse wheel does (`Detent`).
+//! mouse wheel does (`Detent`), but on the board, where it follows the hand
+//! as sideways does (`Rows::Linear`).
 
 /// A cell is come to once the hand is this much nearer it than the one
 /// before, in tenths of the way between them: a little past halfway, so that
@@ -176,16 +177,69 @@ impl Detent {
     }
 }
 
+/// Up and down in a hold: by notches (`Detent`), or, with the board open,
+/// following the hand as sideways does (`Slide`), so the selection goes
+/// over the map as far as the hand goes.
+#[derive(Clone, Copy, Debug)]
+pub enum Rows {
+    Notched(Detent),
+    Linear(Slide),
+}
+
+impl Rows {
+    pub fn cell(&self) -> i32 {
+        match self {
+            Rows::Notched(detent) => detent.cell(),
+            Rows::Linear(slide) => slide.cell(),
+        }
+    }
+
+    /// Travel towards the next row not yet come to (negative upwards).
+    pub fn gathered(&self, step: i32) -> i32 {
+        match self {
+            Rows::Notched(detent) => detent.gathered(),
+            Rows::Linear(slide) => slide.rest(step),
+        }
+    }
+
+    /// How far the minimap leans towards the next row, in rows.
+    pub fn lean(&self, step: i32) -> f32 {
+        match self {
+            Rows::Notched(detent) => detent.lean(step),
+            Rows::Linear(slide) => slide.rest(step) as f32 / step.max(1) as f32,
+        }
+    }
+
+    pub fn set_room(&mut self, up: i32, down: i32, step: i32) {
+        match self {
+            Rows::Notched(detent) => detent.set_room(up, down),
+            Rows::Linear(slide) => slide.set_room(up, down, step),
+        }
+    }
+
+    /// The hand moved `dy` (downwards). True when that came to another row.
+    pub fn travel(&mut self, dy: i32, step: i32) -> bool {
+        match self {
+            Rows::Notched(detent) => detent.travel(dy, step),
+            Rows::Linear(slide) => {
+                let before = slide.cell();
+                slide.travel(dy, step.max(1), true);
+                slide.cell() != before
+            }
+        }
+    }
+}
+
 /// Where the hand is both ways in a hold: each way on its own, sideways
 /// counting only the hand's sideways travel and up and down only its up and
 /// down travel, so a hand going slantwise goes along the row and from row to
 /// row at once. Sideways the cell follows the hand (`Slide`); up and down
-/// goes by notches (`Detent`). A new row begins a new stretch along it
-/// (`Slide::carried_on`).
+/// goes by notches (`Detent`), or follows it too on the board (`Rows`). A
+/// new row begins a new stretch along it (`Slide::carried_on`).
 #[derive(Clone, Copy, Debug)]
 pub struct Plane {
     pub cols: Slide,
-    pub rows: Detent,
+    pub rows: Rows,
 }
 
 /// What one movement came to: another row, another cell along the row.
@@ -197,7 +251,12 @@ pub struct Moved {
 
 impl Plane {
     pub const fn new() -> Plane {
-        Plane { cols: Slide::new(), rows: Detent::new() }
+        Plane { cols: Slide::new(), rows: Rows::Notched(Detent::new()) }
+    }
+
+    /// A hold begun with the board open: up and down follows the hand.
+    pub const fn linear() -> Plane {
+        Plane { cols: Slide::new(), rows: Rows::Linear(Slide::new()) }
     }
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
@@ -310,7 +369,7 @@ mod tests {
             rows += moved.row as i32;
             cells += moved.cell as i32;
         }
-        assert_eq!((rows, slant.rows.gathered()), (2, 0));
+        assert_eq!((rows, slant.rows.gathered(steps.1)), (2, 0));
         assert_eq!(cells, 3);
         // Straight down wavering sideways: rows only; straight across: cells only.
         let mut down = Plane::new();
@@ -323,5 +382,29 @@ mod tests {
             assert!(!across.travel(10, 0, steps).row);
         }
         assert_eq!((across.rows.cell(), across.cols.cell()), (0, 3));
+    }
+
+    /// On the board up and down follows the hand as sideways does: a row a
+    /// little past halfway there, one fling as many rows as it went, and
+    /// back again as soon as the hand is nearer the row before.
+    #[test]
+    fn on_the_board_rows_follow_the_hand() {
+        let steps = (260, 400);
+        let mut plane = Plane::linear();
+        assert!(!plane.travel(0, 239, steps).row);
+        assert!(plane.travel(0, 1, steps).row);
+        assert_eq!(plane.rows.cell(), 1);
+        let mut flung = Plane::linear();
+        assert!(flung.travel(0, 1250, steps).row);
+        assert_eq!(flung.rows.cell(), 3);
+        assert!(flung.travel(0, -300, steps).row);
+        assert_eq!(flung.rows.cell(), 2);
+        // Against the last row the hand pushes only a little past it.
+        let mut wall = Plane::linear();
+        wall.rows.set_room(0, 1, steps.1);
+        wall.travel(0, 5000, steps);
+        assert_eq!(wall.rows.cell(), 1);
+        assert!(wall.travel(0, -320, steps).row);
+        assert_eq!(wall.rows.cell(), 0);
     }
 }
