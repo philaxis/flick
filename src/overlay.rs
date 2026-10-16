@@ -41,7 +41,7 @@ const CELL_W: f32 = 46.0;
 const CELL_H: f32 = 30.0;
 const GAP: f32 = 7.0;
 const PAD: f32 = 20.0;
-/// Room under the grid for the workspace name.
+/// Room under the grid for the shelf name.
 const TITLE_H: f32 = 26.0;
 /// Time constants (seconds) of the exponential easing: of a jump in where
 /// the grid is drawn, and of the fading in and out.
@@ -68,7 +68,7 @@ pub struct View {
     /// sideways so that these line up in one column.
     pub anchors: Vec<usize>,
     pub cur: Option<Pos>,
-    /// Name of the current workspace, shown under the grid.
+    /// Name of the current shelf, shown under the grid.
     pub title: String,
 }
 
@@ -231,7 +231,7 @@ fn create_window() -> Result<HWND> {
 pub struct Overlay {
     hwnd: HWND,
     target: DcTarget,
-    /// Text format for the workspace name, made for `text_scale`.
+    /// Text format for the shelf name, made for `text_scale`.
     text: Option<IDWriteTextFormat>,
     text_scale: f32,
     /// The bitmap the minimap is drawn into, remade when its size changes.

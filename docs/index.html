@@ -237,8 +237,8 @@ class Grid {
   lead() { return Math.max(...this.m.rows.map((_, r) => this.anchor(r))); }
   shift(r) { return this.lead() - this.anchor(r); }
   columns() { return this.lead() + Math.max(1, ...this.m.rows.map((row, r) => row.cells.length - this.anchor(r))); }
-  /* The app names an unnamed workspace by its number. */
-  name(r) { return tr(this.m.rows[r].name) || tr({ ko: `워크스페이스 ${r + 1}`, en: `Workspace ${r + 1}` }); }
+  /* The app names an unnamed shelf by its number. */
+  name(r) { return tr(this.m.rows[r].name) || tr({ ko: `선반 ${r + 1}`, en: `Shelf ${r + 1}` }); }
   /* Left/right stay in the row and stop at its ends; up/down land on the cell that row was last left on (its first if never visited). */
   target(dir) {
     const { r, c } = this.cur, rows = this.m.rows;
@@ -263,7 +263,7 @@ class Grid {
   }
 }
 
-/* Flick's switcher: the panel the real overlay draws (same proportions and opacities), the workspace's name under the grid. */
+/* Flick's switcher: the panel the real overlay draws (same proportions and opacities), the shelf's name under the grid. */
 const MINI_TITLE = 26;
 function drawMini(g, grid, cx, cy, s, alpha) {
   const CW = 46 * s, CH = 30 * s, GAP = 7 * s, PAD = 20 * s, rows = grid.m.rows;
@@ -505,7 +505,7 @@ function repaint() { hero.sprites.clear(); if (STILL) redrawStill(); }
 
 document.getElementById('lang').addEventListener('click', () => { lang = lang === 'ko' ? 'en' : 'ko'; try { localStorage.setItem('flick-lang', lang); } catch (e) {} applyLang(); repaint(); });
 if (document.fonts) {
-  const all = '워크스페이스편집기브라우저메모디자인채팅WorkspaceEditorBrowserNotesDesignChat123';
+  const all = '선반편집기브라우저메모디자인채팅ShelfEditorBrowserNotesDesignChat123';
   Promise.all([500, 600].map(w => document.fonts.load(`${w} 12px "IBM Plex Sans KR"`, all))).then(repaint, () => {});
 }
 new ResizeObserver(() => { hero.resize(); if (STILL) redrawStill(); else hero.draw(); }).observe(hero.cv);

@@ -137,11 +137,11 @@ pub enum Action {
     SetPin { window: HWND, row: bool, all: bool },
     /// Keep a window above the others, or stop doing so.
     SetTop { window: HWND, on: bool },
-    /// Show the menu of a workspace (close its windows, remove it).
+    /// Show the menu of a shelf (close its windows, remove it).
     RowMenu(usize),
     /// Make a cell stand out, or stop it doing so.
     ToggleEmphasis(CellId),
-    /// Move a workspace to before row `at`, counted without the moved one.
+    /// Move a shelf to before row `at`, counted without the moved one.
     MoveRow { from: usize, at: usize },
     Rename(usize, String),
 }
@@ -156,7 +156,7 @@ const DWELL_TIMER_ID: usize = 1;
 const ON_TOP_TIMER_ID: usize = 2;
 const ON_TOP_MS: u32 = 250;
 const DWELL_TICK_MS: u32 = 30;
-/// The longest name a workspace can be given, in characters.
+/// The longest name a shelf can be given, in characters.
 const NAME_LENGTH: usize = 24;
 
 fn contains(r: &Rect, x: f32, y: f32) -> bool {
@@ -198,7 +198,7 @@ fn format_memory(bytes: u64) -> String {
 #[derive(Clone, Copy, PartialEq)]
 enum Pin {
     Off,
-    /// Follows the user within its workspace.
+    /// Follows the user within its shelf.
     Row,
     /// Shown on every desktop.
     Everywhere,
@@ -529,7 +529,7 @@ impl Board {
         self.open
     }
 
-    /// What a workspace's menu is headed with: its name, how many windows
+    /// What a shelf's menu is headed with: its name, how many windows
     /// it has and an estimate of the memory they take.
     pub fn row_summary(&self, row: usize) -> Option<String> {
         let model = self.model.rows.get(row)?;
@@ -1057,7 +1057,7 @@ impl Board {
         }
     }
 
-    /// Where the dragged workspace `from` would land if dropped at height
+    /// Where the dragged shelf `from` would land if dropped at height
     /// `y`: its place among the others, and where to draw the marker, in the
     /// coordinates of the map under the cursor.
     fn row_slot_at(&self, from: usize, y: f32) -> Option<(usize, f32)> {
@@ -1270,7 +1270,7 @@ impl Board {
             let _ = ImmReleaseContext(self.hwnd, context);
         }
         self.invalidate();
-        // A workspace always has a name: one left empty keeps what it had.
+        // A shelf always has a name: one left empty keeps what it had.
         let name = name.trim();
         (!name.is_empty()).then(|| (row, name.to_owned()))
     }
@@ -1590,7 +1590,7 @@ impl Board {
             Hit::Cell(_) | Hit::CellClose(_) => hint("Click: go   ·   Drag: move   ·   Right-click: highlight"),
             Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
-            Hit::AddRow | Hit::AddRowTop => hint("Add a workspace"),
+            Hit::AddRow | Hit::AddRowTop => hint("Add a shelf"),
             Hit::Nothing => None,
         }
     }

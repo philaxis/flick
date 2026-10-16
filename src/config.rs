@@ -22,18 +22,18 @@ const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them 
 #   Example: trigger = "xbutton2, w+e+r"
 trigger = "xbutton2"
 
-# How far to move (pixels) to go one cell sideways (step_x) and one workspace up or down (step_y). The longer vertical distance keeps you from changing workspace by accident.
+# How far to move (pixels) to go one cell sideways (step_x) and one shelf up or down (step_y). The longer vertical distance keeps you from changing shelf by accident.
 step_x = 260
 step_y = 400
 
-# Up and down, each quick flick goes one workspace (two flicks go two; slowly bringing the hand back is ignored).
+# Up and down, each quick flick goes one shelf (two flicks go two; slowly bringing the hand back is ignored).
 # With false it keeps going by the distance moved, like sideways.
 vertical_sticky = true
 
 # In the overview, resting the cursor on a cell of the map for this long (milliseconds) shows that cell's windows. 0 turns it off.
 dwell_ms = 500
 
-# New cells and new workspaces are made only with + in the overview (click the trigger).
+# New cells and new shelves are made only with + in the overview (click the trigger).
 
 # Holding this key during the gesture carries the active window along. "shift", "ctrl", "alt"
 carry_modifier = "shift"
@@ -41,7 +41,7 @@ carry_modifier = "shift"
 # Ctrl+Alt+Win+arrows to move (add Shift to carry the window), Ctrl+Alt+Win+P for the pin menu of the active window
 hotkeys = true
 
-# Lets Windows compress or page out the memory of apps in a workspace not visited for this long (minutes).
+# Lets Windows compress or page out the memory of apps in a shelf not visited for this long (minutes).
 # Coming back may stutter for a moment. 0 turns it off.
 sleep_after_minutes = 0
 "#;

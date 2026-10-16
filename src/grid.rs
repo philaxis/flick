@@ -1,6 +1,6 @@
 //! The 2D layout laid over Windows' flat list of virtual desktops.
 //!
-//! A row is a workspace; its cells are that workspace's screens. Rows may have
+//! A row is a shelf; its cells are that shelf's screens. Rows may have
 //! different lengths. Cells are identified by the desktop GUID (as a string),
 //! so this module has no Windows dependency.
 
@@ -50,7 +50,7 @@ impl Row {
 /// given it one.
 pub fn row_title(name: &str, index: usize) -> String {
     if name.is_empty() {
-        format!("Workspace {}", index + 1)
+        format!("Shelf {}", index + 1)
     } else {
         name.to_owned()
     }
@@ -150,16 +150,22 @@ impl Grid {
         }
     }
 
-    /// Gives every row without a name one: "Workspace N" with the lowest
-    /// number no row has yet. Returns whether any was given.
+    /// Gives every row without a name one: "Shelf N" with the lowest
+    /// number no row has yet. Rows still called by the name an earlier
+    /// version gave them ("Workspace N", "워크스페이스 N") become "Shelf N".
+    /// Returns whether any name changed.
     pub fn name_unnamed(&mut self) -> bool {
         let mut changed = false;
+        for row in &mut self.rows {
+            let old = ["Workspace ", "워크스페이스 "].iter().find_map(|p| row.name.strip_prefix(p));
+            if let Some(n) = old.filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+                row.name = format!("Shelf {n}");
+                changed = true;
+            }
+        }
         for r in 0..self.rows.len() {
             if self.rows[r].name.trim().is_empty() {
-                // Rows named by versions that spoke Korean keep their numbers.
-                let name = (1..)
-                    .find(|n| self.rows.iter().all(|row| row.name != format!("Workspace {n}") && row.name != format!("워크스페이스 {n}")))
-                    .map(|n| format!("Workspace {n}"));
+                let name = (1..).find(|n| self.rows.iter().all(|row| row.name != format!("Shelf {n}"))).map(|n| format!("Shelf {n}"));
                 self.rows[r].name = name.unwrap_or_default();
                 changed = true;
             }
@@ -255,6 +261,18 @@ impl Grid {
 mod tests {
     use super::*;
 
+    #[test]
+    fn names_from_earlier_versions_become_shelves() {
+        let mut g = grid(&[&["a"], &["b"], &["c"], &["d"]]);
+        g.rows[0].name = "Workspace 1".into();
+        g.rows[1].name = "워크스페이스 3".into();
+        g.rows[2].name = "Workspace of mine".into();
+        assert!(g.name_unnamed());
+        let names: Vec<_> = g.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Shelf 1", "Shelf 3", "Workspace of mine", "Shelf 2"]);
+        assert!(!g.name_unnamed());
+    }
+
     fn grid(rows: &[&[&str]]) -> Grid {
         Grid {
             rows: rows
@@ -317,7 +335,7 @@ mod tests {
         assert_eq!(g.rows[1].cells, ["b", "c", "d"]);
     }
 
-    /// Removing a workspace: each of its cells sends its windows to the cell
+    /// Removing a shelf: each of its cells sends its windows to the cell
     /// drawn closest to it, a neighbouring row winning over a nearer cell
     /// two rows away and the row above winning a tie.
     #[test]

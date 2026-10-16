@@ -171,7 +171,7 @@ struct App {
     following: HashSet<isize>,
     /// A pin menu to show once the current handler has returned.
     pending_menu: Option<(HWND, PinState)>,
-    /// Likewise the menu of a workspace in the board.
+    /// Likewise the menu of a shelf in the board.
     pending_row_menu: Option<usize>,
     /// When each cell was last shown (cells not in here count from
     /// `started`), and the cells of rows put to sleep. Both only matter with
@@ -1208,7 +1208,7 @@ impl App {
         }
     }
 
-    /// Asks every window of a workspace to close; the workspace stays.
+    /// Asks every window of a shelf to close; the shelf stays.
     fn close_row_windows(&mut self, row: usize) {
         let Some(desktops) = self.sync() else { return };
         let Some(ids) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
@@ -1218,7 +1218,7 @@ impl App {
         self.refresh_board_in(600);
     }
 
-    /// Removes a workspace. Each of its desktops hands its windows to the
+    /// Removes a shelf. Each of its desktops hands its windows to the
     /// cell drawn nearest to it in the other rows.
     fn remove_row(&mut self, row: usize) {
         let Some(desktops) = self.sync() else { return };
@@ -1230,7 +1230,7 @@ impl App {
             .iter()
             .filter_map(|id| Some((id.clone(), self.grid.nearest_in_other_rows(self.grid.find(id)?)?.clone())))
             .collect();
-        // Leave the workspace first if we are standing in it.
+        // Leave the shelf first if we are standing in it.
         if let Some((_, to)) = targets.iter().find(|(id, _)| *id == desktops.current) {
             let Some(target) = desktops.get(to) else { return };
             if !self.switch(target) {
@@ -1706,7 +1706,7 @@ fn run_pending_menus(owner: HWND) {
     }
 }
 
-/// The menu of a workspace in the board, if one was asked for.
+/// The menu of a shelf in the board, if one was asked for.
 fn run_row_menu(owner: HWND) {
     let pending = with_app(|app| {
         let row = app.pending_row_menu.take()?;
@@ -1719,7 +1719,7 @@ fn run_row_menu(owner: HWND) {
             // Closing windows can lose work, so it is asked about in earnest,
             // with "No" as the default answer.
             let text = format!(
-                "{summary}\n\nThis closes every window in this workspace.\nUnsaved work can be lost, and this cannot be undone.\n\nClose them all?"
+                "{summary}\n\nThis closes every window in this shelf.\nUnsaved work can be lost, and this cannot be undone.\n\nClose them all?"
             );
             with_app(|app| app.board.set_modal(true));
             let answer = unsafe {
@@ -1935,7 +1935,7 @@ pub fn render_sample(path: &str) {
             vec![CellView::default(); 3],
         ],
         anchors: vec![2, 1, 0],
-        title: "Workspace 2".into(),
+        title: "Shelf 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
     };
     if let Some((size, pixels)) = overlay.render_to_pixels(view, (0.0, 0.0), 2.0) {
@@ -1994,7 +1994,7 @@ pub fn render_minimap_strip(path: &str) {
             rows: rows.clone(),
             anchors: vec![1, view_col as usize, 2, 1],
             cur: Some(cur),
-            title: format!("Workspace {}", cur.row + 1),
+            title: format!("Shelf {}", cur.row + 1),
         };
         let Some((size, pixels, (xs, y_drawn))) = overlay.frame_to_pixels(view, hand, dt, scale) else { return };
         let xs: Vec<String> = xs.iter().map(|x| format!("{x:+.3}")).collect();

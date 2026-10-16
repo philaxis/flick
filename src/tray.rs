@@ -204,9 +204,9 @@ pub enum RowCommand {
     Remove,
 }
 
-/// The menu of a workspace in the board, at the cursor, headed by `summary`
-/// (which workspace it is and what closing would close). `removable` is
-/// false for the only workspace.
+/// The menu of a shelf in the board, at the cursor, headed by `summary`
+/// (which shelf it is and what closing would close). `removable` is
+/// false for the only shelf.
 pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowCommand> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     add_note(menu, summary);
@@ -214,7 +214,7 @@ pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowComman
     add_item(menu, RowCommand::CloseWindows as usize, w!("Close all windows…"), false);
     if removable {
         // Its windows are not closed; they go to the nearest cell that stays.
-        add_item(menu, RowCommand::Remove as usize, w!("Remove the workspace only"), false);
+        add_item(menu, RowCommand::Remove as usize, w!("Remove the shelf only"), false);
     }
     let picked = pick(menu, owner);
     [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as usize == picked)
