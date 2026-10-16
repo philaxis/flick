@@ -175,6 +175,11 @@ fn centre(r: &Rect) -> (f32, f32) {
     ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0)
 }
 
+/// The colour of what is pinned to all rows, on its pin and its part.
+fn everywhere(a: f32) -> D2D1_COLOR_F {
+    rgba(0.62, 0.45, 1.0, a)
+}
+
 fn danger(a: f32) -> D2D1_COLOR_F {
     rgba(0.93, 0.33, 0.33, a)
 }
@@ -1616,19 +1621,19 @@ impl Board {
             let panel = Rect { left: part.left - 10.0 * s, top: head.top - 6.0 * s, right: part.right + 10.0 * s, bottom: part.bottom + 8.0 * s };
             match *name {
                 // What stays on every desktop is on screen wherever the user
-                // goes: its part stands out from the rest, in the accent.
+                // goes: its part stands out from the rest, in its pin's colour.
                 "All rows" => {
-                    p.fill(&panel, 12.0 * s, accent(0.08));
-                    p.stroke(&panel, 12.0 * s, 1.2 * s, accent(0.55));
+                    p.fill(&panel, 12.0 * s, everywhere(0.08));
+                    p.stroke(&panel, 12.0 * s, 1.2 * s, everywhere(0.55));
                     let (_, cy) = centre(&Rect { bottom: head.bottom - 4.0 * s, ..*head });
-                    p.disc((head.left + 4.0 * s, cy), 4.0 * s, accent(1.0));
+                    p.disc((head.left + 4.0 * s, cy), 4.0 * s, everywhere(1.0));
                     let text = Rect { left: head.left + 14.0 * s, ..*head };
-                    p.text("All rows · on every desktop", &fonts.title, &text, accent(1.0));
+                    p.text("All rows · on every desktop", &fonts.title, &text, everywhere(1.0));
                 }
                 "This row" => {
-                    p.fill(&panel, 12.0 * s, white(0.035));
-                    p.stroke(&panel, 12.0 * s, 1.0 * s, white(0.14));
-                    p.text("This row · on every cell of it", &fonts.small, head, white(0.62));
+                    p.fill(&panel, 12.0 * s, accent(0.04));
+                    p.stroke(&panel, 12.0 * s, 1.0 * s, accent(0.30));
+                    p.text("This row · on every cell of it", &fonts.small, head, accent(0.85));
                 }
                 _ => {
                     p.text(name, &fonts.small, head, white(0.45));
@@ -1685,7 +1690,7 @@ impl Board {
 
         let over = self.hover == Hit::Pin(tile.hwnd.0);
         let colour = match pin {
-            Pin::Everywhere => rgba(0.62, 0.45, 1.0, dim),
+            Pin::Everywhere => everywhere(dim),
             Pin::Row => accent(dim),
             Pin::Off => white(if over { 0.20 } else { 0.07 } * dim),
         };
@@ -2079,7 +2084,10 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
         }
         out
     };
-    let lines_fit = |size: f32, lines: usize| lines as f32 * size + (lines - 1) as f32 * line_gap <= cell_h - 12.0 * s;
+    // More than one line keeps clear of the dot of the current cell.
+    let lines_fit = |size: f32, lines: usize| {
+        lines as f32 * size + (lines - 1) as f32 * line_gap <= cell_h - if lines > 1 { 30.0 } else { 12.0 } * s
+    };
     // Rather than leave apps out, smaller icons, then a second line: what is
     // in a cell is told by its apps, so as many of them as can be seen are.
     let least = (icon * 0.55).max(11.0 * s).min(icon);
