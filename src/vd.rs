@@ -32,7 +32,7 @@ use windows::{
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
                 IsIconic, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
                 ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-                SWP_NOSIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SMTO_ABORTIFHUNG, WINDOWPLACEMENT, WM_CLOSE, WM_NULL,
+                SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SMTO_ABORTIFHUNG, WINDOWPLACEMENT, WM_CLOSE, WM_NULL,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
@@ -510,6 +510,18 @@ pub fn move_to_monitor(hwnd: HWND, to: RECT) {
 /// volume indicator, and that window stops showing while minimized (the
 /// approach of the HideVolumeOSD tool). `hidden = false` puts it back.
 pub fn set_switch_label_hidden(hidden: bool) {
+    for host in notice_windows() {
+        if hidden {
+            unsafe { ShowWindow(host, SW_MINIMIZE) };
+        } else {
+            put_notice_away(host);
+        }
+    }
+}
+
+/// The shell's windows for its notices above the taskbar.
+fn notice_windows() -> Vec<HWND> {
+    let mut found = Vec::new();
     unsafe {
         let mut host = HWND(0);
         loop {
@@ -524,8 +536,54 @@ pub fn set_switch_label_hidden(hidden: bool) {
                 w!("DesktopWindowXamlSource"),
             );
             if bridge.0 != 0 {
-                ShowWindow(host, if hidden { SW_MINIMIZE } else { SW_RESTORE });
+                found.push(host);
             }
+        }
+    }
+    found
+}
+
+/// Leaves a notice window as it is between notices: hidden, not minimized.
+/// Shown with no notice in it, it is unseen yet takes the clicks where it
+/// lies, above the middle of the taskbar.
+pub fn put_notice_away(host: HWND) {
+    unsafe {
+        ShowWindow(host, SW_SHOWNOACTIVATE);
+        ShowWindow(host, SW_HIDE);
+    }
+}
+
+/// How long a notice window may stay shown: longer than any notice lasts.
+const NOTICE_STUCK: std::time::Duration = std::time::Duration::from_secs(6);
+
+thread_local! {
+    static NOTICE_SHOWN_SINCE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Called every few seconds: puts away a notice window the shell has left
+/// shown with nothing in it, which happens a few seconds after a desktop is
+/// made. True when it did.
+pub fn put_away_stuck_notice() -> bool {
+    let shown: Vec<HWND> = notice_windows()
+        .into_iter()
+        .filter(|&host| unsafe { IsWindowVisible(host).as_bool() && !IsIconic(host).as_bool() })
+        .collect();
+    let now = std::time::Instant::now();
+    let since = NOTICE_SHOWN_SINCE.get();
+    if shown.is_empty() {
+        NOTICE_SHOWN_SINCE.set(None);
+        return false;
+    }
+    match since {
+        Some(since) if now.duration_since(since) >= NOTICE_STUCK => {
+            shown.into_iter().for_each(put_notice_away);
+            NOTICE_SHOWN_SINCE.set(None);
+            true
+        }
+        Some(_) => false,
+        None => {
+            NOTICE_SHOWN_SINCE.set(Some(now));
+            false
         }
     }
 }

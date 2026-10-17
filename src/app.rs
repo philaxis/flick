@@ -1669,6 +1669,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_TIMER if wparam.0 == CONFIG_TIMER_ID => {
             with_app(App::apply_saved_config);
+            if vd::put_away_stuck_notice() {
+                log("put away the shell's notice window left shown over the taskbar");
+            }
         }
         WM_RESTACK => {
             with_app(|app| app.restack_clicked(HWND(wparam.0 as _)));
