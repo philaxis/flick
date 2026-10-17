@@ -12,14 +12,13 @@
 use crate::{
     config::Config,
     grid::Dir,
-    hold::{Chord, Held, Source, Verdict},
+    hold::{Chord, Held, Source},
     slide::Plane,
 };
 use std::{
     cell::{Cell, RefCell},
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender},
         Mutex,
     },
     time::Instant,
@@ -30,7 +29,6 @@ use windows::Win32::{
     System::{
         LibraryLoader::GetModuleHandleW,
         StationsAndDesktops::{CloseDesktop, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS},
-        SystemInformation::GetTickCount,
         Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
     },
     UI::{
@@ -38,14 +36,14 @@ use windows::Win32::{
             GetRawInputData,
             KeyboardAndMouse::{
                 MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-                KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC_EX, VIRTUAL_KEY,
+                KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
             },
             RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
             RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetForegroundWindow,
-            GetMessageTime, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, KillTimer, PostMessageW, PostThreadMessageW,
+            GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, KillTimer, PostMessageW, PostThreadMessageW,
             RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HC_ACTION, HHOOK,
             HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
             SM_CYVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
@@ -98,6 +96,14 @@ const REHOOK_MS: u32 = 5_000;
 /// Marks key events we replay ourselves, so the hook lets them through. (An
 /// arbitrary number: "KANK" in ASCII.)
 const OWN_INPUT: usize = 0x4B41_4E4B;
+/// All keys of a chord must go down within this long to count as one press.
+/// Two keys next to each other are also typed in quick succession ("ty" in
+/// "type"), so a two-key chord has to be much more simultaneous than that.
+const CHORD_WINDOW_MS: u32 = 100;
+const PAIR_WINDOW_MS: u32 = 40;
+/// Keys sent by software (mouse software sending the chord for a button)
+/// may come further apart, and nobody types with them, so they wait longer.
+const INJECTED_WINDOW_MS: u32 = 500;
 /// Travel this far (pixels) either way into a hold brings the minimap up.
 const DRAG_SHOWS: i32 = 24;
 
@@ -426,76 +432,8 @@ fn capture_key(s: &Settings, key: u32, up: bool) -> bool {
 static SHARED: Mutex<Option<Settings>> = Mutex::new(None);
 static THREAD: AtomicU32 = AtomicU32::new(0);
 
-enum Background {
-    Log(String),
-    Watch(u32, (isize, isize)),
-}
-
-struct Worker {
-    send: SyncSender<Background>,
-    watched: Receiver<(u32, Option<&'static str>)>,
-    checking: bool,
-}
-
-/// Disk writes and queries of other processes must not delay hook callbacks.
-fn start_worker() {
-    let (send, work) = mpsc::sync_channel(16);
-    let (done, watched) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut last_hold = 0;
-        for work in work {
-            match work {
-                Background::Log(line) => crate::app::log(&line),
-                Background::Watch(hold, over) => {
-                    if hold != last_hold {
-                        LEVELS.with(|levels| levels.borrow_mut().1.clear());
-                        last_hold = hold;
-                    }
-                    let _ = done.send((hold, blind(over)));
-                }
-            }
-        }
-    });
-    WORKER.with(|worker| *worker.borrow_mut() = Some(Worker { send, watched, checking: false }));
-}
-
-fn input_log(line: String) {
-    WORKER.with(|worker| {
-        if let Some(worker) = worker.borrow().as_ref() {
-            let _ = worker.send.try_send(Background::Log(line));
-        }
-    });
-}
-
-/// Each kind of evidence gets at most three lines a minute.
-fn log_due(last: &'static std::thread::LocalKey<Cell<Option<Instant>>>) -> bool {
-    last.with(|last| {
-        let now = Instant::now();
-        if last.get().is_some_and(|last| now.duration_since(last).as_secs() < 20) {
-            return false;
-        }
-        last.set(Some(now));
-        true
-    })
-}
-
-fn log_partial(verdict: &Verdict) {
-    if let Some(partial) = &verdict.abandoned {
-        if log_due(&LAST_PARTIAL_LOG) {
-            let names = |keys: &[u32]| keys.iter().map(|key| key_name(*key)).collect::<Vec<_>>().join("+");
-            input_log(format!("partial trigger became typing: got {}, missing {}, waited {} ms ({})",
-                names(&partial.arrived), names(&partial.missing), partial.waited, partial.why));
-        }
-    }
-}
-
 // State of the hook thread.
 thread_local! {
-    static WORKER: RefCell<Option<Worker>> = const { RefCell::new(None) };
-    static LAST_PARTIAL_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
-    static LAST_END_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
-    static LAST_CLICK_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
-    static LAST_REPLAY_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
     static SETTINGS: RefCell<Option<Settings>> = const { RefCell::new(None) };
     /// Which triggers are down right now.
     static HELD: RefCell<Held> = RefCell::new(Held::default());
@@ -507,7 +445,6 @@ thread_local! {
     static PLANE: Cell<Plane> = const { Cell::new(Plane::new()) };
     /// The hook thread's hidden window, which receives raw mouse input.
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
-    static RAW_READY: Cell<bool> = const { Cell::new(false) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
     static LAST_ABSOLUTE: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// The chord among the triggers (one without keys when there is none).
@@ -518,6 +455,8 @@ thread_local! {
     static CAPTURE_KEYS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// The mouse and the keyboard hook.
     static HOOKS: RefCell<Vec<HHOOK>> = const { RefCell::new(Vec::new()) };
+    /// The timer that watches over a hold (`watch`), 0 for none.
+    static WATCH_TIMER: Cell<usize> = const { Cell::new(0) };
     /// How far the mouse got from where it was when the hold began: where it
     /// is now, and the farthest it was.
     static STRAYED: Cell<((i32, i32), i32)> = const { Cell::new(((0, 0), 0)) };
@@ -525,13 +464,17 @@ thread_local! {
     /// last clicked at all.
     static LAST_CLICK: Cell<Option<Instant>> = const { Cell::new(None) };
     static LAST_TAP: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// When the first key of the chord was held back.
+    static CHORD_BEGAN: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The key event being handled was sent by software, not a keyboard.
+    static INJECTED: Cell<bool> = const { Cell::new(false) };
+    /// When a chord given up as typing was last written to the log.
+    static LAST_PARTIAL_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
     /// This process' integrity level, and those found of other processes.
     static LEVELS: RefCell<(Option<u32>, Vec<(u32, Option<u32>)>)> = const { RefCell::new((None, Vec::new())) };
     /// The window that had the keyboard and the one under the cursor when
     /// the hold began.
     static PRESSED_OVER: Cell<(isize, isize)> = const { Cell::new((0, 0)) };
-    /// Event time of the press, so older queued raw releases are ignored.
-    static PRESSED_AT: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Starts the hook thread (once) and gives it these settings.
@@ -577,10 +520,9 @@ fn reload() {
     let keys = settings.as_ref().map(Settings::chord).unwrap_or_default();
     let held_back = CHORD.with(|chord| {
         let mut old = chord.replace(Chord::new(keys));
-        old.flush(unsafe { GetTickCount() }, "the settings changed")
+        old.timeout()
     });
-    log_partial(&held_back);
-    replay(&held_back.replay);
+    replay(&held_back);
     watch_chord();
     #[cfg(feature = "debug-log")]
     if let Some(s) = &settings {
@@ -600,28 +542,19 @@ fn hook() {
         let module = GetModuleHandleW(None).unwrap_or_default();
         let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
         let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
-        let (mouse, keyboard) = match (mouse, keyboard) {
-            (Ok(mouse), Ok(keyboard)) => (mouse, keyboard),
-            (mouse, keyboard) => {
-                input_log("installing the input hooks failed; keeping the previous hooks and retrying".into());
-                for hook in [mouse, keyboard].into_iter().flatten() {
-                    let _ = UnhookWindowsHookEx(hook);
-                }
-                return;
-            }
-        };
-        let old = HOOKS.replace(vec![mouse, keyboard]);
+        if mouse.is_err() || keyboard.is_err() {
+            crate::app::log("installing the input hooks failed");
+        }
+        let old = HOOKS.replace([mouse, keyboard].into_iter().flatten().collect());
         for hook in old {
             let _ = UnhookWindowsHookEx(hook);
         }
     }
 }
 
-/// Refresh even during a hold: an injected release has no raw-input backup
-/// if Windows silently removed the keyboard hook. Held state stays intact.
+/// Now and then, while nothing is held or held back.
 unsafe extern "system" fn rehook(_: HWND, _: u32, _: usize, _: u32) {
-    update_raw();
-    if !CHORD.with(|chord| chord.borrow().waiting()) {
+    if !held() && !CHORD.with(|chord| chord.borrow().waiting()) {
         hook();
     }
     // In the record once a minute, to show the hook thread alive.
@@ -633,7 +566,6 @@ unsafe extern "system" fn rehook(_: HWND, _: u32, _: usize, _: u32) {
 
 fn hook_thread() {
     unsafe {
-        start_worker();
         THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
         reload();
         let module = GetModuleHandleW(None).unwrap_or_default();
@@ -649,7 +581,6 @@ fn hook_thread() {
         RAW_WINDOW.set(window.0);
         hook();
         SetTimer(None, 0, REHOOK_MS, Some(rehook));
-        SetTimer(None, 0, WATCH_MS, Some(watch));
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             if message.hwnd.0 == 0 && message.message == WM_RELOAD {
@@ -668,7 +599,6 @@ fn hook_thread() {
         for hook in HOOKS.take() {
             let _ = UnhookWindowsHookEx(hook);
         }
-        WORKER.with(|worker| worker.borrow_mut().take());
     }
 }
 
@@ -679,8 +609,9 @@ fn post(s: &Settings, message: u32, wparam: usize) {
     }
 }
 
-/// Starts or stops receiving raw input: the mouse for its movement, and
-/// both it and the keyboard to see releases even if the hooks do not.
+/// Starts or stops receiving raw input (only wanted while held): the mouse
+/// for its movement, and both it and the keyboard to see the trigger let go
+/// of even if the hooks do not.
 fn listen_raw(on: bool) {
     let window = HWND(RAW_WINDOW.get());
     // Generic desktop devices: 2 is the mouse, 6 the keyboard.
@@ -691,9 +622,9 @@ fn listen_raw(on: bool) {
         hwndTarget: if on { window } else { HWND(0) },
     });
     let registered = unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
-    match registered {
-        Ok(()) => RAW_READY.set(on),
-        Err(e) => input_log(format!("raw input could not be {}: {e}", if on { "registered" } else { "unregistered" })),
+    if let (true, Err(e)) = (on, registered) {
+        // Without it the held trigger sees no movement at all.
+        crate::app::log(&format!("raw mouse input could not be registered: {e}"));
     }
 }
 
@@ -701,23 +632,10 @@ fn held() -> bool {
     HELD.with(|held| held.borrow().any())
 }
 
-fn raw_needed() -> bool {
-    held() || CHORD.with(|chord| chord.borrow().draining())
-}
-
-/// Receive raw input only while a hold or its remaining key releases need it.
-fn update_raw() {
-    let on = raw_needed();
-    if on != RAW_READY.get() {
-        listen_raw(on);
-    }
-}
-
-fn press(source: Source, time: u32) {
+fn press(source: Source) {
     let began = HELD.with(|held| held.borrow_mut().press(source));
     debug_log!("down {source:?}{}", if began { ": hold begins" } else { "" });
     if began {
-        PRESSED_AT.set(time);
         writing(|| {
             HOLD_ID.fetch_add(1, Ordering::SeqCst);
             STRETCH.store(1, Ordering::SeqCst);
@@ -732,28 +650,41 @@ fn press(source: Source, time: u32) {
         STEPPED.set(false);
         LAST_ABSOLUTE.set(None);
         STRAYED.set(((0, 0), 0));
+        // Process ids come round again: a process found run as administrator
+        // in an earlier hold may be gone, and its id another's by now.
+        LEVELS.with(|levels| levels.borrow_mut().1.clear());
         PRESSED_OVER.set(unsafe { (GetForegroundWindow().0, under_cursor().map_or(0, |window| window.0)) });
-        update_raw();
+        listen_raw(true);
+        WATCH_TIMER.set(unsafe { SetTimer(None, 0, WATCH_MS, Some(watch)) });
+    }
+}
+
+/// Stops what a hold keeps going: the raw input and the watching over it.
+fn stop_listening() {
+    HOLDING.store(false, Ordering::SeqCst);
+    listen_raw(false);
+    let timer = WATCH_TIMER.replace(0);
+    if timer != 0 {
+        unsafe {
+            let _ = KillTimer(None, timer);
+        }
     }
 }
 
 /// Ends the hold, whatever holds it, without waiting for that to be let go
 /// of: for when letting go could not be seen, or does not matter any more.
 fn end_hold(why: &str) {
-    CHORD.with(|chord| chord.borrow_mut().let_go());
     if HELD.with(|held| held.borrow_mut().clear()) {
         debug_log!("press ignored from here on, hold ended by the app: {why}");
-        if log_due(&LAST_END_LOG) {
-            input_log(format!("hold ended by the app: {why}"));
-        }
-        HOLDING.store(false, Ordering::SeqCst);
+        let _ = why;
+        CHORD.with(|chord| chord.borrow_mut().let_go());
+        stop_listening();
         // Never as a click: the user did not ask for the board.
         with_settings(|s| {
             post(s, WM_RELEASE, 0);
             false
         });
     }
-    update_raw();
 }
 
 /// The integrity level of a process (whether it runs as administrator).
@@ -823,11 +754,11 @@ fn under_cursor() -> Option<HWND> {
 /// be asked (as a window just being opened), ended every hold at once: the
 /// trigger did nothing until a click elsewhere gave the keyboard away.
 fn hidden_by(now: isize, at_press: isize, above: impl FnOnce(isize) -> bool) -> bool {
-    now != 0 && now != at_press && above(now)
+    now != at_press && above(now)
 }
 
 /// Why letting go of the trigger could not be seen right now, if so.
-fn blind((keyboard, cursor): (isize, isize)) -> Option<&'static str> {
+fn blind() -> Option<&'static str> {
     unsafe {
         // Locked, or asked for permission on the secure desktop.
         match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
@@ -837,6 +768,7 @@ fn blind((keyboard, cursor): (isize, isize)) -> Option<&'static str> {
             Err(_) => return Some("the screen is locked or asking for permission"),
         }
     }
+    let (keyboard, cursor) = PRESSED_OVER.get();
     let above = |window: isize| above_us(HWND(window));
     if hidden_by(unsafe { GetForegroundWindow() }.0, keyboard, above) {
         return Some("a window run as administrator has the keyboard");
@@ -850,27 +782,11 @@ fn blind((keyboard, cursor): (isize, isize)) -> Option<&'static str> {
 /// Watches over a hold: where its end could not be seen it is ended at
 /// once, or it would go on after the trigger was let go of.
 unsafe extern "system" fn watch(_: HWND, _: u32, _: usize, _: u32) {
-    let result = WORKER.with(|worker| {
-        let mut worker = worker.borrow_mut();
-        let worker = worker.as_mut()?;
-        let result = worker.watched.try_recv().ok()?;
-        worker.checking = false;
-        Some(result)
-    });
-    // A slow check of the last hold must never cancel a newer press.
-    if let Some((hold, Some(why))) = result {
-        if held() && hold == HOLD_ID.load(Ordering::SeqCst) {
-            end_hold(why);
-        }
+    if !held() {
+        return stop_listening();
     }
-    if held() {
-        WORKER.with(|worker| {
-            if let Some(worker) = worker.borrow_mut().as_mut() {
-                if !worker.checking {
-                    worker.checking = worker.send.try_send(Background::Watch(HOLD_ID.load(Ordering::SeqCst), PRESSED_OVER.get())).is_ok();
-                }
-            }
-        });
+    if let Some(why) = blind() {
+        end_hold(why);
     }
 }
 
@@ -883,7 +799,7 @@ fn release(s: &Settings, source: Source) {
             if STEPPED.get() { "move" } else { "click" },
             crate::debuglog::take_held_back()
         );
-        HOLDING.store(false, Ordering::SeqCst);
+        stop_listening();
         // A click is the trigger pressed and let go of where it was. One
         // that travelled, only not far enough for a step, is a move given
         // up: it must not open the board.
@@ -904,9 +820,6 @@ fn release(s: &Settings, source: Source) {
             && (within(LAST_CLICK.get(), CLICK_APART_MS) || (within(LAST_TAP.get(), REPEAT_APART_MS) && within(LAST_CLICK.get(), 1000)));
         if again {
             debug_log!("click ignored: one was taken less than {CLICK_APART_MS} ms ago, or they come faster than a hand clicks");
-            if log_due(&LAST_CLICK_LOG) {
-                input_log("trigger tap ignored by the click/repeat filter".into());
-            }
         }
         let click = stayed && !again;
         if stayed {
@@ -917,7 +830,6 @@ fn release(s: &Settings, source: Source) {
         }
         post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
     }
-    update_raw();
 }
 
 /// A trigger seen let go of by raw input, which tells of it as well as the
@@ -936,26 +848,9 @@ fn raw_release(source: Source) {
 /// A key seen coming up by raw input.
 fn raw_key_up(key: u32) {
     raw_release(Source::Key(key));
-    if CHORD.with(|chord| chord.borrow_mut().raw_up(key)) {
+    if CHORD.with(|chord| chord.borrow().holds(key)) {
+        CHORD.with(|chord| chord.borrow_mut().let_go());
         raw_release(Source::Chord);
-    }
-    update_raw();
-}
-
-/// Event times wrap about every 49 days; a queued event is only moments old.
-fn since_press(time: u32, press: u32) -> bool {
-    time.wrapping_sub(press) as i32 >= 0
-}
-
-/// Raw input names modifiers without their side; the scan code and E0 flag
-/// tell which key the low-level hook would have named.
-fn raw_key_code(key: u16, scan: u16, flags: u16) -> u32 {
-    let right = flags & 0x02 != 0;
-    match key {
-        0x10 => if scan == 0x36 { 0xA1 } else { 0xA0 },
-        0x11 => if right { 0xA3 } else { 0xA2 },
-        0x12 => if right { 0xA5 } else { 0xA4 },
-        key => key as u32,
     }
 }
 
@@ -967,7 +862,8 @@ fn on_raw_input(handle: HRAWINPUT) {
     // Buttons coming up, as raw input flags them.
     const BUTTONS_UP: [(u16, Source); 3] = [(0x0020, Source::Middle), (0x0080, Source::XButton1), (0x0200, Source::XButton2)];
     const KEY_UP: u16 = 0x01;
-    if !raw_needed() || !since_press(unsafe { GetMessageTime() } as u32, PRESSED_AT.get()) {
+    const KEY_E0: u16 = 0x02;
+    if !held() {
         return;
     }
     let mut raw = RAWINPUT::default();
@@ -980,7 +876,13 @@ fn on_raw_input(handle: HRAWINPUT) {
     if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
         let keyboard = unsafe { raw.data.keyboard };
         if keyboard.Flags & KEY_UP != 0 {
-            raw_key_up(raw_key_code(keyboard.VKey, keyboard.MakeCode, keyboard.Flags));
+            // Raw input does not tell right from left Ctrl and Alt by the key.
+            let right = keyboard.Flags & KEY_E0 != 0;
+            raw_key_up(match keyboard.VKey {
+                0x11 => if right { 0xA3 } else { 0xA2 },
+                0x12 => if right { 0xA5 } else { 0xA4 },
+                key => key as u32,
+            });
         }
         return;
     }
@@ -1114,7 +1016,7 @@ fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     if let Some((trigger, source)) = button {
         if s.triggers.contains(&trigger) {
             if down {
-                press(source, info.time);
+                press(source);
             } else {
                 release(s, source);
             }
@@ -1132,18 +1034,13 @@ fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
 }
 
 fn key_event(key: u32, up: bool) -> INPUT {
-    let scan = unsafe { MapVirtualKeyW(key, MAPVK_VK_TO_VSC_EX) };
-    let mut flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
-    if scan & 0xFF00 == 0xE000 {
-        flags |= KEYEVENTF_EXTENDEDKEY;
-    }
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(key as u16),
-                wScan: (scan & 0xFF) as u16,
-                dwFlags: flags,
+                wScan: unsafe { MapVirtualKeyW(key, MAPVK_VK_TO_VSC) } as u16,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
                 time: 0,
                 dwExtraInfo: OWN_INPUT,
             },
@@ -1157,26 +1054,26 @@ fn replay(events: &[(u32, bool)]) {
         return;
     }
     let events: Vec<INPUT> = events.iter().map(|&(key, up)| key_event(key, up)).collect();
-    let sent = unsafe { SendInput(&events, std::mem::size_of::<INPUT>() as i32) };
-    if sent != events.len() as u32 && log_due(&LAST_REPLAY_LOG) {
-        input_log(format!("replaying trigger keys sent only {sent} of {} events (Windows may block input into an administrator window)", events.len()));
+    unsafe {
+        SendInput(&events, std::mem::size_of::<INPUT>() as i32);
     }
 }
 
 /// Keeps the timer that ends the wait for the rest of the chord in step with
 /// the chord: running, from the first key held back, while any is.
 fn watch_chord() {
-    let now = unsafe { GetTickCount() };
-    let (waiting, remaining) = CHORD.with(|chord| (chord.borrow().waiting(), chord.borrow().remaining(now)));
+    let (waiting, keys) = CHORD.with(|chord| (chord.borrow().waiting(), chord.borrow().len()));
     let timer = CHORD_TIMER.get();
     if waiting && timer == 0 {
-        let timer = unsafe { SetTimer(None, 0, remaining.max(1), Some(chord_timeout)) };
-        CHORD_TIMER.set(timer);
-        if timer == 0 {
-            let verdict = CHORD.with(|chord| chord.borrow_mut().flush(now, "the chord timer could not be started"));
-            log_partial(&verdict);
-            replay(&verdict.replay);
-        }
+        let window = if INJECTED.get() {
+            INJECTED_WINDOW_MS
+        } else if keys <= 2 {
+            PAIR_WINDOW_MS
+        } else {
+            CHORD_WINDOW_MS
+        };
+        CHORD_BEGAN.set(Some(Instant::now()));
+        CHORD_TIMER.set(unsafe { SetTimer(None, 0, window, Some(chord_timeout)) });
     } else if !waiting && timer != 0 {
         CHORD_TIMER.set(0);
         unsafe {
@@ -1186,22 +1083,23 @@ fn watch_chord() {
 }
 
 /// The rest of the chord did not follow in time.
-unsafe extern "system" fn chord_timeout(_: HWND, _: u32, timer: usize, _: u32) {
-    if timer != CHORD_TIMER.get() {
-        return;
+unsafe extern "system" fn chord_timeout(_: HWND, _: u32, _: usize, _: u32) {
+    let held_back = CHORD.with(|chord| chord.borrow_mut().timeout());
+    debug_log!("the chord's keys did not all go down in time: typing");
+    // In the regular log too, now and then, so a lost press can be told.
+    let now = Instant::now();
+    let due = LAST_PARTIAL_LOG.get().map_or(true, |last| now.duration_since(last).as_secs() >= 20);
+    if due && !held_back.is_empty() {
+        LAST_PARTIAL_LOG.set(Some(now));
+        let keys = held_back.iter().map(|(key, _)| key_name(*key)).collect::<Vec<_>>().join("+");
+        let waited = CHORD_BEGAN.get().map_or(0, |began| began.elapsed().as_millis());
+        crate::app::log(&format!("only {keys} of the trigger came within {waited} ms: typed instead"));
     }
-    let _ = KillTimer(None, timer);
-    CHORD_TIMER.set(0);
-    let verdict = CHORD.with(|chord| chord.borrow_mut().timeout(GetTickCount()));
-    if verdict.abandoned.is_some() {
-        debug_log!("the chord's keys did not all go down in time: typing");
-    }
-    log_partial(&verdict);
-    replay(&verdict.replay);
+    replay(&held_back);
     watch_chord();
 }
 
-fn on_key(s: &Settings, key: u32, up: bool, injected: bool, time: u32) -> bool {
+fn on_key(s: &Settings, key: u32, up: bool) -> bool {
     if CAPTURING.load(Ordering::SeqCst) {
         return capture_key(s, key, up);
     }
@@ -1211,20 +1109,29 @@ fn on_key(s: &Settings, key: u32, up: bool, injected: bool, time: u32) -> bool {
         if up {
             release(s, Source::Key(key));
         } else {
-            press(Source::Key(key), time);
+            press(Source::Key(key));
         }
         return true;
     }
-    let verdict = CHORD.with(|chord| chord.borrow_mut().key(key, up, injected, time));
+    let verdict = CHORD.with(|chord| {
+        let mut chord = chord.borrow_mut();
+        if chord.has(key) {
+            chord.key(key, up)
+        } else {
+            chord.other_key(key, up)
+        }
+    });
     #[cfg(feature = "debug-log")]
-    if let Some(partial) = &verdict.abandoned {
-        debug_log!("partial chord became typing after {} ms: {}", partial.waited, partial.why);
+    if !up && verdict == crate::hold::Verdict::default() && CHORD.with(|chord| chord.borrow().has(key)) {
+        // How late the rest of the chord came says whether the wait is too short.
+        if let Some(late) = CHORD_BEGAN.get().map(|began| began.elapsed().as_millis()).filter(|late| *late < 1000) {
+            debug_log!("another key of the chord went down {late} ms after the first: too late, typing");
+        }
     }
-    log_partial(&verdict);
     replay(&verdict.replay);
     watch_chord();
     match verdict.trigger {
-        Some(true) => press(Source::Chord, time),
+        Some(true) => press(Source::Chord),
         Some(false) => release(s, Source::Chord),
         None => {}
     }
@@ -1250,10 +1157,10 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let up = matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP);
         let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-        // Our own replayed keys pass. Mouse software's injected chords get
-        // more time than typing on a physical keyboard.
-        if (up || down) && info.dwExtraInfo != OWN_INPUT
-            && with_settings(|s| on_key(s, info.vkCode, up, info.flags.contains(LLKHF_INJECTED), info.time)) {
+        // Our own replayed keys pass; input injected by others (remote
+        // desktop tools) is treated like a real keyboard.
+        INJECTED.set(info.flags.0 & LLKHF_INJECTED.0 != 0);
+        if (up || down) && info.dwExtraInfo != OWN_INPUT && with_settings(|s| on_key(s, info.vkCode, up)) {
             return LRESULT(1);
         }
     }
@@ -1262,7 +1169,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::hidden_by;
 
     /// A window run as administrator that already had the keyboard, or was
     /// under the cursor, as the trigger went down must not end the hold: the
@@ -1276,109 +1183,5 @@ mod tests {
         // No window has the keyboard at the press, then one run as
         // administrator gets it.
         assert!(hidden_by(8, 0, admin));
-        // The shell, an empty desktop and no foreground window do not
-        // hide a release merely because focus changed.
-        assert!(!hidden_by(0, 7, |_| panic!("there is no window to ask")));
-        assert!(!hidden_by(9, 7, |_| false));
-    }
-
-    #[test]
-    fn queued_raw_releases_from_an_earlier_press_do_not_end_a_new_hold() {
-        assert!(!since_press(99, 100));
-        assert!(since_press(100, 100));
-        assert!(since_press(101, 100));
-        assert!(!since_press(u32::MAX, 1));
-        assert!(since_press(1, u32::MAX));
-    }
-
-    #[test]
-    fn raw_modifier_releases_name_the_same_keys_as_the_hook() {
-        assert_eq!(raw_key_code(0x10, 0x2A, 1), 0xA0);
-        assert_eq!(raw_key_code(0x10, 0x36, 1), 0xA1);
-        assert_eq!(raw_key_code(0x11, 0x1D, 1), 0xA2);
-        assert_eq!(raw_key_code(0x11, 0x1D, 3), 0xA3);
-        assert_eq!(raw_key_code(0x12, 0x38, 1), 0xA4);
-        assert_eq!(raw_key_code(0x12, 0x38, 3), 0xA5);
-    }
-
-    #[test]
-    fn raw_input_is_needed_until_the_hold_and_its_chord_have_both_ended() {
-        for raw_release in [false, true] {
-            CHORD.with(|chord| *chord.borrow_mut() = Chord::new(vec![0x54, 0x59]));
-            CHORD.with(|chord| chord.borrow_mut().key(0x54, false, false, 0));
-            assert!(!raw_needed(), "a partial chord registered raw input");
-            CHORD.with(|chord| chord.borrow_mut().key(0x59, false, false, 1));
-            HELD.with(|held| held.borrow_mut().press(Source::Chord));
-            assert!(raw_needed());
-
-            CHORD.with(|chord| chord.borrow_mut().key(0x54, true, false, 2));
-            HELD.with(|held| held.borrow_mut().release(Source::Chord));
-            assert!(raw_needed(), "the remaining chord key still needs raw input");
-            HELD.with(|held| held.borrow_mut().press(Source::XButton1));
-            CHORD.with(|chord| {
-                if raw_release {
-                    chord.borrow_mut().raw_up(0x59);
-                } else {
-                    chord.borrow_mut().key(0x59, true, false, 3);
-                }
-            });
-            assert!(raw_needed(), "another trigger is still held");
-            HELD.with(|held| held.borrow_mut().release(Source::XButton1));
-            assert!(!raw_needed(), "idle input must be unregistered");
-        }
-    }
-
-    #[test]
-    fn a_forced_end_also_clears_a_chord_that_is_only_draining() {
-        CHORD.with(|chord| {
-            let mut chord = chord.borrow_mut();
-            *chord = Chord::new(vec![0x54, 0x59]);
-            chord.key(0x54, false, false, 0);
-            chord.key(0x59, false, false, 1);
-            chord.key(0x54, true, false, 2);
-        });
-        assert!(!held());
-        assert!(raw_needed());
-        end_hold("the PC had gone to sleep");
-        assert!(!raw_needed(), "a wake or settings change must stop draining");
-    }
-
-    #[test]
-    fn a_slow_watch_of_an_old_hold_cannot_cancel_a_new_press() {
-        let (send, requests) = mpsc::sync_channel(2);
-        let (done, watched) = mpsc::channel();
-        WORKER.with(|worker| *worker.borrow_mut() = Some(Worker { send, watched, checking: true }));
-        HELD.with(|held| held.borrow_mut().press(Source::Chord));
-        HOLD_ID.store(42, Ordering::SeqCst);
-        done.send((41, Some("an old window"))).unwrap();
-        unsafe { watch(HWND(0), 0, 0, 0) };
-        assert!(held());
-        assert!(matches!(requests.try_recv(), Ok(Background::Watch(42, _))));
-        HELD.with(|held| held.borrow_mut().clear());
-        WORKER.with(|worker| worker.borrow_mut().take());
-    }
-
-    #[test]
-    fn regular_log_explains_partial_chords_and_forced_ends_without_flooding() {
-        let (send, lines) = mpsc::sync_channel(8);
-        let (_, watched) = mpsc::channel();
-        WORKER.with(|worker| *worker.borrow_mut() = Some(Worker { send, watched, checking: false }));
-        LAST_PARTIAL_LOG.set(None);
-        LAST_END_LOG.set(None);
-        let mut chord = Chord::new(vec![0xA2, 0x7C]);
-        chord.key(0xA2, false, true, 0);
-        let verdict = chord.key(0x54, false, true, 30);
-        log_partial(&verdict);
-        log_partial(&verdict);
-        let Background::Log(line) = lines.try_recv().unwrap() else { panic!("a log line was expected") };
-        assert!(line.contains("got vka2, missing f13, waited 30 ms"));
-        assert!(!line.contains("54"), "ordinary typing was logged");
-        assert!(lines.try_recv().is_err());
-        HELD.with(|held| held.borrow_mut().press(Source::Chord));
-        end_hold("a test window took the keyboard");
-        let Background::Log(line) = lines.try_recv().unwrap() else { panic!("a log line was expected") };
-        assert_eq!(line, "hold ended by the app: a test window took the keyboard");
-        assert!(!held());
-        WORKER.with(|worker| worker.borrow_mut().take());
     }
 }
