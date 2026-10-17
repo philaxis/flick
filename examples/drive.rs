@@ -238,6 +238,58 @@ fn main() {
                 let done = SetForegroundWindow(window).as_bool();
                 println!("0x{:x} {done}", before.0);
             }
+            Some("under") => {
+                // under <x> <y>...: which window takes a click at each point, and whose it is.
+                use windows::Win32::Foundation::{POINT, RECT};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    GetAncestor, GetClassNameW, GetWindowRect, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT,
+                };
+                for pair in args[2..].chunks(2) {
+                    let at = POINT { x: pair[0].parse().unwrap(), y: pair[1].parse().unwrap() };
+                    let window = WindowFromPoint(at);
+                    let root = GetAncestor(window, GA_ROOT);
+                    let mut class = [0u16; 128];
+                    let n = GetClassNameW(root, &mut class).max(0) as usize;
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(root, Some(&mut pid));
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(root, &mut rect);
+                    println!(
+                        "{},{}: 0x{:x} {} pid {pid} ({},{})-({},{})",
+                        at.x, at.y, root.0, String::from_utf16_lossy(&class[..n]),
+                        rect.left, rect.top, rect.right, rect.bottom
+                    );
+                }
+            }
+            Some("shell") => {
+                // shell [show]: the shell's notice windows Flick minimizes on a switch, and their
+                // state. "show" first shows them with no notice in them, as the shell leaves them stuck.
+                use windows::Win32::Foundation::{HWND, RECT};
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    FindWindowExW, GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, ShowWindow, GWL_EXSTYLE,
+                    SW_SHOWNOACTIVATE,
+                };
+                let mut host = HWND(0);
+                loop {
+                    host = FindWindowExW(None, host, w!("XamlExplorerHostIslandWindow"), w!(""));
+                    if host.0 == 0 {
+                        break;
+                    }
+                    let bridge = FindWindowExW(
+                        host, None, w!("Windows.UI.Composition.DesktopWindowContentBridge"), w!("DesktopWindowXamlSource"),
+                    );
+                    if bridge.0 != 0 && args.get(2).is_some_and(|word| word == "show") {
+                        ShowWindow(host, SW_SHOWNOACTIVATE);
+                    }
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(host, &mut rect);
+                    println!(
+                        "0x{:x} bridge {} visible {} minimized {} ex 0x{:x} ({},{})-({},{})",
+                        host.0, bridge.0 != 0, IsWindowVisible(host).as_bool(), IsIconic(host).as_bool(),
+                        GetWindowLongW(host, GWL_EXSTYLE), rect.left, rect.top, rect.right, rect.bottom
+                    );
+                }
+            }
             Some("mem") => {
                 // mem: what the running app holds. Working set and private bytes in MB, GDI and
                 // USER objects, handles and threads.
