@@ -133,7 +133,7 @@ impl Chord {
     /// Windows uptime counter wrapping. Repeats never extend the wait.
     pub fn remaining(&self, now: u32) -> u32 {
         // Two letters typed next to each other need a shorter wait.
-        // shortcut: injected keys get 500 ms, widen only if missed-press logs show longer gaps.
+        // Mouse software may send the chord slowly, so give it half a second.
         let window: u32 = if self.injected { 500 } else if self.keys.len() <= 2 { 40 } else { 100 };
         window.saturating_sub(now.wrapping_sub(self.began))
     }

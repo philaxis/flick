@@ -620,9 +620,7 @@ fn hook() {
 /// Refresh even during a hold: an injected release has no raw-input backup
 /// if Windows silently removed the keyboard hook. Held state stays intact.
 unsafe extern "system" fn rehook(_: HWND, _: u32, _: usize, _: u32) {
-    if !RAW_READY.get() {
-        listen_raw(true);
-    }
+    update_raw();
     if !CHORD.with(|chord| chord.borrow().waiting()) {
         hook();
     }
@@ -649,9 +647,6 @@ fn hook_thread() {
         let window =
             CreateWindowExW(WINDOW_EX_STYLE(0), class, None, WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, module, None);
         RAW_WINDOW.set(window.0);
-        // Register once, before any press: device registration must not
-        // hold up the hook callback or race the first movement/release.
-        listen_raw(true);
         hook();
         SetTimer(None, 0, REHOOK_MS, Some(rehook));
         SetTimer(None, 0, WATCH_MS, Some(watch));
@@ -661,7 +656,6 @@ fn hook_thread() {
                 reload();
             } else if message.hwnd.0 == 0 && message.message == WM_WOKE {
                 end_hold("the PC had gone to sleep");
-                listen_raw(true);
                 hook();
             } else {
                 // Timer callbacks arrive here.
@@ -671,7 +665,6 @@ fn hook_thread() {
         // Whoever holds a trigger down as the app goes must not find the
         // cursor still kept in place by it.
         end_hold("the app is closing");
-        listen_raw(false);
         for hook in HOOKS.take() {
             let _ = UnhookWindowsHookEx(hook);
         }
@@ -686,9 +679,8 @@ fn post(s: &Settings, message: u32, wparam: usize) {
     }
 }
 
-/// Starts or stops receiving raw input: the mouse
-/// for its movement, and both it and the keyboard to see the trigger let go
-/// of even if the hooks do not.
+/// Starts or stops receiving raw input: the mouse for its movement, and
+/// both it and the keyboard to see releases even if the hooks do not.
 fn listen_raw(on: bool) {
     let window = HWND(RAW_WINDOW.get());
     // Generic desktop devices: 2 is the mouse, 6 the keyboard.
@@ -699,15 +691,26 @@ fn listen_raw(on: bool) {
         hwndTarget: if on { window } else { HWND(0) },
     });
     let registered = unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) };
-    RAW_READY.set(on && registered.is_ok());
-    if let (true, Err(e)) = (on, registered) {
-        // Without it the held trigger sees no movement at all.
-        input_log(format!("raw mouse input could not be registered: {e}"));
+    match registered {
+        Ok(()) => RAW_READY.set(on),
+        Err(e) => input_log(format!("raw input could not be {}: {e}", if on { "registered" } else { "unregistered" })),
     }
 }
 
 fn held() -> bool {
     HELD.with(|held| held.borrow().any())
+}
+
+fn raw_needed() -> bool {
+    held() || CHORD.with(|chord| chord.borrow().draining())
+}
+
+/// Receive raw input only while a hold or its remaining key releases need it.
+fn update_raw() {
+    let on = raw_needed();
+    if on != RAW_READY.get() {
+        listen_raw(on);
+    }
 }
 
 fn press(source: Source, time: u32) {
@@ -730,18 +733,19 @@ fn press(source: Source, time: u32) {
         LAST_ABSOLUTE.set(None);
         STRAYED.set(((0, 0), 0));
         PRESSED_OVER.set(unsafe { (GetForegroundWindow().0, under_cursor().map_or(0, |window| window.0)) });
+        update_raw();
     }
 }
 
 /// Ends the hold, whatever holds it, without waiting for that to be let go
 /// of: for when letting go could not be seen, or does not matter any more.
 fn end_hold(why: &str) {
+    CHORD.with(|chord| chord.borrow_mut().let_go());
     if HELD.with(|held| held.borrow_mut().clear()) {
         debug_log!("press ignored from here on, hold ended by the app: {why}");
         if log_due(&LAST_END_LOG) {
             input_log(format!("hold ended by the app: {why}"));
         }
-        CHORD.with(|chord| chord.borrow_mut().let_go());
         HOLDING.store(false, Ordering::SeqCst);
         // Never as a click: the user did not ask for the board.
         with_settings(|s| {
@@ -749,6 +753,7 @@ fn end_hold(why: &str) {
             false
         });
     }
+    update_raw();
 }
 
 /// The integrity level of a process (whether it runs as administrator).
@@ -912,6 +917,7 @@ fn release(s: &Settings, source: Source) {
         }
         post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
     }
+    update_raw();
 }
 
 /// A trigger seen let go of by raw input, which tells of it as well as the
@@ -933,6 +939,7 @@ fn raw_key_up(key: u32) {
     if CHORD.with(|chord| chord.borrow_mut().raw_up(key)) {
         raw_release(Source::Chord);
     }
+    update_raw();
 }
 
 /// Event times wrap about every 49 days; a queued event is only moments old.
@@ -960,8 +967,7 @@ fn on_raw_input(handle: HRAWINPUT) {
     // Buttons coming up, as raw input flags them.
     const BUTTONS_UP: [(u16, Source); 3] = [(0x0020, Source::Middle), (0x0080, Source::XButton1), (0x0200, Source::XButton2)];
     const KEY_UP: u16 = 0x01;
-    if (!held() && !CHORD.with(|chord| chord.borrow().draining()))
-        || !since_press(unsafe { GetMessageTime() } as u32, PRESSED_AT.get()) {
+    if !raw_needed() || !since_press(unsafe { GetMessageTime() } as u32, PRESSED_AT.get()) {
         return;
     }
     let mut raw = RAWINPUT::default();
@@ -1293,6 +1299,48 @@ mod tests {
         assert_eq!(raw_key_code(0x11, 0x1D, 3), 0xA3);
         assert_eq!(raw_key_code(0x12, 0x38, 1), 0xA4);
         assert_eq!(raw_key_code(0x12, 0x38, 3), 0xA5);
+    }
+
+    #[test]
+    fn raw_input_is_needed_until_the_hold_and_its_chord_have_both_ended() {
+        for raw_release in [false, true] {
+            CHORD.with(|chord| *chord.borrow_mut() = Chord::new(vec![0x54, 0x59]));
+            CHORD.with(|chord| chord.borrow_mut().key(0x54, false, false, 0));
+            assert!(!raw_needed(), "a partial chord registered raw input");
+            CHORD.with(|chord| chord.borrow_mut().key(0x59, false, false, 1));
+            HELD.with(|held| held.borrow_mut().press(Source::Chord));
+            assert!(raw_needed());
+
+            CHORD.with(|chord| chord.borrow_mut().key(0x54, true, false, 2));
+            HELD.with(|held| held.borrow_mut().release(Source::Chord));
+            assert!(raw_needed(), "the remaining chord key still needs raw input");
+            HELD.with(|held| held.borrow_mut().press(Source::XButton1));
+            CHORD.with(|chord| {
+                if raw_release {
+                    chord.borrow_mut().raw_up(0x59);
+                } else {
+                    chord.borrow_mut().key(0x59, true, false, 3);
+                }
+            });
+            assert!(raw_needed(), "another trigger is still held");
+            HELD.with(|held| held.borrow_mut().release(Source::XButton1));
+            assert!(!raw_needed(), "idle input must be unregistered");
+        }
+    }
+
+    #[test]
+    fn a_forced_end_also_clears_a_chord_that_is_only_draining() {
+        CHORD.with(|chord| {
+            let mut chord = chord.borrow_mut();
+            *chord = Chord::new(vec![0x54, 0x59]);
+            chord.key(0x54, false, false, 0);
+            chord.key(0x59, false, false, 1);
+            chord.key(0x54, true, false, 2);
+        });
+        assert!(!held());
+        assert!(raw_needed());
+        end_hold("the PC had gone to sleep");
+        assert!(!raw_needed(), "a wake or settings change must stop draining");
     }
 
     #[test]
