@@ -52,7 +52,8 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     // `--render-board <file> 1920x1040,400x300` draws made-up windows of
-    // those sizes in place of the current cell's.
+    // those sizes in place of the current cell's. FLICK_HOVER=row,col also
+    // draws that map cell's popup (row and column counted from zero).
     if let [_, flag, path, sizes] = args.as_slice() {
         if flag == "--render-board" {
             return app::render_board(path, Some(sizes));

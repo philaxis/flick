@@ -30,9 +30,6 @@ step_y = 400
 # With false it keeps going by the distance moved, like sideways.
 vertical_sticky = true
 
-# In the overview, resting the cursor on a cell of the map for this long (milliseconds) shows that cell's windows. 0 turns it off.
-dwell_ms = 500
-
 # New cells and new shelves are made only with + in the overview (click the trigger).
 
 # Holding this key during the gesture carries the active window along. "shift", "ctrl", "alt"
@@ -53,8 +50,7 @@ pub struct Config {
     pub step_x: i32,
     pub step_y: i32,
     pub vertical_sticky: bool,
-    /// How long the cursor must rest on a cell of the board's map for the
-    /// board to turn to that cell, in milliseconds; 0 for never.
+    /// Accepted from older config files; hover previews appear immediately.
     pub dwell_ms: u32,
     pub carry_modifier: String,
     pub hotkeys: bool,
@@ -68,9 +64,6 @@ impl Default for Config {
             step_x: 260,
             step_y: 400,
             vertical_sticky: true,
-            // Long enough that a cell passed over on the way to another is
-            // not taken, short enough not to feel like waiting: about what
-            // Windows waits before showing a taskbar preview or a tooltip.
             dwell_ms: 500,
             carry_modifier: "shift".into(),
             hotkeys: true,

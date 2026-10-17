@@ -1,4 +1,4 @@
-//! The settings window: the trigger, the distance, the hover preview and
+//! The settings window: the trigger, the distance and
 //! whether to start with Windows.
 //!
 //! It owns layout, hit-testing and drawing, in the look of the board. It
@@ -44,7 +44,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
 /// Below the last row, the link to the file and a margin.
-const SIZE: (f32, f32) = (400.0, ROWS.0 + (6.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
+const SIZE: (f32, f32) = (400.0, ROWS.0 + (5.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
 /// Whether up and down has settings of its own (a flick or a distance, and
 /// how much). Not now: rows go by distance, a distance of their own. The
 /// switch is kept hidden, and its key in config.toml read and left alone,
@@ -58,8 +58,6 @@ const ROWS: (f32, f32) = (14.0, 46.0);
 const EDGES: (f32, f32) = (28.0, 372.0);
 /// What the distance sliders span, and the step they move in.
 const DISTANCES: (i32, i32, i32) = (80, 600, 10);
-/// The same for how long to rest on a cell, in milliseconds; none is "off".
-const RESTS: (i32, i32, i32) = (0, 1500, 100);
 
 /// What the window shows.
 #[derive(Clone, Default)]
@@ -72,8 +70,6 @@ pub struct View {
     pub step_x: i32,
     pub step_y: i32,
     pub sticky: bool,
-    /// See `Config::dwell_ms`.
-    pub dwell_ms: i32,
     pub autostart: bool,
 }
 
@@ -101,7 +97,6 @@ enum Hit {
     /// One half of the vertical mode switch: flick (true) or distance.
     Mode(bool),
     StepY,
-    Dwell,
     Autostart,
     File,
 }
@@ -112,7 +107,6 @@ struct Layout {
     step_x: Rect,
     mode: [Rect; 2],
     step_y: Rect,
-    dwell: Rect,
     autostart: Rect,
     file: Rect,
 }
@@ -132,9 +126,8 @@ impl Layout {
             step_x: slider(1.0),
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
             step_y: slider(if UP_AND_DOWN_OF_ITS_OWN { 3.0 } else { 2.0 }),
-            dwell: slider(4.0 - up),
-            autostart: right(5.0 - up, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(6.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
+            autostart: right(4.0 - up, 44.0, 24.0),
+            file: rect(EDGES.0 * s, (row(5.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -146,7 +139,6 @@ impl Layout {
             (&self.mode[0], Hit::Mode(true)),
             (&self.mode[1], Hit::Mode(false)),
             (&self.step_y, Hit::StepY),
-            (&self.dwell, Hit::Dwell),
             (&self.autostart, Hit::Autostart),
             (&self.file, Hit::File),
         ]
@@ -350,7 +342,6 @@ impl Settings {
         match hit {
             Hit::StepX => Some(self.view.step_x as f32),
             Hit::StepY => Some(self.view.step_y as f32),
-            Hit::Dwell => Some(self.view.dwell_ms as f32),
             _ => None,
         }
     }
@@ -368,12 +359,6 @@ impl Settings {
         match hit {
             Hit::StepX => self.view.step_x = distance(&layout.step_x),
             Hit::StepY => self.view.step_y = distance(&layout.step_y),
-            Hit::Dwell => {
-                // Nothing of the gesture: only shown until the drag ends.
-                self.view.dwell_ms = along(&layout.dwell, RESTS);
-                self.invalidate();
-                return Action::None;
-            }
             _ => return Action::None,
         }
         self.invalidate();
@@ -424,7 +409,6 @@ impl Settings {
             // A drag ended: what it arrived at is kept.
             let key = match hit {
                 Hit::StepX => "step_x",
-                Hit::Dwell => "dwell_ms",
                 _ => "step_y",
             };
             return if now == before { Action::None } else { Action::Set(key, format!("{now}")) };
@@ -532,15 +516,7 @@ impl Settings {
         }
         let up = BELOW_UP_AND_DOWN;
 
-        // In the board: resting the cursor on a cell of the map shows it.
-        label(4.0 - up, "Hover preview");
-        let rest = match view.dwell_ms {
-            0 => "Off".to_owned(),
-            ms => format!("{:.1} s", ms as f32 / 1000.0),
-        };
-        self.draw_slider(&p, fonts, &layout.dwell, view.dwell_ms, RESTS, &rest, Hit::Dwell);
-
-        label(5.0 - up, "Start with Windows");
+        label(4.0 - up, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
 
         let hot = self.hover == Hit::File;

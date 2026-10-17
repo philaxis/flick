@@ -39,7 +39,7 @@ use windows::{
                 DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{BitBlt, GdiFlush, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
+            Gdi::{BitBlt, CreateRoundRectRgn, DeleteObject, GdiFlush, GetDC, InvalidateRect, ReleaseDC, SetWindowRgn, ValidateRect, SRCCOPY},
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -49,22 +49,24 @@ use windows::{
                     GCS_RESULTSTR, IME_COMPOSITION_STRING, NI_COMPOSITIONSTR,
                 },
                 KeyboardAndMouse::{
-                    ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+                    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_DOWN, VK_ESCAPE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
                     VK_UP,
                 },
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DrawIconEx, GetClassLongPtrW, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
+                CreateWindowExW, DefWindowProcW, DrawIconEx, GetClassLongPtrW, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
                 GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SW_SHOWNOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+                GW_OWNER, HTTRANSPARENT, WM_NCHITTEST, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
 };
 
+#[derive(Clone)]
 pub struct WindowModel {
     pub hwnd: HWND,
     /// Screen rectangle; for a minimized window, where it will be restored to.
@@ -115,6 +117,25 @@ impl Model {
     fn cell(&self, id: &str) -> Option<&CellModel> {
         self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)
     }
+
+    /// The same membership and order for the main previews and a popup.
+    fn tile_windows(&self, id: &str) -> Vec<(&WindowModel, bool)> {
+        let cell = self.cell(id).into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
+        // Windows pinned to their row are shown in every cell of it: going
+        // there brings them along. So their part stays put within the row.
+        let row = self.rows.iter().find(|row| row.cells.iter().any(|cell| cell.id == id));
+        let followers = row
+            .into_iter()
+            .flat_map(|row| &row.cells)
+            .filter(|cell| cell.id != id)
+            .flat_map(|cell| &cell.windows)
+            .filter(|w| w.follows)
+            .map(|w| (w, false));
+        let mut windows: Vec<(&WindowModel, bool)> =
+            cell.chain(followers).chain(self.pinned.iter().map(|w| (w, true))).collect();
+        windows.sort_by_cached_key(|(w, _)| (w.app_name.to_lowercase(), w.app.clone(), w.hwnd.0));
+        windows
+    }
 }
 
 /// What the user asked for; carried out by the app.
@@ -156,15 +177,13 @@ pub enum Action {
 /// Height of the line at the bottom that says what the thing under the
 /// cursor is or does, in unscaled units.
 const FOOTER: f32 = 44.0;
-/// The timer that runs while the cursor rests on a cell of the map, and how
-/// often it redraws the bar that shows how long it has.
-const DWELL_TIMER_ID: usize = 1;
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
 const ON_TOP_MS: u32 = 250;
-const DWELL_TICK_MS: u32 = 30;
 /// The longest name a shelf can be given, in characters.
 const NAME_LENGTH: usize = 24;
+/// Sent after the cursor leaves a window that called `TrackMouseEvent`.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 fn contains(r: &Rect, x: f32, y: f32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
@@ -291,6 +310,17 @@ struct TileLayout {
     close: Rect,
 }
 
+/// A cell's small previews, above the map on the monitor being pointed at.
+struct PopupLayout {
+    id: CellId,
+    monitor: usize,
+    frame: Rect,
+    cell: Rect,
+    label: Rect,
+    body: Rect,
+    tiles: Vec<TileLayout>,
+}
+
 /// The map of all rows and cells, in the coordinates of the monitor it is on.
 #[derive(Default)]
 struct MapLayout {
@@ -365,6 +395,11 @@ struct Fonts {
 
 pub struct Board {
     hwnd: HWND,
+    /// An owned window keeps the panel above the main DWM previews without
+    /// hiding or moving them, and lets pointer input pass through.
+    popup_hwnd: HWND,
+    popup: Option<PopupLayout>,
+    popup_thumbs: Vec<(isize, isize)>,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
@@ -405,15 +440,6 @@ pub struct Board {
     /// What the input method is still putting together (a Korean syllable
     /// in the making), shown after the typed text.
     composing: String,
-    /// How long the cursor must rest on a cell of the map for the board to
-    /// turn to it, in milliseconds; 0 for never.
-    dwell_ms: u32,
-    /// The cell the cursor is resting on, and since when.
-    dwell: Option<(CellId, Instant)>,
-    /// Where the cursor was when the board last turned to a cell it rested
-    /// on. The map shifts under it then, and whatever cell that puts there
-    /// must not be taken for one the user is resting on.
-    rested_at: Option<(f32, f32)>,
     /// A window that could not be asked to close, and when that was found.
     refused: Option<(isize, Instant)>,
     /// When and where a click last added or took away something. What it
@@ -491,8 +517,26 @@ impl Board {
             if hwnd.0 == 0 {
                 return Err(Error::from_win32());
             }
+            let popup_class = w!("flick.board.preview");
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(popup_wndproc),
+                hInstance: instance.into(),
+                lpszClassName: popup_class,
+                ..Default::default()
+            });
+            let popup_hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                popup_class, w!("Flick preview"), WS_POPUP,
+                0, 0, 0, 0, hwnd, None, instance, None,
+            );
+            if popup_hwnd.0 == 0 {
+                return Err(Error::from_win32());
+            }
             Ok(Board {
                 hwnd,
+                popup_hwnd,
+                popup: None,
+                popup_thumbs: Vec::new(),
                 factory: paint::d2d_factory()?,
                 canvas: None,
                 fonts: None,
@@ -517,9 +561,6 @@ impl Board {
                 origin: (0, 0),
                 editing: None,
                 composing: String::new(),
-                dwell_ms: 0,
-                dwell: None,
-                rested_at: None,
                 refused: None,
                 changed_at: None,
                 sections: Vec::new(),
@@ -560,11 +601,6 @@ impl Board {
         self.selected.clone()
     }
 
-    /// See `Config::dwell_ms`.
-    pub fn set_dwell(&mut self, ms: u32) {
-        self.dwell_ms = ms;
-    }
-
     /// Covers every monitor and shows `model`.
     pub fn open(&mut self, model: Model, grid: Grid) {
         let monitors = vd::monitors();
@@ -593,8 +629,7 @@ impl Board {
         self.selected = model.current.clone();
         self.hover = Hit::Nothing;
         self.press = None;
-        self.rest_on(None);
-        self.rested_at = None;
+        self.hide_popup();
         self.refused = None;
         self.stop_editing();
         self.open = true;
@@ -620,9 +655,11 @@ impl Board {
         let selected = self.selected.clone();
         self.nav.visit(&selected);
         self.press = None;
+        self.hide_popup();
         self.relayout();
         self.hover_under_cursor();
         self.register_thumbnails();
+        self.update_popup();
         self.invalidate();
     }
 
@@ -652,7 +689,7 @@ impl Board {
         }
         self.open = false;
         crate::input::set_board_open(false);
-        self.rest_on(None);
+        self.hide_popup();
         self.clear_thumbnails();
         self.icons.clear();
         // A picture the size of every screen together, of no use until the
@@ -713,49 +750,11 @@ impl Board {
             self.nav.visit(&id);
         }
         self.selected = id;
+        self.hide_popup();
         self.relayout();
+        self.hover_under_cursor();
         self.register_thumbnails();
-        self.invalidate();
-    }
-
-    /// Notes which cell of the map the cursor rests on, if any, and keeps
-    /// the timer that counts the rest going for as long as it does.
-    fn rest_on(&mut self, cell: Option<CellId>) {
-        if self.dwell.as_ref().map(|(id, _)| id) == cell.as_ref() {
-            return;
-        }
-        debug_log!("board: rest on {:?}", cell.as_deref().map(|id| &id[..4.min(id.len())]));
-        self.dwell = cell.map(|id| (id, Instant::now()));
-        unsafe {
-            match self.dwell {
-                Some(_) => {
-                    SetTimer(self.hwnd, DWELL_TIMER_ID, DWELL_TICK_MS, None);
-                }
-                None => {
-                    let _ = KillTimer(self.hwnd, DWELL_TIMER_ID);
-                }
-            }
-        }
-        self.invalidate();
-    }
-
-    /// How much of the time it takes has the cursor rested on this cell.
-    fn rested(&self, cell: &str) -> Option<f32> {
-        let (id, since) = self.dwell.as_ref()?;
-        (id == cell && self.dwell_ms > 0).then(|| (since.elapsed().as_millis() as f32 / self.dwell_ms as f32).min(1.0))
-    }
-
-    /// The rest timer ticked: the bar grows, and at its end the board turns
-    /// to the cell.
-    fn rest_tick(&mut self) {
-        let Some((id, _)) = self.dwell.clone() else { return self.rest_on(None) };
-        if self.rested(&id).is_some_and(|share| share >= 1.0) {
-            debug_log!("board: rested on {}, turning to it", &id[..4.min(id.len())]);
-            self.rest_on(None);
-            self.rested_at = Some(self.cursor);
-            self.select(id, false);
-            self.hover = self.hit_test(self.cursor.0, self.cursor.1);
-        }
+        self.update_popup();
         self.invalidate();
     }
 
@@ -818,22 +817,9 @@ impl Board {
     /// window's handle), never on which was used last, so the same windows
     /// always appear in the same places.
     fn tile_windows(&self) -> Vec<(&WindowModel, bool)> {
-        let cell = self.model.cell(&self.selected).into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
-        // Windows pinned to their row are shown in every cell of it: going
-        // there brings them along. So their part stays put within the row.
-        let row = self.model.rows.iter().find(|row| row.cells.iter().any(|cell| cell.id == self.selected));
-        let followers = row
-            .into_iter()
-            .flat_map(|row| &row.cells)
-            .filter(|cell| cell.id != self.selected)
-            .flat_map(|cell| &cell.windows)
-            .filter(|w| w.follows)
-            .map(|w| (w, false));
-        let mut windows: Vec<(&WindowModel, bool)> =
-            cell.chain(followers).chain(self.model.pinned.iter().map(|w| (w, true))).collect();
-        windows.sort_by_cached_key(|(w, _)| (w.app_name.to_lowercase(), w.app.clone(), w.hwnd.0));
-        windows
+        self.model.tile_windows(&self.selected)
     }
+
 
     fn home_index(&self) -> usize {
         self.monitors.iter().position(|m| *m == self.home).unwrap_or(0)
@@ -1030,12 +1016,70 @@ impl Board {
 
     // ---- thumbnails -------------------------------------------------------
 
-    fn clear_thumbnails(&mut self) {
-        for (_, thumb) in self.thumbs.drain(..) {
-            unsafe {
-                let _ = DwmUnregisterThumbnail(thumb);
+    fn hide_popup(&mut self) {
+        unregister_thumbnails(&mut self.popup_thumbs);
+        self.popup = None;
+        unsafe {
+            ShowWindow(self.popup_hwnd, SW_HIDE);
+        }
+    }
+
+    /// Follows the cell under the cursor without changing the selection.
+    fn update_popup(&mut self) {
+        let wanted = match &self.hover {
+            Hit::Cell(id) | Hit::CellClose(id) if *id != self.selected && self.press.is_none() && self.editing.is_none() => {
+                Some((id.clone(), self.map_at(self.cursor.0, self.cursor.1).0.monitor))
+            }
+            _ => None,
+        };
+        if self.popup.as_ref().map(|popup| (&popup.id, popup.monitor)) == wanted.as_ref().map(|(id, monitor)| (id, *monitor)) {
+            return;
+        }
+        self.hide_popup();
+        if let Some((id, monitor)) = wanted {
+            self.popup = self.layout_popup(id, monitor);
+        }
+        if self.open {
+            if let Some(popup) = &self.popup {
+                let frame = popup.frame;
+                let (w, h) = (size(&frame).0.ceil() as i32, size(&frame).1.ceil() as i32);
+                unsafe {
+                    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, (24.0 * self.scale) as i32, (24.0 * self.scale) as i32);
+                    if SetWindowRgn(self.popup_hwnd, region, false) == 0 {
+                        let _ = DeleteObject(region);
+                    }
+                    let _ = SetWindowPos(self.popup_hwnd, HWND_TOPMOST,
+                        self.origin.0 + frame.left.round() as i32, self.origin.1 + frame.top.round() as i32,
+                        w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+                let wanted: Vec<HWND> = self.model.tile_windows(&popup.id).into_iter().map(|(window, _)| window.hwnd).collect();
+                for hwnd in wanted {
+                    if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.popup_hwnd, hwnd) } {
+                        self.popup_thumbs.push((hwnd.0, thumb));
+                    }
+                }
+                self.update_thumbnails();
             }
         }
+        self.invalidate();
+    }
+
+    fn layout_popup(&self, id: CellId, monitor: usize) -> Option<PopupLayout> {
+        let map = self.maps.iter().find(|map| map.monitor == monitor)?;
+        let cell = map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)?.body;
+        let cell = Rect { left: cell.left + map.area.left, right: cell.right + map.area.left,
+            top: cell.top + map.area.top, bottom: cell.bottom + map.area.top };
+        let windows = self.model.tile_windows(&id);
+        let s = self.scale;
+        let frame = popup_frame(&cell, &map.area, map.area.top + map.layout.top, windows.is_empty(), s);
+        let label = Rect { bottom: frame.top + 42.0 * s, ..grow(&frame, -14.0 * s) };
+        let body = Rect { top: label.bottom + 4.0 * s, ..grow(&frame, -14.0 * s) };
+        let tiles = layout_tiles(&windows, &body, 0.55 * s);
+        Some(PopupLayout { id, monitor, frame, cell, label, body, tiles })
+    }
+
+    fn clear_thumbnails(&mut self) {
+        unregister_thumbnails(&mut self.thumbs);
     }
 
     /// Registers a live thumbnail for every tile.
@@ -1089,15 +1133,21 @@ impl Board {
     /// Puts every thumbnail where its tile is, or under the cursor while its
     /// window is being dragged.
     fn update_thumbnails(&self) {
-        let dragged = self.dragged_window();
-        let windows = self.tile_windows();
+        self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window());
+        if let Some(popup) = &self.popup {
+            self.place_thumbnails(&self.popup_thumbs, &popup.tiles, &self.model.tile_windows(&popup.id),
+                (popup.frame.left.round(), popup.frame.top.round()), None);
+        }
+    }
+
+    fn place_thumbnails(&self, thumbs: &[(isize, isize)], tiles: &[TileLayout], windows: &[(&WindowModel, bool)], offset: (f32, f32), dragged: Option<isize>) {
         let to_rect = |r: &Rect| RECT {
-            left: r.left.round() as i32,
-            top: r.top.round() as i32,
-            right: r.right.round() as i32,
-            bottom: r.bottom.round() as i32,
+            left: (r.left - offset.0).round() as i32,
+            top: (r.top - offset.1).round() as i32,
+            right: (r.right - offset.0).round() as i32,
+            bottom: (r.bottom - offset.1).round() as i32,
         };
-        for &(hwnd, thumb) in &self.thumbs {
+        for &(hwnd, thumb) in thumbs {
             let mut props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
                 opacity: 255,
@@ -1116,7 +1166,7 @@ impl Board {
                 }
                 None => (w, h),
             };
-            match self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
+            match tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
                 Some(tile) if dragged == Some(hwnd) => {
                     // Follows the cursor, small enough to see the map under it.
                     let (tw, th) = size(&tile.thumb);
@@ -1200,7 +1250,16 @@ impl Board {
                 Action::None
             }
             WM_MOUSEMOVE => {
+                let mut track = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE, hwndTrack: self.hwnd, ..Default::default() };
+                unsafe { let _ = TrackMouseEvent(&mut track); }
                 self.mouse_move(x, y);
+                Action::None
+            }
+            WM_MOUSELEAVE => {
+                self.hover = Hit::Nothing;
+                self.hide_popup();
+                self.invalidate();
                 Action::None
             }
             WM_LBUTTONUP => self.mouse_up(x, y),
@@ -1211,10 +1270,6 @@ impl Board {
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_TIMER if wparam.0 == ON_TOP_TIMER_ID => {
                 self.keep_on_top();
-                Action::None
-            }
-            WM_TIMER if wparam.0 == DWELL_TIMER_ID => {
-                self.rest_tick();
                 Action::None
             }
             WM_CHAR => {
@@ -1242,6 +1297,7 @@ impl Board {
         if let Some(model) = self.model.rows.get(row) {
             self.editing = Some((row, model.name.clone()));
             self.composing.clear();
+            self.hide_popup();
             self.invalidate();
         }
     }
@@ -1316,7 +1372,7 @@ impl Board {
         let hit = self.hit_test(x, y);
         debug_log!("board: down on {:?} at {x:.0},{y:.0}", hit);
         self.cursor = (x, y);
-        self.rest_on(None);
+        self.hide_popup();
         self.press = Some(Press { hit, x, y, dragging: false });
         unsafe {
             SetCapture(self.hwnd);
@@ -1357,28 +1413,11 @@ impl Board {
         if hover != self.hover {
             debug_log!("board: hover {:?} at {x:.0},{y:.0}", hover);
         }
-        // Resting on a cell other than the one shown turns the board to it;
-        // not on the cell the map put under the cursor by turning, though,
-        // until the cursor has been moved.
-        if self.rested_at.is_some_and(|(rx, ry)| (x - rx).hypot(y - ry) > 8.0 * self.scale) {
-            self.rested_at = None;
-        }
-        let resting = match &hover {
-            Hit::Cell(id) if *id != self.selected && self.dwell_ms > 0 && self.rested_at.is_none() && self.editing.is_none() => Some(id.clone()),
-            _ => None,
-        };
-        #[cfg(feature = "debug-log")]
-        if let (Hit::Cell(id), None, true) = (&hover, &resting, hover != self.hover) {
-            debug_log!(
-                "board: no rest on {}: selected {}, just turned {}, editing {}, dwell {}",
-                &id[..4.min(id.len())], *id == self.selected, self.rested_at.is_some(), self.editing.is_some(), self.dwell_ms
-            );
-        }
-        self.rest_on(resting);
         if hover != self.hover {
             self.hover = hover;
             self.invalidate();
         }
+        self.update_popup();
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Action {
@@ -1386,6 +1425,8 @@ impl Board {
             let _ = ReleaseCapture();
         }
         let Some(press) = self.press.take() else { return Action::None };
+        self.hover = self.hit_test(x, y);
+        self.update_popup();
         self.invalidate();
         if press.dragging {
             let action = match &press.hit {
@@ -1518,6 +1559,12 @@ impl Board {
                 let window = GetDC(self.hwnd);
                 let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
                 ReleaseDC(self.hwnd, window);
+                if let Some(popup) = &self.popup {
+                    let dc = GetDC(self.popup_hwnd);
+                    let _ = BitBlt(dc, 0, 0, size(&popup.frame).0.ceil() as i32, size(&popup.frame).1.ceil() as i32,
+                        canvas.dib.dc, popup.frame.left.round() as i32, popup.frame.top.round() as i32, SRCCOPY);
+                    ReleaseDC(self.popup_hwnd, dc);
+                }
             }
         }
     }
@@ -1556,6 +1603,7 @@ impl Board {
         unsafe {
             target.SetTransform(&Matrix3x2::identity());
         }
+        self.draw_popup(&p, fonts);
         Ok(())
     }
 
@@ -1591,10 +1639,9 @@ impl Board {
                 };
                 Some((title, 0.85))
             }
-            Hit::Cell(_) | Hit::CellClose(_) if self.dwell_ms > 0 => {
+            Hit::Cell(_) | Hit::CellClose(_) => {
                 hint("Hover: show windows   ·   Click: go   ·   Drag: move   ·   Right-click: highlight")
             }
-            Hit::Cell(_) | Hit::CellClose(_) => hint("Click: go   ·   Drag: move   ·   Right-click: highlight"),
             Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
             Hit::AddRow | Hit::AddRowTop => hint("Add a shelf"),
@@ -1613,6 +1660,39 @@ impl Board {
         }
         if let Some((line, alpha)) = self.footer() {
             p.text(&line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
+        }
+    }
+
+    fn draw_popup(&self, p: &Painter, fonts: &Fonts) {
+        let Some(popup) = &self.popup else { return };
+        let s = self.scale;
+        let x = centre(&popup.cell).0;
+        let end = (x.clamp(popup.frame.left + 16.0 * s, popup.frame.right - 16.0 * s), popup.frame.bottom);
+        p.line((x, popup.cell.top - 2.0 * s), (x, end.1 + 8.0 * s), 2.0 * s, accent(0.65));
+        p.line((x, end.1 + 8.0 * s), end, 2.0 * s, accent(0.65));
+        p.disc((x, popup.cell.top - 2.0 * s), 3.0 * s, accent(0.9));
+        p.fill(&popup.frame, 12.0 * s, rgba(0.09, 0.10, 0.13, 1.0));
+        p.stroke(&grow(&popup.frame, -1.0 * s), 11.0 * s, 1.0 * s, accent(0.65));
+        if let Some(pos) = self.nav.find(&popup.id) {
+            let row = grid::row_title(&self.model.rows[pos.row].name, pos.row);
+            p.text(&format!("{row}  ·  cell {}", pos.col + 1), &fonts.small, &popup.label, white(0.9));
+        }
+        if self.model.tile_windows(&popup.id).is_empty() {
+            p.text("Empty", &fonts.centered, &popup.body, white(0.45));
+        }
+        let windows = self.model.tile_windows(&popup.id);
+        for tile in &popup.tiles {
+            p.fill(&tile.frame, 5.0 * s, rgba(0.15, 0.16, 0.19, 1.0));
+            p.fill_square(&tile.thumb, rgba(0.055, 0.06, 0.075, 1.0));
+            if let Some((window, _)) = windows.iter().find(|(window, _)| window.hwnd == tile.hwnd) {
+                let title = Rect { left: tile.frame.left + 6.0 * s, right: tile.frame.right - 6.0 * s,
+                    bottom: tile.thumb.top, ..tile.frame };
+                p.text(&window.title, &fonts.small, &title, white(0.8));
+                if let Some(icon) = self.icons.get(&window.hwnd.0) {
+                    let (cx, cy) = centre(&tile.thumb);
+                    p.bitmap(icon, &rect(cx - 12.0 * s, cy - 12.0 * s, 24.0 * s, 24.0 * s), 0.75);
+                }
+            }
         }
     }
 
@@ -1812,11 +1892,6 @@ impl Board {
             // one inside it, or marking the selected cell would show nothing.
             p.stroke(&grow(&cell.body, -4.0 * s), (radius - 4.0 * s).max(1.0), 2.0 * s, warm(0.95 * dim));
         }
-        if let Some(share) = self.rested(&cell.id) {
-            // Filling up while the cursor rests here; full, the board turns to it.
-            let w = size(&cell.body).0;
-            p.fill(&rect(cell.body.left + 6.0 * s, cell.body.bottom - 6.0 * s, (w - 12.0 * s) * share, 3.0 * s), 1.5 * s, accent(0.95));
-        }
         if cell.id == self.model.current {
             // Where the user actually is, as opposed to what is selected.
             let dot = rect(cell.body.left + 7.0 * s, cell.body.top + 7.0 * s, 6.0 * s, 6.0 * s);
@@ -1907,7 +1982,7 @@ impl Board {
 
     /// Draws the board (without live thumbnails) into a bitmap and returns the
     /// BGRA pixels, for reviewing the layout without showing a window.
-    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32) -> Option<Vec<u8>> {
+    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>) -> Option<Vec<u8>> {
         self.size = size;
         self.scale = scale;
         self.home = rect(0.0, 0.0, size.0 as f32, size.1 as f32);
@@ -1918,10 +1993,49 @@ impl Board {
         let selected = self.selected.clone();
         self.nav.visit(&selected);
         self.relayout();
+        self.hover = Hit::Nothing;
+        if let Some(cell) = hover.and_then(|pos| self.maps[0].layout.rows.get(pos.row)?.cells.get(pos.col)) {
+            self.cursor = centre(&cell.body);
+            self.hover = Hit::Cell(cell.id.clone());
+        }
+        self.update_popup();
         self.fonts = None;
         let _ = self.draw_to_canvas()?;
         Some(self.canvas.as_ref()?.dib.pixels().to_vec())
     }
+}
+
+/// The panel is painted with the board, including when Windows exposes it
+/// again. It never takes mouse input or the keyboard from its owner.
+unsafe extern "system" fn popup_wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match message {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            InvalidateRect(GetWindow(hwnd, GW_OWNER), None, false);
+            ValidateRect(hwnd, None);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+fn unregister_thumbnails(thumbs: &mut Vec<(isize, isize)>) {
+    for (_, thumb) in thumbs.drain(..) {
+        unsafe { let _ = DwmUnregisterThumbnail(thumb); }
+    }
+}
+
+/// Keeps the panel above the whole map and within the hovered monitor,
+/// including monitors whose origin is not the board's top-left corner.
+fn popup_frame(cell: &Rect, monitor: &Rect, map_top: f32, empty: bool, s: f32) -> Rect {
+    let bounds = grow(monitor, -12.0 * s);
+    let w = (size(monitor).0 * 0.4).min(640.0 * s).min(size(&bounds).0).max(0.0);
+    let bottom = (map_top - 16.0 * s).clamp(bounds.top, bounds.bottom);
+    let h = if empty { 100.0 * s } else { (size(monitor).1 * 0.32).min(380.0 * s) };
+    let h = h.min(bottom - bounds.top).max(0.0);
+    let left = (centre(cell).0 - w / 2.0).clamp(bounds.left, bounds.right - w);
+    rect(left, bottom - h, w, h)
 }
 
 fn make_fonts(scale: f32) -> Result<Fonts> {
@@ -2305,6 +2419,53 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_stays_above_the_map_on_its_monitor() {
+        for (monitor, s) in [(rect(0.0, 0.0, 1920.0, 1080.0), 1.0),
+            (rect(2560.0, 400.0, 1280.0, 720.0), 1.5),
+            (rect(-1600.0, -900.0, 1600.0, 900.0), 1.0)] {
+            let map_top = monitor.top + size(&monitor).1 * 0.65;
+            for x in [monitor.left + 12.0 * s, centre(&monitor).0, monitor.right - 90.0 * s] {
+                let cell = rect(x, map_top + 20.0 * s, 70.0 * s, 50.0 * s);
+                for empty in [false, true] {
+                    let frame = popup_frame(&cell, &monitor, map_top, empty, s);
+                    assert!(frame.left >= monitor.left && frame.right <= monitor.right);
+                    assert!(frame.top >= monitor.top && frame.bottom < map_top);
+                    assert!(size(&frame).0 > 0.0 && size(&frame).0 <= size(&monitor).0 * 0.4 + 0.01);
+                    assert!(size(&frame).1 > 0.0);
+                    assert!(!overlaps(&frame, &cell));
+                }
+            }
+        }
+    }
+
+    fn window(hwnd: isize, follows: bool) -> WindowModel {
+        WindowModel { hwnd: HWND(hwnd), rect: RECT { right: 1280, bottom: 720, ..Default::default() },
+            follows, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
+            icon_key: 0, app_name: String::new(), topmost: false }
+    }
+
+    #[test]
+    fn popup_includes_the_cells_windows_and_both_kinds_of_pins() {
+        let mut rows = vec![row(&["a", "b"]), row(&["c"])];
+        rows[0].cells[0].windows = vec![window(1, false), window(2, true)];
+        rows[0].cells[1].windows = vec![window(3, false), window(4, true)];
+        rows[1].cells[0].windows = vec![window(5, true)];
+        let model = Model { rows, pinned: vec![window(6, false)], current: "a".into() };
+        let handles = |id| model.tile_windows(id).iter().map(|(window, all)| (window.hwnd.0, *all)).collect::<Vec<_>>();
+        assert_eq!(handles("a"), [(1, false), (2, false), (4, false), (6, true)]);
+        assert_eq!(handles("b"), [(2, false), (3, false), (4, false), (6, true)]);
+        assert_eq!(handles("c"), [(5, false), (6, true)]);
+        let popup = popup_frame(&rect(100.0, 800.0, 70.0, 50.0), &rect(0.0, 0.0, 1920.0, 1080.0), 760.0, false, 1.0);
+        let body = Rect { top: popup.top + 46.0, ..grow(&popup, -14.0) };
+        let tiles = layout_tiles(&model.tile_windows("b"), &body, 0.55);
+        assert_eq!(tiles.len(), 4);
+        for tile in tiles {
+            assert!(tile.frame.left >= body.left - 0.5 && tile.frame.right <= body.right + 0.5);
+            assert!(tile.frame.top >= body.top - 0.5 && tile.frame.bottom <= body.bottom + 0.5);
+        }
+    }
 
     #[test]
     fn apps_are_grouped_by_icon_with_executable_fallback() {

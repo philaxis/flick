@@ -970,7 +970,6 @@ impl App {
         self.minimap.hide_after(0);
         self.focus_before_board = unsafe { GetForegroundWindow() };
         let model = self.model(&desktops);
-        self.board.set_dwell(self.config.dwell_ms);
         self.board.open(model, self.grid.clone());
         self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
         vd::force_foreground(self.board.hwnd());
@@ -1261,7 +1260,6 @@ impl App {
             step_x: self.config.step_x,
             step_y: self.config.step_y,
             sticky: self.config.vertical_sticky,
-            dwell_ms: self.config.dwell_ms as i32,
             autostart: self.autostart,
         }
     }
@@ -1410,7 +1408,6 @@ impl App {
                 SetTimer(self.hwnd, SLEEP_TIMER_ID, 60_000, None);
             }
         }
-        self.board.set_dwell(config.dwell_ms);
         self.config = config;
         self.refresh_settings();
     }
@@ -2036,6 +2033,8 @@ pub fn render_minimap_strip(path: &str) {
 /// `write_raw`), without live thumbnails and without showing it. With
 /// `sizes` ("1920x1040,400x300") the current cell holds made-up windows of
 /// those sizes instead of its own, to see how any mix of them is laid out.
+/// `FLICK_HOVER=row,col` also previews that cell (zero-based), using the
+/// same made-up windows when sizes were supplied.
 pub fn render_board(path: &str, sizes: Option<&str>) {
     // Reading the desktops needs a backend, and only a known Windows gets one.
     if vdapi::select(false).is_none() {
@@ -2059,6 +2058,10 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
         let other = app.grid.rows.iter().flat_map(|row| &row.cells).find(|id| **id != desktops.current).cloned();
         app.grid.emphasised.extend(other);
     }
+    let hover = std::env::var("FLICK_HOVER").ok().and_then(|value| {
+        let (row, col) = value.split_once(',')?;
+        Some(Pos { row: row.trim().parse().ok()?, col: col.trim().parse().ok()? })
+    });
     let mut model = app.model(&desktops);
     if let Some(sizes) = sizes {
         let made_up = sizes.split(',').filter_map(|size| size.trim().split_once('x')).enumerate().filter_map(|(i, (w, h))| {
@@ -2093,12 +2096,15 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             window.follows = true;
         }
         model.pinned.extend(made_up.drain(..all.min(made_up.len())));
+        if let Some(cell) = hover.and_then(|pos| model.rows.get_mut(pos.row)?.cells.get_mut(pos.col)) {
+            cell.windows = made_up.clone();
+        }
         if let Some(cell) = model.rows.iter_mut().flat_map(|row| &mut row.cells).find(|cell| cell.id == desktops.current) {
             cell.windows = made_up;
         }
     }
     let size = (2560, 1440);
-    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5) {
+    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5, hover) {
         write_raw(path, size, &pixels);
     }
 }
@@ -2133,7 +2139,6 @@ pub fn render_settings(path: &str) {
         step_x: config.step_x,
         step_y: config.step_y,
         sticky: config.vertical_sticky,
-        dwell_ms: config.dwell_ms as i32,
         autostart: true,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
