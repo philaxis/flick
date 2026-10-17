@@ -103,7 +103,7 @@ const CHORD_WINDOW_MS: u32 = 100;
 const PAIR_WINDOW_MS: u32 = 40;
 /// Keys sent by software (mouse software sending the chord for a button)
 /// may come further apart, and nobody types with them, so they wait longer.
-const INJECTED_WINDOW_MS: u32 = 500;
+const INJECTED_WINDOW_MS: u32 = 1000;
 /// Travel this far (pixels) either way into a hold brings the minimap up.
 const DRAG_SHOWS: i32 = 24;
 
