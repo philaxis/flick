@@ -2057,6 +2057,21 @@ pub fn render_minimap_strip(path: &str) {
     write_raw(path, (width, h), &out);
 }
 
+/// Measures a made-up hold on the actual monitors, at their current DPI,
+/// without starting input hooks or switching any real desktops.
+pub fn time_minimap(path: &str) {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let run = || -> Result<(), Box<dyn std::error::Error>> {
+        Overlay::new()?.time_minimap(path)
+    };
+    if let Err(e) = run() {
+        warn(&format!("Minimap timing failed: {e}"));
+    }
+}
+
 /// Renders the board for the real desktops and windows into `path` (see
 /// `write_raw`), without live thumbnails and without showing it. With
 /// `sizes` ("1920x1040,400x300") the current cell holds made-up windows of

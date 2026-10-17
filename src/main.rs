@@ -69,6 +69,9 @@ fn main() {
         if flag == "--render-minimap-strip" {
             return app::render_minimap_strip(path);
         }
+        if flag == "--time-minimap" {
+            return app::time_minimap(path);
+        }
         if flag == "--render-settings" {
             return app::render_settings(path);
         }

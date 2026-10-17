@@ -12,6 +12,8 @@ use crate::{
     vd,
 };
 use std::{
+    fs::File,
+    io::{BufWriter, Write},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -253,6 +255,17 @@ pub struct Overlay {
     others: Vec<(HWND, RECT)>,
 }
 
+#[derive(Default)]
+struct FrameTiming {
+    interval: Duration,
+    draw: Duration,
+    update: Duration,
+    flush: Duration,
+    fallback: Duration,
+    total: Duration,
+    flush_ok: bool,
+}
+
 impl Overlay {
     pub fn new() -> Result<Overlay> {
         unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -299,10 +312,8 @@ impl Overlay {
             self.visible = true;
             self.last_tick = Instant::now();
         }
-        self.view = view;
-        self.views += 1;
+        self.update(view);
         self.hide_at = None;
-        self.tick();
         unsafe {
             // Shown and raised: the minimap stays above the sliding picture
             // of the desktop being left.
@@ -316,7 +327,7 @@ impl Overlay {
 
     /// Replaces the content without changing visibility or timing.
     pub fn update(&mut self, view: View) {
-        if self.visible {
+        if self.visible && self.view != view {
             self.view = view;
             self.views += 1;
         }
@@ -328,19 +339,27 @@ impl Overlay {
         }
     }
 
-    /// Advances the animations by the time elapsed and repaints.
-    pub fn tick(&mut self) {
+    /// Samples the hand, advances and draws once, then waits for the next
+    /// refresh. The made-up hold uses this same path with its own hand.
+    fn tick(&mut self, sample_hand: impl FnOnce() -> Hand) -> Result<FrameTiming> {
         if !self.visible {
-            return;
+            return Ok(FrameTiming::default());
         }
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                DispatchMessageW(&message);
+            }
+        }
+        let hand = sample_hand();
         let now = Instant::now();
-        let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
+        let interval = now.duration_since(self.last_tick);
+        let dt = interval.as_secs_f32().min(0.1);
         self.last_tick = now;
 
         let hiding = self.hide_at.is_some_and(|at| now >= at);
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
-        let hand = crate::input::hand();
         self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt);
         #[cfg(feature = "debug-log")]
         if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.abs() > 0.001 {
@@ -357,9 +376,18 @@ impl Overlay {
                     ShowWindow(*window, SW_HIDE);
                 }
             }
-            return;
+            return Ok(FrameTiming { interval, ..Default::default() });
         }
-        self.render();
+        let (draw, update) = self.render()?;
+        let before = Instant::now();
+        let flush_ok = unsafe { DwmFlush() }.is_ok();
+        let flush = before.elapsed();
+        let before = Instant::now();
+        if !flush_ok {
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        let fallback = if flush_ok { Duration::ZERO } else { before.elapsed() };
+        Ok(FrameTiming { interval, draw, update, flush, fallback, total: now.elapsed(), flush_ok })
     }
 
     /// Finds the monitors: the primary one sets the scale, and each of the
@@ -400,23 +428,23 @@ impl Overlay {
     }
 
     /// Draws the minimap as it is now into the canvas, which is remade when
-    /// the size it needs has changed. `None` when that failed.
-    fn draw_to_canvas(&mut self) -> Option<&Dib> {
+    /// the size it needs has changed.
+    fn draw_to_canvas(&mut self) -> Result<&Dib> {
         if self.text.is_none() || self.text_scale != self.scale {
-            self.text = text_format(self.scale).ok();
+            self.text = Some(text_format(self.scale)?);
             self.text_scale = self.scale;
         }
         let size = self.wanted_size();
         if !self.canvas.as_ref().is_some_and(|canvas| canvas.size == size) {
-            self.canvas = Dib::new(size).ok();
+            self.canvas = Some(Dib::new(size)?);
         }
-        let canvas = self.canvas.as_ref()?;
-        self.draw(canvas).ok()?;
-        Some(canvas)
+        let canvas = self.canvas.as_ref().unwrap();
+        self.draw(canvas)?;
+        Ok(canvas)
     }
 
     /// Redraws the minimap and hands the picture to its windows.
-    fn render(&mut self) {
+    fn render(&mut self) -> Result<(Duration, Duration)> {
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -424,13 +452,17 @@ impl Overlay {
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         let windows: Vec<(HWND, RECT)> = std::iter::once((self.hwnd, self.monitor)).chain(self.others.iter().copied()).collect();
-        let Some(canvas) = self.draw_to_canvas() else { return };
+        let before = Instant::now();
+        let canvas = self.draw_to_canvas()?;
+        let draw = before.elapsed();
         let size = canvas.size;
+        let mut update = Duration::ZERO;
         for (window, area) in windows {
             // Centred on each monitor.
             let origin = POINT { x: (area.left + area.right - size.0) / 2, y: (area.top + area.bottom - size.1) / 2 };
-            unsafe {
-                let _ = UpdateLayeredWindow(
+            let before = Instant::now();
+            let result = unsafe {
+                UpdateLayeredWindow(
                     window,
                     None,
                     Some(&origin),
@@ -440,9 +472,12 @@ impl Overlay {
                     COLORREF(0),
                     Some(&blend),
                     ULW_ALPHA,
-                );
-            }
+                )
+            };
+            update += before.elapsed();
+            result?;
         }
+        Ok((draw, update))
     }
 
     fn draw(&self, canvas: &Dib) -> Result<()> {
@@ -522,7 +557,7 @@ impl Overlay {
         self.camera.advance(&view, hand, (0, 0), 0.0);
         self.view = view;
         self.scale = scale;
-        let canvas = self.draw_to_canvas()?;
+        let canvas = self.draw_to_canvas().ok()?;
         Some((canvas.size, canvas.pixels().to_vec()))
     }
 
@@ -537,9 +572,146 @@ impl Overlay {
         let drawn = ((0..view.rows.len()).map(|r| self.camera.x(r)).collect(), self.camera.y());
         self.view = view;
         self.scale = scale;
-        let canvas = self.draw_to_canvas()?;
+        let canvas = self.draw_to_canvas().ok()?;
         Some((canvas.size, canvas.pixels().to_vec(), drawn))
     }
+
+    /// Times 300 real screen refreshes of a hold, including the cold first
+    /// draw. Counts go steadily sideways, then down; the app answers three
+    /// frames late and the hand's reference catches up one frame after that.
+    /// Results are kept in memory until the hold ends so file writes do not
+    /// disturb the frames being measured.
+    pub fn time_minimap(&mut self, path: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut out = BufWriter::new(File::create(path)?);
+        let cells = |n| vec![CellView::default(); n];
+        let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true }], cells(4), cells(2)];
+        let view = |col, row| View {
+            rows: rows.clone(),
+            anchors: vec![1, col, 2, 1],
+            cur: Some(if row == 2 { Pos { row, col: 2 } } else { Pos { row, col } }),
+            title: format!("Shelf {}", row + 1),
+        };
+        self.show(view(0, 1), None);
+        let monitors = 1 + self.others.len();
+        if monitors != vd::monitors().len() {
+            return Err("could not create an overlay on every monitor".into());
+        }
+        let steps = (260, 400);
+        let mut plane = crate::slide::Plane::new();
+        plane.rows.set_room(1, 2, steps.1);
+        plane.cols.set_room(0, 1, steps.0);
+        let (mut counts, mut stretch) = ((0, 0), 0u64);
+        let (mut came_col, mut came_row) = (None, None);
+        let mut frames = Vec::with_capacity(300);
+        for frame in 0..300 {
+            let t = frame as f32;
+            let x = (300.0 * (t / 90.0).min(1.0)) as i32;
+            let y = (450.0 * ((t - 108.0) / 120.0).clamp(0.0, 1.0)) as i32;
+            let moved = plane.travel(x - counts.0, y - counts.1, steps);
+            counts = (x, y);
+            if moved.cell && came_col.is_none() {
+                came_col = Some(frame);
+            }
+            if moved.row {
+                came_row = Some(frame);
+                stretch += 1;
+            }
+            let after = |came: Option<i32>, delay| came.is_some_and(|at| frame >= at + delay);
+            let (col, told_col) = (after(came_col, 3) as usize, after(came_col, 4) as i32);
+            let (row, told_row) = (1 + after(came_row, 3) as usize, after(came_row, 4) as i32);
+            let hand = Hand {
+                along: (plane.cols.cell() - if stretch == 0 { told_col } else { 0 }) as f32
+                    + plane.cols.rest(steps.0) as f32 / steps.0 as f32,
+                across: (plane.rows.cell() - told_row) as f32 + plane.rows.lean(steps.1),
+                counted_from: stretch << 8 | (told_col as u64) << 4 | told_row as u64,
+            };
+            self.update(view(col, row));
+            let timing = self.tick(|| hand)?;
+            let xs: Vec<f64> = (0..rows.len()).map(|r| (self.camera.x(r) * (CELL_W + GAP) * self.scale) as f64).collect();
+            let y = (self.camera.y() * (CELL_H + GAP) * self.scale) as f64;
+            frames.push((timing, xs, y, hand, self.view.cur.unwrap()));
+        }
+        self.visible = false;
+        unsafe {
+            ShowWindow(self.hwnd, SW_HIDE);
+            for (window, _) in &self.others {
+                ShowWindow(*window, SW_HIDE);
+            }
+        }
+        let (width, height) = self.canvas.as_ref().unwrap().size;
+        writeln!(out, "# Intervals are frame-start to frame-start; frame 0 has no previous frame. Frame work includes DwmFlush and fallback sleep.")?;
+        writeln!(out, "# The script advances by frame, independent of refresh rate. Positions and deltas are physical pixels from the highlight, for each row's first cell.")?;
+        write!(out, "frame,interval_ms,draw_ms,update_layered_window_ms,dwm_flush_ms,fallback_ms,frame_work_ms,width_px,height_px,scale,monitors,dwm_ok,cur_row,cur_col,hand_along,hand_across")?;
+        for r in 0..rows.len() {
+            write!(out, ",row{r}_x_px,row{r}_dx_px")?;
+        }
+        writeln!(out, ",grid_y_px,grid_dy_px,largest_row_step_px")?;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut jumps = Vec::with_capacity(frames.len() - 1);
+        for (frame, (timing, xs, y, hand, cur)) in frames.iter().enumerate() {
+            let interval = if frame == 0 { 0.0 } else { ms(timing.interval) };
+            write!(out, "{frame},{interval:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{width},{height},{:.3},{monitors},{},{},{},{:.5},{:.5}",
+                ms(timing.draw), ms(timing.update), ms(timing.flush), ms(timing.fallback), ms(timing.total), self.scale,
+                timing.flush_ok as u8, cur.row, cur.col, hand.along, hand.across)?;
+            let previous = frame.checked_sub(1).map(|f| &frames[f]);
+            let dy = previous.map_or(0.0, |p| y - p.2);
+            let mut jump = 0.0f64;
+            for (r, x) in xs.iter().enumerate() {
+                let dx = previous.map_or(0.0, |p| x - p.1[r]);
+                jump = jump.max(dx.hypot(dy));
+                write!(out, ",{x:.5},{dx:.5}")?;
+            }
+            writeln!(out, ",{y:.5},{dy:.5},{jump:.5}")?;
+            if frame != 0 {
+                jumps.push(jump);
+            }
+        }
+        let timings: Vec<&FrameTiming> = frames.iter().map(|f| &f.0).collect();
+        let mut summary = format!("# {} frames, {width}x{height} px, scale {:.3}, {monitors} monitor(s); first interval excluded\n", frames.len(), self.scale);
+        let metrics: [(&str, fn(&FrameTiming) -> Duration); 6] = [
+            ("interval", |t| t.interval), ("draw", |t| t.draw), ("UpdateLayeredWindow (all monitors)", |t| t.update),
+            ("DwmFlush", |t| t.flush), ("fallback sleep", |t| t.fallback), ("frame work", |t| t.total),
+        ];
+        for (name, get) in metrics {
+            let (mean, median, p95, max) = distribution(timings.iter().skip((name == "interval") as usize).map(|t| ms(get(t))));
+            summary += &format!("# {name} ms: mean {mean:.3}, median {median:.3}, p95 {p95:.3}, max {max:.3}\n");
+        }
+        let slow = timings.iter().skip(1).filter(|t| ms(t.interval) > 16.7).count();
+        let clamped = timings.iter().filter(|t| t.interval > Duration::from_millis(100)).count();
+        let failed = timings.iter().filter(|t| !t.flush_ok).count();
+        let immediate = timings.iter().filter(|t| t.flush_ok && t.flush < Duration::from_millis(1)).count();
+        summary += &format!("# Intervals over 16.7 ms: {slow}/{}; animation dt clamped at 100 ms: {clamped}; DwmFlush failures: {failed}; successful waits under 1 ms: {immediate}\n", frames.len() - 1);
+        let (mean, median, p95, max) = distribution(jumps.into_iter());
+        let ratio = if median > 0.0 { format!("{:.3}x median", max / median) } else { "undefined (median is zero)".into() };
+        summary += &format!("# Largest row displacement per frame px: mean {mean:.5}, median {median:.5}, p95 {p95:.5}, max {max:.5}; largest jump {ratio}\n");
+        write!(out, "{summary}")?;
+        out.flush()?;
+        println!("{summary}");
+        Ok(())
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+            for (window, _) in &self.others {
+                let _ = DestroyWindow(*window);
+            }
+        }
+    }
+}
+
+/// Mean, median, nearest-rank 95th percentile and maximum of a measurement.
+fn distribution(values: impl Iterator<Item = f64>) -> (f64, f64, f64, f64) {
+    let mut values: Vec<f64> = values.collect();
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    (values.iter().sum::<f64>() / n as f64, (values[(n - 1) / 2] + values[n / 2]) / 2.0,
+        values[(0.95 * n as f64).ceil() as usize - 1], values[n - 1])
 }
 
 /// Tells the debug record where the grid is drawn this frame.
@@ -601,17 +773,10 @@ impl Minimap {
                 while let Ok(request) = inbox.try_recv() {
                     apply(&mut overlay, request);
                 }
-                unsafe {
-                    let mut message = MSG::default();
-                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-                        DispatchMessageW(&message);
-                    }
-                    if overlay.is_visible() {
-                        overlay.tick();
-                        // Wait for the next refresh of the screen.
-                        if DwmFlush().is_err() {
-                            std::thread::sleep(Duration::from_millis(8));
-                        }
+                if overlay.is_visible() {
+                    if let Err(e) = overlay.tick(crate::input::hand) {
+                        crate::app::log(&format!("minimap frame failed: {e}"));
+                        std::thread::sleep(Duration::from_millis(8));
                     }
                 }
             }
@@ -635,6 +800,33 @@ impl Minimap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_statistics_include_outliers_and_handle_no_samples() {
+        assert_eq!(distribution(std::iter::empty()), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(distribution([7.0].into_iter()), (7.0, 7.0, 7.0, 7.0));
+        assert_eq!(distribution((1..=100).rev().map(f64::from)), (50.5, 50.5, 95.0, 100.0));
+    }
+
+    #[test]
+    fn identical_updates_do_not_move_the_grid_after_the_hand_stops() {
+        let mut overlay = Overlay::new().unwrap();
+        overlay.visible = true;
+        let view = View {
+            rows: vec![vec![CellView::default(); 3]],
+            cur: Some(Pos { row: 0, col: 0 }),
+            ..Default::default()
+        };
+        overlay.update(view.clone());
+        overlay.camera.advance(&view, (0.0, 0.0), (overlay.views, 0), 1.0 / 60.0);
+        overlay.camera.advance(&view, (0.1, 0.0), (overlay.views, 0), 1.0 / 60.0);
+        let x = overlay.camera.x(0);
+        for _ in 0..4 {
+            overlay.update(view.clone());
+            overlay.camera.advance(&view, (0.1, 0.0), (overlay.views, 0), 1.0 / 60.0);
+            assert!((overlay.camera.x(0) - x).abs() < 0.0001, "the grid moved after the hand stopped");
+        }
+    }
 
     /// One cell right and one row down at a steady hand, the app getting to
     /// each a few frames late and the count of the hand catching up with it
