@@ -639,10 +639,13 @@ impl App {
     /// along. Returns false when there is no cell that way.
     fn step(&mut self, dir: Dir, carry: bool) -> bool {
         if self.board.is_open() {
-            // With the board open the gesture only moves the selection; the
-            // desktop changes once, when the board is confirmed.
+            // Row anchors change now; the desktop changes when confirmed.
             debug_log!("app: {dir:?} moves the selection, the board being open");
-            self.board.select_dir(dir);
+            if let Some(from) = self.grid.find(&self.board.selected()) {
+                if let Some(id) = self.grid.target(from, dir).and_then(|pos| self.grid.id_at(pos).cloned()) {
+                    self.select_board(id);
+                }
+            }
             return true;
         }
         let Some(desktops) = self.sync() else { return true };
@@ -676,11 +679,13 @@ impl App {
     fn slide(&mut self, key: (u32, u8), to: Option<i32>, carry: bool) -> Option<(i32, (usize, usize))> {
         let began = self.sliding.take().filter(|(of, _)| *of == key).map(|(_, origin)| origin);
         let (origin, on, room) = if self.board.is_open() {
-            // With the board open the gesture only moves the selection; the
-            // desktop changes once, when the board is confirmed.
             let origin = began.unwrap_or_else(|| self.board.selected());
             let (on, room) = match to {
-                Some(to) => self.board.select_along(&origin, to)?,
+                Some(to) => {
+                    let along = self.grid.along(&origin, to)?;
+                    self.select_board(self.grid.id_at(along.0)?.clone());
+                    along
+                }
                 None => self.grid.along(&origin, 0)?,
             };
             debug_log!("app: the selection slides to {to:?}, the board being open");
@@ -722,9 +727,11 @@ impl App {
     fn rows(&mut self, hold: u32, to: i32, carry: bool) -> Option<(i32, (usize, usize))> {
         let began = self.rowing.take().filter(|(of, _)| *of == hold).map(|(_, row)| row);
         let (on, room) = if self.board.is_open() {
-            let origin = began.or_else(|| self.board.selected_row())?;
+            let origin = began.or_else(|| self.grid.find(&self.board.selected()).map(|pos| pos.row))?;
             debug_log!("app: the selection goes to row {to:+}, the board being open");
-            self.board.select_across(origin, to)?
+            let across = self.grid.across(origin, to)?;
+            self.select_board(self.grid.id_at(across.0)?.clone());
+            across
         } else {
             let desktops = self.sync()?;
             let heading = self.heading(&desktops);
@@ -932,6 +939,16 @@ impl App {
 
     // ---- the board ------------------------------------------------------------
 
+    /// Saves a board move in the real grid without visiting the desktop.
+    fn select_board(&mut self, id: String) {
+        if id == self.board.selected() {
+            return;
+        }
+        self.grid.visit(&id);
+        self.save();
+        self.board.select(id, self.grid.clone());
+    }
+
     fn model(&self, desktops: &Desktops) -> Model {
         let mut windows = vd::windows(&desktops.current);
         let parents = vd::process_parents();
@@ -1058,6 +1075,10 @@ impl App {
         match action {
             // These are done with here: no grid to commit, no board to rebuild.
             Action::None => return,
+            Action::Step(dir) => {
+                self.step(dir, false);
+                return;
+            }
             // Right after a switch of desktops, or a desktop made or removed,
             // Windows gives the keyboard to a window of that desktop: the
             // board takes it back instead of closing under the user's hand.
@@ -1856,7 +1877,14 @@ pub fn run(first_run: bool) {
     let mut app = App::new(hwnd, board, settings, events, listener);
     app.guide = Some(guide);
     if let Some(desktops) = app.sync() {
-        app.visit(&desktops.current);
+        // A board gesture may have lined this shelf up on another cell.
+        let remembered = app.grid.find(&desktops.current).is_some_and(|pos| {
+            let row = &app.grid.rows[pos.row];
+            row.last.as_ref().is_some_and(|id| row.cells.contains(id))
+        });
+        if !remembered {
+            app.visit(&desktops.current);
+        }
         app.commit();
     }
     app.apply_config();

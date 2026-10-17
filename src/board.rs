@@ -141,6 +141,8 @@ impl Model {
 /// What the user asked for; carried out by the app.
 pub enum Action {
     None,
+    /// Move the board selection and save its row anchor without switching desktops.
+    Step(Dir),
     /// Close without going anywhere and give focus back.
     Cancel,
     /// The board lost focus; close without touching focus.
@@ -405,9 +407,8 @@ pub struct Board {
     fonts: Option<Fonts>,
     open: bool,
     model: Model,
-    /// Copy of the grid used to move the selection, so that looking around
-    /// does not disturb the real per-row memory until a cell is chosen.
-    nav: Grid,
+    /// The app's grid as last supplied, for laying out and labelling cells.
+    grid: Grid,
     selected: CellId,
     /// The selected cell's windows, the main content of the board, in the
     /// board window's coordinates.
@@ -542,7 +543,7 @@ impl Board {
                 fonts: None,
                 open: false,
                 model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new() },
-                nav: Grid::default(),
+                grid: Grid::default(),
                 selected: String::new(),
                 tiles: Vec::new(),
                 tiles_area: Rect::default(),
@@ -647,13 +648,10 @@ impl Board {
             return;
         }
         self.model = model;
-        self.nav = grid;
-        if self.nav.find(&self.selected).is_none() {
+        self.grid = grid;
+        if self.grid.find(&self.selected).is_none() {
             self.selected = self.model.current.clone();
         }
-        // Makes the selected cell its row's landing cell, which the map lines up.
-        let selected = self.selected.clone();
-        self.nav.visit(&selected);
         self.press = None;
         self.hide_popup();
         self.relayout();
@@ -706,49 +704,9 @@ impl Board {
         }
     }
 
-    /// Moves the selection one cell, by the same rules as real navigation.
-    pub fn select_dir(&mut self, dir: Dir) {
-        let Some(from) = self.nav.find(&self.selected) else { return };
-        if let Some(id) = self.nav.target(from, dir).and_then(|pos| self.nav.id_at(pos).cloned()) {
-            self.select(id, true);
-        }
-    }
-
-    /// Moves the selection to the cell `by` cells along the row from `origin`
-    /// (`Grid::along`), and returns what that says.
-    pub fn select_along(&mut self, origin: &str, by: i32) -> Option<(crate::grid::Pos, (usize, usize))> {
-        let along = self.nav.along(origin, by)?;
-        let id = self.nav.id_at(along.0)?.clone();
-        if id != self.selected {
-            self.select(id, true);
-        }
-        Some(along)
-    }
-
-    /// The row of the selected cell.
-    pub fn selected_row(&self) -> Option<usize> {
-        self.nav.find(&self.selected).map(|pos| pos.row)
-    }
-
-    /// Moves the selection `by` rows from row `origin` (`Grid::across`), and
-    /// returns what that says.
-    pub fn select_across(&mut self, origin: usize, by: i32) -> Option<(crate::grid::Pos, (usize, usize))> {
-        let across = self.nav.across(origin, by)?;
-        let id = self.nav.id_at(across.0)?.clone();
-        if id != self.selected {
-            self.select(id, true);
-        }
-        Some(across)
-    }
-
-    /// Turns the board to a cell: its windows are shown. With `line_up` the
-    /// rows slide to stay lined up on it, as they will be once it is gone
-    /// to; without, the map stays as it is, for the mouse to go on from
-    /// where it is.
-    fn select(&mut self, id: CellId, line_up: bool) {
-        if line_up {
-            self.nav.visit(&id);
-        }
+    /// Shows a selection whose row anchors the app has already saved.
+    pub fn select(&mut self, id: CellId, grid: Grid) {
+        self.grid = grid;
         self.selected = id;
         self.hide_popup();
         self.relayout();
@@ -856,7 +814,7 @@ impl Board {
         let margin = 40.0 * s;
         // Each row is shifted so that the cell a vertical move would land on
         // sits in the same column for all rows.
-        let anchors: Vec<usize> = self.nav.rows.iter().map(Row::anchor).collect();
+        let anchors: Vec<usize> = self.grid.rows.iter().map(Row::anchor).collect();
         let windows = self.tile_windows();
         let mut tiles = Vec::new();
         let mut tiles_area = Rect::default();
@@ -1352,14 +1310,14 @@ impl Board {
             return Action::None;
         }
         match key {
-            k if k == VK_LEFT.0 => self.select_dir(Dir::Left),
-            k if k == VK_RIGHT.0 => self.select_dir(Dir::Right),
-            k if k == VK_UP.0 => self.select_dir(Dir::Up),
-            k if k == VK_DOWN.0 => self.select_dir(Dir::Down),
+            k if k == VK_LEFT.0 => return Action::Step(Dir::Left),
+            k if k == VK_RIGHT.0 => return Action::Step(Dir::Right),
+            k if k == VK_UP.0 => return Action::Step(Dir::Up),
+            k if k == VK_DOWN.0 => return Action::Step(Dir::Down),
             k if k == VK_RETURN.0 => return Action::Go(self.selected.clone(), None),
             k if k == VK_ESCAPE.0 => return Action::Cancel,
             k if k == VK_F2.0 => {
-                if let Some(pos) = self.nav.find(&self.selected) {
+                if let Some(pos) = self.grid.find(&self.selected) {
                     self.start_rename(pos.row);
                 }
             }
@@ -1653,7 +1611,7 @@ impl Board {
     fn draw_captions(&self, p: &Painter, fonts: &Fonts) {
         let s = self.scale;
         let (w, h) = size(&self.home);
-        if let Some(pos) = self.nav.find(&self.selected) {
+        if let Some(pos) = self.grid.find(&self.selected) {
             let row = grid::row_title(self.model.rows.get(pos.row).map_or("", |row| &row.name), pos.row);
             let here = if self.selected == self.model.current { "   ● current" } else { "" };
             p.text(&format!("{row}  ·  cell {}{here}", pos.col + 1), &fonts.label, &self.label, white(0.80));
@@ -1673,7 +1631,7 @@ impl Board {
         p.disc((x, popup.cell.top - 2.0 * s), 3.0 * s, accent(0.9));
         p.fill(&popup.frame, 12.0 * s, rgba(0.09, 0.10, 0.13, 1.0));
         p.stroke(&grow(&popup.frame, -1.0 * s), 11.0 * s, 1.0 * s, accent(0.65));
-        if let Some(pos) = self.nav.find(&popup.id) {
+        if let Some(pos) = self.grid.find(&popup.id) {
             let row = grid::row_title(&self.model.rows[pos.row].name, pos.row);
             p.text(&format!("{row}  ·  cell {}", pos.col + 1), &fonts.small, &popup.label, white(0.9));
         }
@@ -1815,7 +1773,7 @@ impl Board {
     fn draw_map(&self, p: &Painter, fonts: &Fonts, map: &Map) {
         let s = self.scale;
         let layout = &map.layout;
-        let selected_row = self.nav.find(&self.selected).map(|pos| pos.row);
+        let selected_row = self.grid.find(&self.selected).map(|pos| pos.row);
         // The cell a dragged window would be dropped on.
         let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
 
@@ -1989,9 +1947,7 @@ impl Board {
         self.monitors = vec![self.home];
         self.selected = model.current.clone();
         self.model = model;
-        self.nav = grid;
-        let selected = self.selected.clone();
-        self.nav.visit(&selected);
+        self.grid = grid;
         self.relayout();
         self.hover = Hit::Nothing;
         if let Some(cell) = hover.and_then(|pos| self.maps[0].layout.rows.get(pos.row)?.cells.get(pos.col)) {

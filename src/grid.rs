@@ -319,6 +319,26 @@ mod tests {
         assert_eq!(go(&mut g, "b1", Dir::Up).as_deref(), Some("a0"));
     }
 
+    /// Board moves save each shelf's anchor even while Windows stays on
+    /// the original cell. Reading desktops again must leave them there.
+    #[test]
+    fn anchors_survive_saving_and_refreshing_on_a_different_current_cell() {
+        let mut g = grid(&[&["a1", "a2", "a3"], &["b1", "b2"], &["c1"]]);
+        g.visit("a2");
+        g.visit("b2");
+        g.visit("a3");
+        let saved = serde_json::to_string(&g).unwrap();
+        let mut restored: Grid = serde_json::from_str(&saved).unwrap();
+        let actual: Vec<_> = ["a1", "a2", "a3", "b1", "b2", "c1"].into_iter().map(str::to_owned).collect();
+        assert!(!restored.sync(&actual, "a1"));
+        assert_eq!(restored.rows.iter().map(Row::anchor).collect::<Vec<_>>(), [2, 1, 0]);
+        assert_eq!(restored.id_at(restored.across(0, 1).unwrap().0).map(String::as_str), Some("b2"));
+        assert_eq!(restored.id_at(restored.across(1, -1).unwrap().0).map(String::as_str), Some("a3"));
+        let before = restored.clone();
+        restored.visit("gone");
+        assert_eq!(restored, before);
+    }
+
     /// Dragging a cell: the drop index is counted without the dragged cell, so
     /// a move to the right inside the same row must not land one too far, and
     /// a row emptied by the move must vanish.
