@@ -484,7 +484,9 @@ impl Overlay {
                     p.fill(&cell, radius, warm((0.30 + 0.12 * near) * shown));
                     emphasised.push((cell, shown));
                 } else {
-                    p.fill(&cell, radius, white((0.08 + 0.09 * near) * shown));
+                    // Bright enough that the other cells are seen against
+                    // any wallpaper, not only the one being moved to.
+                    p.fill(&cell, radius, white((0.22 + 0.10 * near) * shown));
                 }
             }
         }
