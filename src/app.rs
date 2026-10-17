@@ -133,6 +133,9 @@ struct App {
     board_settling: Instant,
     /// The window that had focus when the board opened, to give it back on cancel.
     focus_before_board: HWND,
+    /// The desktop the board was last opened on. Opened again on it, the
+    /// board comes back to the cell it was left on.
+    board_opened_on: String,
     /// The cell gone to from the board and when, for as long as Windows may
     /// still go back on it.
     going: Option<(String, Instant)>,
@@ -291,6 +294,7 @@ impl App {
             board,
             board_settling: Instant::now(),
             focus_before_board: HWND(0),
+            board_opened_on: String::new(),
             going: None,
             settings,
             guide: None,
@@ -987,7 +991,15 @@ impl App {
         self.minimap.hide_after(0);
         self.focus_before_board = unsafe { GetForegroundWindow() };
         let model = self.model(&desktops);
+        // Left by Esc, a click outside or any other close, the board keeps
+        // the cell it was on, as long as Windows is still on the same desktop.
+        let left_on = self.board.selected();
+        let resume = desktops.current == self.board_opened_on && left_on != desktops.current && self.grid.find(&left_on).is_some();
+        self.board_opened_on = desktops.current.clone();
         self.board.open(model, self.grid.clone());
+        if resume {
+            self.board.select(left_on, self.grid.clone());
+        }
         self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
         vd::force_foreground(self.board.hwnd());
     }
