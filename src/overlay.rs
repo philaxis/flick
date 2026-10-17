@@ -14,20 +14,30 @@ use crate::{
 use std::{
     fs::File,
     io::{BufWriter, Write},
-    sync::mpsc,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 use windows::{
     core::{w, Error, Result, PCWSTR},
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+        Foundation::{CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_FAILED, WAIT_OBJECT_0, WPARAM},
         Graphics::{
             Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
             DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER},
-            Dwm::DwmFlush,
-            Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION},
+            Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_OUTPUT_DESC},
+            Gdi::{
+                EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromPoint, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
+                DEVMODEW, ENUM_CURRENT_SETTINGS, HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+            },
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{
+                CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimerEx, WaitForMultipleObjects,
+                WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+            },
+        },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW, RegisterClassW,
             SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE,
@@ -144,41 +154,43 @@ impl Camera {
     }
 
     /// One frame, `dt` seconds after the last. `counted_from` changes
-    /// whenever the view or what the hand is counted from does.
-    fn advance(&mut self, view: &View, hand: (f32, f32), counted_from: (u64, u64), dt: f32) {
+    /// whenever the view or what the hand is counted from does. After a late
+    /// frame, missed motion is eased in without extrapolating stale speed.
+    fn advance(&mut self, view: &View, hand: (f32, f32), counted_from: (u64, u64), dt: f32, refresh: f32) {
         let (goal_x, goal_y) = Camera::goals(view, hand);
+        let step = dt.min(refresh);
+        let late = dt > refresh * 2.0;
         if goal_x.len() != self.goal_x.len() {
             // Rows came or went: nothing to ease from.
             self.rest_x = vec![0.0; goal_x.len()];
             self.put_x = vec![0.0; goal_x.len()];
             self.pace_x = vec![0.0; goal_x.len()];
             (self.rest_y, self.put_y, self.pace_y) = (0.0, 0.0, 0.0);
-        } else if self.counted_from != Some(counted_from) {
-            // The jump is put by, less the way the hand went meanwhile. Not
-            // eased yet in this frame: the app tells the minimap of the cell
-            // it got to a moment before it tells the count of the hand, and a
-            // frame drawn in between is taken back in the next.
-            for (((put, before), now), pace) in self.put_x.iter_mut().zip(&self.goal_x).zip(&goal_x).zip(&self.pace_x) {
-                *put += before + pace * dt - now;
-            }
-            self.put_y += self.goal_y + self.pace_y * dt - goal_y;
-            let keep = (-dt / SETTLE_TAU).exp();
-            for rest in &mut self.rest_x {
-                *rest *= keep;
-            }
-            self.rest_y *= keep;
         } else {
-            for (rest, put) in self.rest_x.iter_mut().zip(&mut self.put_x) {
-                *rest += std::mem::take(put);
+            if late || self.counted_from == Some(counted_from) {
+                for (rest, put) in self.rest_x.iter_mut().zip(&mut self.put_x) {
+                    *rest += std::mem::take(put);
+                }
+                self.rest_y += std::mem::take(&mut self.put_y);
             }
-            self.rest_y += std::mem::take(&mut self.put_y);
-            if dt > 0.0 {
+            if late {
+                self.pace_x.fill(0.0);
+                self.pace_y = 0.0;
+            }
+            if late || self.counted_from != Some(counted_from) {
+                // The app's view and the hand's reference can disagree for
+                // a frame. Defer that jump, or travel missed in a pause.
+                for (((put, before), now), pace) in self.put_x.iter_mut().zip(&self.goal_x).zip(&goal_x).zip(&self.pace_x) {
+                    *put += before + pace * step - now;
+                }
+                self.put_y += self.goal_y + self.pace_y * step - goal_y;
+            } else if dt > 0.0 {
                 for ((pace, before), now) in self.pace_x.iter_mut().zip(&self.goal_x).zip(&goal_x) {
                     *pace = (now - before) / dt;
                 }
                 self.pace_y = (goal_y - self.goal_y) / dt;
             }
-            let keep = (-dt / SETTLE_TAU).exp();
+            let keep = (-step / SETTLE_TAU).exp();
             for rest in &mut self.rest_x {
                 *rest *= keep;
             }
@@ -230,6 +242,177 @@ fn create_window() -> Result<HWND> {
     }
 }
 
+/// WaitForVBlank has no timeout. Keep at most one call on one worker, so an
+/// idle display or a stuck driver cannot hold up the drawing thread.
+struct VBlank {
+    requests: mpsc::SyncSender<HMONITOR>,
+    done: mpsc::Receiver<bool>,
+    ready: Arc<OwnedHandle>,
+    pending: bool,
+    enabled: bool,
+}
+
+impl VBlank {
+    fn spawn() -> Option<Self> {
+        let (requests, inbox) = mpsc::sync_channel(1);
+        let (reply, done) = mpsc::sync_channel(1);
+        let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).ok()?.0 as _) };
+        let ready = Arc::new(ready);
+        let signal = ready.clone();
+        std::thread::Builder::new().name("minimap vblank".into()).spawn(move || {
+            let mut monitor = HMONITOR(0);
+            let mut output = None;
+            while let Ok(wanted) = inbox.recv() {
+                if wanted != monitor {
+                    output = output_for_monitor(wanted);
+                    monitor = wanted;
+                }
+                let ok = output.as_ref().is_some_and(|output| unsafe { output.WaitForVBlank() }.is_ok());
+                if !ok {
+                    monitor = HMONITOR(0);
+                    output = None;
+                }
+                if reply.send(ok).is_err() || unsafe { SetEvent(HANDLE(signal.as_raw_handle() as isize)) }.is_err() {
+                    return;
+                }
+            }
+        }).ok()?;
+        Some(Self { requests, done, ready, pending: false, enabled: true })
+    }
+
+    fn reset(&mut self) {
+        if self.pending && self.done.try_recv().is_ok() {
+            self.pending = false;
+        }
+        self.enabled = !self.pending;
+    }
+
+    fn wait(&mut self, monitor: HMONITOR, timer: HANDLE, deadline: Instant) -> bool {
+        if !self.enabled || self.pending {
+            return false;
+        }
+        if self.requests.try_send(monitor).is_err() {
+            self.enabled = false;
+            return false;
+        }
+        self.pending = true;
+        let handles = [HANDLE(self.ready.as_raw_handle() as isize), timer];
+        loop {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() || unsafe { WaitForMultipleObjects(&handles, false, budget.as_millis() as u32 + 1) } != WAIT_OBJECT_0 {
+                self.enabled = false;
+                return false;
+            }
+            // A reply from a previous, timed-out hold can signal late.
+            match self.done.try_recv() {
+                Ok(ok) => {
+                    self.pending = false;
+                    self.enabled = ok;
+                    return ok;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.enabled = false;
+                    return false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+}
+
+fn output_for_monitor(monitor: HMONITOR) -> Option<IDXGIOutput> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut a = 0;
+        while let Ok(adapter) = factory.EnumAdapters(a) {
+            let mut o = 0;
+            while let Ok(output) = adapter.EnumOutputs(o) {
+                let mut desc = DXGI_OUTPUT_DESC::default();
+                if output.GetDesc(&mut desc).is_ok() && desc.AttachedToDesktop.as_bool() && desc.Monitor == monitor {
+                    return Some(output);
+                }
+                o += 1;
+            }
+            a += 1;
+        }
+    }
+    None
+}
+
+struct FramePacer {
+    timer: HANDLE,
+    vblank: Option<VBlank>,
+    monitor: HMONITOR,
+    period: Duration,
+}
+
+impl FramePacer {
+    fn new() -> Result<Self> {
+        let timer = unsafe { CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)? };
+        Ok(Self { timer, vblank: None, monitor: HMONITOR(0), period: Duration::from_secs_f64(1.0 / 60.0) })
+    }
+
+    /// Pace to the primary overlay's monitor; all its other windows show
+    /// the same frame. Read the current mode again for each new hold.
+    fn place(&mut self, area: RECT) {
+        unsafe {
+            self.monitor = MonitorFromPoint(POINT { x: (area.left + area.right) / 2, y: (area.top + area.bottom) / 2 }, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+            let hz = if GetMonitorInfoW(self.monitor, &mut info.monitorInfo).as_bool()
+                && EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool()
+                && mode.dmDisplayFrequency > 1 { mode.dmDisplayFrequency } else { 60 };
+            self.period = Duration::from_secs_f64(1.0 / hz as f64);
+        }
+        if self.vblank.is_none() {
+            self.vblank = VBlank::spawn();
+        }
+        if let Some(vblank) = &mut self.vblank {
+            vblank.reset();
+        }
+    }
+
+    /// Give DXGI at most two refresh intervals, including drawing time.
+    /// On failure, the timer waits only for what remains of this frame.
+    fn wait(&mut self, frame: Instant) -> Result<(Duration, bool)> {
+        let deadline = frame + self.period * 2;
+        if Instant::now() >= deadline {
+            return Ok((Duration::ZERO, false));
+        }
+        if self.vblank.as_ref().is_some_and(|v| v.enabled && !v.pending) {
+            self.arm(deadline)?;
+            if self.vblank.as_mut().unwrap().wait(self.monitor, self.timer, deadline) {
+                return Ok((Duration::ZERO, true));
+            }
+        }
+        let before = Instant::now();
+        let remaining = (frame + self.period).saturating_duration_since(before);
+        if !remaining.is_zero() {
+            let timeout = deadline.saturating_duration_since(before).as_millis() as u32 + 1;
+            self.arm(frame + self.period)?;
+            unsafe {
+                if WaitForSingleObject(self.timer, timeout) == WAIT_FAILED {
+                    return Err(Error::from_win32());
+                }
+            }
+        }
+        Ok((before.elapsed(), false))
+    }
+
+    fn arm(&self, deadline: Instant) -> Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let due = -(remaining.as_nanos().div_ceil(100).max(1) as i64);
+        unsafe { SetWaitableTimerEx(self.timer, &due, 0, None, None, None, 0) }
+    }
+}
+
+impl Drop for FramePacer {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseHandle(self.timer); }
+    }
+}
+
 pub struct Overlay {
     hwnd: HWND,
     target: DcTarget,
@@ -247,6 +430,7 @@ pub struct Overlay {
     /// When to start fading out; `None` keeps the minimap up.
     hide_at: Option<Instant>,
     last_tick: Instant,
+    pacer: FramePacer,
     scale: f32,
     /// Work area of the primary monitor, which `hwnd` is centred on.
     monitor: RECT,
@@ -260,10 +444,10 @@ struct FrameTiming {
     interval: Duration,
     draw: Duration,
     update: Duration,
-    flush: Duration,
+    wait: Duration,
     fallback: Duration,
     total: Duration,
-    flush_ok: bool,
+    vblank_ok: bool,
 }
 
 impl Overlay {
@@ -292,6 +476,7 @@ impl Overlay {
             visible: false,
             hide_at: None,
             last_tick: Instant::now(),
+            pacer: FramePacer::new()?,
             scale: 1.0,
             monitor: RECT::default(),
             others: Vec::new(),
@@ -354,13 +539,13 @@ impl Overlay {
         let hand = sample_hand();
         let now = Instant::now();
         let interval = now.duration_since(self.last_tick);
-        let dt = interval.as_secs_f32().min(0.1);
+        let dt = interval.as_secs_f32();
         self.last_tick = now;
 
         let hiding = self.hide_at.is_some_and(|at| now >= at);
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
-        self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt);
+        self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
         #[cfg(feature = "debug-log")]
         if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.abs() > 0.001 {
             // Frame by frame where the grid is drawn while it follows the hand.
@@ -380,14 +565,9 @@ impl Overlay {
         }
         let (draw, update) = self.render()?;
         let before = Instant::now();
-        let flush_ok = unsafe { DwmFlush() }.is_ok();
-        let flush = before.elapsed();
-        let before = Instant::now();
-        if !flush_ok {
-            std::thread::sleep(Duration::from_millis(8));
-        }
-        let fallback = if flush_ok { Duration::ZERO } else { before.elapsed() };
-        Ok(FrameTiming { interval, draw, update, flush, fallback, total: now.elapsed(), flush_ok })
+        let (fallback, vblank_ok) = self.pacer.wait(now)?;
+        let wait = before.elapsed();
+        Ok(FrameTiming { interval, draw, update, wait, fallback, total: now.elapsed(), vblank_ok })
     }
 
     /// Finds the monitors: the primary one sets the scale, and each of the
@@ -400,6 +580,7 @@ impl Overlay {
             self.monitor = primary.work;
             self.scale = primary.scale;
         }
+        self.pacer.place(self.monitor);
         let areas: Vec<RECT> = monitors.iter().filter(|m| !m.primary).map(|m| m.work).collect();
         while self.others.len() > areas.len() {
             if let Some((window, _)) = self.others.pop() {
@@ -554,7 +735,7 @@ impl Overlay {
     /// window. The hand is `hand` (along, across) from the current cell.
     pub fn render_to_pixels(&mut self, view: View, hand: (f32, f32), scale: f32) -> Option<((i32, i32), Vec<u8>)> {
         self.camera = Camera::default();
-        self.camera.advance(&view, hand, (0, 0), 0.0);
+        self.camera.advance(&view, hand, (0, 0), 0.0, 1.0 / 60.0);
         self.view = view;
         self.scale = scale;
         let canvas = self.draw_to_canvas().ok()?;
@@ -568,7 +749,7 @@ impl Overlay {
         if view != self.view {
             self.views += 1;
         }
-        self.camera.advance(&view, (hand.along, hand.across), (self.views, hand.counted_from), dt);
+        self.camera.advance(&view, (hand.along, hand.across), (self.views, hand.counted_from), dt, 1.0 / 60.0);
         let drawn = ((0..view.rows.len()).map(|r| self.camera.x(r)).collect(), self.camera.y());
         self.view = view;
         self.scale = scale;
@@ -639,9 +820,9 @@ impl Overlay {
             }
         }
         let (width, height) = self.canvas.as_ref().unwrap().size;
-        writeln!(out, "# Intervals are frame-start to frame-start; frame 0 has no previous frame. Frame work includes DwmFlush and fallback sleep.")?;
+        writeln!(out, "# Intervals are frame-start to frame-start; frame 0 has no previous frame. Frame work includes the bounded vblank/timer wait; fallback_ms is the timer portion of wait_ms.")?;
         writeln!(out, "# The script advances by frame, independent of refresh rate. Positions and deltas are physical pixels from the highlight, for each row's first cell.")?;
-        write!(out, "frame,interval_ms,draw_ms,update_layered_window_ms,dwm_flush_ms,fallback_ms,frame_work_ms,width_px,height_px,scale,monitors,dwm_ok,cur_row,cur_col,hand_along,hand_across")?;
+        write!(out, "frame,interval_ms,draw_ms,update_layered_window_ms,wait_ms,fallback_ms,frame_work_ms,width_px,height_px,scale,monitors,vblank_ok,cur_row,cur_col,hand_along,hand_across")?;
         for r in 0..rows.len() {
             write!(out, ",row{r}_x_px,row{r}_dx_px")?;
         }
@@ -651,8 +832,8 @@ impl Overlay {
         for (frame, (timing, xs, y, hand, cur)) in frames.iter().enumerate() {
             let interval = if frame == 0 { 0.0 } else { ms(timing.interval) };
             write!(out, "{frame},{interval:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{width},{height},{:.3},{monitors},{},{},{},{:.5},{:.5}",
-                ms(timing.draw), ms(timing.update), ms(timing.flush), ms(timing.fallback), ms(timing.total), self.scale,
-                timing.flush_ok as u8, cur.row, cur.col, hand.along, hand.across)?;
+                ms(timing.draw), ms(timing.update), ms(timing.wait), ms(timing.fallback), ms(timing.total), self.scale,
+                timing.vblank_ok as u8, cur.row, cur.col, hand.along, hand.across)?;
             let previous = frame.checked_sub(1).map(|f| &frames[f]);
             let dy = previous.map_or(0.0, |p| y - p.2);
             let mut jump = 0.0f64;
@@ -668,19 +849,20 @@ impl Overlay {
         }
         let timings: Vec<&FrameTiming> = frames.iter().map(|f| &f.0).collect();
         let mut summary = format!("# {} frames, {width}x{height} px, scale {:.3}, {monitors} monitor(s); first interval excluded\n", frames.len(), self.scale);
+        summary += &format!("# Refresh interval {:.4} ms ({:.3} Hz); wait deadline is two intervals from frame start\n", ms(self.pacer.period), 1.0 / self.pacer.period.as_secs_f64());
         let metrics: [(&str, fn(&FrameTiming) -> Duration); 6] = [
             ("interval", |t| t.interval), ("draw", |t| t.draw), ("UpdateLayeredWindow (all monitors)", |t| t.update),
-            ("DwmFlush", |t| t.flush), ("fallback sleep", |t| t.fallback), ("frame work", |t| t.total),
+            ("wait (vblank or timer)", |t| t.wait), ("fallback timer", |t| t.fallback), ("frame work", |t| t.total),
         ];
         for (name, get) in metrics {
             let (mean, median, p95, max) = distribution(timings.iter().skip((name == "interval") as usize).map(|t| ms(get(t))));
             summary += &format!("# {name} ms: mean {mean:.3}, median {median:.3}, p95 {p95:.3}, max {max:.3}\n");
         }
         let slow = timings.iter().skip(1).filter(|t| ms(t.interval) > 16.7).count();
-        let clamped = timings.iter().filter(|t| t.interval > Duration::from_millis(100)).count();
-        let failed = timings.iter().filter(|t| !t.flush_ok).count();
-        let immediate = timings.iter().filter(|t| t.flush_ok && t.flush < Duration::from_millis(1)).count();
-        summary += &format!("# Intervals over 16.7 ms: {slow}/{}; animation dt clamped at 100 ms: {clamped}; DwmFlush failures: {failed}; successful waits under 1 ms: {immediate}\n", frames.len() - 1);
+        let late = timings.iter().skip(1).filter(|t| t.interval > self.pacer.period * 2).count();
+        let fallback = timings.iter().filter(|t| !t.vblank_ok).count();
+        let immediate = timings.iter().filter(|t| t.vblank_ok && t.wait < Duration::from_millis(1)).count();
+        summary += &format!("# Intervals over 16.7 ms: {slow}/{}; late frames (>2 refresh intervals): {late}; timer fallback frames: {fallback}; vblank waits under 1 ms: {immediate}\n", frames.len() - 1);
         let (mean, median, p95, max) = distribution(jumps.into_iter());
         let ratio = if median > 0.0 { format!("{:.3}x median", max / median) } else { "undefined (median is zero)".into() };
         summary += &format!("# Largest row displacement per frame px: mean {mean:.5}, median {median:.5}, p95 {p95:.5}, max {max:.5}; largest jump {ratio}\n");
@@ -801,6 +983,100 @@ impl Minimap {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn a_stuck_vblank_uses_the_timer_without_queuing_more_work() {
+        let mut pacer = FramePacer::new().unwrap();
+        pacer.period = Duration::from_millis(4);
+        let (requests, inbox) = mpsc::sync_channel(1);
+        let (reply, done) = mpsc::sync_channel(1);
+        let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).unwrap().0 as _) };
+        pacer.vblank = Some(VBlank { requests, done, ready: Arc::new(ready), pending: false, enabled: true });
+
+        let before = Instant::now();
+        assert!(!pacer.wait(before).unwrap().1);
+        assert!(before.elapsed() < Duration::from_millis(100), "the vblank wait was not bounded");
+        assert!(pacer.vblank.as_ref().unwrap().pending);
+        assert!(!pacer.vblank.as_ref().unwrap().enabled);
+        assert_eq!(inbox.try_recv().unwrap(), pacer.monitor);
+        let (fallback, ok) = pacer.wait(Instant::now()).unwrap();
+        assert!(!ok && fallback > Duration::ZERO);
+        assert!(inbox.try_recv().is_err(), "a blocked worker was given another request");
+
+        // A late reply permits a retry when the next hold starts.
+        reply.send(true).unwrap();
+        pacer.vblank.as_mut().unwrap().reset();
+        assert!(!pacer.vblank.as_ref().unwrap().pending);
+        assert!(pacer.vblank.as_ref().unwrap().enabled);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_vblank_waits_out_the_frame_on_the_timer() {
+        let mut pacer = FramePacer::new().unwrap();
+        pacer.period = Duration::from_millis(10);
+        let (requests, _inbox) = mpsc::sync_channel(1);
+        let (reply, done) = mpsc::sync_channel(1);
+        let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).unwrap().0 as _) };
+        reply.send(false).unwrap();
+        unsafe { SetEvent(HANDLE(ready.as_raw_handle() as isize)).unwrap(); }
+        pacer.vblank = Some(VBlank { requests, done, ready: Arc::new(ready), pending: false, enabled: true });
+        let before = Instant::now();
+        let (fallback, ok) = pacer.wait(before).unwrap();
+        assert!(!ok && fallback > Duration::ZERO);
+        assert!(before.elapsed() >= pacer.period);
+        assert!(!pacer.vblank.as_ref().unwrap().enabled);
+        assert!(!pacer.vblank.as_ref().unwrap().pending);
+    }
+
+    #[test]
+    fn a_late_frame_eases_missed_motion_without_a_jump_or_stale_speed() {
+        for hz in [60.0, 144.0] {
+            let refresh = 1.0 / hz;
+            for reference in [(0, 0), (1, 0)] {
+                let view = View {
+                    rows: vec![vec![CellView::default(); 3]],
+                    cur: Some(Pos { row: 0, col: 0 }),
+                    ..Default::default()
+                };
+                let mut camera = Camera::default();
+                camera.advance(&view, (0.0, 0.0), (0, 0), refresh, refresh);
+                camera.advance(&view, (0.05, 0.0), (0, 0), refresh, refresh);
+                let before = camera.x(0);
+                camera.advance(&view, (1.0, 0.0), reference, 0.14, refresh);
+                assert!((camera.x(0) - before).abs() < 0.0001, "a late frame jumped at {hz} Hz");
+                assert_eq!(camera.pace_x[0], 0.0);
+                let mut last = before;
+                for _ in 0..90 {
+                    camera.advance(&view, (1.0, 0.0), reference, refresh, refresh);
+                    let x = camera.x(0);
+                    assert!(x <= last + 0.0001 && x >= -1.0001, "recovery overshot or ran backwards");
+                    last = x;
+                }
+                assert!((last + 1.0).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_late_frames_still_settle_towards_the_hand() {
+        let view = View {
+            rows: vec![vec![CellView::default(); 3]],
+            cur: Some(Pos { row: 0, col: 0 }),
+            ..Default::default()
+        };
+        let mut camera = Camera::default();
+        let refresh = 1.0 / 60.0;
+        camera.advance(&view, (0.0, 0.0), (0, 0), refresh, refresh);
+        camera.advance(&view, (1.0, 0.0), (0, 0), 0.14, refresh);
+        camera.advance(&view, (1.0, 0.0), (0, 0), 0.14, refresh);
+        assert!(camera.x(0) < -0.1 && camera.x(0) > -0.5, "a late frame collapsed all the easing at once");
+        for _ in 0..30 {
+            camera.advance(&view, (1.0, 0.0), (0, 0), 0.14, refresh);
+        }
+        assert!((camera.x(0) + 1.0).abs() < 0.001, "late frames kept deferring the same motion");
+    }
+
     #[test]
     fn timing_statistics_include_outliers_and_handle_no_samples() {
         assert_eq!(distribution(std::iter::empty()), (0.0, 0.0, 0.0, 0.0));
@@ -818,12 +1094,12 @@ mod tests {
             ..Default::default()
         };
         overlay.update(view.clone());
-        overlay.camera.advance(&view, (0.0, 0.0), (overlay.views, 0), 1.0 / 60.0);
-        overlay.camera.advance(&view, (0.1, 0.0), (overlay.views, 0), 1.0 / 60.0);
+        overlay.camera.advance(&view, (0.0, 0.0), (overlay.views, 0), 1.0 / 60.0, 1.0 / 60.0);
+        overlay.camera.advance(&view, (0.1, 0.0), (overlay.views, 0), 1.0 / 60.0, 1.0 / 60.0);
         let x = overlay.camera.x(0);
         for _ in 0..4 {
             overlay.update(view.clone());
-            overlay.camera.advance(&view, (0.1, 0.0), (overlay.views, 0), 1.0 / 60.0);
+            overlay.camera.advance(&view, (0.1, 0.0), (overlay.views, 0), 1.0 / 60.0, 1.0 / 60.0);
             assert!((overlay.camera.x(0) - x).abs() < 0.0001, "the grid moved after the hand stopped");
         }
     }
@@ -864,7 +1140,7 @@ mod tests {
             let cur = if view_row == 2 { Pos { row: 2, col: 2 } } else { Pos { row: 1, col: view_col } };
             let v = view(cur, vec![1, view_col, 2]);
             views += (f == came_col + 3 || f == came_row + 3) as u64;
-            camera.advance(&v, (along, row - told_row as f32), (views, stretch << 8 | (told_col as u64) << 4 | told_row as u64), 1.0 / 60.0);
+            camera.advance(&v, (along, row - told_row as f32), (views, stretch << 8 | (told_col as u64) << 4 | told_row as u64), 1.0 / 60.0, 1.0 / 60.0);
             let now: (Vec<f32>, f32) = ((0..3).map(|r| camera.x(r)).collect(), camera.y());
             if let Some((xs, y)) = &before {
                 for (r, (a, b)) in xs.iter().zip(&now.0).enumerate() {
