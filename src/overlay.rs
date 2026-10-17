@@ -374,15 +374,17 @@ impl FramePacer {
     }
 
     /// Give DXGI at most two refresh intervals, including drawing time.
-    /// On failure, the timer waits only for what remains of this frame.
+    /// On failure or an early vblank, the timer finishes this frame.
     fn wait(&mut self, frame: Instant) -> Result<(Duration, bool)> {
         let deadline = frame + self.period * 2;
         if Instant::now() >= deadline {
             return Ok((Duration::ZERO, false));
         }
+        let mut vblank_ok = false;
         if self.vblank.as_ref().is_some_and(|v| v.enabled && !v.pending) {
             self.arm(deadline)?;
-            if self.vblank.as_mut().unwrap().wait(self.monitor, self.timer, deadline) {
+            vblank_ok = self.vblank.as_mut().unwrap().wait(self.monitor, self.timer, deadline);
+            if vblank_ok && frame.elapsed() >= self.period.mul_f64(0.9) {
                 return Ok((Duration::ZERO, true));
             }
         }
@@ -397,7 +399,7 @@ impl FramePacer {
                 }
             }
         }
-        Ok((before.elapsed(), false))
+        Ok((if remaining.is_zero() { Duration::ZERO } else { before.elapsed() }, vblank_ok))
     }
 
     fn arm(&self, deadline: Instant) -> Result<()> {
@@ -852,7 +854,7 @@ impl Overlay {
         summary += &format!("# Refresh interval {:.4} ms ({:.3} Hz); wait deadline is two intervals from frame start\n", ms(self.pacer.period), 1.0 / self.pacer.period.as_secs_f64());
         let metrics: [(&str, fn(&FrameTiming) -> Duration); 6] = [
             ("interval", |t| t.interval), ("draw", |t| t.draw), ("UpdateLayeredWindow (all monitors)", |t| t.update),
-            ("wait (vblank or timer)", |t| t.wait), ("fallback timer", |t| t.fallback), ("frame work", |t| t.total),
+            ("wait (vblank or timer)", |t| t.wait), ("timer (fallback or top-up)", |t| t.fallback), ("frame work", |t| t.total),
         ];
         for (name, get) in metrics {
             let (mean, median, p95, max) = distribution(timings.iter().skip((name == "interval") as usize).map(|t| ms(get(t))));
@@ -861,8 +863,9 @@ impl Overlay {
         let slow = timings.iter().skip(1).filter(|t| ms(t.interval) > 16.7).count();
         let late = timings.iter().skip(1).filter(|t| t.interval > self.pacer.period * 2).count();
         let fallback = timings.iter().filter(|t| !t.vblank_ok).count();
-        let immediate = timings.iter().filter(|t| t.vblank_ok && t.wait < Duration::from_millis(1)).count();
-        summary += &format!("# Intervals over 16.7 ms: {slow}/{}; late frames (>2 refresh intervals): {late}; timer fallback frames: {fallback}; vblank waits under 1 ms: {immediate}\n", frames.len() - 1);
+        let immediate = timings.iter().filter(|t| t.vblank_ok && t.wait.saturating_sub(t.fallback) < Duration::from_millis(1)).count();
+        let topped_up = timings.iter().filter(|t| t.vblank_ok && !t.fallback.is_zero()).count();
+        summary += &format!("# Intervals over 16.7 ms: {slow}/{}; late frames (>2 refresh intervals): {late}; timer fallback frames: {fallback}; vblank waits under 1 ms: {immediate}; early vblank timer top-ups: {topped_up}\n", frames.len() - 1);
         let (mean, median, p95, max) = distribution(jumps.into_iter());
         let ratio = if median > 0.0 { format!("{:.3}x median", max / median) } else { "undefined (median is zero)".into() };
         summary += &format!("# Largest row displacement per frame px: mean {mean:.5}, median {median:.5}, p95 {p95:.5}, max {max:.5}; largest jump {ratio}\n");
@@ -982,6 +985,29 @@ impl Minimap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn an_early_vblank_uses_the_timer_but_a_normal_vblank_does_not() {
+        for elapsed in [Duration::ZERO, Duration::from_millis(19)] {
+            let mut pacer = FramePacer::new().unwrap();
+            pacer.period = Duration::from_millis(20);
+            let (requests, _inbox) = mpsc::sync_channel(1);
+            let (reply, done) = mpsc::sync_channel(1);
+            let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).unwrap().0 as _) };
+            reply.send(true).unwrap();
+            unsafe { SetEvent(HANDLE(ready.as_raw_handle() as isize)).unwrap(); }
+            pacer.vblank = Some(VBlank { requests, done, ready: Arc::new(ready), pending: false, enabled: true });
+            let frame = Instant::now() - elapsed;
+            let (timer, ok) = pacer.wait(frame).unwrap();
+            assert!(ok);
+            assert_eq!(!timer.is_zero(), elapsed.is_zero(), "only an early vblank needs a timer top-up");
+            if elapsed.is_zero() {
+                assert!(frame.elapsed() >= pacer.period, "an early vblank let the next frame start too soon");
+            }
+            assert!(pacer.vblank.as_ref().unwrap().enabled);
+        }
+    }
 
     #[cfg(windows)]
     #[test]
