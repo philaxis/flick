@@ -525,7 +525,7 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
     use std::{sync::atomic::{AtomicUsize, Ordering}, time::{Duration, Instant}};
     use windows::{core::w, Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
-        System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+        System::{Com::{CoInitializeEx, COINIT_MULTITHREADED}, LibraryLoader::GetModuleHandleW},
         UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     }};
     static CLICKS: AtomicUsize = AtomicUsize::new(0);
@@ -542,10 +542,11 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
         let app = FindWindowW(w!("flick.main"), None);
         assert!(app.0 != 0, "Flick is not running");
         let class = w!("flick.test.clicks");
-        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(probe), lpszClassName: class, ..Default::default() });
+        let instance = GetModuleHandleW(None).unwrap();
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(probe), hInstance: instance.into(), lpszClassName: class, ..Default::default() });
         let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let make = || CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("Flick click probe"), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            width / 2 - 200, height / 2 - 150, 400, 300, None, None, None, None);
+            width / 2 - 200, height / 2 - 150, 400, 300, None, None, instance, None);
         let target = make();
         let other = make();
         assert!(target.0 != 0 && other.0 != 0);

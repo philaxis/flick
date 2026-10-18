@@ -1075,23 +1075,28 @@ impl App {
     }
 
     fn open_board(&mut self) {
+        debug_log!("ui: open board sync");
         let Some(desktops) = self.sync() else { return };
         self.forget_gone_windows();
         self.minimap.hide_after(0);
         self.focus_before_board = unsafe { GetForegroundWindow() };
+        debug_log!("ui: open board model");
         let model = self.model(&desktops);
         // Left by Esc, a click outside or any other close, the board keeps
         // the cell it was on, as long as Windows is still on the same desktop.
         let left_on = self.board.selected();
         let resume = desktops.current == self.board_opened_on && left_on != desktops.current && self.grid.find(&left_on).is_some();
         self.board_opened_on = desktops.current.clone();
+        debug_log!("ui: board open");
         self.board.open(model, self.usage_grid());
         self.record_foreground(self.board.hwnd());
         if resume {
             self.board.select(left_on, self.usage_grid());
         }
         self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
+        debug_log!("ui: board foreground");
         vd::force_foreground(self.board.hwnd());
+        debug_log!("ui: board opened");
     }
 
     fn refresh_board(&mut self) {
@@ -1128,9 +1133,12 @@ impl App {
 
     fn board_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         let started = Instant::now();
+        debug_log!("ui: board handle {message:#x}");
         let action = self.board.handle(message, wparam, lparam)?;
         let handled = started.elapsed();
+        debug_log!("ui: board perform {message:#x}");
         self.perform(action);
+        debug_log!("ui: board finished {message:#x}");
         // Kept as a diagnostic: anything this slow is felt as a hitch.
         if started.elapsed() > Duration::from_millis(250) {
             log(&format!("slow board message {message:#x}: handle {handled:?}, total {:?}", started.elapsed()));
@@ -1250,6 +1258,7 @@ impl App {
         // The board stays up until the keyboard is with a window of the cell
         // gone to. Hidden while it has the keyboard, Windows gives that to
         // the window under it, one of the cell left, and goes back there.
+        debug_log!("ui: leave board sync");
         let Some(desktops) = self.sync() else { return self.board.close() };
         if !id.is_empty() && id != desktops.current {
             let Some(target) = desktops.get(id) else { return self.board.close() };
@@ -1260,6 +1269,7 @@ impl App {
             self.visit(id);
             self.going = Some((id.to_owned(), Instant::now()));
         }
+        debug_log!("ui: leave board focus");
         match window {
             Some(hwnd) if unsafe { IsWindow(hwnd) }.as_bool() => unsafe {
                 if IsIconic(hwnd).as_bool() {
@@ -1269,8 +1279,11 @@ impl App {
             },
             _ => vd::focus_top_window(),
         }
+        debug_log!("ui: leave board close");
         self.board.close();
+        debug_log!("ui: leave board save");
         self.save();
+        debug_log!("ui: left board");
     }
 
     fn move_window(&mut self, window: HWND, cell: Option<String>, monitor: Option<RECT>) {
