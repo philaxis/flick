@@ -424,11 +424,12 @@ impl PopupAnimation {
         self.leave_at.get_or_insert(now + Duration::from_millis(POPUP_GRACE_MS));
     }
 
-    /// One wake-up for a settled gap; frame ticks only while something changes.
-    fn next_tick(&self, now: Instant) -> Option<u32> {
+    /// A delayed timer must still paint its final frame or hide the finished fade.
+    fn next_tick(&self, now: Instant, shown: (Rect, Rect, f32)) -> Option<u32> {
         let (frame, cell, alpha) = self.sample(now);
         let goal = if self.leave_at.is_some_and(|at| now >= at) { 0.0 } else { 1.0 };
-        if frame != self.target.0 || cell != self.target.1 || alpha != goal {
+        if (frame, cell, alpha) != shown || frame != self.target.0 || cell != self.target.1 || alpha != goal
+            || self.leave_at.is_some() && alpha == 0.0 {
             Some(16)
         } else {
             self.leave_at.filter(|at| *at > now).map(|at| at.duration_since(now).as_millis().max(1) as u32)
@@ -1110,7 +1111,10 @@ impl Board {
 
     fn schedule_popup(&mut self, now: Instant) {
         if !self.open { return; }
-        let delay = self.popup_animation.as_ref().and_then(|animation| animation.next_tick(now));
+        let delay = self.popup_animation.as_ref().and_then(|animation| {
+            let popup = self.popup.as_ref()?;
+            animation.next_tick(now, (popup.frame, popup.cell, self.popup_alpha))
+        });
         let due = delay.map(|ms| now + Duration::from_millis(ms as u64));
         if self.popup_timer.is_some() && due.is_some() && self.popup_timer <= due { return; }
         unsafe {
@@ -2601,7 +2605,27 @@ mod tests {
         assert_eq!(animation.sample(halfway), before);
         let end = halfway + Duration::from_millis(POPUP_GLIDE_MS);
         assert_eq!(animation.sample(end), (c, cell(-100.0), 1.0));
-        assert_eq!(animation.next_tick(end), None);
+        assert_eq!(animation.next_tick(end, animation.sample(end)), None);
+    }
+
+    #[test]
+    fn late_mouse_moves_cannot_cancel_the_final_popup_paint_or_hide() {
+        let now = Instant::now();
+        let a = rect(0.0, 0.0, 500.0, 100.0);
+        let b = rect(200.0, 50.0, 640.0, 350.0);
+        let mut animation = PopupAnimation::new(a, a, now);
+        let shown = animation.sample(now);
+        animation.glide_to(b, b, now);
+        let late = now + Duration::from_millis(200);
+        assert_eq!(animation.sample(late), (b, b, 1.0));
+        assert_eq!(animation.next_tick(late, shown), Some(16));
+        let shown = animation.sample(late);
+        assert_eq!(animation.next_tick(late, shown), None);
+        animation.leave(late);
+        let faded = late + Duration::from_secs(1);
+        assert_eq!(animation.sample(faded).2, 0.0);
+        assert_eq!(animation.next_tick(faded, shown), Some(16));
+        assert_eq!(animation.next_tick(faded, animation.sample(faded)), Some(16));
     }
 
     #[test]
@@ -2611,17 +2635,17 @@ mod tests {
         let mut animation = PopupAnimation::new(frame, frame, now);
         let left = now + Duration::from_millis(80);
         assert_eq!(animation.sample(left).2, 1.0);
-        assert_eq!(animation.next_tick(left), None);
+        assert_eq!(animation.next_tick(left, animation.sample(left)), None);
         animation.leave(left);
-        assert_eq!(animation.next_tick(left), Some(200));
+        assert_eq!(animation.next_tick(left, animation.sample(left)), Some(200));
         animation.leave(left + Duration::from_millis(100));
         assert_eq!(animation.sample(left + Duration::from_millis(199)).2, 1.0);
         let fading = left + Duration::from_millis(260);
         assert!((animation.sample(fading).2 - 0.125).abs() < 0.001);
-        assert_eq!(animation.next_tick(fading), Some(16));
+        assert_eq!(animation.next_tick(fading, animation.sample(fading)), Some(16));
         let end = left + Duration::from_millis(320);
         assert_eq!(animation.sample(end).2, 0.0);
-        assert_eq!(animation.next_tick(end), None);
+        assert_eq!(animation.next_tick(end, animation.sample(end)), Some(16));
         assert_eq!(animation.sample(end + Duration::from_secs(1)).2, 0.0);
     }
 
@@ -2631,7 +2655,7 @@ mod tests {
         let frame = rect(0.0, 0.0, 640.0, 350.0);
         let mut animation = PopupAnimation::new(frame, frame, now);
         assert_eq!(animation.sample(now).2, 0.0);
-        assert_eq!(animation.next_tick(now), Some(16));
+        assert_eq!(animation.next_tick(now, animation.sample(now)), Some(16));
         let visible = now + Duration::from_millis(80);
         animation.leave(visible);
         animation.show(visible + Duration::from_millis(100));
@@ -2645,7 +2669,7 @@ mod tests {
         assert!(animation.sample(returned + Duration::from_millis(40)).2 > alpha);
         let settled = returned + Duration::from_millis(80);
         assert_eq!(animation.sample(settled).2, 1.0);
-        assert_eq!(animation.next_tick(settled), None);
+        assert_eq!(animation.next_tick(settled, animation.sample(settled)), None);
     }
 
     #[test]
