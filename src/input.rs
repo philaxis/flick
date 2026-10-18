@@ -451,8 +451,9 @@ fn reload_touchpad() {
     with_settings(|s| { finish_release(s, Source::Touchpad, Some(false)); false });
     let on = !devices.is_empty();
     TOUCHPAD.with(|reader| *reader.borrow_mut() = crate::touchpad::Reader::new(devices));
-    if !crate::touchpad::register(HWND(RAW_WINDOW.get()), on) && on {
-        crate::app::log("precision touchpad raw input registration failed");
+    let failed = !crate::touchpad::register(HWND(RAW_WINDOW.get()), on) && on;
+    crate::touchpad::registration_failed(failed);
+    if failed {
         TOUCHPAD.with(|reader| reader.borrow_mut().devices.clear());
     }
 }

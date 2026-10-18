@@ -3,6 +3,7 @@
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Contact {
     pub id: u32,
+    pub confident: bool,
     pub x: f64,
     pub y: f64,
 }
@@ -63,7 +64,11 @@ impl Gesture {
         }
         // Re-basing navigation must not hide travel from tap classification.
         self.path += farthest;
-        if !self.held && !self.blocked && contacts.len() == 3 {
+        if !self.held
+            && !self.blocked
+            && contacts.len() == 3
+            && contacts.iter().all(|c| c.confident)
+        {
             self.held = true;
             event.began = true;
         } else if self.held {
@@ -153,6 +158,7 @@ mod tests {
         (0..n)
             .map(|id| Contact {
                 id,
+                confident: true,
                 x: x + id as f64,
                 y: 0.0,
             })
@@ -185,6 +191,18 @@ mod tests {
         assert_eq!(g.update(&hand(1, 9.0), 400), Event::default());
         assert_eq!(g.update(&hand(1, 10.0), 500).delta, (1.0, 0.0));
         assert_eq!(g.update(&[], 600).ended, Some(false));
+    }
+    #[test]
+    fn low_confidence_cannot_start_a_hold_or_end_one_before_tip_up() {
+        let mut g = Gesture::default();
+        let mut contacts = hand(3, 0.0);
+        contacts[0].confident = false;
+        assert!(!g.update(&contacts, 0).began);
+        contacts[0].confident = true;
+        assert!(g.update(&contacts, 10).began);
+        contacts.iter_mut().for_each(|c| c.confident = false);
+        assert_eq!(g.update(&contacts, 20), Event::default());
+        assert_eq!(g.update(&[], 30).ended, Some(true));
     }
     #[test]
     fn lifting_fingers_or_one_wandering_finger_does_not_hide_travel() {

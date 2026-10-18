@@ -1,6 +1,10 @@
 //! Device discovery and registry reads run on the app thread, never in a hook.
 use super::{cm_per_unit, Contact, Event, Frame, Gesture};
-use std::{cell::RefCell, time::Instant};
+use std::{
+    cell::RefCell,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 use windows::{
     core::{w, PCWSTR},
     Win32::{
@@ -23,6 +27,12 @@ pub enum Status {
 
 pub const NOTICE: &str =
     "Windows' three-finger gestures (swipes and taps) must be set to Nothing to use this";
+static REGISTRATION_FAILED: AtomicBool = AtomicBool::new(false);
+
+pub fn registration_failed(failed: bool) {
+    REGISTRATION_FAILED.store(failed, Ordering::Relaxed);
+}
+
 const KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\PrecisionTouchPad");
 
 fn value(name: PCWSTR, absent: Option<u32>) -> Option<u32> {
@@ -83,9 +93,21 @@ pub fn poll(enabled: bool) -> Status {
             Status::Off
         } else if !gestures_off() {
             Status::Conflict
+        } else if REGISTRATION_FAILED.load(Ordering::Relaxed) {
+            Status::Unavailable
         } else {
             Status::Active
         };
+        if status == Status::Unavailable
+            && REGISTRATION_FAILED.load(Ordering::Relaxed)
+            && known.0 == handles
+        {
+            if known.1 != status {
+                crate::app::log("precision touchpad raw input registration failed");
+            }
+            known.1 = status;
+            return status;
+        }
         if known.0 != handles || known.1 != status {
             let readers = if status == Status::Active {
                 handles
@@ -351,9 +373,10 @@ impl Device {
                 return None;
             }
             let usages = &usages[..length as usize];
-            let contact = if usages.contains(&0x42) && usages.contains(&0x47) {
+            let contact = if usages.contains(&0x42) {
                 Some(Contact {
                     id,
+                    confident: usages.contains(&0x47),
                     x: self.position(slot, &slot.x, 0x30, report)?,
                     y: self.position(slot, &slot.y, 0x31, report)?,
                 })
