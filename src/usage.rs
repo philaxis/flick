@@ -100,10 +100,10 @@ impl<T: PartialEq> Stay<T> {
     }
 }
 
-/// Area factor: no history keeps equal sizes, otherwise unused windows get
-/// the floor and the most used window gets the ceiling.
+/// Importance sets preview area: no history gives equal areas, otherwise
+/// the most used window gets four times an unused window's area.
 pub fn preview_factor(score: f64, maximum: f64) -> f32 {
-    if maximum <= 0.0 { 1.0 } else { 0.7 + 0.8 * normalised(score, maximum) }
+    if maximum <= 0.0 { 1.0 } else { 1.0 + 3.0 * normalised(score, maximum).sqrt() }
 }
 
 /// A share of the highest score, bounded even for values outside that range.
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn cells_decay_over_three_days_and_windows_over_one_hour() {
+    fn cells_and_windows_decay_over_one_hour() {
         for half_life in [CELL_HALF_LIFE, WINDOW_HALF_LIFE] {
             let mut score = Score::default();
             score.record(100, 1.0, half_life);
@@ -205,6 +205,7 @@ mod tests {
             assert_eq!(score.value(100 + 21 * half_life, half_life), 0.0);
             assert_eq!(Score { score: -1.0, updated: 0 }.value(0, half_life), 0.0);
         }
+        assert_eq!(CELL_HALF_LIFE, 3600);
         assert_eq!(WINDOW_HALF_LIFE, 3600);
         let mut score = Score::default();
         score.record(100, credit(3.0, CELL_TAU), CELL_HALF_LIFE);
@@ -214,7 +215,7 @@ mod tests {
     #[test]
     fn area_factors_are_bounded_and_each_side_uses_the_square_root() {
         assert_eq!(preview_factor(0.0, 0.0), 1.0);
-        for (score, expected) in [(0.0, 0.7), (5.0, 1.1), (10.0, 1.5), (20.0, 1.5), (-1.0, 0.7)] {
+        for (score, expected) in [(0.0, 1.0), (2.5, 2.5), (10.0, 4.0), (20.0, 4.0), (-1.0, 1.0)] {
             let factor = preview_factor(score, 10.0);
             assert!((factor - expected).abs() < 0.0001);
             let side = factor.sqrt();

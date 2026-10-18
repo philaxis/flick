@@ -1,6 +1,6 @@
 //! The full-screen view: the selected cell's windows as live previews, each
-//! sized by the window itself and its recent active-stay credits, and, at the bottom of
-//! every monitor, a small map of all rows and cells.
+//! with area set by recent active-stay credits and each window's aspect
+//! ratio preserved, and a small map of all rows and cells on every monitor.
 //! Windows can be dragged onto cells and monitors, cells around the map.
 //!
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
@@ -2143,14 +2143,15 @@ fn tile_least(s: f32) -> f32 {
     (124.0 + Pin::WIDTH + Pin::TOP_WIDTH) * s
 }
 
-/// Lays out titled previews with usage factors on area, applying the square
-/// root to each side. The existing title-bar minimums still apply (see `tiles`).
+/// Importance sets area; real window dimensions supply only the aspect ratio.
+/// All previews share a fit scale and keep the title-bar minimums (see `tiles`).
 fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32, weights: &HashMap<isize, f32>) -> Vec<TileLayout> {
     let (aw, ah) = size(area);
     let (title_h, gap) = (46.0 * s, 26.0 * s);
     let sizes: Vec<(f32, f32)> = windows.iter().map(|(w, _)| {
-        let factor = weights.get(&w.hwnd.0).copied().unwrap_or(1.0).sqrt();
-        ((w.rect.right - w.rect.left).max(1) as f32 * factor, (w.rect.bottom - w.rect.top).max(1) as f32 * factor)
+        let aspect = (w.rect.right - w.rect.left).max(1) as f32 / (w.rect.bottom - w.rect.top).max(1) as f32;
+        let area = (aw * ah).max(1.0) * weights.get(&w.hwnd.0).copied().unwrap_or(1.0);
+        ((area * aspect).sqrt(), (area / aspect).sqrt())
     }).collect();
     let min_widths: Vec<f32> = vec![tile_least(s); windows.len()];
     let space = Space {
@@ -2478,11 +2479,11 @@ mod tests {
             grid.window_usage.entry(hwnd).or_default().record(now, count as f64, usage::WINDOW_HALF_LIFE);
         }
         let weights = model.window_weights("a", &grid);
-        assert_eq!(weights[&1], 0.7);
-        assert_eq!(weights[&2], 1.5);
-        assert!((weights[&3] - 1.1).abs() < 0.0001);
+        assert_eq!(weights[&1], 1.0);
+        assert_eq!(weights[&2], 4.0);
+        assert!((weights[&3] - (1.0 + 3.0 * 0.5_f32.sqrt())).abs() < 0.0001);
         let other_cell = model.window_weights("b", &grid);
-        assert_eq!(other_cell, HashMap::from([(3, 1.5)]));
+        assert_eq!(other_cell, HashMap::from([(3, 4.0)]));
         // A part gets the whole cell's weights even when its winner is elsewhere.
         let part = vec![(&model.rows[0].cells[0].windows[0], false)];
         let tiles = layout_tiles(&part, &area, 1.0, &weights);
@@ -2494,7 +2495,9 @@ mod tests {
 
     #[test]
     fn preview_usage_scales_area_instead_of_each_side() {
-        let windows = [window(1, false), window(2, false)];
+        let mut windows = [window(1, false), window(2, false)];
+        windows[0].rect = RECT { right: 320, bottom: 180, ..Default::default() };
+        windows[1].rect = RECT { right: 3840, bottom: 2160, ..Default::default() };
         let windows: Vec<_> = windows.iter().map(|w| (w, false)).collect();
         let weights = HashMap::from([(1, usage::preview_factor(0.0, 1.0)), (2, usage::preview_factor(1.0, 1.0))]);
         for scale in [1.0, 0.55] {
@@ -2502,10 +2505,30 @@ mod tests {
             assert_eq!(tiles.len(), 2);
             let (w0, h0) = size(&tiles[0].thumb);
             let (w1, h1) = size(&tiles[1].thumb);
-            let side_ratio = (1.5_f32 / 0.7).sqrt();
+            let side_ratio = 2.0;
             assert!((w1 / w0 - side_ratio).abs() < 0.0001);
             assert!((h1 / h0 - side_ratio).abs() < 0.0001);
-            assert!((w1 * h1 / (w0 * h0) - 1.5 / 0.7).abs() < 0.0001);
+            assert!((w1 * h1 / (w0 * h0) - 4.0).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn previews_without_history_have_equal_area_and_keep_aspect_ratios() {
+        let mut windows = [window(1, false), window(2, false), window(3, false)];
+        for (window, (w, h)) in windows.iter_mut().zip([(320, 180), (1920, 1200), (2400, 1800)]) {
+            window.rect = RECT { right: w, bottom: h, ..Default::default() };
+        }
+        let windows: Vec<_> = windows.iter().map(|w| (w, false)).collect();
+        for scale in [1.0, 0.55] {
+            let tiles = layout_tiles(&windows, &rect(0.0, 0.0, 2400.0, 1400.0), scale, &HashMap::new());
+            assert_eq!(tiles.len(), windows.len());
+            let (w, h) = size(&tiles[0].thumb);
+            for (tile, (window, _)) in tiles.iter().zip(&windows) {
+                let (tw, th) = size(&tile.thumb);
+                assert!((tw * th / (w * h) - 1.0).abs() < 0.0001);
+                let aspect = window.rect.right as f32 / window.rect.bottom as f32;
+                assert!((tw / th - aspect).abs() < 0.0001);
+            }
         }
     }
 

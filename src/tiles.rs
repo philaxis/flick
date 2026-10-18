@@ -1,9 +1,8 @@
 //! How large the preview of each window is, and where it goes.
 //!
-//! Plain numbers with no Windows in them. Every window is shown at one common
-//! scale, so a small window looks small next to a large one; the scale is as
-//! large as fits, but never above the windows' real size and never so large
-//! that a preview outgrows its share of the area.
+//! Plain numbers with no Windows in them. The board supplies desired sizes
+//! from importance and aspect ratio. One common scale preserves their relative
+//! areas, as large as fits within the supplied sizes and preview limits.
 
 /// What the previews have to fit into.
 pub struct Space {
@@ -61,7 +60,7 @@ pub fn arrange(windows: &[(f32, f32)], min_widths: &[f32], space: &Space) -> Vec
         }
         fit(low).unwrap_or_default()
     };
-    // Real size at most, and the largest window within the largest preview.
+    // Supplied size at most, and the largest within the preview limits.
     let cap = windows.iter().map(|(w, h)| (space.max.0 / w.max(1.0)).min(space.max.1 / h.max(1.0))).fold(1.0, f32::min);
     if let Some(placed) = fit(cap, 1.0) {
         return placed;
@@ -189,11 +188,10 @@ mod tests {
         Space { area: (1820.0, 575.0), title: 57.0, gap: 32.0, max: (1092.0, 518.0), min_height: 75.0 }
     }
 
-    /// A small dialog next to a maximized window must look as much smaller
-    /// as it is, the large one must stay within the largest preview allowed,
-    /// and a small window on its own must not be blown up past its real size.
+    /// Desired sizes keep their proportions under one common fit scale,
+    /// within preview limits and without growing beyond the supplied sizes.
     #[test]
-    fn previews_keep_the_windows_relative_sizes() {
+    fn previews_keep_the_requested_relative_sizes() {
         let placed = arrange(&[(1936.0, 1056.0), (400.0, 300.0)], &[200.0, 200.0], &space());
         let (large, small) = (placed[0], placed[1]);
         assert!(large.w <= 1092.0 && large.h <= 518.0, "{large:?}");
