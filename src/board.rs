@@ -2143,13 +2143,13 @@ fn tile_least(s: f32) -> f32 {
     (124.0 + Pin::WIDTH + Pin::TOP_WIDTH) * s
 }
 
-/// Lays out titled previews from their real sizes times the cell's usage
-/// weights. The existing title-bar minimums still apply (see `tiles`).
+/// Lays out titled previews with usage factors on area, applying the square
+/// root to each side. The existing title-bar minimums still apply (see `tiles`).
 fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32, weights: &HashMap<isize, f32>) -> Vec<TileLayout> {
     let (aw, ah) = size(area);
     let (title_h, gap) = (46.0 * s, 26.0 * s);
     let sizes: Vec<(f32, f32)> = windows.iter().map(|(w, _)| {
-        let factor = weights.get(&w.hwnd.0).copied().unwrap_or(1.0);
+        let factor = weights.get(&w.hwnd.0).copied().unwrap_or(1.0).sqrt();
         ((w.rect.right - w.rect.left).max(1) as f32 * factor, (w.rect.bottom - w.rect.top).max(1) as f32 * factor)
     }).collect();
     let min_widths: Vec<f32> = vec![tile_least(s); windows.len()];
@@ -2490,6 +2490,23 @@ mod tests {
         let popup = layout_tiles(&model.popup_windows("a"), &area, 1.0, &weights);
         assert_eq!(popup.len(), 3);
         assert!(popup.iter().all(|tile| size(&tile.frame).0 >= tile_least(1.0)));
+    }
+
+    #[test]
+    fn preview_usage_scales_area_instead_of_each_side() {
+        let windows = [window(1, false), window(2, false)];
+        let windows: Vec<_> = windows.iter().map(|w| (w, false)).collect();
+        let weights = HashMap::from([(1, usage::preview_factor(0.0, 1.0)), (2, usage::preview_factor(1.0, 1.0))]);
+        for scale in [1.0, 0.55] {
+            let tiles = layout_tiles(&windows, &rect(0.0, 0.0, 2400.0, 1400.0), scale, &weights);
+            assert_eq!(tiles.len(), 2);
+            let (w0, h0) = size(&tiles[0].thumb);
+            let (w1, h1) = size(&tiles[1].thumb);
+            let side_ratio = (1.5_f32 / 0.7).sqrt();
+            assert!((w1 / w0 - side_ratio).abs() < 0.0001);
+            assert!((h1 / h0 - side_ratio).abs() < 0.0001);
+            assert!((w1 * h1 / (w0 * h0) - 1.5 / 0.7).abs() < 0.0001);
+        }
     }
 
     #[test]
