@@ -2,6 +2,7 @@
 //! input and captures the screen, so behaviour can be checked without a person
 //! at the mouse.
 //!   drive step <0..3> | click | release | settings
+//!   drive clickprobe
 //!   drive boardstress <cycles> <ms> <post|xbutton|chord> <still|move|hover>
 //!   drive xbutton <down|up> | mouse <x> <y> [down|up|rdown|rup] | move <dx> <dy>
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
@@ -44,6 +45,7 @@ fn main() {
             let _ = PostMessageW(app, message, WPARAM(wparam), LPARAM(0));
         };
         match args.get(1).map(String::as_str) {
+            Some("clickprobe") => boardstress(0, 0, "post", "still"),
             Some("boardstress") => boardstress(args[2].parse().unwrap(), args[3].parse().unwrap(), &args[4], &args[5]),
             Some("step") => post(WM_APP + 1, args[2].parse().unwrap()),
             Some("click") => post(WM_APP + 2, 0),
@@ -533,14 +535,14 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
         if message == WM_LBUTTONDOWN { CLICKS.fetch_add(1, Ordering::Relaxed); }
         DefWindowProcW(hwnd, message, w, l)
     }
-    assert!((1..=10_000).contains(&cycles) && millis <= 1000);
+    assert!(cycles <= 10_000 && millis <= 1000);
     assert!(["post", "xbutton", "chord"].contains(&mode));
     assert!(["still", "move", "hover"].contains(&cursor));
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         assert!(vdapi::select(false).is_some());
         let app = FindWindowW(w!("flick.main"), None);
-        assert!(app.0 != 0, "Flick is not running");
+        assert!(cycles == 0 || app.0 != 0, "Flick is not running");
         let class = w!("flick.test.clicks");
         let instance = GetModuleHandleW(None).unwrap();
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(probe), hInstance: instance.into(), lpszClassName: class, ..Default::default() });
@@ -551,9 +553,11 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
         let other = make();
         assert!(target.0 != 0 && other.0 != 0);
         let current = vdapi::get_current_desktop().unwrap();
-        let desktop = vdapi::create_desktop().unwrap();
-        let moved = vdapi::move_window_to_desktop(desktop, other);
-        println!("temporary desktop {} thumbnail source {:x}: {moved:?}", desktop.id(), other.0);
+        let desktop = (cycles > 0).then(|| vdapi::create_desktop().unwrap());
+        if let Some(desktop) = desktop {
+            let moved = vdapi::move_window_to_desktop(desktop, other);
+            println!("temporary desktop {} thumbnail source {:x}: {moved:?}", desktop.id(), other.0);
+        }
         let pump = |millis| {
             let until = Instant::now() + Duration::from_millis(millis);
             let mut message = MSG::default();
@@ -577,8 +581,8 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
                 send(&events);
             }
             _ => {
-                let events: Vec<_> = [MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP].into_iter().map(|dwFlags| INPUT {
-                    r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { mouseData: 2, dwFlags, ..Default::default() } },
+                let events: Vec<_> = [MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP].into_iter().map(|flags| INPUT {
+                    r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { mouseData: 2, dwFlags: flags, ..Default::default() } },
                 }).collect();
                 send(&events);
             }
@@ -600,8 +604,10 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
             completed += 1;
             if completed % 25 == 0 { println!("cycle {completed}/{cycles}: open {open} closed {closed} popup {popups}"); }
         }
-        let alive = IsWindow(app).as_bool();
-        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
+        let alive = cycles == 0 || IsWindow(app).as_bool();
+        if cycles > 0 {
+            let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
+        }
         pump(350);
         SetForegroundWindow(target);
         pump(150);
@@ -613,8 +619,8 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
             let mut name = [0u16; 128];
             let n = GetClassNameW(under, &mut name).max(0) as usize;
             let before = CLICKS.load(Ordering::Relaxed);
-            let events: Vec<_> = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].into_iter().map(|dwFlags| INPUT {
-                r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags, ..Default::default() } },
+            let events: Vec<_> = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].into_iter().map(|flags| INPUT {
+                r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: flags, ..Default::default() } },
             }).collect();
             send(&events);
             pump(150);
@@ -624,7 +630,9 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
             IsWindowVisible(board).as_bool(), IsWindowVisible(popup).as_bool(), CLICKS.load(Ordering::Relaxed));
         let _ = DestroyWindow(other);
         let _ = DestroyWindow(target);
-        println!("remove temporary desktop: {:?}", vdapi::remove_desktop(desktop, current));
+        if let Some(desktop) = desktop {
+            println!("remove temporary desktop: {:?}", vdapi::remove_desktop(desktop, current));
+        }
         assert!(alive && completed == cycles && CLICKS.load(Ordering::Relaxed) == 3, "stress or click delivery failed");
     }
 }
