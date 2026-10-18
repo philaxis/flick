@@ -82,6 +82,7 @@ thread_local! {
 
 /// Called at startup and by the existing CONFIG timer, including when the config is unchanged.
 pub fn poll(enabled: bool) -> Status {
+    if !enabled { registration_failed(false); }
     let handles = devices();
     KNOWN.with(|known| {
         let mut known = known.borrow_mut();

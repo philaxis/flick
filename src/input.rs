@@ -915,7 +915,12 @@ fn raw_key_up(key: u32) {
 /// Raw mouse input while the trigger is held: the device's own movement,
 /// unaffected by the cursor being frozen.
 fn on_raw_input(handle: HRAWINPUT) {
-    if !TOUCHPAD_ON.get() { return on_raw_mouse_input(handle); }
+    if TOUCHPAD_ON.get() { on_raw_touchpad_input(handle); } else { on_raw_mouse_input(handle); }
+}
+
+// Keep the larger HID stack frame out of the default mouse/keyboard path.
+#[inline(never)]
+fn on_raw_touchpad_input(handle: HRAWINPUT) {
     let mut buffer = [0u64; 128];
     let mut size = std::mem::size_of_val(&buffer) as u32;
     let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
