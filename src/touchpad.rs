@@ -18,7 +18,7 @@ pub struct Event {
 #[derive(Default)]
 pub struct Gesture {
     previous: Vec<Contact>,
-    landed: Option<u64>,
+    landed: Option<u32>,
     held: bool,
     blocked: bool,
     path: f64,
@@ -31,13 +31,13 @@ impl Gesture {
         self.blocked = true;
     }
 
-    pub fn update(&mut self, contacts: &[Contact], ms: u64) -> Event {
+    pub fn update(&mut self, contacts: &[Contact], ms: u32) -> Event {
         let mut event = Event::default();
         if contacts.is_empty() {
             if self.held {
                 event.ended = Some(
                     self.landed
-                        .is_some_and(|start| ms.saturating_sub(start) <= 250)
+                        .is_some_and(|start| ms.wrapping_sub(start) <= 250)
                         && self.path < 0.2,
                 );
             }
@@ -177,6 +177,13 @@ mod tests {
             g.update(&hand(3, travel), 100);
             assert_eq!(g.update(&[], time).ended, Some(tap));
         }
+    }
+    #[test]
+    fn tap_duration_uses_input_timestamps_including_tick_wrap() {
+        let mut g = Gesture::default();
+        g.update(&hand(3, 0.0), u32::MAX - 100);
+        g.update(&hand(3, 0.01), u32::MAX - 50);
+        assert_eq!(g.update(&[], 20).ended, Some(true));
     }
     #[test]
     fn hold_lasts_through_two_and_one_finger_and_rebases() {

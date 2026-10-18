@@ -3,7 +3,6 @@ use super::{cm_per_unit, Contact, Event, Frame, Gesture};
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
 };
 use windows::{
     core::{w, PCWSTR},
@@ -211,6 +210,8 @@ pub struct Device {
     data: Vec<u64>, // aligned owned preparsed data, not a borrowed Windows pointer
     slots: Vec<Slot>,
     frame: Frame,
+    #[cfg(test)]
+    samples: usize,
 }
 
 impl Device {
@@ -260,6 +261,8 @@ impl Device {
                 data,
                 slots: Vec::new(),
                 frame: Frame::default(),
+                #[cfg(test)]
+                samples: 0,
             };
             let mut caps = HIDP_CAPS::default();
             if HidP_GetCaps(device.prep(), &mut caps) != HIDP_STATUS_SUCCESS
@@ -353,7 +356,12 @@ impl Device {
 
     fn report(&mut self, report: &[u8]) -> Option<Vec<Contact>> {
         #[cfg(test)]
-        eprintln!("touchpad raw report: {report:02x?}");
+        {
+            self.samples += 1;
+            if self.samples <= 12 {
+                eprintln!("touchpad raw report: {report:02x?}");
+            }
+        }
         let count = self.value(0x0D, 0, 0x54, report)? as usize;
         let scan = self.value(0x0D, 0, 0x56, report)?;
         let mut records = Vec::new();
@@ -399,9 +407,9 @@ impl Device {
         }
         debug_log!("touchpad report: device {} scan {scan} count {count} records {records:?} bytes {report:02x?}", self.handle);
         #[cfg(test)]
-        eprintln!(
-            "touchpad report: scan {scan} count {count} records {records:?} bytes {report:02x?}"
-        );
+        if self.samples <= 12 {
+            eprintln!("touchpad report: scan {scan} count {count} records {records:?}");
+        }
         self.frame.push(scan, count, &records)
     }
 }
@@ -410,7 +418,8 @@ pub struct Reader {
     pub devices: Vec<Device>,
     owner: Option<isize>,
     gesture: Gesture,
-    clock: Instant,
+    #[cfg(test)]
+    last_count: usize,
 }
 
 impl Default for Reader {
@@ -419,7 +428,8 @@ impl Default for Reader {
             devices: Vec::new(),
             owner: None,
             gesture: Gesture::default(),
-            clock: Instant::now(),
+            #[cfg(test)]
+            last_count: 0,
         }
     }
 }
@@ -434,7 +444,7 @@ impl Reader {
     pub fn cancel(&mut self) {
         self.gesture.cancel();
     }
-    pub fn report(&mut self, device: isize, report: &[u8]) -> Option<Event> {
+    pub fn report(&mut self, device: isize, report: &[u8], ms: u32) -> Option<Event> {
         let contacts = self
             .devices
             .iter_mut()
@@ -446,11 +456,17 @@ impl Reader {
         if !contacts.is_empty() {
             self.owner = Some(device);
         }
-        let event = self
-            .gesture
-            .update(&contacts, self.clock.elapsed().as_millis() as u64);
+        let event = self.gesture.update(&contacts, ms);
         #[cfg(test)]
-        eprintln!("touchpad frame: {} contacts {event:?}", contacts.len());
+        {
+            if self.last_count != contacts.len() || event.began || event.ended.is_some() {
+                eprintln!(
+                    "touchpad frame at {ms}: {} contacts {event:?}",
+                    contacts.len()
+                );
+            }
+            self.last_count = contacts.len();
+        }
         if contacts.is_empty() {
             self.owner = None;
         }

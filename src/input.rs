@@ -43,7 +43,7 @@ use windows::Win32::{
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetForegroundWindow,
-            GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, KillTimer, PostMessageW, PostThreadMessageW,
+            GetMessageW, GetMessageTime, GetSystemMetrics, GetWindowThreadProcessId, KillTimer, PostMessageW, PostThreadMessageW,
             RegisterClassW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, HC_ACTION, HHOOK,
             HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
             SM_CYVIRTUALSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
@@ -909,8 +909,6 @@ fn on_raw_input(handle: HRAWINPUT) {
     let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(buffer.as_mut_ptr().cast()), &mut size, header) };
     if read == u32::MAX || read < header { return; }
     let raw = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
-    #[cfg(test)]
-    eprintln!("raw packet: type {} device {} bytes {read}", raw.header.dwType, raw.header.hDevice.0);
     let offset = std::mem::offset_of!(RAWINPUT, data);
     if raw.header.dwType == RIM_TYPEHID.0 {
         if (read as usize) < offset + 8 { return; }
@@ -919,7 +917,7 @@ fn on_raw_input(handle: HRAWINPUT) {
         if hid.dwSizeHid == 0 || bytes > read as usize - offset - 8 { return; }
         let reports = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>().add(offset + 8), bytes) };
         for report in reports.chunks_exact(hid.dwSizeHid as usize) {
-            let event = TOUCHPAD.with(|reader| reader.borrow_mut().report(raw.header.hDevice.0, report));
+            let event = TOUCHPAD.with(|reader| reader.borrow_mut().report(raw.header.hDevice.0, report, unsafe { GetMessageTime() } as u32));
             if let Some(event) = event { touchpad_event(event); }
         }
         return;
@@ -1286,7 +1284,7 @@ mod tests {
             let began = Instant::now();
             while began.elapsed().as_secs() < 45 {
                 let mut message = MSG::default();
-                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                while began.elapsed().as_secs() < 45 && PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                     DispatchMessageW(&message);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
