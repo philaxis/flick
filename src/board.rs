@@ -23,7 +23,7 @@ use windows::{
     core::{w, Error, Result},
     Foundation::Numerics::Matrix3x2,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -57,12 +57,12 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DrawIconEx, GetClassLongPtrW, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
-                KillTimer, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
-                GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
+                KillTimer, SetTimer, SetWindowPos, SetLayeredWindowAttributes, ShowWindow, LWA_ALPHA, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
+                GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOREDRAW, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
                 GW_OWNER, HTTRANSPARENT, WM_NCHITTEST, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_LAYERED, WS_POPUP,
             },
         },
     },
@@ -204,6 +204,7 @@ const FOOTER: f32 = 44.0;
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
 const ON_TOP_MS: u32 = 250;
+const POPUP_TIMER_ID: usize = 3;
 const POPUP_GLIDE_MS: u64 = 120;
 const POPUP_GRACE_MS: u64 = 200;
 const POPUP_FADE_IN_MS: u64 = 80;
@@ -348,6 +349,25 @@ struct PopupLayout {
     label: Rect,
     body: Rect,
     tiles: Vec<TileLayout>,
+}
+
+impl PopupLayout {
+    fn move_to(&mut self, frame: Rect, cell: Rect) {
+        let old = self.frame;
+        let place = |r: Rect| {
+            let x = |x| frame.left + (x - old.left) * size(&frame).0 / size(&old).0.max(1.0);
+            let y = |y| frame.top + (y - old.top) * size(&frame).1 / size(&old).1.max(1.0);
+            Rect { left: x(r.left), right: x(r.right), top: y(r.top), bottom: y(r.bottom) }
+        };
+        self.label = place(self.label);
+        self.body = place(self.body);
+        for tile in &mut self.tiles {
+            tile.frame = place(tile.frame);
+            tile.thumb = place(tile.thumb);
+        }
+        self.frame = frame;
+        self.cell = cell;
+    }
 }
 
 /// Geometry and opacity have separate clocks so crossing a gap never restarts a glide.
@@ -495,6 +515,9 @@ pub struct Board {
     popup_hwnd: HWND,
     popup: Option<PopupLayout>,
     popup_thumbs: Vec<(isize, isize)>,
+    popup_animation: Option<PopupAnimation>,
+    popup_alpha: f32,
+    popup_timer: Option<Instant>,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
@@ -619,18 +642,22 @@ impl Board {
                 ..Default::default()
             });
             let popup_hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
                 popup_class, w!("Flick preview"), WS_POPUP,
                 0, 0, 0, 0, hwnd, None, instance, None,
             );
             if popup_hwnd.0 == 0 {
                 return Err(Error::from_win32());
             }
+            SetLayeredWindowAttributes(popup_hwnd, COLORREF(0), 0, LWA_ALPHA)?;
             Ok(Board {
                 hwnd,
                 popup_hwnd,
                 popup: None,
                 popup_thumbs: Vec::new(),
+                popup_animation: None,
+                popup_alpha: 0.0,
+                popup_timer: None,
                 factory: paint::d2d_factory()?,
                 canvas: None,
                 fonts: None,
@@ -750,7 +777,7 @@ impl Board {
         self.relayout();
         self.hover_under_cursor();
         self.register_thumbnails();
-        self.update_popup();
+        self.update_popup(Instant::now());
         self.invalidate();
     }
 
@@ -805,7 +832,7 @@ impl Board {
         self.relayout();
         self.hover_under_cursor();
         self.register_thumbnails();
-        self.update_popup();
+        self.update_popup(Instant::now());
         self.invalidate();
     }
 
@@ -1071,48 +1098,92 @@ impl Board {
     fn hide_popup(&mut self) {
         unregister_thumbnails(&mut self.popup_thumbs);
         self.popup = None;
+        self.popup_animation = None;
+        self.popup_timer = None;
+        self.popup_alpha = 0.0;
         unsafe {
+            let _ = KillTimer(self.hwnd, POPUP_TIMER_ID);
             ShowWindow(self.popup_hwnd, SW_HIDE);
+            let _ = SetLayeredWindowAttributes(self.popup_hwnd, COLORREF(0), 0, LWA_ALPHA);
         }
     }
 
+    fn schedule_popup(&mut self, now: Instant) {
+        if !self.open { return; }
+        let delay = self.popup_animation.as_ref().and_then(|animation| animation.next_tick(now));
+        let due = delay.map(|ms| now + Duration::from_millis(ms as u64));
+        if self.popup_timer.is_some() && due.is_some() && self.popup_timer <= due { return; }
+        unsafe {
+            let _ = KillTimer(self.hwnd, POPUP_TIMER_ID);
+            if let Some(ms) = delay { SetTimer(self.hwnd, POPUP_TIMER_ID, ms, None); }
+        }
+        self.popup_timer = due;
+    }
+
+    fn tick_popup(&mut self, now: Instant) {
+        let Some(animation) = &self.popup_animation else { return };
+        let (frame, cell, alpha) = animation.sample(now);
+        if alpha == 0.0 && animation.leave_at.is_some() {
+            self.hide_popup();
+            self.invalidate();
+            return;
+        }
+        if let Some(popup) = &mut self.popup { popup.move_to(frame, cell); }
+        self.popup_alpha = alpha;
+        if self.open {
+            let (w, h) = (size(&frame).0.ceil() as i32, size(&frame).1.ceil() as i32);
+            unsafe {
+                let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, (24.0 * self.scale) as i32, (24.0 * self.scale) as i32);
+                if SetWindowRgn(self.popup_hwnd, region, false) == 0 { let _ = DeleteObject(region); }
+                // Keep the last composed image until the resized frame has been painted.
+                let _ = SetWindowPos(self.popup_hwnd, HWND_TOPMOST,
+                    self.origin.0 + frame.left.round() as i32, self.origin.1 + frame.top.round() as i32,
+                    w, h, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_SHOWWINDOW);
+            }
+            self.update_thumbnails();
+            self.paint();
+            unsafe { let _ = SetLayeredWindowAttributes(self.popup_hwnd, COLORREF(0), (alpha * 255.0).round() as u8, LWA_ALPHA); }
+        }
+        self.schedule_popup(now);
+    }
+
     /// Follows the cell under the cursor without changing the selection.
-    fn update_popup(&mut self) {
+    fn update_popup(&mut self, now: Instant) {
         let wanted = match &self.hover {
             Hit::Cell(id) | Hit::CellClose(id) if *id != self.selected && self.press.is_none() && self.editing.is_none() => {
                 Some((id.clone(), self.map_at(self.cursor.0, self.cursor.1).0.monitor))
             }
             _ => None,
         };
-        if self.popup.as_ref().map(|popup| (&popup.id, popup.monitor)) == wanted.as_ref().map(|(id, monitor)| (id, *monitor)) {
+        let Some((id, monitor)) = wanted else {
+            if let Some(animation) = &mut self.popup_animation { animation.leave(now); }
+            self.schedule_popup(now);
+            return;
+        };
+        if self.popup.as_ref().is_some_and(|popup| popup.id == id && popup.monitor == monitor) {
+            if let Some(animation) = &mut self.popup_animation { animation.show(now); }
+            self.schedule_popup(now);
             return;
         }
-        self.hide_popup();
-        if let Some((id, monitor)) = wanted {
-            self.popup = self.layout_popup(id, monitor);
+        let Some(popup) = self.layout_popup(id, monitor) else { return };
+        match &mut self.popup_animation {
+            Some(animation) => animation.glide_to(popup.frame, popup.cell, now),
+            None => self.popup_animation = Some(PopupAnimation::new(popup.frame, popup.cell, now)),
         }
+        self.popup = Some(popup);
+        let mut old = std::mem::take(&mut self.popup_thumbs);
         if self.open {
-            if let Some(popup) = &self.popup {
-                let frame = popup.frame;
-                let (w, h) = (size(&frame).0.ceil() as i32, size(&frame).1.ceil() as i32);
-                unsafe {
-                    let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, (24.0 * self.scale) as i32, (24.0 * self.scale) as i32);
-                    if SetWindowRgn(self.popup_hwnd, region, false) == 0 {
-                        let _ = DeleteObject(region);
-                    }
-                    let _ = SetWindowPos(self.popup_hwnd, HWND_TOPMOST,
-                        self.origin.0 + frame.left.round() as i32, self.origin.1 + frame.top.round() as i32,
-                        w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            for (window, _) in self.model.popup_windows(&self.popup.as_ref().unwrap().id) {
+                if let Some(i) = old.iter().position(|(hwnd, _)| *hwnd == window.hwnd.0) {
+                    self.popup_thumbs.push(old.remove(i));
+                } else if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.popup_hwnd, window.hwnd) } {
+                    self.popup_thumbs.push((window.hwnd.0, thumb));
                 }
-                let wanted: Vec<HWND> = self.model.popup_windows(&popup.id).into_iter().map(|(window, _)| window.hwnd).collect();
-                for hwnd in wanted {
-                    if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.popup_hwnd, hwnd) } {
-                        self.popup_thumbs.push((hwnd.0, thumb));
-                    }
-                }
-                self.update_thumbnails();
             }
         }
+        self.tick_popup(now);
+        // Replacements are visible and painted before the old thumbnails go away.
+        unregister_thumbnails(&mut old);
         self.invalidate();
     }
 
@@ -1186,14 +1257,14 @@ impl Board {
     /// Puts every thumbnail where its tile is, or under the cursor while its
     /// window is being dragged.
     fn update_thumbnails(&self) {
-        self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window());
+        self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window(), 1.0);
         if let Some(popup) = &self.popup {
             self.place_thumbnails(&self.popup_thumbs, &popup.tiles, &self.model.popup_windows(&popup.id),
-                (popup.frame.left.round(), popup.frame.top.round()), None);
+                (popup.frame.left.round(), popup.frame.top.round()), None, self.popup_alpha);
         }
     }
 
-    fn place_thumbnails(&self, thumbs: &[(isize, isize)], tiles: &[TileLayout], windows: &[(&WindowModel, bool)], offset: (f32, f32), dragged: Option<isize>) {
+    fn place_thumbnails(&self, thumbs: &[(isize, isize)], tiles: &[TileLayout], windows: &[(&WindowModel, bool)], offset: (f32, f32), dragged: Option<isize>, opacity: f32) {
         let to_rect = |r: &Rect| RECT {
             left: (r.left - offset.0).round() as i32,
             top: (r.top - offset.1).round() as i32,
@@ -1246,6 +1317,7 @@ impl Board {
                 None => props.fVisible = false.into(),
             }
             unsafe {
+                props.opacity = (props.opacity as f32 * opacity).round() as u8;
                 let _ = DwmUpdateThumbnailProperties(thumb, &props);
             }
         }
@@ -1311,7 +1383,7 @@ impl Board {
             }
             WM_MOUSELEAVE => {
                 self.hover = Hit::Nothing;
-                self.hide_popup();
+                self.update_popup(Instant::now());
                 self.invalidate();
                 Action::None
             }
@@ -1321,6 +1393,12 @@ impl Board {
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
+            WM_TIMER if wparam.0 == POPUP_TIMER_ID => {
+                unsafe { let _ = KillTimer(self.hwnd, POPUP_TIMER_ID); }
+                self.popup_timer = None;
+                self.tick_popup(Instant::now());
+                Action::None
+            }
             WM_TIMER if wparam.0 == ON_TOP_TIMER_ID => {
                 self.keep_on_top();
                 Action::None
@@ -1470,7 +1548,7 @@ impl Board {
             self.hover = hover;
             self.invalidate();
         }
-        self.update_popup();
+        self.update_popup(Instant::now());
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Action {
@@ -1479,7 +1557,7 @@ impl Board {
         }
         let Some(press) = self.press.take() else { return Action::None };
         self.hover = self.hit_test(x, y);
-        self.update_popup();
+        self.update_popup(Instant::now());
         self.invalidate();
         if press.dragging {
             let action = match &press.hit {
@@ -1613,6 +1691,15 @@ impl Board {
                 let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
                 ReleaseDC(self.hwnd, window);
                 if let Some(popup) = &self.popup {
+                    // The board underneath stays bare, so the layered panel can fade away.
+                    let target = &canvas.target.target;
+                    target.BeginDraw();
+                    if let (Ok(p), Some(fonts)) = (Painter::new(target), &self.fonts) {
+                        self.draw_popup_panel(&p, fonts);
+                    }
+                    if let Err(error) = target.EndDraw(None, None) {
+                        crate::app::log(&format!("popup draw failed: {error}"));
+                    }
                     let dc = GetDC(self.popup_hwnd);
                     let _ = BitBlt(dc, 0, 0, size(&popup.frame).0.ceil() as i32, size(&popup.frame).1.ceil() as i32,
                         canvas.dib.dc, popup.frame.left.round() as i32, popup.frame.top.round() as i32, SRCCOPY);
@@ -1721,9 +1808,15 @@ impl Board {
         let s = self.scale;
         let x = centre(&popup.cell).0;
         let end = (x.clamp(popup.frame.left + 16.0 * s, popup.frame.right - 16.0 * s), popup.frame.bottom);
-        p.line((x, popup.cell.top - 2.0 * s), (x, end.1 + 8.0 * s), 2.0 * s, accent(0.65));
-        p.line((x, end.1 + 8.0 * s), end, 2.0 * s, accent(0.65));
-        p.disc((x, popup.cell.top - 2.0 * s), 3.0 * s, accent(0.9));
+        p.line((x, popup.cell.top - 2.0 * s), (x, end.1 + 8.0 * s), 2.0 * s, accent(0.65 * self.popup_alpha));
+        p.line((x, end.1 + 8.0 * s), end, 2.0 * s, accent(0.65 * self.popup_alpha));
+        p.disc((x, popup.cell.top - 2.0 * s), 3.0 * s, accent(0.9 * self.popup_alpha));
+        if !self.open { self.draw_popup_panel(p, fonts); }
+    }
+
+    fn draw_popup_panel(&self, p: &Painter, fonts: &Fonts) {
+        let Some(popup) = &self.popup else { return };
+        let s = self.scale;
         p.fill(&popup.frame, 12.0 * s, rgba(0.09, 0.10, 0.13, 1.0));
         p.stroke(&grow(&popup.frame, -1.0 * s), 11.0 * s, 1.0 * s, accent(0.65));
         if let Some(pos) = self.grid.find(&popup.id) {
@@ -2039,7 +2132,7 @@ impl Board {
 
     /// Draws the board (without live thumbnails) into a bitmap and returns the
     /// BGRA pixels, for reviewing the layout without showing a window.
-    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>) -> Option<Vec<u8>> {
+    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>, glide: Option<(grid::Pos, u64)>) -> Option<Vec<u8>> {
         self.size = size;
         self.scale = scale;
         self.home = rect(0.0, 0.0, size.0 as f32, size.1 as f32);
@@ -2048,12 +2141,23 @@ impl Board {
         self.model = model;
         self.grid = grid;
         self.relayout();
-        self.hover = Hit::Nothing;
-        if let Some(cell) = hover.and_then(|pos| self.maps[0].layout.rows.get(pos.row)?.cells.get(pos.col)) {
-            self.cursor = centre(&cell.body);
-            self.hover = Hit::Cell(cell.id.clone());
+        let now = Instant::now();
+        let point_at = |board: &mut Self, pos: Option<grid::Pos>| {
+            board.hover = Hit::Nothing;
+            if let Some(cell) = pos.and_then(|pos| board.maps[0].layout.rows.get(pos.row)?.cells.get(pos.col)) {
+                board.cursor = centre(&cell.body);
+                board.hover = Hit::Cell(cell.id.clone());
+            }
+        };
+        if let Some((from, _)) = glide {
+            point_at(self, Some(from));
+            self.update_popup(now);
+            self.tick_popup(now + Duration::from_millis(POPUP_FADE_IN_MS));
         }
-        self.update_popup();
+        let now = now + Duration::from_millis(POPUP_FADE_IN_MS);
+        point_at(self, hover);
+        self.update_popup(now);
+        self.tick_popup(now + Duration::from_millis(glide.map_or(POPUP_FADE_IN_MS, |(_, ms)| ms)));
         self.fonts = None;
         let _ = self.draw_to_canvas()?;
         Some(self.canvas.as_ref()?.dib.pixels().to_vec())

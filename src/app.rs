@@ -2263,6 +2263,7 @@ pub fn time_minimap(path: &str) {
 /// `FLICK_HOVER=row,col` also previews that cell (zero-based), using the
 /// same made-up windows when sizes were supplied. `FLICK_USAGE=1` adds
 /// scores 0,1,4,16 and a sample grid; it also adds varied usage to minimap renders.
+/// `FLICK_HOVER_FROM=row,col` and `FLICK_HOVER_MS=60` sample a glide to `FLICK_HOVER`.
 pub fn render_board(path: &str, sizes: Option<&str>) {
     // Reading the desktops needs a backend, and only a known Windows gets one.
     if vdapi::select(false).is_none() {
@@ -2352,8 +2353,14 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             cell.windows = made_up;
         }
     }
+    let glide = std::env::var("FLICK_HOVER_FROM").ok().and_then(|value| {
+        let (row, col) = value.split_once(',')?;
+        let pos = Pos { row: row.trim().parse().ok()?, col: col.trim().parse().ok()? };
+        let ms = std::env::var("FLICK_HOVER_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(60).min(10_000);
+        Some((pos, ms))
+    });
     let size = (2560, 1440);
-    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5, hover) {
+    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5, hover, glide) {
         write_raw(path, size, &pixels);
     }
 }
