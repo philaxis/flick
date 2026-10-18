@@ -17,7 +17,7 @@ use windows::{
             Direct2D::{ID2D1Factory, ID2D1RenderTarget},
             DirectWrite::{
                 IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-                DWRITE_TEXT_ALIGNMENT_TRAILING,
+                DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
             },
             Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE},
             Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
@@ -163,15 +163,19 @@ struct Fonts {
     label: IDWriteTextFormat,
     value: IDWriteTextFormat,
     button: IDWriteTextFormat,
+    notice: IDWriteTextFormat,
 }
 
 impl Fonts {
     fn new(s: f32) -> Result<Fonts> {
         let factory = paint::dwrite_factory()?;
+        let notice = paint::text_format(&factory, 13.5 * s, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?;
+        unsafe { notice.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?; }
         Ok(Fonts {
             label: paint::text_format(&factory, 13.5 * s, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             value: paint::text_format(&factory, 13.5 * s, 600, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             button: paint::text_format(&factory, 12.5 * s, 600, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+            notice,
         })
     }
 }
@@ -546,7 +550,7 @@ impl Settings {
             crate::touchpad::Status::Unavailable => "Touchpad reports could not be read on this device.",
         };
         let area = Rect { bottom: row(8.0 - up).top, ..row(6.0 - up) };
-        p.text(notice, &fonts.label, &area, white(0.62));
+        p.text(notice, &fonts.notice, &area, white(0.62));
         if view.touchpad_status == crate::touchpad::Status::Conflict {
             self.draw_button(&p, fonts, &layout.touchpad_settings, "Open Windows touchpad settings (W)", Hit::TouchpadSettings);
         }

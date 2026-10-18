@@ -1262,7 +1262,52 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
 #[cfg(test)]
 mod tests {
-    use super::hidden_by;
+    use super::*;
+
+    /// Reads real reports without installing hooks, freezing the cursor, or changing settings.
+    #[test]
+    #[ignore = "requires the user at a precision touchpad for 45 seconds"]
+    fn touchpad_report_probe() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, DestroyWindow, PM_REMOVE};
+        let devices = crate::touchpad::probe_devices();
+        assert!(!devices.is_empty(), "no readable precision touchpad collection");
+        TOUCHPAD.with(|reader| *reader.borrow_mut() = crate::touchpad::Reader::new(devices));
+        unsafe {
+            let module = GetModuleHandleW(None).unwrap_or_default();
+            let class = windows::core::w!("flick.touchpad.probe");
+            RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(raw_window_proc), hInstance: module.into(), lpszClassName: class, ..Default::default() });
+            let window = CreateWindowExW(WINDOW_EX_STYLE(0), class, None, WINDOW_STYLE(0), 0, 0, 0, 0, HWND_MESSAGE, None, module, None);
+            assert_ne!(window.0, 0);
+            assert!(crate::touchpad::register(window, true));
+            eprintln!("TOUCHPAD PROBE READY: three fingers tap/move, lift to two, one, then zero; 45 seconds");
+            let began = Instant::now();
+            while began.elapsed().as_secs() < 45 {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            crate::touchpad::register(window, false);
+            let _ = DestroyWindow(window);
+        }
+    }
+
+    #[test]
+    fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400 };
+        let info = MSLLHOOKSTRUCT::default();
+        HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });
+        for message in [WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_LBUTTONDOWN, WM_RBUTTONDOWN] {
+            assert!(on_mouse(&settings, message, &info));
+        }
+        HELD.with(|held| { held.borrow_mut().clear(); });
+        assert!(on_mouse(&settings, WM_LBUTTONUP, &info));
+        assert!(on_mouse(&settings, WM_RBUTTONUP, &info));
+        assert!(!on_mouse(&settings, WM_LBUTTONDOWN, &info));
+        assert!(!on_mouse(&settings, WM_LBUTTONUP, &info));
+        assert!(!on_mouse(&settings, WM_MOUSEMOVE, &info));
+    }
 
     /// A window run as administrator that already had the keyboard, or was
     /// under the cursor, as the trigger went down must not end the hold: the

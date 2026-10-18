@@ -25,10 +25,10 @@ pub const NOTICE: &str =
     "Windows' three-finger gestures (swipes and taps) must be set to Nothing to use this";
 const KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\PrecisionTouchPad");
 
-fn value(name: PCWSTR) -> Option<u32> {
+fn value(name: PCWSTR, absent: Option<u32>) -> Option<u32> {
     let mut value = 0u32;
     let mut size = 4u32;
-    unsafe {
+    let result = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             KEY,
@@ -38,14 +38,34 @@ fn value(name: PCWSTR) -> Option<u32> {
             Some((&mut value as *mut u32).cast()),
             Some(&mut size),
         )
-        .ok()?;
+    };
+    if result == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+        return absent;
     }
+    result.ok().ok()?;
     Some(value)
 }
 
 fn gestures_off() -> bool {
-    // Missing values use Windows defaults, which enable gestures. Unknown modes stay inactive.
-    value(w!("ThreeFingerSlideEnabled")) == Some(0) && value(w!("ThreeFingerTapEnabled")) == Some(0)
+    // Missing global values use Windows defaults, which enable gestures.
+    let modes = [
+        value(w!("ThreeFingerSlideEnabled"), None),
+        value(w!("ThreeFingerTapEnabled"), None),
+    ];
+    // shortcut: conflicting advanced mappings stay inactive even with global Nothing,
+    // until Windows' undocumented precedence can be verified on hardware.
+    let advanced = [
+        w!("ThreeFingerUp"),
+        w!("ThreeFingerDown"),
+        w!("ThreeFingerLeft"),
+        w!("ThreeFingerRight"),
+        w!("ThreeFingerTap"),
+    ]
+    .map(|name| value(name, Some(0)));
+    modes
+        .iter()
+        .chain(advanced.iter())
+        .all(|value| *value == Some(0))
 }
 
 thread_local! {
@@ -89,6 +109,19 @@ pub fn poll(enabled: bool) -> Status {
 
 pub fn status() -> Status {
     KNOWN.with(|known| known.borrow().1)
+}
+
+#[cfg(test)]
+pub fn probe_devices() -> Vec<Device> {
+    devices().into_iter().filter_map(Device::open).inspect(|device| {
+        eprintln!("touchpad device {}: {} contact slots", device.handle, device.slots.len());
+        for slot in &device.slots {
+            for (name, cap) in [("X", slot.x), ("Y", slot.y)] {
+                eprintln!("  link {} report {} {name}: logical {}..{} physical {}..{} units {:#x} exponent {:#x}",
+                    slot.link, slot.report, cap.LogicalMin, cap.LogicalMax, cap.PhysicalMin, cap.PhysicalMax, cap.Units, cap.UnitsExp);
+            }
+        }
+    }).collect()
 }
 
 fn devices() -> Vec<isize> {
@@ -330,6 +363,10 @@ impl Device {
             records.push((id, contact));
         }
         debug_log!("touchpad report: device {} scan {scan} count {count} records {records:?} bytes {report:02x?}", self.handle);
+        #[cfg(test)]
+        eprintln!(
+            "touchpad report: scan {scan} count {count} records {records:?} bytes {report:02x?}"
+        );
         self.frame.push(scan, count, &records)
     }
 }
@@ -377,6 +414,8 @@ impl Reader {
         let event = self
             .gesture
             .update(&contacts, self.clock.elapsed().as_millis() as u64);
+        #[cfg(test)]
+        eprintln!("touchpad frame: {} contacts {event:?}", contacts.len());
         if contacts.is_empty() {
             self.owner = None;
         }

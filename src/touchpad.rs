@@ -50,16 +50,19 @@ impl Gesture {
                 .iter()
                 .all(|c| self.previous.iter().any(|p| p.id == c.id));
         let mut delta = (0.0, 0.0);
-        if same {
-            for contact in contacts {
-                let old = self.previous.iter().find(|p| p.id == contact.id).unwrap();
+        let mut farthest: f64 = 0.0;
+        for contact in contacts {
+            if let Some(old) = self.previous.iter().find(|p| p.id == contact.id) {
                 let (dx, dy) = (contact.x - old.x, contact.y - old.y);
-                delta.0 += dx / contacts.len() as f64;
-                delta.1 += dy / contacts.len() as f64;
-                // One wandering finger also disqualifies a tap.
-                self.path += dx.hypot(dy) / contacts.len() as f64;
+                farthest = farthest.max(dx.hypot(dy));
+                if same {
+                    delta.0 += dx / contacts.len() as f64;
+                    delta.1 += dy / contacts.len() as f64;
+                }
             }
         }
+        // Re-basing navigation must not hide travel from tap classification.
+        self.path += farthest;
         if !self.held && !self.blocked && contacts.len() == 3 {
             self.held = true;
             event.began = true;
@@ -184,6 +187,19 @@ mod tests {
         assert_eq!(g.update(&[], 600).ended, Some(false));
     }
     #[test]
+    fn lifting_fingers_or_one_wandering_finger_does_not_hide_travel() {
+        let mut g = Gesture::default();
+        g.update(&hand(3, 0.0), 0);
+        assert_eq!(g.update(&hand(2, 1.0), 100), Event::default());
+        assert_eq!(g.update(&[], 150).ended, Some(false));
+        let mut g = Gesture::default();
+        g.update(&hand(3, 0.0), 0);
+        let mut fingers = hand(3, 0.0);
+        fingers[0].x += 0.3;
+        g.update(&fingers, 100);
+        assert_eq!(g.update(&[], 150).ended, Some(false));
+    }
+    #[test]
     fn landing_time_and_cancellation() {
         let mut g = Gesture::default();
         g.update(&hand(1, 0.0), 0);
@@ -209,6 +225,17 @@ mod tests {
             );
             assert_eq!((plane.cols.cell(), plane.rows.cell()), (1, 1));
         }
+    }
+    #[test]
+    fn hybrid_frame_recovers_from_scan_rollover_and_ignores_orphan_active_reports() {
+        let mut f = Frame::default();
+        let c = hand(3, 0.0);
+        assert_eq!(f.push(10, 0, &[(0, Some(c[0]))]), None);
+        assert_eq!(f.push(65535, 3, &[(0, Some(c[0]))]), None);
+        assert_eq!(f.push(0, 1, &[(0, Some(c[0]))]), Some(vec![c[0]]));
+        assert_eq!(f.push(1, 3, &[(0, Some(c[0])), (1, Some(c[1]))]), None);
+        assert_eq!(f.push(1, 0, &[(2, Some(c[2])), (0, None)]), Some(c));
+        assert_eq!(f.push(2, 1, &[(0, None), (0, None)]), Some(vec![]));
     }
     #[test]
     fn hybrid_frames_include_lift_records_and_ignore_zero_continuations() {
