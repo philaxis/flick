@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CELL_HALF_LIFE: u64 = 3 * 24 * 60 * 60;
+/// Cells follow the work as quickly as windows do: half gone after an hour.
+pub const CELL_HALF_LIFE: u64 = WINDOW_HALF_LIFE;
 pub const WINDOW_HALF_LIFE: u64 = 60 * 60;
 pub const CELL_TAU: f64 = 5.0 * 60.0;
 pub const WINDOW_TAU: f64 = 2.0 * 60.0;
