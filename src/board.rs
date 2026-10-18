@@ -1130,6 +1130,7 @@ impl Board {
         }
         if let Some(popup) = &mut self.popup { popup.move_to(frame, cell); }
         self.popup_alpha = alpha;
+        self.schedule_popup(now);
         if self.open {
             let (w, h) = (size(&frame).0.ceil() as i32, size(&frame).1.ceil() as i32);
             unsafe {
@@ -1142,9 +1143,11 @@ impl Board {
             }
             self.update_thumbnails();
             self.paint();
-            unsafe { let _ = SetLayeredWindowAttributes(self.popup_hwnd, COLORREF(0), (alpha * 255.0).round() as u8, LWA_ALPHA); }
+            unsafe {
+                ValidateRect(self.hwnd, None);
+                let _ = SetLayeredWindowAttributes(self.popup_hwnd, COLORREF(0), (alpha * 255.0).round() as u8, LWA_ALPHA);
+            }
         }
-        self.schedule_popup(now);
     }
 
     /// Follows the cell under the cursor without changing the selection.
@@ -1184,7 +1187,6 @@ impl Board {
         self.tick_popup(now);
         // Replacements are visible and painted before the old thumbnails go away.
         unregister_thumbnails(&mut old);
-        self.invalidate();
     }
 
     fn layout_popup(&self, id: CellId, monitor: usize) -> Option<PopupLayout> {
