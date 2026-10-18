@@ -17,7 +17,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use windows::{
     core::{w, Error, Result},
@@ -204,6 +204,10 @@ const FOOTER: f32 = 44.0;
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
 const ON_TOP_MS: u32 = 250;
+const POPUP_GLIDE_MS: u64 = 120;
+const POPUP_GRACE_MS: u64 = 200;
+const POPUP_FADE_IN_MS: u64 = 80;
+const POPUP_FADE_OUT_MS: u64 = 120;
 /// The longest name a shelf can be given, in characters.
 const NAME_LENGTH: usize = 24;
 /// Sent after the cursor leaves a window that called `TrackMouseEvent`.
@@ -344,6 +348,72 @@ struct PopupLayout {
     label: Rect,
     body: Rect,
     tiles: Vec<TileLayout>,
+}
+
+/// Geometry and opacity have separate clocks so crossing a gap never restarts a glide.
+struct PopupAnimation {
+    from: (Rect, Rect),
+    target: (Rect, Rect),
+    moved: Instant,
+    fade_from: f32,
+    faded: Instant,
+    leave_at: Option<Instant>,
+}
+
+impl PopupAnimation {
+    fn new(frame: Rect, cell: Rect, now: Instant) -> Self {
+        Self { from: (frame, cell), target: (frame, cell), moved: now, fade_from: 0.0, faded: now, leave_at: None }
+    }
+
+    fn sample(&self, now: Instant) -> (Rect, Rect, f32) {
+        let progress = |since: Instant, ms| (now.saturating_duration_since(since).as_secs_f32() * 1000.0 / ms as f32).min(1.0);
+        let ease = |t: f32| 1.0 - (1.0 - t).powi(3);
+        let t = ease(progress(self.moved, POPUP_GLIDE_MS));
+        let blend = |a: Rect, b: Rect| if t == 1.0 { b } else { Rect {
+            left: a.left + (b.left - a.left) * t, top: a.top + (b.top - a.top) * t,
+            right: a.right + (b.right - a.right) * t, bottom: a.bottom + (b.bottom - a.bottom) * t,
+        } };
+        let fade_in = |at: Instant| {
+            let t = (at.saturating_duration_since(self.faded).as_secs_f32() * 1000.0 / POPUP_FADE_IN_MS as f32).min(1.0);
+            self.fade_from + (1.0 - self.fade_from) * ease(t)
+        };
+        let alpha = match self.leave_at {
+            Some(at) if now >= at => fade_in(at) * (1.0 - ease(progress(at, POPUP_FADE_OUT_MS))),
+            _ => fade_in(now),
+        };
+        (blend(self.from.0, self.target.0), blend(self.from.1, self.target.1), alpha)
+    }
+
+    fn show(&mut self, now: Instant) {
+        if self.leave_at.is_some() {
+            self.fade_from = self.sample(now).2;
+            self.faded = now;
+            self.leave_at = None;
+        }
+    }
+
+    fn glide_to(&mut self, frame: Rect, cell: Rect, now: Instant) {
+        let (from, from_cell, _) = self.sample(now);
+        self.from = (from, from_cell);
+        self.target = (frame, cell);
+        self.moved = now;
+        self.show(now);
+    }
+
+    fn leave(&mut self, now: Instant) {
+        self.leave_at.get_or_insert(now + Duration::from_millis(POPUP_GRACE_MS));
+    }
+
+    /// One wake-up for a settled gap; frame ticks only while something changes.
+    fn next_tick(&self, now: Instant) -> Option<u32> {
+        let (frame, cell, alpha) = self.sample(now);
+        let goal = if self.leave_at.is_some_and(|at| now >= at) { 0.0 } else { 1.0 };
+        if frame != self.target.0 || cell != self.target.1 || alpha != goal {
+            Some(16)
+        } else {
+            self.leave_at.filter(|at| *at > now).map(|at| at.duration_since(now).as_millis().max(1) as u32)
+        }
+    }
 }
 
 /// The map of all rows and cells, in the coordinates of the monitor it is on.
@@ -2407,6 +2477,70 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_glides_continue_from_the_current_frame_and_connector() {
+        let now = Instant::now();
+        let a = rect(10.0, 20.0, 500.0, 100.0);
+        let b = rect(200.0, 50.0, 640.0, 350.0);
+        let c = rect(-100.0, 80.0, 400.0, 200.0);
+        let cell = |x| rect(x, 800.0, 70.0, 50.0);
+        let mut animation = PopupAnimation::new(a, cell(10.0), now);
+        animation.glide_to(b, cell(200.0), now);
+        let halfway = now + Duration::from_millis(60);
+        let before = animation.sample(halfway);
+        assert!(before.0.left > 105.0 && before.0.left < b.left);
+        assert!(before.0.bottom > a.bottom && before.0.bottom < b.bottom);
+        animation.glide_to(c, cell(-100.0), halfway);
+        assert_eq!(animation.sample(halfway), before);
+        let end = halfway + Duration::from_millis(POPUP_GLIDE_MS);
+        assert_eq!(animation.sample(end), (c, cell(-100.0), 1.0));
+        assert_eq!(animation.next_tick(end), None);
+    }
+
+    #[test]
+    fn popup_gaps_wait_once_then_fade_without_extending_the_grace() {
+        let now = Instant::now();
+        let frame = rect(0.0, 0.0, 640.0, 350.0);
+        let mut animation = PopupAnimation::new(frame, frame, now);
+        let left = now + Duration::from_millis(80);
+        assert_eq!(animation.sample(left).2, 1.0);
+        assert_eq!(animation.next_tick(left), None);
+        animation.leave(left);
+        assert_eq!(animation.next_tick(left), Some(200));
+        animation.leave(left + Duration::from_millis(100));
+        assert_eq!(animation.sample(left + Duration::from_millis(199)).2, 1.0);
+        let fading = left + Duration::from_millis(260);
+        assert!((animation.sample(fading).2 - 0.125).abs() < 0.001);
+        assert_eq!(animation.next_tick(fading), Some(16));
+        let end = left + Duration::from_millis(320);
+        assert_eq!(animation.sample(end).2, 0.0);
+        assert_eq!(animation.next_tick(end), None);
+        assert_eq!(animation.sample(end + Duration::from_secs(1)).2, 0.0);
+    }
+
+    #[test]
+    fn returning_during_a_gap_or_fade_keeps_the_current_opacity() {
+        let now = Instant::now();
+        let frame = rect(0.0, 0.0, 640.0, 350.0);
+        let mut animation = PopupAnimation::new(frame, frame, now);
+        assert_eq!(animation.sample(now).2, 0.0);
+        assert_eq!(animation.next_tick(now), Some(16));
+        let visible = now + Duration::from_millis(80);
+        animation.leave(visible);
+        animation.show(visible + Duration::from_millis(100));
+        assert_eq!(animation.sample(visible + Duration::from_millis(200)).2, 1.0);
+        animation.leave(visible + Duration::from_millis(200));
+        let returned = visible + Duration::from_millis(460);
+        let alpha = animation.sample(returned).2;
+        assert!(alpha > 0.0 && alpha < 1.0);
+        animation.show(returned);
+        assert_eq!(animation.sample(returned).2, alpha);
+        assert!(animation.sample(returned + Duration::from_millis(40)).2 > alpha);
+        let settled = returned + Duration::from_millis(80);
+        assert_eq!(animation.sample(settled).2, 1.0);
+        assert_eq!(animation.next_tick(settled), None);
+    }
 
     #[test]
     fn popup_stays_above_the_map_on_its_monitor() {
