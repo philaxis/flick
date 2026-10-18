@@ -157,6 +157,19 @@ pub fn save_grid(grid: &Grid) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Older state files have no usage field. New counts survive the same
+    /// serialization path without changing the grid or its remembered cells.
+    #[test]
+    fn saved_grid_accepts_old_state_and_round_trips_usage() {
+        let old = r#"{"rows":[{"cells":["a"],"last":"a"}],"emphasised":["a"]}"#;
+        let mut grid: Grid = serde_json::from_str(old).unwrap();
+        assert!(grid.usage.is_empty());
+        grid.usage.entry("a".into()).or_default().visits.record(100);
+        grid.usage.get_mut("a").unwrap().windows.entry("app:a.exe".into()).or_default().record(100);
+        let saved = serde_json::to_string_pretty(&grid).unwrap();
+        assert_eq!(serde_json::from_str::<Grid>(&saved).unwrap(), grid);
+    }
+
     /// Changing a setting from the settings window rewrites the user's file:
     /// their comments and other values must survive, a key that only starts
     /// like the one being set must not be mistaken for it, and a key missing

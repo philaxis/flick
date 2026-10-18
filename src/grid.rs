@@ -4,7 +4,9 @@
 //! different lengths. Cells are identified by the desktop GUID (as a string),
 //! so this module has no Windows dependency.
 
+use crate::usage::{self, CellUsage};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub type CellId = String;
 
@@ -59,6 +61,9 @@ pub fn row_title(name: &str, index: usize) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     pub rows: Vec<Row>,
+    /// Recent visits and app uses, keyed by desktop id.
+    #[serde(default)]
+    pub usage: BTreeMap<CellId, CellUsage>,
     /// Executable names (lower case) whose windows follow the user from cell
     /// to cell inside whichever row they are in.
     #[serde(default)]
@@ -77,6 +82,22 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// Drops removed desktops and counts too old to affect the display.
+    pub fn prune_usage(&mut self, now: u64) {
+        self.usage.retain(|id, usage| {
+            usage.windows.retain(|_, score| score.value(now) > 0.0);
+            self.rows.iter().any(|row| row.cells.contains(id))
+                && (usage.visits.value(now) > 0.0 || !usage.windows.is_empty())
+        });
+    }
+
+    /// Brightness added to a cell, as a share of the most visited cell.
+    pub fn cell_usage(&self, id: &str, now: u64) -> f32 {
+        let maximum = self.usage.values().map(|cell| cell.visits.value(now)).fold(0.0, f64::max);
+        let score = self.usage.get(id).map_or(0.0, |cell| cell.visits.value(now));
+        usage::normalised(score, maximum)
+    }
+
     pub fn find(&self, id: &str) -> Option<Pos> {
         self.rows.iter().enumerate().find_map(|(row, r)| {
             r.cells.iter().position(|c| c == id).map(|col| Pos { row, col })
@@ -216,6 +237,7 @@ impl Grid {
         }
         self.rows.retain(|r| !r.cells.is_empty());
         self.emphasised.retain(|c| c != id);
+        self.usage.remove(id);
     }
 
     pub fn is_emphasised(&self, id: &str) -> bool {
@@ -242,6 +264,7 @@ impl Grid {
         }
         self.rows.retain(|r| !r.cells.is_empty());
         self.emphasised.retain(|c| actual.contains(c));
+        self.usage.retain(|id, _| actual.contains(id));
 
         let unknown: Vec<CellId> = actual.iter().filter(|id| self.find(id).is_none()).cloned().collect();
         if !unknown.is_empty() {
@@ -260,6 +283,25 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_prunes_removed_cells_and_old_counts() {
+        let mut g = grid(&[&["a", "b"]]);
+        for id in ["a", "b", "gone"] {
+            let cell = g.usage.entry(id.into()).or_default();
+            cell.visits.record(100);
+            cell.windows.entry("old".into()).or_default().record(0);
+            cell.windows.entry("recent".into()).or_default().record(2_000_000);
+        }
+        g.prune_usage(2_000_000);
+        assert_eq!(g.usage.len(), 2);
+        assert_eq!(g.usage["a"].windows.len(), 1);
+        assert_eq!(g.cell_usage("a", 2_000_000), 0.0);
+        g.remove("b");
+        assert!(!g.usage.contains_key("b"));
+        g.sync(&["other".into()], "other");
+        assert!(g.usage.is_empty());
+    }
 
     #[test]
     fn names_from_earlier_versions_become_shelves() {

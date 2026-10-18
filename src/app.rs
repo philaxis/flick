@@ -14,6 +14,7 @@ use crate::{
     tray::{self, Command, PinCommand, PinState, RowCommand},
     vd::{self, Desktops},
     vdapi,
+    usage,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -126,6 +127,12 @@ struct App {
     hwnd: HWND,
     config: Config,
     grid: Grid,
+    /// Last desktop actually observed, separate from a queued switch or board selection.
+    usage_cell: String,
+    foreground: usage::Foreground,
+    ignore_foreground: HWND,
+    usage_dirty: bool,
+    usage_saved: Instant,
     minimap: Minimap,
     board: Board,
     /// Until when the board losing the keyboard is Windows' doing, not the
@@ -290,7 +297,11 @@ impl App {
             hwnd,
             config: Config::default(),
             grid,
-            minimap: Minimap::spawn(),
+            usage_cell: String::new(),
+            foreground: usage::Foreground::default(),
+            ignore_foreground: HWND(0),
+            usage_dirty: false,
+            usage_saved: Instant::now(),            minimap: Minimap::spawn(),
             board,
             board_settling: Instant::now(),
             focus_before_board: HWND(0),
@@ -334,9 +345,53 @@ impl App {
         Some(desktops)
     }
 
-    fn save(&self) {
-        if let Err(e) = config::save_grid(&self.grid) {
-            log(&format!("saving the grid failed: {e}"));
+    fn save(&mut self) {
+        self.grid.prune_usage(usage::now());
+        match config::save_grid(&self.grid) {
+            Ok(()) => {
+                self.usage_dirty = false;
+                self.usage_saved = Instant::now();
+            }
+            Err(e) => log(&format!("saving the grid failed: {e}")),
+        }
+    }
+
+    /// Counts arrivals once, including cells passed through during a gesture.
+    /// Selecting a cell on the board and queuing a switch are not visits.
+    fn record_arrival(&mut self, id: &str) {
+        if self.usage_cell != id && self.grid.find(id).is_some() {
+            self.grid.usage.entry(id.to_owned()).or_default().visits.record(usage::now());
+            self.usage_cell = id.to_owned();
+            self.usage_dirty = true;
+        }
+    }
+
+    /// Uses the existing foreground notification; no window polling or disk
+    /// write is needed here. Flick's own windows never count as app use.
+    fn record_foreground(&mut self, hwnd: HWND) {
+        if hwnd == self.ignore_foreground {
+            self.ignore_foreground = HWND(0);
+            return;
+        }
+        self.ignore_foreground = HWND(0);
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
+        if pid == unsafe { GetCurrentProcessId() } || !vd::is_app_window(hwnd) {
+            return;
+        }
+        let cell = if vd::pinned_everywhere(hwnd) {
+            Desktops::read().map(|d| d.current)
+        } else {
+            vdapi::get_desktop_by_window(hwnd).ok().map(|d| d.id())
+        };
+        let Some(cell) = cell.filter(|id| self.grid.find(id).is_some()) else { return };
+        let icon = crate::board::icon_key(hwnd);
+        let exe = vd::exe_name(pid).unwrap_or_default();
+        let name = if icon == 0 && exe.is_empty() { vd::app_label(pid) } else { String::new() };
+        let Some(key) = usage::app_key(icon, &exe, &name) else { return };
+        if self.foreground.record(hwnd.0, self.started.elapsed().as_millis() as u64) {
+            self.grid.usage.entry(cell).or_default().windows.entry(key).or_default().record(usage::now());
+            self.usage_dirty = true;
         }
     }
 
@@ -820,6 +875,7 @@ impl App {
     /// switched to. True when that is under way, the cell come to only
     /// being passed by.
     fn land(&mut self, new: &str) -> bool {
+        self.record_arrival(new);
         if self.in_flight.take().is_none() {
             return false;
         }
@@ -1150,6 +1206,7 @@ impl App {
     fn cancel_board(&mut self) {
         self.board.close();
         if unsafe { IsWindow(self.focus_before_board) }.as_bool() {
+            self.ignore_foreground = self.focus_before_board;
             vd::force_foreground(self.focus_before_board);
         }
     }
@@ -1680,13 +1737,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(App::sleep_idle_rows);
         }
         WM_TIMER if wparam.0 == CONFIG_TIMER_ID => {
-            with_app(App::apply_saved_config);
+            with_app(|app| {
+                app.apply_saved_config();
+                // Piggyback on the existing timer, at most once per half minute.
+                if app.usage_dirty && app.usage_saved.elapsed() >= Duration::from_secs(30) {
+                    app.save();
+                }
+            });
             if vd::put_away_stuck_notice() {
                 log("put away the shell's notice window left shown over the taskbar");
             }
         }
         WM_RESTACK => {
-            with_app(|app| app.restack_clicked(HWND(wparam.0 as _)));
+            with_app(|app| {
+                let window = HWND(wparam.0 as _);
+                app.record_foreground(window);
+                app.restack_clicked(window);
+            });
             admin_in_front(HWND(wparam.0 as _));
             let _ = SetTimer(hwnd, RESTACK_TIMER_ID, 120, None);
         }
@@ -1713,6 +1780,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             }
         }
         WM_DESTROY => {
+            with_app(App::save);
             vd::set_switch_label_hidden(false);
             input::uninstall();
             tray::remove(hwnd);
@@ -1899,6 +1967,7 @@ pub fn run(first_run: bool) {
         });
         if !remembered {
             app.visit(&desktops.current);
+        app.record_arrival(&desktops.current);
         }
         app.commit();
     }

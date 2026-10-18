@@ -6,6 +6,7 @@ mod debuglog;
 
 mod config;
 mod grid;
+mod usage;
 
 #[cfg(windows)]
 mod admin;
