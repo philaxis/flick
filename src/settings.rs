@@ -44,7 +44,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
 /// Below the last row, the link to the file and a margin.
-const SIZE: (f32, f32) = (400.0, ROWS.0 + (5.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
+const SIZE: (f32, f32) = (400.0, ROWS.0 + (9.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
 /// Whether up and down has settings of its own (a flick or a distance, and
 /// how much). Not now: rows go by distance, a distance of their own. The
 /// switch is kept hidden, and its key in config.toml read and left alone,
@@ -71,6 +71,8 @@ pub struct View {
     pub step_y: i32,
     pub sticky: bool,
     pub autostart: bool,
+    pub touchpad: bool,
+    pub touchpad_status: crate::touchpad::Status,
 }
 
 /// What the user asked for; carried out by the app.
@@ -85,6 +87,7 @@ pub enum Action {
     Autostart(bool),
     /// Open the config file, which has the settings not shown here.
     OpenFile,
+    TouchpadSettings,
     Close,
 }
 
@@ -98,6 +101,8 @@ enum Hit {
     Mode(bool),
     StepY,
     Autostart,
+    Touchpad,
+    TouchpadSettings,
     File,
 }
 
@@ -108,6 +113,8 @@ struct Layout {
     mode: [Rect; 2],
     step_y: Rect,
     autostart: Rect,
+    touchpad: Rect,
+    touchpad_settings: Rect,
     file: Rect,
 }
 
@@ -127,7 +134,9 @@ impl Layout {
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
             step_y: slider(if UP_AND_DOWN_OF_ITS_OWN { 3.0 } else { 2.0 }),
             autostart: right(4.0 - up, 44.0, 24.0),
-            file: rect(EDGES.0 * s, (row(5.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
+            touchpad: right(5.0 - up, 44.0, 24.0),
+            touchpad_settings: rect(EDGES.0 * s, (row(8.0 - up) + 4.0) * s, 240.0 * s, 30.0 * s),
+            file: rect(EDGES.0 * s, (row(9.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -140,6 +149,8 @@ impl Layout {
             (&self.mode[1], Hit::Mode(false)),
             (&self.step_y, Hit::StepY),
             (&self.autostart, Hit::Autostart),
+            (&self.touchpad, Hit::Touchpad),
+            (&self.touchpad_settings, Hit::TouchpadSettings),
             (&self.file, Hit::File),
         ]
         .into_iter()
@@ -321,6 +332,10 @@ impl Settings {
                 Action::None
             }
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => Action::Close,
+            WM_KEYDOWN if wparam.0 == 0x54 && !self.view.capturing =>
+                Action::Set("three_finger_touchpad", (!self.view.touchpad).to_string()),
+            WM_KEYDOWN if wparam.0 == 0x57 && self.view.touchpad_status == crate::touchpad::Status::Conflict =>
+                Action::TouchpadSettings,
             WM_DPICHANGED => {
                 // Moved to a monitor with another scaling: Windows says where
                 // the window should be now.
@@ -420,6 +435,8 @@ impl Settings {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Mode(sticky) if sticky != self.view.sticky => Action::Set("vertical_sticky", sticky.to_string()),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
+            Hit::Touchpad => Action::Set("three_finger_touchpad", (!self.view.touchpad).to_string()),
+            Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
             Hit::File => Action::OpenFile,
             _ => Action::None,
         }
@@ -518,6 +535,21 @@ impl Settings {
 
         label(4.0 - up, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
+
+        label(5.0 - up, "Three-finger touchpad (T)");
+        self.draw_switch(&p, &layout.touchpad, view.touchpad, Hit::Touchpad);
+        let notice = match view.touchpad_status {
+            crate::touchpad::Status::Absent => "No precision touchpad detected",
+            crate::touchpad::Status::Off => "Off. Enable to use three fingers as the trigger.",
+            crate::touchpad::Status::Active => "Ready. Tap for the board; move about 1 cm per desktop.",
+            crate::touchpad::Status::Conflict => crate::touchpad::NOTICE,
+            crate::touchpad::Status::Unavailable => "Touchpad reports could not be read on this device.",
+        };
+        let area = Rect { bottom: row(8.0 - up).top, ..row(6.0 - up) };
+        p.text(notice, &fonts.label, &area, white(0.62));
+        if view.touchpad_status == crate::touchpad::Status::Conflict {
+            self.draw_button(&p, fonts, &layout.touchpad_settings, "Open Windows touchpad settings (W)", Hit::TouchpadSettings);
+        }
 
         let hot = self.hover == Hit::File;
         p.text("More settings: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));

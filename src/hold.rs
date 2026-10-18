@@ -12,6 +12,7 @@ pub enum Source {
     Middle,
     Key(u32),
     Chord,
+    Touchpad,
 }
 
 /// The triggers that are down right now. The gesture lasts while any of them

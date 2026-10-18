@@ -20,6 +20,8 @@
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
 
+**Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop.
+
 ## Get started
 
 1. Download with the button above and run it. It installs itself and starts with Windows.
