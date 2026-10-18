@@ -19,7 +19,7 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    sync::mpsc,
+    sync::{atomic::{AtomicU32, Ordering}, mpsc},
     time::{Duration, Instant, SystemTime},
 };
 use windows::{
@@ -44,14 +44,17 @@ use windows::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
                 GetWindowThreadProcessId, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
                 IsIconic, IsWindow, KillTimer, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-                RegisterWindowMessageW, SetTimer, ShowWindow, TranslateMessage, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
+                RegisterWindowMessageW, SendMessageTimeoutW, SetTimer, ShowWindow, TranslateMessage, SMTO_ABORTIFHUNG, SMTO_BLOCK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
                 MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
                 WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_POWERBROADCAST,
-                WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+                WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
 };
+
+/// The last UI message, retained while a Windows call holds up its handler.
+static UI_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
 const WM_TRAY: u32 = WM_APP + 10;
 const WM_DESKTOP_EVENT: u32 = WM_APP + 11;
@@ -255,6 +258,36 @@ pub fn log(message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let _ = writeln!(file, "{secs} {message}");
+    }
+}
+
+/// Uses an independent thread so an unresponsive UI can still leave evidence.
+fn watch_ui(hwnd: HWND) {
+    let target = hwnd.0;
+    let started = std::thread::Builder::new().name("UI watchdog".into()).spawn(move || {
+        let mut delayed = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let hwnd = HWND(target);
+            if !unsafe { IsWindow(hwnd) }.as_bool() {
+                return;
+            }
+            let answering = unsafe {
+                SendMessageTimeoutW(hwnd, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, None).0 != 0
+            };
+            if !unsafe { IsWindow(hwnd) }.as_bool() {
+                return;
+            }
+            if !answering && !delayed {
+                log(&format!("UI did not answer within 2 s; last message {:#x}", UI_MESSAGE.load(Ordering::Relaxed)));
+            } else if answering && delayed {
+                log("UI is answering again");
+            }
+            delayed = !answering;
+        }
+    });
+    if let Err(error) = started {
+        log(&format!("starting the UI watchdog failed: {error}"));
     }
 }
 
@@ -1606,6 +1639,9 @@ fn on_tray_command(hwnd: HWND, command: Command) {
 /// The window procedure of the app's hidden message window, the board and
 /// the settings window.
 unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message != WM_NULL {
+        UI_MESSAGE.store(message, Ordering::Relaxed);
+    }
     if hwnd.0 == SETTINGS_HWND.get() {
         if message == WM_CLOSE {
             // Its close button puts it away; the window itself is kept.
@@ -2031,6 +2067,7 @@ pub fn run(first_run: bool) {
         app.open_guide(false);
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
+    watch_ui(hwnd);
 
     unsafe {
         let mut message = MSG::default();

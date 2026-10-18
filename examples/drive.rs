@@ -3,7 +3,7 @@
 //! at the mouse.
 //!   drive step <0..3> | click | release | settings
 //!   drive clickprobe
-//!   drive boardstress <cycles> <ms> <post|xbutton|chord> <still|move|hover>
+//!   drive boardstress <cycles> <ms> <post|xbutton|chord|winpair> <still|move|hover>
 //!   drive xbutton <down|up> | mouse <x> <y> [down|up|rdown|rup] | move <dx> <dy>
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
@@ -536,7 +536,7 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
         DefWindowProcW(hwnd, message, w, l)
     }
     assert!(cycles <= 10_000 && millis <= 1000);
-    assert!(["post", "xbutton", "chord"].contains(&mode));
+    assert!(["post", "xbutton", "chord", "winpair"].contains(&mode));
     assert!(["still", "move", "hover"].contains(&cursor));
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -576,8 +576,9 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
         let send = |events: &[INPUT]| assert_eq!(SendInput(events, std::mem::size_of::<INPUT>() as i32), events.len() as u32);
         let tap = || match mode {
             "post" => { PostMessageW(app, WM_APP + 2, WPARAM(0), LPARAM(0)).unwrap(); }
-            "chord" => {
-                let events: Vec<_> = [false, true].into_iter().flat_map(|up| "WER".chars().map(move |c| key(c, up))).collect();
+            "chord" | "winpair" => {
+                let codes: &[u32] = if mode == "winpair" { &[0x5B, 0x7C] } else { &[0x57, 0x45, 0x52] };
+                let events: Vec<_> = [false, true].into_iter().flat_map(|up| codes.iter().map(move |vk| key_vk(*vk, up))).collect();
                 send(&events);
             }
             _ => {
@@ -619,7 +620,9 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
             let mut name = [0u16; 128];
             let n = GetClassNameW(under, &mut name).max(0) as usize;
             let before = CLICKS.load(Ordering::Relaxed);
-            let events: Vec<_> = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].into_iter().map(|flags| INPUT {
+            let buttons = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { [MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP] }
+                else { [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP] };
+            let events: Vec<_> = buttons.into_iter().map(|flags| INPUT {
                 r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: flags, ..Default::default() } },
             }).collect();
             send(&events);
