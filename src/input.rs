@@ -992,7 +992,7 @@ fn touchpad_event(event: crate::touchpad::Event) {
         if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
             let rest = TOUCHPAD_REST.get();
             let (x, y) = (rest.0 + event.delta.0 * s.step_x as f64, rest.1 + event.delta.1 * s.step_y as f64);
-            let (dx, dy) = (x.round() as i32, y.round() as i32);
+            let (dx, dy) = (x as i32, y as i32);
             TOUCHPAD_REST.set((x - dx as f64, y - dy as f64));
             if dx != 0 || dy != 0 { travel(s, dx, dy); }
             if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
