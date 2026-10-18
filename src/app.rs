@@ -1430,6 +1430,8 @@ impl App {
             step_y: self.config.step_y,
             sticky: self.config.vertical_sticky,
             autostart: self.autostart,
+            touchpad: self.config.three_finger_touchpad,
+            touchpad_status: crate::touchpad::status(),
         }
     }
 
@@ -1545,6 +1547,9 @@ impl App {
                 let path = HSTRING::from(config::config_path().as_os_str());
                 ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
             },
+            settings::Action::TouchpadSettings => unsafe {
+                ShellExecuteW(None, w!("open"), w!("ms-settings:devices-touchpad"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+            },
             settings::Action::Close => self.close_settings(),
         }
         Some(LRESULT(0))
@@ -1569,6 +1574,7 @@ impl App {
         if !unknown.is_empty() {
             warn(&format!("Unknown entries in trigger in config.toml: {}", unknown.join(", ")));
         }
+        crate::touchpad::poll(config.three_finger_touchpad);
         input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);
         unsafe {
@@ -1579,6 +1585,9 @@ impl App {
         }
         self.config = config;
         self.refresh_settings();
+        if crate::touchpad::status() == crate::touchpad::Status::Conflict && !self.settings.is_open() {
+            self.settings.open(self.settings_view());
+        }
     }
 
     /// Ctrl+Alt+Win with an arrow moves, with Shift added it carries the
@@ -1821,6 +1830,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_TIMER if wparam.0 == CONFIG_TIMER_ID => {
             with_app(|app| {
                 app.apply_saved_config();
+                let before = crate::touchpad::status();
+                let status = crate::touchpad::poll(app.config.three_finger_touchpad);
+                if status != before {
+                    app.refresh_settings();
+                    if status == crate::touchpad::Status::Conflict { app.open_settings(); }
+                }
                 app.usage_tick();
                 // Piggyback on the existing timer, at most once per half minute.
                 if app.usage_dirty && app.usage_saved.elapsed() >= Duration::from_secs(30) {
@@ -2396,6 +2411,8 @@ pub fn render_settings(path: &str) {
         step_y: config.step_y,
         sticky: config.vertical_sticky,
         autostart: true,
+        touchpad: false,
+        touchpad_status: crate::touchpad::Status::Absent,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
         write_raw(path, size, &pixels);

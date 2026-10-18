@@ -7,6 +7,8 @@ mod debuglog;
 mod config;
 mod grid;
 mod usage;
+#[cfg(any(windows, test))]
+mod touchpad;
 
 #[cfg(windows)]
 mod admin;

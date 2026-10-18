@@ -22,6 +22,9 @@ const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them 
 #   Example: trigger = "xbutton2, w+e+r"
 trigger = "xbutton2"
 
+# Three-finger precision touchpad trigger (Windows three-finger swipes and taps must be Nothing).
+three_finger_touchpad = false
+
 # How far to move (pixels) to go one cell sideways (step_x) and one shelf up or down (step_y). The longer vertical distance keeps you from changing shelf by accident.
 step_x = 260
 step_y = 400
@@ -47,6 +50,7 @@ sleep_after_minutes = 0
 #[serde(default)]
 pub struct Config {
     pub trigger: String,
+    pub three_finger_touchpad: bool,
     pub step_x: i32,
     pub step_y: i32,
     pub vertical_sticky: bool,
@@ -61,6 +65,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             trigger: "xbutton2".into(),
+            three_finger_touchpad: false,
             step_x: 260,
             step_y: 400,
             vertical_sticky: true,
@@ -156,6 +161,15 @@ pub fn save_grid(grid: &Grid) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touchpad_is_opt_in_for_new_and_existing_configs() {
+        assert!(!Config::default().three_finger_touchpad);
+        assert!(!toml::from_str::<Config>(DEFAULT_CONFIG).unwrap().three_finger_touchpad);
+        assert!(!toml::from_str::<Config>("trigger = \"f13\"").unwrap().three_finger_touchpad);
+        let enabled = with_value("# keep me\n", "three_finger_touchpad", "true");
+        assert!(toml::from_str::<Config>(&enabled).unwrap().three_finger_touchpad);
+    }
 
     /// Older state files have no usage field. New credits survive the same
     /// serialization path without changing the grid or its remembered cells.
