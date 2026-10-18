@@ -62,8 +62,7 @@ fn gestures_off() -> bool {
         value(w!("ThreeFingerSlideEnabled"), None),
         value(w!("ThreeFingerTapEnabled"), None),
     ];
-    // shortcut: conflicting advanced mappings stay inactive even with global Nothing,
-    // until Windows' undocumented precedence can be verified on hardware.
+    // shortcut: stale advanced mappings block activation, relax after verifying Windows' override behavior.
     let advanced = [
         w!("ThreeFingerUp"),
         w!("ThreeFingerDown"),
@@ -316,6 +315,12 @@ impl Device {
                 report,
             )
         };
+        #[cfg(test)]
+        if status != HIDP_STATUS_SUCCESS {
+            eprintln!(
+                "HID value failed: page {page:x} link {link} usage {usage:x}, status {status:?}"
+            );
+        }
         (status == HIDP_STATUS_SUCCESS).then_some(value)
     }
 
@@ -347,6 +352,8 @@ impl Device {
     }
 
     fn report(&mut self, report: &[u8]) -> Option<Vec<Contact>> {
+        #[cfg(test)]
+        eprintln!("touchpad raw report: {report:02x?}");
         let count = self.value(0x0D, 0, 0x54, report)? as usize;
         let scan = self.value(0x0D, 0, 0x56, report)?;
         let mut records = Vec::new();
@@ -370,6 +377,11 @@ impl Device {
                 )
             };
             if status != HIDP_STATUS_SUCCESS || length as usize > usages.len() {
+                #[cfg(test)]
+                eprintln!(
+                    "HID buttons failed: link {} status {status:?} length {length}",
+                    slot.link
+                );
                 return None;
             }
             let usages = &usages[..length as usize];

@@ -909,6 +909,8 @@ fn on_raw_input(handle: HRAWINPUT) {
     let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(buffer.as_mut_ptr().cast()), &mut size, header) };
     if read == u32::MAX || read < header { return; }
     let raw = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
+    #[cfg(test)]
+    eprintln!("raw packet: type {} device {} bytes {read}", raw.header.dwType, raw.header.hDevice.0);
     let offset = std::mem::offset_of!(RAWINPUT, data);
     if raw.header.dwType == RIM_TYPEHID.0 {
         if (read as usize) < offset + 8 { return; }
