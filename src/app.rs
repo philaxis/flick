@@ -2069,11 +2069,22 @@ fn write_raw(path: &str, (w, h): (i32, i32), pixels: &[u8]) {
     let _ = std::fs::write(path, out);
 }
 
+/// Render-only scores span unused, lightly used and heavily used windows/cells.
+const SAMPLE_USAGE: [f64; 4] = [0.0, 1.0, 4.0, 16.0];
+
+fn sample_usage(rows: &mut [Vec<CellView>]) {
+    if std::env::var_os("FLICK_USAGE").is_some() {
+        for (i, cell) in rows.iter_mut().flatten().enumerate() {
+            cell.usage = usage::normalised(SAMPLE_USAGE[i % SAMPLE_USAGE.len()], 16.0).sqrt();
+        }
+    }
+}
+
 /// Renders a sample minimap into `path` (see `write_raw`; premultiplied
 /// alpha) so the design can be reviewed without touching the desktop.
 pub fn render_sample(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
-    let view = View {
+    let mut view = View {
         rows: vec![
             vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }, CellView::default(), CellView::default()],
             vec![CellView::default(); 2],
@@ -2083,6 +2094,7 @@ pub fn render_sample(path: &str) {
         title: "Shelf 2".into(),
         cur: Some(Pos { row: 1, col: 1 }),
     };
+    sample_usage(&mut view.rows);
     if let Some((size, pixels)) = overlay.render_to_pixels(view, (0.0, 0.0), 2.0) {
         write_raw(path, size, &pixels);
     }
@@ -2100,7 +2112,8 @@ pub fn render_sample(path: &str) {
 pub fn render_minimap_strip(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let cells = |n: usize| vec![CellView::default(); n];
-    let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }], cells(4), cells(2)];
+    let mut rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }], cells(4), cells(2)];
+    sample_usage(&mut rows);
     let smooth = |u: f32| u * u * (3.0 - 2.0 * u);
     let (dt, scale, gap, steps) = (1.0 / 60.0, 1.5, 6, (260, 400));
     let mut plane = crate::slide::Plane::new();
@@ -2196,7 +2209,8 @@ pub fn time_minimap(path: &str) {
 /// `sizes` ("1920x1040,400x300") the current cell holds made-up windows of
 /// those sizes instead of its own, to see how any mix of them is laid out.
 /// `FLICK_HOVER=row,col` also previews that cell (zero-based), using the
-/// same made-up windows when sizes were supplied.
+/// same made-up windows when sizes were supplied. `FLICK_USAGE=1` adds
+/// scores 0,1,4,16 and a sample grid; it also adds varied usage to minimap renders.
 pub fn render_board(path: &str, sizes: Option<&str>) {
     // Reading the desktops needs a backend, and only a known Windows gets one.
     if vdapi::select(false).is_none() {
@@ -2224,6 +2238,19 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
         let (row, col) = value.split_once(',')?;
         Some(Pos { row: row.trim().parse().ok()?, col: col.trim().parse().ok()? })
     });
+    let sample = sizes.is_some() && std::env::var_os("FLICK_USAGE").is_some();
+    if sample {
+        app.grid.rows = vec![
+            Row { name: "Importance".into(), cells: vec![desktops.current.clone(), "sample-1".into(), "sample-2".into(), "sample-3".into()], last: None },
+            Row { name: "Other shelf".into(), cells: (4..8).map(|i| format!("sample-{i}")).collect(), last: None },
+        ];
+        app.grid.emphasised = vec!["sample-2".into()];
+        app.grid.usage.clear();
+        let now = usage::now();
+        for (i, id) in app.grid.rows.iter().flat_map(|row| &row.cells).enumerate() {
+            app.grid.usage.entry(id.clone()).or_default().visits.record(now, SAMPLE_USAGE[i % SAMPLE_USAGE.len()], usage::CELL_HALF_LIFE);
+        }
+    }
     let mut model = app.model(&desktops);
     if let Some(sizes) = sizes {
         let made_up = sizes.split(',').filter_map(|size| size.trim().split_once('x')).enumerate().filter_map(|(i, (w, h))| {
@@ -2242,6 +2269,14 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             })
         });
         let mut made_up: Vec<WindowModel> = made_up.collect();
+        if sample {
+            let now = usage::now();
+            for (i, window) in made_up.iter_mut().enumerate() {
+                let score = SAMPLE_USAGE[i % SAMPLE_USAGE.len()];
+                app.grid.window_usage.entry(window.hwnd.0).or_default().record(now, score, usage::WINDOW_HALF_LIFE);
+                window.title += &format!(" · use {score}");
+            }
+        }
         model.pinned.clear();
         // For pictures of how pinned windows are placed: FLICK_PINS=a,r pins
         // the first a made-up windows everywhere and the next r to their row.

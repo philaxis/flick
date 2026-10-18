@@ -91,7 +91,7 @@ pub struct CellModel {
     pub id: CellId,
     /// Marked by the user to stand out.
     pub emphasised: bool,
-    /// Active-stay score as a share of the highest cell score.
+    /// Square root of this cell's share of the highest active-stay score.
     pub usage: f32,
     /// Topmost first.
     pub windows: Vec<WindowModel>,
@@ -1857,10 +1857,14 @@ impl Board {
                 p.fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
             }
         }
-        p.fill(&cell.body, radius, white(((if in_selected_row { 0.14 } else { 0.07 }) + 0.08 * cell.usage) * dim));
-        if cell.emphasised {
-            p.fill(&cell.body, radius, warm(0.26 * dim));
-        }
+        let fill = if is_selected {
+            accent(0.35 * dim)
+        } else if cell.emphasised {
+            warm(0.40 * dim)
+        } else {
+            white((if in_selected_row { 0.08 + 0.32 * cell.usage } else { 0.04 + 0.28 * cell.usage }) * dim)
+        };
+        p.fill(&cell.body, radius, fill);
         if drop_target {
             p.stroke(&cell.body, radius, 2.5 * s, accent(1.0));
         } else if is_selected {

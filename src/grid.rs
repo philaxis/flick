@@ -93,11 +93,11 @@ impl Grid {
         });
     }
 
-    /// Brightness added to a cell, as a share of the highest active-stay score.
+    /// Brightness uses the square root of the share of the highest score.
     pub fn cell_usage(&self, id: &str, now: u64) -> f32 {
         let maximum = self.usage.values().map(|cell| cell.visits.value(now, usage::CELL_HALF_LIFE)).fold(0.0, f64::max);
         let score = self.usage.get(id).map_or(0.0, |cell| cell.visits.value(now, usage::CELL_HALF_LIFE));
-        usage::normalised(score, maximum)
+        usage::normalised(score, maximum).sqrt()
     }
 
     pub fn find(&self, id: &str) -> Option<Pos> {
@@ -293,9 +293,13 @@ mod tests {
         g.usage.entry("a".into()).or_default().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
         g.usage.entry("b".into()).or_default().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
         g.usage.get_mut("b").unwrap().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
-        assert_eq!(g.cell_usage("a", 100), 0.5);
+        assert!((g.cell_usage("a", 100) - 0.5_f32.sqrt()).abs() < 0.0001);
         assert_eq!(g.cell_usage("b", 100), 1.0);
         assert_eq!(g.cell_usage("unused", 100), 0.0);
+        g.usage.get_mut("b").unwrap().visits.record(100, 2.0, usage::CELL_HALF_LIFE);
+        assert_eq!(g.cell_usage("a", 100), 0.5);
+        assert_eq!(g.cell_usage("b", 100), 1.0);
+        assert_eq!(g.cell_usage("a", 100 + usage::CELL_HALF_LIFE), 0.5);
         let before = g.usage.clone();
         g.visit("a");
         assert_eq!(g.usage, before, "board selection only changes the row anchor");

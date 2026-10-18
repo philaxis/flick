@@ -70,7 +70,7 @@ const REACH: usize = 3;
 pub struct CellView {
     /// Marked by the user to stand out.
     pub emphasised: bool,
-    /// Active-stay score as a share of the highest cell score.
+    /// Square root of this cell's share of the highest active-stay score.
     pub usage: f32,
 }
 
@@ -701,12 +701,12 @@ impl Overlay {
                 }
                 let cell = cell_at(apart);
                 if view.emphasised {
-                    p.fill(&cell, radius, warm((0.30 + 0.12 * near + 0.08 * view.usage) * shown));
+                    p.fill(&cell, radius, warm((0.42 + 0.12 * near + 0.08 * view.usage) * shown));
                     emphasised.push((cell, shown));
                 } else {
                     // Bright enough that the other cells are seen against
                     // any wallpaper, not only the one being moved to.
-                    p.fill(&cell, radius, white((0.22 + 0.10 * near + 0.08 * view.usage) * shown));
+                    p.fill(&cell, radius, white((0.12 + 0.38 * view.usage) * (1.0 + 0.20 * near) * shown));
                 }
             }
         }
