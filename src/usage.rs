@@ -57,11 +57,16 @@ pub struct Stay<T> {
     pub current: Option<T>,
     active: f64,
     ticked: u64,
+    suspended: bool,
 }
 
 impl<T: PartialEq> Stay<T> {
     /// Ends the previous stay once; duplicate observations keep it intact.
     pub fn switch(&mut self, current: Option<T>, millis: u64) -> Option<(T, f64)> {
+        if self.suspended {
+            self.ticked = millis;
+            self.suspended = false;
+        }
         if self.current == current {
             return None;
         }
@@ -72,12 +77,17 @@ impl<T: PartialEq> Stay<T> {
         previous
     }
 
+    /// In transit, keep the old stay without starting one for a passed cell.
+    pub fn suspend(&mut self) {
+        self.suspended = true;
+    }
+
     /// A failed input query is idle too. Advance the clock even while idle,
     /// so a later input cannot claim that time.
     pub fn tick(&mut self, millis: u64, input_age: Option<u32>) -> bool {
         let elapsed = millis.saturating_sub(self.ticked);
         self.ticked = millis;
-        if self.current.is_some() && input_age.is_some_and(|age| age <= 60_000) {
+        if !self.suspended && self.current.is_some() && input_age.is_some_and(|age| age <= 60_000) {
             self.active += elapsed as f64 / 1000.0;
             return elapsed > 0;
         }
@@ -140,6 +150,25 @@ mod tests {
         stay.switch(Some(2), 9000);
         stay.tick(10_000, Some(0));
         assert_eq!(stay.active, 1.0, "time before becoming foreground is excluded");
+    }
+
+    #[test]
+    fn passed_and_bounced_cells_never_start_stays() {
+        let mut stay = Stay::default();
+        stay.switch(Some("start"), 0);
+        stay.tick(4000, Some(0));
+        // The switch pipeline suspends sampling until a settled arrival.
+        stay.suspend();
+        assert!(!stay.tick(6000, Some(0)));
+        assert_eq!(stay.current, Some("start"));
+        assert!(stay.switch(Some("start"), 7000).is_none(), "a bounce keeps the old stay");
+        stay.tick(8000, Some(0));
+        assert_eq!(stay.active, 5.0, "the partial transit tick is excluded too");
+        stay.suspend();
+        assert!(!stay.tick(10_000, Some(0)));
+        assert_eq!(stay.switch(Some("destination"), 12_000), Some(("start", 5.0)));
+        assert_eq!(stay.current, Some("destination"));
+        assert_eq!(stay.credit(CELL_TAU), 0.0);
     }
 
     #[test]

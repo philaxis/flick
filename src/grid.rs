@@ -287,7 +287,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cell_brightness_uses_the_same_decayed_counts_across_rows() {
+    fn cell_brightness_uses_the_same_decayed_credits_across_rows() {
         let mut g = grid(&[&["a"], &["b", "unused"]]);
         assert_eq!(g.cell_usage("a", 100), 0.0);
         g.usage.entry("a".into()).or_default().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_prunes_removed_cells_and_old_counts() {
+    fn usage_prunes_removed_cells_and_old_credits() {
         let mut g = grid(&[&["a", "b"]]);
         for id in ["a", "b", "gone"] {
             let cell = g.usage.entry(id.into()).or_default();

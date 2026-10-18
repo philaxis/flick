@@ -36,8 +36,8 @@ use windows::{
             Accessibility::{SetWinEventHook, HWINEVENTHOOK},
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
-                MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_UP,
+                GetAsyncKeyState, GetLastInputInfo, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, LASTINPUTINFO,
+                MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_UP,
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
@@ -130,7 +130,6 @@ struct App {
     grid: Grid,
     /// Last desktop actually observed, separate from a queued switch or board selection.
     usage_cell: usage::Stay<String>,
-    usage_cell_settled: bool,
     foreground: usage::Stay<isize>,
     usage_dirty: bool,
     usage_saved: Instant,
@@ -299,7 +298,6 @@ impl App {
             config: Config::default(),
             grid,
             usage_cell: usage::Stay::default(),
-            usage_cell_settled: false,
             foreground: usage::Stay::default(),
             usage_dirty: false,
             usage_saved: Instant::now(),
@@ -387,7 +385,6 @@ impl App {
         if self.grid.find(id).is_none() {
             return;
         }
-        self.usage_cell_settled = true;
         if let Some((previous, active)) = self.usage_cell.switch(Some(id.to_owned()), self.started.elapsed().as_millis() as u64) {
             let credit = usage::credit(active, usage::CELL_TAU);
             if credit > 0.0 && self.grid.find(&previous).is_some() {
@@ -419,7 +416,7 @@ impl App {
             .then(|| unsafe { GetTickCount() }.wrapping_sub(input.dwTime));
         self.record_foreground(unsafe { GetForegroundWindow() });
         let millis = self.started.elapsed().as_millis() as u64;
-        self.usage_dirty |= self.usage_cell.tick(millis, if self.usage_cell_settled { input_age } else { None });
+        self.usage_dirty |= self.usage_cell.tick(millis, input_age);
         self.foreground.tick(millis, input_age);
     }
 
@@ -894,7 +891,7 @@ impl App {
 
     /// Windows was just asked to switch to `to`.
     fn take_off(&mut self, to: &str) {
-        self.usage_cell_settled = false;
+        self.usage_cell.suspend();
         self.in_flight = Some(to.to_owned());
         unsafe {
             SetTimer(self.hwnd, FLIGHT_TIMER_ID, FLIGHT_MS, None);
@@ -994,7 +991,7 @@ impl App {
 
     /// The current desktop changed, by us or by Windows' own shortcuts.
     fn desktop_changed(&mut self, new: &str) {
-        self.usage_cell_settled = false;
+        self.usage_cell.suspend();
         debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
         #[cfg(feature = "debug-log")]
         {

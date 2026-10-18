@@ -1,5 +1,5 @@
 //! The full-screen view: the selected cell's windows as live previews, each
-//! sized by the window itself and its recent use, and, at the bottom of
+//! sized by the window itself and its recent active-stay credits, and, at the bottom of
 //! every monitor, a small map of all rows and cells.
 //! Windows can be dragged onto cells and monitors, cells around the map.
 //!
@@ -2463,7 +2463,7 @@ mod tests {
         rows[0].cells[1].windows = vec![window(3, true)];
         for cell in &mut rows[0].cells {
             for w in &mut cell.windows {
-                w.icon_key = w.hwnd.0 as u64;
+                w.icon_key = 9;
                 w.rect = RECT { right: 80, bottom: 50, ..Default::default() };
             }
         }
