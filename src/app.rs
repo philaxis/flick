@@ -450,12 +450,13 @@ impl App {
     /// What the minimap shows with the user on `current`.
     fn view(&self, current: &str) -> View {
         let cur = self.grid.find(current);
+        let now = usage::now();
         View {
             rows: self
                 .grid
                 .rows
                 .iter()
-                .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id) }).collect())
+                .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id), usage: self.grid.cell_usage(id, now) }).collect())
                 .collect(),
             anchors: self.grid.rows.iter().map(Row::anchor).collect(),
             cur,
@@ -989,6 +990,7 @@ impl App {
             }
         }
         let Some(desktops) = self.sync() else { return };
+        self.record_arrival(new);
         self.visit(new);
         self.bring_followers(&desktops, new);
         self.save();
@@ -1012,6 +1014,7 @@ impl App {
     fn model(&self, desktops: &Desktops) -> Model {
         let mut windows = vd::windows(&desktops.current);
         let parents = vd::process_parents();
+        let now = usage::now();
         let rows = self
             .grid
             .rows
@@ -1026,7 +1029,7 @@ impl App {
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
                         let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
-                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), windows }
+                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: self.grid.cell_usage(id, now), windows }
                     })
                     .collect();
                 RowModel {
@@ -2040,7 +2043,7 @@ pub fn render_sample(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let view = View {
         rows: vec![
-            vec![CellView::default(), CellView { emphasised: true }, CellView::default(), CellView::default()],
+            vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }, CellView::default(), CellView::default()],
             vec![CellView::default(); 2],
             vec![CellView::default(); 3],
         ],
@@ -2065,7 +2068,7 @@ pub fn render_sample(path: &str) {
 pub fn render_minimap_strip(path: &str) {
     let Ok(mut overlay) = Overlay::new() else { return };
     let cells = |n: usize| vec![CellView::default(); n];
-    let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true }], cells(4), cells(2)];
+    let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }], cells(4), cells(2)];
     let smooth = |u: f32| u * u * (3.0 - 2.0 * u);
     let (dt, scale, gap, steps) = (1.0 / 60.0, 1.5, 6, (260, 400));
     let mut plane = crate::slide::Plane::new();

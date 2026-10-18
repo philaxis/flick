@@ -70,6 +70,8 @@ const REACH: usize = 3;
 pub struct CellView {
     /// Marked by the user to stand out.
     pub emphasised: bool,
+    /// Recent visits as a share of the most visited cell.
+    pub usage: f32,
 }
 
 /// What the minimap should show.
@@ -699,12 +701,12 @@ impl Overlay {
                 }
                 let cell = cell_at(apart);
                 if view.emphasised {
-                    p.fill(&cell, radius, warm((0.30 + 0.12 * near) * shown));
+                    p.fill(&cell, radius, warm((0.30 + 0.12 * near + 0.08 * view.usage) * shown));
                     emphasised.push((cell, shown));
                 } else {
                     // Bright enough that the other cells are seen against
                     // any wallpaper, not only the one being moved to.
-                    p.fill(&cell, radius, white((0.22 + 0.10 * near) * shown));
+                    p.fill(&cell, radius, white((0.22 + 0.10 * near + 0.08 * view.usage) * shown));
                 }
             }
         }
@@ -767,7 +769,7 @@ impl Overlay {
     pub fn time_minimap(&mut self, path: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut out = BufWriter::new(File::create(path)?);
         let cells = |n| vec![CellView::default(); n];
-        let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true }], cells(4), cells(2)];
+        let rows = vec![cells(3), vec![CellView::default(), CellView { emphasised: true, ..CellView::default() }], cells(4), cells(2)];
         let view = |col, row| View {
             rows: rows.clone(),
             anchors: vec![1, col, 2, 1],

@@ -1,5 +1,6 @@
 //! The full-screen view: the selected cell's windows as live previews, each
-//! as large among the others as the window itself is, and, at the bottom of every monitor, a small map of all rows and cells.
+//! sized by the window itself and its recent use, and, at the bottom of
+//! every monitor, a small map of all rows and cells.
 //! Windows can be dragged onto cells and monitors, cells around the map.
 //!
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
@@ -10,6 +11,7 @@ use crate::{
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Painter, Rect},
     tiles::{self, Space},
     vd,
+    usage,
 };
 use std::{
     cell::RefCell,
@@ -89,6 +91,8 @@ pub struct CellModel {
     pub id: CellId,
     /// Marked by the user to stand out.
     pub emphasised: bool,
+    /// Recent visits as a share of the most visited cell.
+    pub usage: f32,
     /// Topmost first.
     pub windows: Vec<WindowModel>,
 }
@@ -118,7 +122,27 @@ impl Model {
         self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)
     }
 
-    /// The same membership and order for the main previews and a popup.
+    /// Popup membership keeps row followers but leaves out All rows windows.
+    fn popup_windows(&self, id: &str) -> Vec<(&WindowModel, bool)> {
+        self.tile_windows(id).into_iter().filter(|(_, all)| !all).collect()
+    }
+
+    /// Normalize across the whole cell, before splitting monitors or pinned
+    /// sections, so a window has the same weight in the board and its popup.
+    fn window_weights(&self, id: &str, grid: &Grid) -> HashMap<isize, f32> {
+        let now = usage::now();
+        let history = grid.usage.get(id);
+        let scores: Vec<_> = self.tile_windows(id).into_iter().map(|(w, _)| {
+            let score = usage::app_key(w.icon_key, &w.app, &w.app_name)
+                .and_then(|key| history?.windows.get(&key))
+                .map_or(0.0, |score| score.value(now));
+            (w.hwnd.0, score)
+        }).collect();
+        let maximum = scores.iter().map(|(_, score)| *score).fold(0.0, f64::max);
+        scores.into_iter().map(|(hwnd, score)| (hwnd, usage::preview_factor(score, maximum))).collect()
+    }
+
+    /// Shared membership and order, including both kinds of pinned windows.
     fn tile_windows(&self, id: &str) -> Vec<(&WindowModel, bool)> {
         let cell = self.cell(id).into_iter().flat_map(|cell| &cell.windows).map(|w| (w, false));
         // Windows pinned to their row are shown in every cell of it: going
@@ -269,6 +293,7 @@ struct AppBadge {
 struct CellLayout {
     id: CellId,
     emphasised: bool,
+    usage: f32,
     body: Rect,
     close: Rect,
     apps: Vec<AppBadge>,
@@ -816,6 +841,7 @@ impl Board {
         // sits in the same column for all rows.
         let anchors: Vec<usize> = self.grid.rows.iter().map(Row::anchor).collect();
         let windows = self.tile_windows();
+        let weights = self.model.window_weights(&self.selected, &self.grid);
         let mut tiles = Vec::new();
         let mut tiles_area = Rect::default();
         let mut sections = Vec::new();
@@ -840,7 +866,7 @@ impl Board {
                 if is_home {
                     tiles_area = part;
                 }
-                tiles.extend(layout_tiles(&group, &part, s));
+                tiles.extend(layout_tiles(&group, &part, s, &weights));
             }
             maps.push(Map { monitor: m, area: *monitor, layout });
         }
@@ -1010,7 +1036,7 @@ impl Board {
                         self.origin.0 + frame.left.round() as i32, self.origin.1 + frame.top.round() as i32,
                         w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
                 }
-                let wanted: Vec<HWND> = self.model.tile_windows(&popup.id).into_iter().map(|(window, _)| window.hwnd).collect();
+                let wanted: Vec<HWND> = self.model.popup_windows(&popup.id).into_iter().map(|(window, _)| window.hwnd).collect();
                 for hwnd in wanted {
                     if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.popup_hwnd, hwnd) } {
                         self.popup_thumbs.push((hwnd.0, thumb));
@@ -1027,12 +1053,13 @@ impl Board {
         let cell = map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)?.body;
         let cell = Rect { left: cell.left + map.area.left, right: cell.right + map.area.left,
             top: cell.top + map.area.top, bottom: cell.bottom + map.area.top };
-        let windows = self.model.tile_windows(&id);
+        let windows = self.model.popup_windows(&id);
         let s = self.scale;
         let frame = popup_frame(&cell, &map.area, map.area.top + map.layout.top, windows.is_empty(), s);
         let label = Rect { bottom: frame.top + 42.0 * s, ..grow(&frame, -14.0 * s) };
         let body = Rect { top: label.bottom + 4.0 * s, ..grow(&frame, -14.0 * s) };
-        let tiles = layout_tiles(&windows, &body, 0.55 * s);
+        let weights = self.model.window_weights(&id, &self.grid);
+        let tiles = layout_tiles(&windows, &body, 0.55 * s, &weights);
         Some(PopupLayout { id, monitor, frame, cell, label, body, tiles })
     }
 
@@ -1093,7 +1120,7 @@ impl Board {
     fn update_thumbnails(&self) {
         self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window());
         if let Some(popup) = &self.popup {
-            self.place_thumbnails(&self.popup_thumbs, &popup.tiles, &self.model.tile_windows(&popup.id),
+            self.place_thumbnails(&self.popup_thumbs, &popup.tiles, &self.model.popup_windows(&popup.id),
                 (popup.frame.left.round(), popup.frame.top.round()), None);
         }
     }
@@ -1635,10 +1662,10 @@ impl Board {
             let row = grid::row_title(&self.model.rows[pos.row].name, pos.row);
             p.text(&format!("{row}  ·  cell {}", pos.col + 1), &fonts.small, &popup.label, white(0.9));
         }
-        if self.model.tile_windows(&popup.id).is_empty() {
+        if self.model.popup_windows(&popup.id).is_empty() {
             p.text("Empty", &fonts.centered, &popup.body, white(0.45));
         }
-        let windows = self.model.tile_windows(&popup.id);
+        let windows = self.model.popup_windows(&popup.id);
         for tile in &popup.tiles {
             p.fill(&tile.frame, 5.0 * s, rgba(0.15, 0.16, 0.19, 1.0));
             p.fill_square(&tile.thumb, rgba(0.055, 0.06, 0.075, 1.0));
@@ -1832,7 +1859,7 @@ impl Board {
                 p.fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
             }
         }
-        p.fill(&cell.body, radius, white(if in_selected_row { 0.14 } else { 0.07 } * dim));
+        p.fill(&cell.body, radius, white(((if in_selected_row { 0.14 } else { 0.07 }) + 0.08 * cell.usage) * dim));
         if cell.emphasised {
             p.fill(&cell.body, radius, warm(0.26 * dim));
         }
@@ -2118,14 +2145,15 @@ fn tile_least(s: f32) -> f32 {
     (124.0 + Pin::WIDTH + Pin::TOP_WIDTH) * s
 }
 
-/// Lays out windows as rows of titled previews, all at one scale so that
-/// each is as large among the others as its window is (see `tiles`), centred
-/// in `area`.
-fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32) -> Vec<TileLayout> {
+/// Lays out titled previews from their real sizes times the cell's usage
+/// weights. The existing title-bar minimums still apply (see `tiles`).
+fn layout_tiles(windows: &[(&WindowModel, bool)], area: &Rect, s: f32, weights: &HashMap<isize, f32>) -> Vec<TileLayout> {
     let (aw, ah) = size(area);
     let (title_h, gap) = (46.0 * s, 26.0 * s);
-    let sizes: Vec<(f32, f32)> =
-        windows.iter().map(|(w, _)| ((w.rect.right - w.rect.left).max(1) as f32, (w.rect.bottom - w.rect.top).max(1) as f32)).collect();
+    let sizes: Vec<(f32, f32)> = windows.iter().map(|(w, _)| {
+        let factor = weights.get(&w.hwnd.0).copied().unwrap_or(1.0);
+        ((w.rect.right - w.rect.left).max(1) as f32 * factor, (w.rect.bottom - w.rect.top).max(1) as f32 * factor)
+    }).collect();
     let min_widths: Vec<f32> = vec![tile_least(s); windows.len()];
     let space = Space {
         area: (aw, ah),
@@ -2340,6 +2368,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
             cells.push(CellLayout {
                 id: cell.id.clone(),
                 emphasised: cell.emphasised,
+                usage: cell.usage,
                 body,
                 close: rect(body.right - 15.0 * s, body.top - 5.0 * s, 20.0 * s, 20.0 * s),
                 apps,
@@ -2403,7 +2432,7 @@ mod tests {
     }
 
     #[test]
-    fn popup_includes_the_cells_windows_and_both_kinds_of_pins() {
+    fn popup_keeps_row_followers_and_leaves_all_rows_on_the_board() {
         let mut rows = vec![row(&["a", "b"]), row(&["c"])];
         rows[0].cells[0].windows = vec![window(1, false), window(2, true)];
         rows[0].cells[1].windows = vec![window(3, false), window(4, true)];
@@ -2415,12 +2444,55 @@ mod tests {
         assert_eq!(handles("c"), [(5, false), (6, true)]);
         let popup = popup_frame(&rect(100.0, 800.0, 70.0, 50.0), &rect(0.0, 0.0, 1920.0, 1080.0), 760.0, false, 1.0);
         let body = Rect { top: popup.top + 46.0, ..grow(&popup, -14.0) };
-        let tiles = layout_tiles(&model.tile_windows("b"), &body, 0.55);
-        assert_eq!(tiles.len(), 4);
+        let handles = |id| model.popup_windows(id).iter().map(|(window, _)| window.hwnd.0).collect::<Vec<_>>();
+        assert_eq!(handles("a"), [1, 2, 4]);
+        assert_eq!(handles("b"), [2, 3, 4]);
+        assert_eq!(handles("c"), [5]);
+        let empty = Model { rows: vec![row(&["empty"])], pinned: vec![window(6, false)], current: "empty".into() };
+        assert!(empty.popup_windows("empty").is_empty());
+        let tiles = layout_tiles(&model.popup_windows("b"), &body, 0.55, &HashMap::new());
+        assert_eq!(tiles.len(), 3);
         for tile in tiles {
             assert!(tile.frame.left >= body.left - 0.5 && tile.frame.right <= body.right + 0.5);
             assert!(tile.frame.top >= body.top - 0.5 && tile.frame.bottom <= body.bottom + 0.5);
         }
+    }
+
+    #[test]
+    fn preview_weights_share_one_cell_maximum_and_keep_title_widths() {
+        let mut rows = vec![row(&["a", "b"])];
+        rows[0].cells[0].windows = vec![window(1, false), window(2, false)];
+        rows[0].cells[1].windows = vec![window(3, true)];
+        for cell in &mut rows[0].cells {
+            for w in &mut cell.windows {
+                w.icon_key = w.hwnd.0 as u64;
+                w.rect = RECT { right: 80, bottom: 50, ..Default::default() };
+            }
+        }
+        let model = Model { rows, pinned: vec![], current: "a".into() };
+        let mut grid = Grid::default();
+        let area = rect(0.0, 0.0, 1600.0, 900.0);
+        let no_data = model.window_weights("a", &grid);
+        assert!(no_data.values().all(|weight| *weight == 1.0));
+        assert_eq!(model.window_weights("b", &grid), HashMap::from([(3, 1.0)]));
+        let history = grid.usage.entry("a".into()).or_default();
+        let now = usage::now();
+        for (icon, count) in [(2, 10), (3, 5)] {
+            let score = history.windows.entry(usage::app_key(icon, "", "").unwrap()).or_default();
+            for _ in 0..count { score.record(now); }
+        }
+        let weights = model.window_weights("a", &grid);
+        assert_eq!(weights[&1], 0.7);
+        assert_eq!(weights[&2], 1.5);
+        assert!((weights[&3] - 1.1).abs() < 0.0001);
+        assert!(model.window_weights("b", &grid).values().all(|weight| *weight == 1.0));
+        // A part gets the whole cell's weights even when its winner is elsewhere.
+        let part = vec![(&model.rows[0].cells[0].windows[0], false)];
+        let tiles = layout_tiles(&part, &area, 1.0, &weights);
+        assert!(size(&tiles[0].frame).0 >= tile_least(1.0));
+        let popup = layout_tiles(&model.popup_windows("a"), &area, 1.0, &weights);
+        assert_eq!(popup.len(), 3);
+        assert!(popup.iter().all(|tile| size(&tile.frame).0 >= tile_least(1.0)));
     }
 
     #[test]
@@ -2461,7 +2533,7 @@ mod tests {
             name: String::new(),
             memory: 0,
             asleep: false,
-            cells: cells.iter().map(|id| CellModel { id: id.to_string(), emphasised: false, windows: Vec::new() }).collect(),
+            cells: cells.iter().map(|id| CellModel { id: id.to_string(), emphasised: false, usage: 0.0, windows: Vec::new() }).collect(),
         }
     }
 
