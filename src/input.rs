@@ -33,12 +33,11 @@ use windows::Win32::{
     },
     UI::{
         Input::{
-            GetRawInputData,
             KeyboardAndMouse::{
                 MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
                 KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
             },
-            RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
+            HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
             RID_INPUT, RIM_TYPEHID, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
         },
         WindowsAndMessaging::{
@@ -52,6 +51,11 @@ use windows::Win32::{
         },
     },
 };
+
+#[cfg(not(test))]
+pub(crate) use windows::Win32::UI::Input::{GetRawInputData, RegisterRawInputDevices};
+#[cfg(test)]
+pub(crate) use tests::api::{GetRawInputData, RegisterRawInputDevices};
 
 /// One step in a direction, as a hotkey takes it; sent by the test driver
 /// (examples/drive.rs). wparam: direction index (see `dir_from_index`).
@@ -447,12 +451,16 @@ fn reload_touchpad() {
     // Never wait for the app while hooks are installed.
     let devices = TOUCHPAD_DEVICES.try_lock().ok().and_then(|mut pending| pending.take());
     let Some(devices) = devices else { return };
+    TOUCHPAD_BUTTONS.set(0);
+    let on = !devices.is_empty();
+    let was_on = TOUCHPAD_ON.replace(false);
+    if !on && !was_on { return; }
     TOUCHPAD.with(|reader| reader.borrow_mut().cancel());
     with_settings(|s| { finish_release(s, Source::Touchpad, Some(false)); false });
-    let on = !devices.is_empty();
     TOUCHPAD.with(|reader| *reader.borrow_mut() = crate::touchpad::Reader::new(devices));
     let failed = !crate::touchpad::register(HWND(RAW_WINDOW.get()), on) && on;
     crate::touchpad::registration_failed(failed);
+    TOUCHPAD_ON.set(on && !failed);
     if failed {
         TOUCHPAD.with(|reader| reader.borrow_mut().devices.clear());
     }
@@ -461,6 +469,7 @@ fn reload_touchpad() {
 // State of the hook thread.
 thread_local! {
     static TOUCHPAD: RefCell<crate::touchpad::Reader> = RefCell::new(crate::touchpad::Reader::default());
+    static TOUCHPAD_ON: Cell<bool> = const { Cell::new(false) };
     static TOUCHPAD_REST: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     static TOUCHPAD_BUTTONS: Cell<u32> = const { Cell::new(0) };
     static SETTINGS: RefCell<Option<Settings>> = const { RefCell::new(None) };
@@ -567,6 +576,9 @@ fn reload() {
 
 /// Puts the hooks in, taking out the ones there were.
 fn hook() {
+    TOUCHPAD_BUTTONS.set(0);
+    #[cfg(test)]
+    if tests::api::mocking() { return; }
     unsafe {
         let module = GetModuleHandleW(None).unwrap_or_default();
         let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
@@ -613,14 +625,7 @@ fn hook_thread() {
         SetTimer(None, 0, REHOOK_MS, Some(rehook));
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            if message.hwnd.0 == 0 && message.message == WM_RELOAD {
-                reload();
-            } else if message.hwnd.0 == 0 && message.message == WM_TOUCHPAD {
-                reload_touchpad();
-            } else if message.hwnd.0 == 0 && message.message == WM_WOKE {
-                end_hold("the PC had gone to sleep");
-                hook();
-            } else {
+            if message.hwnd.0 != 0 || !thread_message(message.message) {
                 // Timer callbacks arrive here.
                 DispatchMessageW(&message);
             }
@@ -634,7 +639,19 @@ fn hook_thread() {
     }
 }
 
+fn thread_message(message: u32) -> bool {
+    match message {
+        WM_RELOAD => reload(),
+        WM_TOUCHPAD => reload_touchpad(),
+        WM_WOKE => { end_hold("the PC had gone to sleep"); hook(); }
+        _ => return false,
+    }
+    true
+}
+
 fn post(s: &Settings, message: u32, wparam: usize) {
+    #[cfg(test)]
+    if tests::api::post(message, wparam) { return; }
     unsafe {
         let hold = HOLD_ID.load(Ordering::SeqCst);
         let _ = PostMessageW(HWND(s.target), message, WPARAM(wparam), LPARAM(hold as isize));
@@ -665,6 +682,9 @@ fn held() -> bool {
 }
 
 fn press(source: Source) {
+    if source == Source::Touchpad && !HELD.with(|held| held.borrow().has(source)) {
+        TOUCHPAD_BUTTONS.set(0);
+    }
     let began = HELD.with(|held| held.borrow_mut().press(source));
     debug_log!("down {source:?}{}", if began { ": hold begins" } else { "" });
     if began {
@@ -706,7 +726,8 @@ fn stop_listening() {
 /// Ends the hold, whatever holds it, without waiting for that to be let go
 /// of: for when letting go could not be seen, or does not matter any more.
 fn end_hold(why: &str) {
-    TOUCHPAD.with(|reader| reader.borrow_mut().cancel());
+    TOUCHPAD_BUTTONS.set(0);
+    if TOUCHPAD_ON.get() { TOUCHPAD.with(|reader| reader.borrow_mut().cancel()); }
     if HELD.with(|held| held.borrow_mut().clear()) {
         debug_log!("press ignored from here on, hold ended by the app: {why}");
         let _ = why;
@@ -894,37 +915,66 @@ fn raw_key_up(key: u32) {
 /// Raw mouse input while the trigger is held: the device's own movement,
 /// unaffected by the cursor being frozen.
 fn on_raw_input(handle: HRAWINPUT) {
+    if !TOUCHPAD_ON.get() { return on_raw_mouse_input(handle); }
+    let mut buffer = [0u64; 128];
+    let mut size = std::mem::size_of_val(&buffer) as u32;
+    let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(buffer.as_mut_ptr().cast()), &mut size, header) };
+    // Oversized packets fail the bounded read; never query, allocate, or retry here.
+    if read == u32::MAX || read < header || read as usize > std::mem::size_of_val(&buffer) { return; }
+    let raw = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
+    let offset = std::mem::offset_of!(RAWINPUT, data);
+    if raw.header.dwType == RIM_TYPEMOUSE.0 || raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+        if !held() { return; }
+        let minimum = if raw.header.dwType == RIM_TYPEMOUSE.0 {
+            std::mem::size_of::<windows::Win32::UI::Input::RAWMOUSE>()
+        } else {
+            std::mem::size_of::<windows::Win32::UI::Input::RAWKEYBOARD>()
+        };
+        if (read as usize) < offset + minimum { return; }
+        if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
+            // Mouse releases still end other triggers; only contact movement counts.
+            if raw.header.dwType == RIM_TYPEMOUSE.0 {
+                let mut buttons = *raw;
+                unsafe { buttons.data.mouse.lLastX = 0; buttons.data.mouse.lLastY = 0; buttons.data.mouse.usFlags = 0; }
+                return raw_mouse_input(&buttons);
+            }
+        }
+        return raw_mouse_input(raw);
+    }
+    if raw.header.dwType != RIM_TYPEHID.0 || (read as usize) < offset + 8 { return; }
+    let hid = unsafe { &raw.data.hid };
+    let Some(bytes) = (hid.dwSizeHid as usize).checked_mul(hid.dwCount as usize) else { return };
+    if hid.dwSizeHid == 0 || bytes > read as usize - offset - 8 { return; }
+    let reports = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>().add(offset + 8), bytes) };
+    for report in reports.chunks_exact(hid.dwSizeHid as usize) {
+        let event = TOUCHPAD.with(|reader| reader.borrow_mut().report(raw.header.hDevice.0, report, unsafe { GetMessageTime() } as u32));
+        if let Some(event) = event { touchpad_event(event); }
+    }
+}
+
+fn on_raw_mouse_input(handle: HRAWINPUT) {
+    if !held() {
+        return;
+    }
+    let mut raw = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(&mut raw as *mut _ as *mut _), &mut size, header) };
+    if read == u32::MAX {
+        return;
+    }
+    raw_mouse_input(&raw);
+}
+
+fn raw_mouse_input(raw: &RAWINPUT) {
     const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
     const MOUSE_VIRTUAL_DESKTOP: u16 = 0x02;
     // Buttons coming up, as raw input flags them.
     const BUTTONS_UP: [(u16, Source); 3] = [(0x0020, Source::Middle), (0x0080, Source::XButton1), (0x0200, Source::XButton2)];
     const KEY_UP: u16 = 0x01;
     const KEY_E0: u16 = 0x02;
-    if !held() && TOUCHPAD.with(|r| r.borrow().devices.is_empty()) { return; }
-    let mut size = 0;
-    let header = std::mem::size_of::<RAWINPUTHEADER>() as u32;
-    unsafe { GetRawInputData(handle, RID_INPUT, None, &mut size, header); }
-    if size < header || size > 65536 { return; }
-    let mut buffer = vec![0u64; (size as usize).max(std::mem::size_of::<RAWINPUT>()).div_ceil(8)];
-    let read = unsafe { GetRawInputData(handle, RID_INPUT, Some(buffer.as_mut_ptr().cast()), &mut size, header) };
-    if read == u32::MAX || read < header { return; }
-    let raw = unsafe { &*(buffer.as_ptr() as *const RAWINPUT) };
-    let offset = std::mem::offset_of!(RAWINPUT, data);
-    if raw.header.dwType == RIM_TYPEHID.0 {
-        if (read as usize) < offset + 8 { return; }
-        let hid = unsafe { &raw.data.hid };
-        let Some(bytes) = (hid.dwSizeHid as usize).checked_mul(hid.dwCount as usize) else { return };
-        if hid.dwSizeHid == 0 || bytes > read as usize - offset - 8 { return; }
-        let reports = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>().add(offset + 8), bytes) };
-        for report in reports.chunks_exact(hid.dwSizeHid as usize) {
-            let event = TOUCHPAD.with(|reader| reader.borrow_mut().report(raw.header.hDevice.0, report, unsafe { GetMessageTime() } as u32));
-            if let Some(event) = event { touchpad_event(event); }
-        }
-        return;
-    }
-    if !held() { return; }
     if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
-        if (read as usize) < offset + std::mem::size_of::<windows::Win32::UI::Input::RAWKEYBOARD>() { return; }
         let keyboard = unsafe { raw.data.keyboard };
         if keyboard.Flags & KEY_UP != 0 {
             // Raw input does not tell right from left Ctrl and Alt by the key.
@@ -940,7 +990,6 @@ fn on_raw_input(handle: HRAWINPUT) {
     if raw.header.dwType != RIM_TYPEMOUSE.0 {
         return;
     }
-    if (read as usize) < offset + std::mem::size_of::<windows::Win32::UI::Input::RAWMOUSE>() { return; }
     let mouse = unsafe { raw.data.mouse };
     let buttons = unsafe { mouse.Anonymous.Anonymous.usButtonFlags };
     for (flag, source) in BUTTONS_UP {
@@ -951,9 +1000,6 @@ fn on_raw_input(handle: HRAWINPUT) {
     if !held() {
         return;
     }
-    // During a touchpad hold only contact deltas count. Windows may also emit
-    // legacy mouse deltas for the remaining one or two fingers.
-    if HELD.with(|held| held.borrow().has(Source::Touchpad)) { return; }
     #[cfg(feature = "debug-log")]
     crate::debuglog::device(raw.header.hDevice);
     let (dx, dy) = if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
@@ -1069,6 +1115,11 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
 
 /// Returns true when the event belongs to the gesture and must not reach apps.
 fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
+    if (TOUCHPAD_ON.get() || TOUCHPAD_BUTTONS.get() != 0) && on_touchpad_mouse(message, info) { return true; }
+    on_mouse_trigger(s, message, info)
+}
+
+fn on_touchpad_mouse(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     let xbutton = (info.mouseData >> 16) as u16;
     // Track swallowed downs so their ups cannot leak after the last contact lifts.
     let button_edge = match message {
@@ -1080,9 +1131,13 @@ fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     };
     let touchpad = HELD.with(|held| held.borrow().has(Source::Touchpad));
     if let Some((bit, down)) = button_edge {
-        if down && touchpad {
-            TOUCHPAD_BUTTONS.set(TOUCHPAD_BUTTONS.get() | bit);
-            return true;
+        if down {
+            if touchpad {
+                TOUCHPAD_BUTTONS.set(TOUCHPAD_BUTTONS.get() | bit);
+                return true;
+            }
+            // A fresh ordinary down supersedes a swallowed down whose up was lost.
+            TOUCHPAD_BUTTONS.set(TOUCHPAD_BUTTONS.get() & !bit);
         }
         if !down && TOUCHPAD_BUTTONS.get() & bit != 0 {
             TOUCHPAD_BUTTONS.set(TOUCHPAD_BUTTONS.get() & !bit);
@@ -1090,6 +1145,11 @@ fn on_mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
         }
     }
     if touchpad && matches!(message, WM_MOUSEMOVE | WM_MOUSEWHEEL | WM_MOUSEHWHEEL) { return true; }
+    false
+}
+
+fn on_mouse_trigger(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool {
+    let xbutton = (info.mouseData >> 16) as u16;
     let button = match message {
         WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 1 => Some((Trigger::XButton1, Source::XButton1)),
         WM_XBUTTONDOWN | WM_XBUTTONUP if xbutton == 2 => Some((Trigger::XButton2, Source::XButton2)),
@@ -1265,6 +1325,278 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 mod tests {
     use super::*;
 
+    mod legacy {
+        use super::super::*;
+        include!("input_legacy_test.rs");
+        pub(super) fn mouse(s: &Settings, message: u32, info: &MSLLHOOKSTRUCT) -> bool { on_mouse(s, message, info) }
+        pub(super) fn raw(handle: HRAWINPUT) { on_raw_input(handle); }
+    }
+
+    pub(crate) mod api {
+        use super::*;
+        use std::ffi::c_void;
+        use windows::Win32::UI::Input::RAW_INPUT_DATA_COMMAND_FLAGS;
+
+        #[derive(Clone, Debug, PartialEq)]
+        pub(super) struct Read {
+            pub command: u32,
+            pub capacity: u32,
+            pub header: u32,
+            pub query: bool,
+        }
+        #[derive(Default)]
+        pub(super) struct Calls {
+            pub enabled: bool,
+            pub packet: Vec<u8>,
+            pub reads: Vec<Read>,
+            pub registrations: Vec<Vec<(u16, u16, u32, isize)>>,
+            pub messages: Vec<(u32, usize)>,
+        }
+        thread_local! { pub(super) static CALLS: RefCell<Calls> = RefCell::new(Calls::default()); }
+        pub(crate) fn mocking() -> bool { CALLS.with(|c| c.borrow().enabled) }
+        pub(crate) fn post(message: u32, wparam: usize) -> bool {
+            CALLS.with(|c| {
+                let mut c = c.borrow_mut();
+                if !c.enabled { return false; }
+                c.messages.push((message, wparam));
+                true
+            })
+        }
+        #[allow(non_snake_case)]
+        pub(crate) unsafe fn GetRawInputData(handle: HRAWINPUT, command: RAW_INPUT_DATA_COMMAND_FLAGS,
+            data: Option<*mut c_void>, size: *mut u32, header: u32) -> u32 {
+            if !mocking() {
+                return windows::Win32::UI::Input::GetRawInputData(handle, command, data, size, header);
+            }
+            CALLS.with(|c| {
+                let mut c = c.borrow_mut();
+                c.reads.push(Read { command: command.0, capacity: *size, header, query: data.is_none() });
+                let capacity = *size as usize;
+                *size = c.packet.len() as u32;
+                let Some(data) = data else { return 0 };
+                if c.packet.len() > capacity { return u32::MAX; }
+                std::ptr::copy_nonoverlapping(c.packet.as_ptr(), data.cast::<u8>(), c.packet.len());
+                c.packet.len() as u32
+            })
+        }
+        #[allow(non_snake_case)]
+        pub(crate) unsafe fn RegisterRawInputDevices(devices: &[RAWINPUTDEVICE], size: u32) -> windows::core::Result<()> {
+            if !mocking() { return windows::Win32::UI::Input::RegisterRawInputDevices(devices, size); }
+            assert_eq!(size as usize, std::mem::size_of::<RAWINPUTDEVICE>());
+            CALLS.with(|c| c.borrow_mut().registrations.push(devices.iter()
+                .map(|d| (d.usUsagePage, d.usUsage, d.dwFlags.0, d.hwndTarget.0)).collect()));
+            Ok(())
+        }
+    }
+
+    fn settings() -> Settings { Settings { target: 0, triggers: vec![Trigger::XButton2], step_x: 260, step_y: 400 } }
+
+    fn reset() {
+        api::CALLS.with(|c| *c.borrow_mut() = api::Calls { enabled: true, ..Default::default() });
+        HELD.with(|held| { held.borrow_mut().clear(); });
+        TOUCHPAD_ON.set(false);
+        TOUCHPAD_BUTTONS.set(0);
+        SETTINGS.with(|s| *s.borrow_mut() = Some(settings()));
+        STEPPED.set(false);
+        DRAGGING.set(false);
+        STRAYED.set(((0, 0), 0));
+        PLANE.set(Plane::new());
+        LAST_ABSOLUTE.set(None);
+        LAST_CLICK.set(None);
+        LAST_TAP.set(None);
+    }
+
+    const EDGES: [(u32, u32, u32, u32); 5] = [
+        (WM_LBUTTONDOWN, WM_LBUTTONUP, 0, 1),
+        (WM_RBUTTONDOWN, WM_RBUTTONUP, 0, 2),
+        (WM_MBUTTONDOWN, WM_MBUTTONUP, 0, 4),
+        (WM_XBUTTONDOWN, WM_XBUTTONUP, 1 << 16, 8),
+        (WM_XBUTTONDOWN, WM_XBUTTONUP, 2 << 16, 16),
+    ];
+
+    #[test]
+    fn an_ordinary_down_recovers_every_button_after_a_lost_up() {
+        for (down, up, mouse_data, bit) in EDGES {
+            reset();
+            TOUCHPAD_ON.set(true);
+            HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });
+            let info = MSLLHOOKSTRUCT { mouseData: mouse_data, ..Default::default() };
+            let s = Settings { triggers: vec![], ..settings() };
+            assert!(on_mouse(&s, down, &info));
+            assert_eq!(TOUCHPAD_BUTTONS.get(), bit);
+            HELD.with(|held| { held.borrow_mut().clear(); }); // the swallowed up was lost
+            assert!(!on_mouse(&s, down, &info));
+            assert_eq!(TOUCHPAD_BUTTONS.get(), 0);
+            assert!(!on_mouse(&s, up, &info));
+        }
+    }
+
+    #[test]
+    fn lifecycle_resets_clear_stale_buttons_even_after_the_hold_has_ended() {
+        for holding in [false, true] {
+            for action in [0, 1, 2, 3, 4] {
+                reset();
+                TOUCHPAD_ON.set(true);
+                if holding { HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); }); }
+                TOUCHPAD_BUTTONS.set(31);
+                match action {
+                    0 => end_hold("the hook lost a release"),
+                    1 => assert!(thread_message(WM_WOKE)),
+                    2 => assert!(thread_message(WM_RELOAD)),
+                    3 => hook(), // hook replacement after timeout
+                    _ => {
+                        *TOUCHPAD_DEVICES.lock().unwrap() = Some(Vec::new());
+                        assert!(thread_message(WM_TOUCHPAD));
+                    }
+                }
+                assert_eq!(TOUCHPAD_BUTTONS.get(), 0, "holding={holding}, reset={action}");
+                HELD.with(|held| { held.borrow_mut().clear(); });
+                let s = Settings { triggers: vec![], ..settings() };
+                for (down, up, mouse_data, _) in EDGES {
+                    let info = MSLLHOOKSTRUCT { mouseData: mouse_data, ..Default::default() };
+                    assert!(!on_mouse(&s, down, &info));
+                    assert!(!on_mouse(&s, up, &info));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_touchpad_source_clears_old_bits_even_when_another_trigger_holds() {
+        reset();
+        HELD.with(|held| { held.borrow_mut().press(Source::Key(0x7C)); });
+        TOUCHPAD_BUTTONS.set(31);
+        press(Source::Touchpad);
+        assert_eq!(TOUCHPAD_BUTTONS.get(), 0);
+        TOUCHPAD_BUTTONS.set(1);
+        press(Source::Touchpad); // repeated down is still the same hold
+        assert_eq!(TOUCHPAD_BUTTONS.get(), 1);
+    }
+
+    fn packet(kind: u32, len: usize) -> Vec<u8> {
+        let mut packet = vec![0; len];
+        packet[..4].copy_from_slice(&kind.to_le_bytes());
+        packet[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        packet
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        reads: Vec<api::Read>,
+        registrations: Vec<Vec<(u16, u16, u32, isize)>>,
+        messages: Vec<(u32, usize)>,
+        strayed: ((i32, i32), i32),
+        held: bool,
+        sources: Vec<Source>,
+        last_absolute: Option<(i32, i32)>,
+        stepped: bool,
+    }
+
+    fn raw_outcome(bytes: &[u8], holding: bool, baseline: bool) -> Outcome {
+        reset();
+        if holding { HELD.with(|held| { held.borrow_mut().press(Source::Key(0x7C)); }); }
+        api::CALLS.with(|c| c.borrow_mut().packet = bytes.to_vec());
+        if baseline { legacy::raw(HRAWINPUT(0)); } else { on_raw_input(HRAWINPUT(0)); }
+        api::CALLS.with(|c| {
+            let c = c.borrow();
+            Outcome { reads: c.reads.clone(), registrations: c.registrations.clone(), messages: c.messages.clone(),
+                strayed: STRAYED.get(), held: held(),
+                sources: [Source::XButton1, Source::XButton2, Source::Middle, Source::Key(0x7C), Source::Touchpad].into_iter()
+                    .filter(|source| HELD.with(|held| held.borrow().has(*source))).collect(),
+                last_absolute: LAST_ABSOLUTE.get(), stepped: STEPPED.get() }
+        })
+    }
+
+    #[test]
+    fn feature_off_matches_pre_feature_hook_and_raw_packets_byte_for_byte() {
+        assert!(!Config::default().three_finger_touchpad);
+        let offset = std::mem::offset_of!(RAWINPUT, data);
+        let mut mouse = packet(RIM_TYPEMOUSE.0, std::mem::size_of::<RAWINPUT>());
+        mouse[offset + std::mem::offset_of!(windows::Win32::UI::Input::RAWMOUSE, lLastX)..][..4].copy_from_slice(&12i32.to_le_bytes());
+        mouse[offset + std::mem::offset_of!(windows::Win32::UI::Input::RAWMOUSE, lLastY)..][..4].copy_from_slice(&(-7i32).to_le_bytes());
+        let mut absolute = mouse.clone();
+        absolute[offset..offset + 2].copy_from_slice(&1u16.to_le_bytes());
+        let mut key = packet(RIM_TYPEKEYBOARD.0, std::mem::size_of::<RAWINPUT>());
+        key[offset + std::mem::offset_of!(windows::Win32::UI::Input::RAWKEYBOARD, Flags)..][..2].copy_from_slice(&1u16.to_le_bytes());
+        key[offset + std::mem::offset_of!(windows::Win32::UI::Input::RAWKEYBOARD, VKey)..][..2].copy_from_slice(&0x7Cu16.to_le_bytes());
+        let mut button = mouse.clone();
+        button[offset + 4..offset + 6].copy_from_slice(&0x200u16.to_le_bytes());
+        for bytes in [mouse, absolute, key, button, packet(RIM_TYPEHID.0, std::mem::size_of::<RAWINPUT>())] {
+            for holding in [false, true] {
+                let expected = raw_outcome(&bytes, holding, true);
+                let actual = raw_outcome(&bytes, holding, false);
+                assert_eq!(actual, expected, "kind {}, holding {holding}", bytes[0]);
+                assert_eq!(actual.reads.len(), usize::from(holding));
+                for read in &actual.reads {
+                    assert!(!read.query);
+                    assert_eq!(read.capacity as usize, std::mem::size_of::<RAWINPUT>());
+                }
+                assert!(actual.registrations.iter().flatten().all(|(page, _, _, _)| *page != 0x0D));
+            }
+        }
+        for holding in [false, true] {
+            for (down, up, mouse_data, _) in EDGES {
+                for message in [down, up, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL] {
+                    let info = MSLLHOOKSTRUCT { mouseData: mouse_data, ..Default::default() };
+                    let s = if holding { settings() } else { Settings { triggers: vec![], ..settings() } };
+                    let run = |baseline| {
+                        reset();
+                        if holding { HELD.with(|held| { held.borrow_mut().press(Source::Key(0x7C)); }); }
+                        let swallowed = if baseline { legacy::mouse(&s, message, &info) } else { on_mouse(&s, message, &info) };
+                        let sources: Vec<_> = [Source::XButton1, Source::XButton2, Source::Middle, Source::Key(0x7C)]
+                            .into_iter().filter(|source| HELD.with(|held| held.borrow().has(*source))).collect();
+                        assert_eq!(TOUCHPAD_BUTTONS.get(), 0);
+                        api::CALLS.with(|c| { let c = c.borrow(); (swallowed, sources, c.registrations.clone(), c.messages.clone()) })
+                    };
+                    assert_eq!(run(false), run(true));
+                }
+            }
+        }
+        reset();
+        *TOUCHPAD_DEVICES.lock().unwrap() = Some(Vec::new());
+        assert!(thread_message(WM_TOUCHPAD));
+        api::CALLS.with(|c| assert!(c.borrow().registrations.is_empty(), "OFF registered/unregistered HID"));
+    }
+
+    #[test]
+    fn shared_legacy_processing_is_unchanged_from_the_frozen_tag() {
+        let baseline = include_str!("input_legacy_test.rs");
+        let current = include_str!("input.rs");
+        let hook = current.split_once("fn on_mouse_trigger(").unwrap().1.split_once("{\n").unwrap().1
+            .split_once("\nfn key_event(").unwrap().0.trim();
+        let old_hook = baseline.split_once("fn on_mouse(").unwrap().1.split_once("{\n").unwrap().1.trim();
+        assert_eq!(hook, old_hook);
+        let raw = current.split_once("fn raw_mouse_input(").unwrap().1
+            .split_once("    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {").unwrap().1
+            .split_once("\nfn touchpad_event(").unwrap().0.trim();
+        let old_raw = baseline.split_once("    if raw.header.dwType == RIM_TYPEKEYBOARD.0 {").unwrap().1
+            .split_once("\nfn on_mouse(").unwrap().0.trim();
+        assert_eq!(raw, old_raw);
+    }
+
+    #[test]
+    fn enabled_raw_reads_once_into_a_bounded_stack_buffer_and_skips_idle_mouse_keys() {
+        for kind in [RIM_TYPEMOUSE.0, RIM_TYPEKEYBOARD.0, RIM_TYPEHID.0] {
+            for size in [std::mem::size_of::<RAWINPUT>(), 1024, 1025] {
+                reset();
+                TOUCHPAD_ON.set(true);
+                STRAYED.set(((123, 456), 789));
+                api::CALLS.with(|c| c.borrow_mut().packet = packet(kind, size));
+                on_raw_input(HRAWINPUT(0));
+                assert_eq!(STRAYED.get(), ((123, 456), 789));
+                assert!(!held());
+                api::CALLS.with(|c| {
+                    let c = c.borrow();
+                    assert_eq!(c.reads.len(), 1);
+                    assert_eq!(c.reads[0].capacity, 1024);
+                    assert!(!c.reads[0].query);
+                    assert!(c.messages.is_empty());
+                    assert!(c.registrations.is_empty());
+                });
+            }
+        }
+    }
+
     /// Reads real reports without installing hooks, freezing the cursor, or changing settings.
     #[test]
     #[ignore = "requires the user at a precision touchpad for 45 seconds"]
@@ -1273,6 +1605,7 @@ mod tests {
         let devices = crate::touchpad::probe_devices();
         assert!(!devices.is_empty(), "no readable precision touchpad collection");
         TOUCHPAD.with(|reader| *reader.borrow_mut() = crate::touchpad::Reader::new(devices));
+        TOUCHPAD_ON.set(true);
         unsafe {
             let module = GetModuleHandleW(None).unwrap_or_default();
             let class = windows::core::w!("flick.touchpad.probe");
@@ -1290,6 +1623,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             crate::touchpad::register(window, false);
+            TOUCHPAD_ON.set(false);
             let _ = DestroyWindow(window);
         }
     }
@@ -1298,6 +1632,7 @@ mod tests {
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
         let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400 };
         let info = MSLLHOOKSTRUCT::default();
+        TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });
         for message in [WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_LBUTTONDOWN, WM_RBUTTONDOWN] {
             assert!(on_mouse(&settings, message, &info));

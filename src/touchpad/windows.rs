@@ -120,7 +120,9 @@ pub fn poll(enabled: bool) -> Status {
             } else {
                 status
             };
-            crate::input::update_touchpad(readers);
+            if status == Status::Active || known.1 == Status::Active {
+                crate::input::update_touchpad(readers);
+            }
             *known = (handles, status);
         }
         known.1
@@ -194,7 +196,7 @@ pub fn register(window: HWND, on: bool) -> bool {
         hwndTarget: if on { window } else { HWND(0) },
     };
     unsafe {
-        RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok()
+        crate::input::RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok()
     }
 }
 
