@@ -12,9 +12,9 @@ use crate::{
     settings::{self, Settings},
     stack::{self, Kind},
     tray::{self, Command, PinCommand, PinState, RowCommand},
+    usage,
     vd::{self, Desktops},
     vdapi,
-    usage,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -301,7 +301,8 @@ impl App {
             foreground: usage::Foreground::default(),
             ignore_foreground: HWND(0),
             usage_dirty: false,
-            usage_saved: Instant::now(),            minimap: Minimap::spawn(),
+            usage_saved: Instant::now(),
+            minimap: Minimap::spawn(),
             board,
             board_settling: Instant::now(),
             focus_before_board: HWND(0),
@@ -379,6 +380,9 @@ impl App {
         if pid == unsafe { GetCurrentProcessId() } || !vd::is_app_window(hwnd) {
             return;
         }
+        if !self.foreground.record(hwnd.0, self.started.elapsed().as_millis() as u64) {
+            return;
+        }
         let cell = if vd::pinned_everywhere(hwnd) {
             Desktops::read().map(|d| d.current)
         } else {
@@ -389,10 +393,8 @@ impl App {
         let exe = vd::exe_name(pid).unwrap_or_default();
         let name = if icon == 0 && exe.is_empty() { vd::app_label(pid) } else { String::new() };
         let Some(key) = usage::app_key(icon, &exe, &name) else { return };
-        if self.foreground.record(hwnd.0, self.started.elapsed().as_millis() as u64) {
-            self.grid.usage.entry(cell).or_default().windows.entry(key).or_default().record(usage::now());
-            self.usage_dirty = true;
-        }
+        self.grid.usage.entry(cell).or_default().windows.entry(key).or_default().record(usage::now());
+        self.usage_dirty = true;
     }
 
     /// Saves the grid and reorders Windows' own desktop list to match it
@@ -1970,8 +1972,8 @@ pub fn run(first_run: bool) {
         });
         if !remembered {
             app.visit(&desktops.current);
-        app.record_arrival(&desktops.current);
         }
+        app.record_arrival(&desktops.current);
         app.commit();
     }
     app.apply_config();

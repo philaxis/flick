@@ -285,6 +285,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cell_brightness_uses_the_same_decayed_counts_across_rows() {
+        let mut g = grid(&[&["a"], &["b", "unused"]]);
+        assert_eq!(g.cell_usage("a", 100), 0.0);
+        g.usage.entry("a".into()).or_default().visits.record(100);
+        g.usage.entry("b".into()).or_default().visits.record(100);
+        g.usage.get_mut("b").unwrap().visits.record(100);
+        assert_eq!(g.cell_usage("a", 100), 0.5);
+        assert_eq!(g.cell_usage("b", 100), 1.0);
+        assert_eq!(g.cell_usage("unused", 100), 0.0);
+        let before = g.usage.clone();
+        g.visit("a");
+        assert_eq!(g.usage, before, "board selection only changes the row anchor");
+    }
+
+    #[test]
     fn usage_prunes_removed_cells_and_old_counts() {
         let mut g = grid(&[&["a", "b"]]);
         for id in ["a", "b", "gone"] {

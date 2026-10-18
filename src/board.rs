@@ -10,8 +10,8 @@ use crate::{
     grid::{self, CellId, Dir, Grid, Row},
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Painter, Rect},
     tiles::{self, Space},
-    vd,
     usage,
+    vd,
 };
 use std::{
     cell::RefCell,

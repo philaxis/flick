@@ -14,6 +14,7 @@ pub fn now() -> u64 {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Score {
     pub score: f64,
+    /// Unix seconds of the last counted use.
     pub updated: u64,
 }
 
@@ -70,15 +71,16 @@ pub fn app_key(icon: u64, exe: &str, name: &str) -> Option<String> {
 /// within a second are not another use.
 #[derive(Default)]
 pub struct Foreground {
-    last: Option<(isize, u64)>,
+    recent: BTreeMap<isize, u64>,
 }
 
 impl Foreground {
     pub fn record(&mut self, window: isize, millis: u64) -> bool {
-        if self.last.is_some_and(|(last, at)| last == window && millis.saturating_sub(at) < 1000) {
+        self.recent.retain(|_, at| millis.saturating_sub(*at) < 1000);
+        if self.recent.contains_key(&window) {
             return false;
         }
-        self.last = Some((window, millis));
+        self.recent.insert(window, millis);
         true
     }
 }
@@ -121,8 +123,12 @@ mod tests {
         assert_eq!(app_key(0, "", ""), None);
         let mut foreground = Foreground::default();
         assert!(foreground.record(1, 0));
+        assert!(foreground.record(2, 1));
         assert!(!foreground.record(1, 999));
         assert!(foreground.record(1, 1000));
         assert!(foreground.record(2, 1001));
+        assert_eq!(foreground.recent.len(), 2);
+        assert!(foreground.record(3, 2001));
+        assert_eq!(foreground.recent.len(), 1);
     }
 }
