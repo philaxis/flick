@@ -70,7 +70,7 @@ const REACH: usize = 3;
 pub struct CellView {
     /// Marked by the user to stand out.
     pub emphasised: bool,
-    /// Recent visits as a share of the most visited cell.
+    /// Active-stay score as a share of the highest cell score.
     pub usage: f32,
 }
 

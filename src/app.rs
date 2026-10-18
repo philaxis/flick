@@ -29,13 +29,14 @@ use windows::{
         System::{
             Com::{CoInitializeEx, COINIT_MULTITHREADED},
             LibraryLoader::GetModuleHandleW,
+            SystemInformation::GetTickCount,
             Threading::GetCurrentProcessId,
         },
         UI::{
             Accessibility::{SetWinEventHook, HWINEVENTHOOK},
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+                GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
                 MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_UP,
             },
             Shell::ShellExecuteW,
@@ -128,9 +129,9 @@ struct App {
     config: Config,
     grid: Grid,
     /// Last desktop actually observed, separate from a queued switch or board selection.
-    usage_cell: String,
-    foreground: usage::Foreground,
-    ignore_foreground: HWND,
+    usage_cell: usage::Stay<String>,
+    usage_cell_settled: bool,
+    foreground: usage::Stay<isize>,
     usage_dirty: bool,
     usage_saved: Instant,
     minimap: Minimap,
@@ -297,9 +298,9 @@ impl App {
             hwnd,
             config: Config::default(),
             grid,
-            usage_cell: String::new(),
-            foreground: usage::Foreground::default(),
-            ignore_foreground: HWND(0),
+            usage_cell: usage::Stay::default(),
+            usage_cell_settled: false,
+            foreground: usage::Stay::default(),
             usage_dirty: false,
             usage_saved: Instant::now(),
             minimap: Minimap::spawn(),
@@ -347,8 +348,12 @@ impl App {
     }
 
     fn save(&mut self) {
-        self.grid.prune_usage(usage::now());
-        match config::save_grid(&self.grid) {
+        let now = usage::now();
+        self.grid.prune_usage(now);
+        self.grid.window_usage.retain(|hwnd, score| {
+            unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && score.value(now, usage::WINDOW_HALF_LIFE) > 0.0
+        });
+        match config::save_grid(&self.usage_grid()) {
             Ok(()) => {
                 self.usage_dirty = false;
                 self.usage_saved = Instant::now();
@@ -357,44 +362,65 @@ impl App {
         }
     }
 
-    /// Counts arrivals once, including cells passed through during a gesture.
-    /// Selecting a cell on the board and queuing a switch are not visits.
+    /// Includes ongoing stays in a snapshot, leaving completed history alone
+    /// so repeated saves and layouts cannot credit a stay twice.
+    fn usage_grid(&self) -> Grid {
+        let mut grid = self.grid.clone();
+        let now = usage::now();
+        if let Some(id) = &self.usage_cell.current {
+            let credit = self.usage_cell.credit(usage::CELL_TAU);
+            if credit > 0.0 && grid.find(id).is_some() {
+                grid.usage.entry(id.clone()).or_default().visits.record(now, credit, usage::CELL_HALF_LIFE);
+            }
+        }
+        if let Some(hwnd) = self.foreground.current {
+            let credit = self.foreground.credit(usage::WINDOW_TAU);
+            if credit > 0.0 && unsafe { IsWindow(HWND(hwnd)) }.as_bool() {
+                grid.window_usage.entry(hwnd).or_default().record(now, credit, usage::WINDOW_HALF_LIFE);
+            }
+        }
+        grid
+    }
+
+    /// Starts a stay only after a settled desktop was actually observed.
     fn record_arrival(&mut self, id: &str) {
-        if self.usage_cell != id && self.grid.find(id).is_some() {
-            self.grid.usage.entry(id.to_owned()).or_default().visits.record(usage::now());
-            self.usage_cell = id.to_owned();
-            self.usage_dirty = true;
+        if self.grid.find(id).is_none() {
+            return;
+        }
+        self.usage_cell_settled = true;
+        if let Some((previous, active)) = self.usage_cell.switch(Some(id.to_owned()), self.started.elapsed().as_millis() as u64) {
+            let credit = usage::credit(active, usage::CELL_TAU);
+            if credit > 0.0 && self.grid.find(&previous).is_some() {
+                self.grid.usage.entry(previous).or_default().visits.record(usage::now(), credit, usage::CELL_HALF_LIFE);
+                self.usage_dirty = true;
+            }
         }
     }
 
-    /// Uses the existing foreground notification; no window polling or disk
-    /// write is needed here. Flick's own windows never count as app use.
+    /// Foreground stays belong to individual handles. Flick, the shell and
+    /// any foreground while the board is open end the previous window stay.
     fn record_foreground(&mut self, hwnd: HWND) {
-        if hwnd == self.ignore_foreground {
-            self.ignore_foreground = HWND(0);
-            return;
-        }
-        self.ignore_foreground = HWND(0);
         let mut pid = 0;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
-        if pid == unsafe { GetCurrentProcessId() } || !vd::is_app_window(hwnd) {
-            return;
+        let current = (!self.board.is_open() && pid != unsafe { GetCurrentProcessId() } && vd::is_app_window(hwnd))
+            .then_some(hwnd.0);
+        if let Some((previous, active)) = self.foreground.switch(current, self.started.elapsed().as_millis() as u64) {
+            let credit = usage::credit(active, usage::WINDOW_TAU);
+            if credit > 0.0 && unsafe { IsWindow(HWND(previous)) }.as_bool() {
+                self.grid.window_usage.entry(previous).or_default().record(usage::now(), credit, usage::WINDOW_HALF_LIFE);
+            }
         }
-        if !self.foreground.record(hwnd.0, self.started.elapsed().as_millis() as u64) {
-            return;
-        }
-        let cell = if vd::pinned_everywhere(hwnd) {
-            Desktops::read().map(|d| d.current)
-        } else {
-            vdapi::get_desktop_by_window(hwnd).ok().map(|d| d.id())
-        };
-        let Some(cell) = cell.filter(|id| self.grid.find(id).is_some()) else { return };
-        let icon = crate::board::icon_key(hwnd);
-        let exe = vd::exe_name(pid).unwrap_or_default();
-        let name = if icon == 0 && exe.is_empty() { vd::app_label(pid) } else { String::new() };
-        let Some(key) = usage::app_key(icon, &exe, &name) else { return };
-        self.grid.usage.entry(cell).or_default().windows.entry(key).or_default().record(usage::now());
-        self.usage_dirty = true;
+    }
+
+    /// Samples activity on the existing two-second config timer only.
+    fn usage_tick(&mut self) {
+        let mut input = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, ..Default::default() };
+        let input_age = unsafe { GetLastInputInfo(&mut input) }.as_bool()
+            .then(|| unsafe { GetTickCount() }.wrapping_sub(input.dwTime));
+        self.record_foreground(unsafe { GetForegroundWindow() });
+        let millis = self.started.elapsed().as_millis() as u64;
+        self.usage_dirty |= self.usage_cell.tick(millis, if self.usage_cell_settled { input_age } else { None });
+        self.foreground.tick(millis, input_age);
     }
 
     /// Saves the grid and reorders Windows' own desktop list to match it
@@ -452,13 +478,14 @@ impl App {
     /// What the minimap shows with the user on `current`.
     fn view(&self, current: &str) -> View {
         let cur = self.grid.find(current);
+        let grid = self.usage_grid();
         let now = usage::now();
         View {
             rows: self
                 .grid
                 .rows
                 .iter()
-                .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id), usage: self.grid.cell_usage(id, now) }).collect())
+                .map(|row| row.cells.iter().map(|id| CellView { emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now) }).collect())
                 .collect(),
             anchors: self.grid.rows.iter().map(Row::anchor).collect(),
             cur,
@@ -867,6 +894,7 @@ impl App {
 
     /// Windows was just asked to switch to `to`.
     fn take_off(&mut self, to: &str) {
+        self.usage_cell_settled = false;
         self.in_flight = Some(to.to_owned());
         unsafe {
             SetTimer(self.hwnd, FLIGHT_TIMER_ID, FLIGHT_MS, None);
@@ -878,7 +906,6 @@ impl App {
     /// switched to. True when that is under way, the cell come to only
     /// being passed by.
     fn land(&mut self, new: &str) -> bool {
-        self.record_arrival(new);
         if self.in_flight.take().is_none() {
             return false;
         }
@@ -921,6 +948,7 @@ impl App {
         if self.queued.as_deref().map_or(true, |next| next == passed) {
             // The hand came back meanwhile: this is where it stays.
             self.land(&passed);
+            self.land_failed(&passed);
             return;
         }
         self.in_flight = None;
@@ -938,6 +966,7 @@ impl App {
     fn land_failed(&mut self, passed: &str) {
         self.focus_on_arrival = None;
         if let Some(desktops) = self.sync() {
+            self.record_arrival(&desktops.current);
             self.visit(passed);
             let view = self.view(&desktops.current);
             self.minimap.update(view);
@@ -965,6 +994,7 @@ impl App {
 
     /// The current desktop changed, by us or by Windows' own shortcuts.
     fn desktop_changed(&mut self, new: &str) {
+        self.usage_cell_settled = false;
         debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
         #[cfg(feature = "debug-log")]
         {
@@ -992,7 +1022,7 @@ impl App {
             }
         }
         let Some(desktops) = self.sync() else { return };
-        self.record_arrival(new);
+        self.record_arrival(&desktops.current);
         self.visit(new);
         self.bring_followers(&desktops, new);
         self.save();
@@ -1010,12 +1040,13 @@ impl App {
         }
         self.grid.visit(&id);
         self.save();
-        self.board.select(id, self.grid.clone());
+        self.board.select(id, self.usage_grid());
     }
 
     fn model(&self, desktops: &Desktops) -> Model {
         let mut windows = vd::windows(&desktops.current);
         let parents = vd::process_parents();
+        let grid = self.usage_grid();
         let now = usage::now();
         let rows = self
             .grid
@@ -1031,7 +1062,7 @@ impl App {
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
                         let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
-                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: self.grid.cell_usage(id, now), windows }
+                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now), windows }
                     })
                     .collect();
                 RowModel {
@@ -1057,9 +1088,10 @@ impl App {
         let left_on = self.board.selected();
         let resume = desktops.current == self.board_opened_on && left_on != desktops.current && self.grid.find(&left_on).is_some();
         self.board_opened_on = desktops.current.clone();
-        self.board.open(model, self.grid.clone());
+        self.board.open(model, self.usage_grid());
+        self.record_foreground(self.board.hwnd());
         if resume {
-            self.board.select(left_on, self.grid.clone());
+            self.board.select(left_on, self.usage_grid());
         }
         self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
         vd::force_foreground(self.board.hwnd());
@@ -1069,7 +1101,7 @@ impl App {
         if self.board.is_open() {
             if let Some(desktops) = self.sync() {
                 let model = self.model(&desktops);
-                self.board.set_model(model, self.grid.clone());
+                self.board.set_model(model, self.usage_grid());
             }
         }
     }
@@ -1211,7 +1243,6 @@ impl App {
     fn cancel_board(&mut self) {
         self.board.close();
         if unsafe { IsWindow(self.focus_before_board) }.as_bool() {
-            self.ignore_foreground = self.focus_before_board;
             vd::force_foreground(self.focus_before_board);
         }
     }
@@ -1744,6 +1775,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_TIMER if wparam.0 == CONFIG_TIMER_ID => {
             with_app(|app| {
                 app.apply_saved_config();
+                app.usage_tick();
                 // Piggyback on the existing timer, at most once per half minute.
                 if app.usage_dirty && app.usage_saved.elapsed() >= Duration::from_secs(30) {
                     app.save();
@@ -1976,6 +2008,7 @@ pub fn run(first_run: bool) {
         app.record_arrival(&desktops.current);
         app.commit();
     }
+    app.record_foreground(unsafe { GetForegroundWindow() });
     app.apply_config();
     unsafe {
         SetTimer(hwnd, CONFIG_TIMER_ID, CONFIG_CHECK_MS, None);

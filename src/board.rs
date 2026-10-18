@@ -91,7 +91,7 @@ pub struct CellModel {
     pub id: CellId,
     /// Marked by the user to stand out.
     pub emphasised: bool,
-    /// Recent visits as a share of the most visited cell.
+    /// Active-stay score as a share of the highest cell score.
     pub usage: f32,
     /// Topmost first.
     pub windows: Vec<WindowModel>,
@@ -131,11 +131,9 @@ impl Model {
     /// sections, so a window has the same weight in the board and its popup.
     fn window_weights(&self, id: &str, grid: &Grid) -> HashMap<isize, f32> {
         let now = usage::now();
-        let history = grid.usage.get(id);
         let scores: Vec<_> = self.tile_windows(id).into_iter().map(|(w, _)| {
-            let score = usage::app_key(w.icon_key, &w.app, &w.app_name)
-                .and_then(|key| history?.windows.get(&key))
-                .map_or(0.0, |score| score.value(now));
+            let score = grid.window_usage.get(&w.hwnd.0)
+                .map_or(0.0, |score| score.value(now, usage::WINDOW_HALF_LIFE));
             (w.hwnd.0, score)
         }).collect();
         let maximum = scores.iter().map(|(_, score)| *score).fold(0.0, f64::max);
@@ -2475,17 +2473,16 @@ mod tests {
         let no_data = model.window_weights("a", &grid);
         assert!(no_data.values().all(|weight| *weight == 1.0));
         assert_eq!(model.window_weights("b", &grid), HashMap::from([(3, 1.0)]));
-        let history = grid.usage.entry("a".into()).or_default();
         let now = usage::now();
-        for (icon, count) in [(2, 10), (3, 5)] {
-            let score = history.windows.entry(usage::app_key(icon, "", "").unwrap()).or_default();
-            for _ in 0..count { score.record(now); }
+        for (hwnd, count) in [(2, 10), (3, 5)] {
+            grid.window_usage.entry(hwnd).or_default().record(now, count as f64, usage::WINDOW_HALF_LIFE);
         }
         let weights = model.window_weights("a", &grid);
         assert_eq!(weights[&1], 0.7);
         assert_eq!(weights[&2], 1.5);
         assert!((weights[&3] - 1.1).abs() < 0.0001);
-        assert!(model.window_weights("b", &grid).values().all(|weight| *weight == 1.0));
+        let other_cell = model.window_weights("b", &grid);
+        assert_eq!(other_cell, HashMap::from([(3, 1.5)]));
         // A part gets the whole cell's weights even when its winner is elsewhere.
         let part = vec![(&model.rows[0].cells[0].windows[0], false)];
         let tiles = layout_tiles(&part, &area, 1.0, &weights);

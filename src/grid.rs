@@ -61,9 +61,12 @@ pub fn row_title(name: &str, index: usize) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Grid {
     pub rows: Vec<Row>,
-    /// Recent visits and app uses, keyed by desktop id.
+    /// Decayed active-stay credits, keyed by desktop id.
     #[serde(default)]
     pub usage: BTreeMap<CellId, CellUsage>,
+    /// Individual live windows, shared with the board but never saved.
+    #[serde(skip)]
+    pub window_usage: BTreeMap<isize, usage::Score>,
     /// Executable names (lower case) whose windows follow the user from cell
     /// to cell inside whichever row they are in.
     #[serde(default)]
@@ -82,19 +85,18 @@ pub struct Grid {
 }
 
 impl Grid {
-    /// Drops removed desktops and counts too old to affect the display.
+    /// Drops removed desktops and credits too old to affect the display.
     pub fn prune_usage(&mut self, now: u64) {
         self.usage.retain(|id, usage| {
-            usage.windows.retain(|_, score| score.value(now) > 0.0);
             self.rows.iter().any(|row| row.cells.contains(id))
-                && (usage.visits.value(now) > 0.0 || !usage.windows.is_empty())
+                && usage.visits.value(now, usage::CELL_HALF_LIFE) > 0.0
         });
     }
 
-    /// Brightness added to a cell, as a share of the most visited cell.
+    /// Brightness added to a cell, as a share of the highest active-stay score.
     pub fn cell_usage(&self, id: &str, now: u64) -> f32 {
-        let maximum = self.usage.values().map(|cell| cell.visits.value(now)).fold(0.0, f64::max);
-        let score = self.usage.get(id).map_or(0.0, |cell| cell.visits.value(now));
+        let maximum = self.usage.values().map(|cell| cell.visits.value(now, usage::CELL_HALF_LIFE)).fold(0.0, f64::max);
+        let score = self.usage.get(id).map_or(0.0, |cell| cell.visits.value(now, usage::CELL_HALF_LIFE));
         usage::normalised(score, maximum)
     }
 
@@ -288,9 +290,9 @@ mod tests {
     fn cell_brightness_uses_the_same_decayed_counts_across_rows() {
         let mut g = grid(&[&["a"], &["b", "unused"]]);
         assert_eq!(g.cell_usage("a", 100), 0.0);
-        g.usage.entry("a".into()).or_default().visits.record(100);
-        g.usage.entry("b".into()).or_default().visits.record(100);
-        g.usage.get_mut("b").unwrap().visits.record(100);
+        g.usage.entry("a".into()).or_default().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
+        g.usage.entry("b".into()).or_default().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
+        g.usage.get_mut("b").unwrap().visits.record(100, 1.0, usage::CELL_HALF_LIFE);
         assert_eq!(g.cell_usage("a", 100), 0.5);
         assert_eq!(g.cell_usage("b", 100), 1.0);
         assert_eq!(g.cell_usage("unused", 100), 0.0);
@@ -304,14 +306,13 @@ mod tests {
         let mut g = grid(&[&["a", "b"]]);
         for id in ["a", "b", "gone"] {
             let cell = g.usage.entry(id.into()).or_default();
-            cell.visits.record(100);
-            cell.windows.entry("old".into()).or_default().record(0);
-            cell.windows.entry("recent".into()).or_default().record(2_000_000);
+            cell.visits.record(100, 1.0, usage::CELL_HALF_LIFE);
         }
-        g.prune_usage(2_000_000);
+        g.prune_usage(100);
         assert_eq!(g.usage.len(), 2);
-        assert_eq!(g.usage["a"].windows.len(), 1);
-        assert_eq!(g.cell_usage("a", 2_000_000), 0.0);
+        let mut old = g.clone();
+        old.prune_usage(100 + 21 * usage::CELL_HALF_LIFE);
+        assert!(old.usage.is_empty());
         g.remove("b");
         assert!(!g.usage.contains_key("b"));
         g.sync(&["other".into()], "other");

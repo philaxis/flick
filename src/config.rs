@@ -157,17 +157,24 @@ pub fn save_grid(grid: &Grid) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Older state files have no usage field. New counts survive the same
+    /// Older state files have no usage field. New credits survive the same
     /// serialization path without changing the grid or its remembered cells.
     #[test]
     fn saved_grid_accepts_old_state_and_round_trips_usage() {
         let old = r#"{"rows":[{"cells":["a"],"last":"a"}],"emphasised":["a"]}"#;
         let mut grid: Grid = serde_json::from_str(old).unwrap();
         assert!(grid.usage.is_empty());
-        grid.usage.entry("a".into()).or_default().visits.record(100);
-        grid.usage.get_mut("a").unwrap().windows.entry("app:a.exe".into()).or_default().record(100);
+        grid.usage.entry("a".into()).or_default().visits.record(100, 1.0, crate::usage::CELL_HALF_LIFE);
+        let previous = r#"{"rows":[{"cells":["a"],"last":"a"}],"usage":{"a":{"visits":{"score":2.0,"updated":100},"windows":{"app:a.exe":{"score":8.0,"updated":100}}}}}"#;
+        let previous: Grid = serde_json::from_str(previous).unwrap();
+        assert_eq!(previous.usage["a"].visits.score, 2.0);
+        assert!(!serde_json::to_string(&previous).unwrap().contains("windows"));
         let saved = serde_json::to_string_pretty(&grid).unwrap();
         assert_eq!(serde_json::from_str::<Grid>(&saved).unwrap(), grid);
+        grid.window_usage.entry(42).or_default().record(100, 1.0, crate::usage::WINDOW_HALF_LIFE);
+        let saved = serde_json::to_string(&grid).unwrap();
+        assert!(!saved.contains("window_usage"));
+        assert!(serde_json::from_str::<Grid>(&saved).unwrap().window_usage.is_empty());
     }
 
     /// Changing a setting from the settings window rewrites the user's file:
