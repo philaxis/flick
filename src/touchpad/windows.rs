@@ -49,10 +49,10 @@ fn value(name: PCWSTR, absent: Option<u32>) -> Option<u32> {
             Some(&mut size),
         )
     };
-    if result == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+    if result == Err(windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.into()) {
         return absent;
     }
-    result.ok().ok()?;
+    result.ok()?;
     Some(value)
 }
 
