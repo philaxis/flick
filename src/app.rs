@@ -1925,7 +1925,9 @@ fn init() -> windows::core::Result<HWND> {
 }
 
 pub fn run(first_run: bool) {
-    std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}"))));
+    std::panic::set_hook(Box::new(|info| {
+        log(&format!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture()));
+    }));
     let hwnd = match init() {
         Ok(hwnd) => hwnd,
         Err(e) => return warn(&format!("Flick could not start: {e}")),

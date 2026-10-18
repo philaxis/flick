@@ -2,6 +2,7 @@
 //! input and captures the screen, so behaviour can be checked without a person
 //! at the mouse.
 //!   drive step <0..3> | click | release | settings
+//!   drive boardstress <cycles> <ms> <post|xbutton|chord> <still|move|hover>
 //!   drive xbutton <down|up> | mouse <x> <y> [down|up|rdown|rup] | move <dx> <dy>
 //!   drive stroke <dx> <dy> <ms> | keys <down|up> <letters> | typetest
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
@@ -43,6 +44,7 @@ fn main() {
             let _ = PostMessageW(app, message, WPARAM(wparam), LPARAM(0));
         };
         match args.get(1).map(String::as_str) {
+            Some("boardstress") => boardstress(args[2].parse().unwrap(), args[3].parse().unwrap(), &args[4], &args[5]),
             Some("step") => post(WM_APP + 1, args[2].parse().unwrap()),
             Some("click") => post(WM_APP + 2, 0),
             Some("release") => post(WM_APP + 3, 0),
@@ -238,7 +240,7 @@ fn main() {
                 let done = SetForegroundWindow(window).as_bool();
                 println!("0x{:x} {done}", before.0);
             }
-            Some("under") => {
+            Some("under") if args.len() > 2 => {
                 // under <x> <y>...: which window takes a click at each point, and whose it is.
                 use windows::Win32::Foundation::{POINT, RECT};
                 use windows::Win32::UI::WindowsAndMessaging::{
@@ -513,6 +515,116 @@ fn typetest() {
         // (Tapping the chord opens the board, which takes the focus.)
         println!("after chord: {:?} (expected unchanged)", text(edit));
         let _ = DestroyWindow(edit);
+    }
+}
+
+/// Exercises the live windows and hooks; the click probe verifies delivery,
+/// rather than assuming a window found under the cursor receives the click.
+#[cfg(windows)]
+fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
+    use std::{sync::atomic::{AtomicUsize, Ordering}, time::{Duration, Instant}};
+    use windows::{core::w, Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    }};
+    static CLICKS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "system" fn probe(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if message == WM_LBUTTONDOWN { CLICKS.fetch_add(1, Ordering::Relaxed); }
+        DefWindowProcW(hwnd, message, w, l)
+    }
+    assert!((1..=10_000).contains(&cycles) && millis <= 1000);
+    assert!(["post", "xbutton", "chord"].contains(&mode));
+    assert!(["still", "move", "hover"].contains(&cursor));
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        assert!(vdapi::select(false).is_some());
+        let app = FindWindowW(w!("flick.main"), None);
+        assert!(app.0 != 0, "Flick is not running");
+        let class = w!("flick.test.clicks");
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(probe), lpszClassName: class, ..Default::default() });
+        let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        let make = || CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("Flick click probe"), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            width / 2 - 200, height / 2 - 150, 400, 300, None, None, None, None);
+        let target = make();
+        let other = make();
+        assert!(target.0 != 0 && other.0 != 0);
+        let current = vdapi::get_current_desktop().unwrap();
+        let desktop = vdapi::create_desktop().unwrap();
+        let moved = vdapi::move_window_to_desktop(desktop, other);
+        println!("temporary desktop {} thumbnail source {:x}: {moved:?}", desktop.id(), other.0);
+        let pump = |millis| {
+            let until = Instant::now() + Duration::from_millis(millis);
+            let mut message = MSG::default();
+            while Instant::now() < until {
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        SetForegroundWindow(target);
+        pump(500);
+        let board = FindWindowW(w!("flick.board"), None);
+        let popup = FindWindowW(w!("flick.board.preview"), None);
+        let send = |events: &[INPUT]| assert_eq!(SendInput(events, std::mem::size_of::<INPUT>() as i32), events.len() as u32);
+        let tap = || match mode {
+            "post" => { PostMessageW(app, WM_APP + 2, WPARAM(0), LPARAM(0)).unwrap(); }
+            "chord" => {
+                let events: Vec<_> = [false, true].into_iter().flat_map(|up| "WER".chars().map(move |c| key(c, up))).collect();
+                send(&events);
+            }
+            _ => {
+                let events: Vec<_> = [MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP].into_iter().map(|dwFlags| INPUT {
+                    r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { mouseData: 2, dwFlags, ..Default::default() } },
+                }).collect();
+                send(&events);
+            }
+        };
+        let (mut open, mut closed, mut popups, mut completed) = (0, 0, 0, 0);
+        for cycle in 0..cycles {
+            if !IsWindow(app).as_bool() { println!("CRASH before cycle {cycle}"); break; }
+            for half in 0..2 {
+                tap();
+                if cursor != "still" {
+                    let x = width / 3 + ((cycle * 2 + half) % 9) as i32 * width / 24;
+                    let y = if cursor == "hover" { height - 70 - (cycle % 5) as i32 * 35 } else { height / 3 + (cycle % 5) as i32 * 50 };
+                    let _ = SetCursorPos(x, y);
+                }
+                pump(millis);
+                if IsWindowVisible(board).as_bool() { open += 1; } else { closed += 1; }
+                if IsWindowVisible(popup).as_bool() { popups += 1; }
+            }
+            completed += 1;
+            if completed % 25 == 0 { println!("cycle {completed}/{cycles}: open {open} closed {closed} popup {popups}"); }
+        }
+        let alive = IsWindow(app).as_bool();
+        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(VK_ESCAPE.0 as usize), LPARAM(0));
+        pump(350);
+        SetForegroundWindow(target);
+        pump(150);
+        for (x, y) in [(width / 2, height / 2), (width / 2, height - 180), (150, 150)] {
+            let _ = SetWindowPos(target, HWND_TOP, x - 100, y - 80, 300, 200, SWP_SHOWWINDOW);
+            pump(100);
+            let _ = SetCursorPos(x, y);
+            let under = WindowFromPoint(POINT { x, y });
+            let mut name = [0u16; 128];
+            let n = GetClassNameW(under, &mut name).max(0) as usize;
+            let before = CLICKS.load(Ordering::Relaxed);
+            let events: Vec<_> = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].into_iter().map(|dwFlags| INPUT {
+                r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags, ..Default::default() } },
+            }).collect();
+            send(&events);
+            pump(150);
+            println!("click probe {x},{y}: under {:x}:{} delivered {}", under.0, String::from_utf16_lossy(&name[..n]), CLICKS.load(Ordering::Relaxed) - before);
+        }
+        println!("RESULT cycles {completed}/{cycles} mode {mode} interval {millis} cursor {cursor} alive {alive} board_visible {} popup_visible {} clicks {}/3",
+            IsWindowVisible(board).as_bool(), IsWindowVisible(popup).as_bool(), CLICKS.load(Ordering::Relaxed));
+        let _ = DestroyWindow(other);
+        let _ = DestroyWindow(target);
+        println!("remove temporary desktop: {:?}", vdapi::remove_desktop(desktop, current));
+        assert!(alive && completed == cycles && CLICKS.load(Ordering::Relaxed) == 3, "stress or click delivery failed");
     }
 }
 
