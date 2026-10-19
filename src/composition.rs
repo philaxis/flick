@@ -42,12 +42,12 @@ fn trail(previous: [f32;4], current: [f32;4], elapsed: f32) -> (f32,f32) {
 pub unsafe fn register(destination: HWND, source: HWND) -> Result<isize> {
     // shortcut: public DWM trails are discrete exposures, use captured textures for a true convolution.
     if !BLUR.load(std::sync::atomic::Ordering::Relaxed) || enabled() { return register_inner(destination,source); }
-    let a=DwmRegisterThumbnail(destination,source)?;
-    let b=match DwmRegisterThumbnail(destination,source) {Ok(b)=>b,Err(e)=>{let _=DwmUnregisterThumbnail(a);return Err(e)}};
-    match register_inner(destination,source) {
-        Ok(id)=>{TRAILS.with(|t|t.borrow_mut().insert(id,Trails{ids:[a,b],last:None}));Ok(id)},
-        Err(e)=>{let _=DwmUnregisterThumbnail(a);let _=DwmUnregisterThumbnail(b);Err(e)}
-    }
+    let id=register_inner(destination,source)?;
+    // Later registrations overlay the opaque source, softening its contents as well as its edge.
+    let a=match DwmRegisterThumbnail(destination,source) {Ok(a)=>a,Err(e)=>{let _=DwmUnregisterThumbnail(id);return Err(e)}};
+    let b=match DwmRegisterThumbnail(destination,source) {Ok(b)=>b,Err(e)=>{let _=DwmUnregisterThumbnail(a);let _=DwmUnregisterThumbnail(id);return Err(e)}};
+    TRAILS.with(|t|t.borrow_mut().insert(id,Trails{ids:[a,b],last:None}));
+    Ok(id)
 }
 
 pub fn enabled() -> bool {

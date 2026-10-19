@@ -92,6 +92,20 @@ def report(folder):
             changed = next((r for r in active if pos(r,'magenta') is not None and abs(pos(r,'magenta')-base) >= 1), None)
             if changed:
                 first = (int(changed['qpc'])-start)*1000/frequency
+        # A short steady tracking window avoids the F latch and commit on slow input.
+        # The tanh target's speed changes by about 9% here (roughly 3% ideal CV).
+        tracking=[]
+        tracking_unknown=0
+        if label.endswith('-slow'):
+            lo,hi=eligible+frequency*.6,eligible+frequency*1.0
+            for a,b in zip(frames,frames[1:]):
+                if not lo<=int(a['qpc'])<int(b['qpc'])<=hi: continue
+                if int(b['accumulated'])>1:
+                    tracking_unknown+=int(b['accumulated'])-1;continue
+                if pos(a,'magenta') is None or pos(b,'magenta') is None:continue
+                count=max(1,round((int(b['qpc'])-int(a['qpc']))/period))
+                tracking.extend([0.]*(count-1))
+                tracking.append(pos(b,'magenta')-pos(a,'magenta'))
         settling=[r for r in frames if end<int(r['qpc'])<=end+frequency*0.8]
         settle_steps=[]
         for a,b in zip(settling,settling[1:]):
@@ -100,7 +114,7 @@ def report(folder):
                 if pos(a,c) is not None and pos(b,c) is not None: settle_steps.append(abs(pos(b,c)-pos(a,c)))
         p95 = sorted(marker_errors)[int(len(marker_errors)*.95)] if marker_errors else math.nan
         line = dict(scenario=label, updates=len(active), capture_losses=losses, repeat_pairs=repeats, pairs=len(changes), no_update_refreshes=gaps,
-                    step_cv=cv(list(map(abs,changes))), first_response_ms=first, input_step_cv=input_cv, marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95, settling_max_step_px=max(settle_steps,default=0))
+                    step_cv=cv(list(map(abs,changes))), first_response_ms=first, input_step_cv=input_cv, marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95, settling_max_step_px=max(settle_steps,default=0), tracking_cv=cv(list(map(abs,tracking))), tracking_repeats=sum(abs(d)<0.01 for d in tracking), tracking_frames=len(tracking), tracking_unknown=tracking_unknown)
         data.append(line)
         first_text = f'{first:.1f}' if first is not None else 'missing'
         onset=f'{line["eligible_response_ms"]:.1f}' if first is not None else 'missing'

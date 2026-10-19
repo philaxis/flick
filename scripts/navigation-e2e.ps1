@@ -26,7 +26,7 @@ try {
         foreach ($variant in $variants) {
             Write-Output "VARIANT=$variant"
             Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE -ErrorAction SilentlyContinue
-            if ($Mode -eq 'gpu') { $env:FLICK_GPU_TRACE='1'; $env:FLICK_SHORT_PROBE='1' }
+            if ($Mode -eq 'gpu') { $env:FLICK_GPU_TRACE='1' }
             $exe = $flick
             if ($variant -eq 'baseline') { $exe = Join-Path (Get-Location) 'baseline.exe' }
             if ($variant -eq 'blur') { $env:FLICK_PROBE_BLUR='1' }
