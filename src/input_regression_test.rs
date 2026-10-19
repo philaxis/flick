@@ -604,7 +604,7 @@ fn a_new_press_does_not_replace_the_previous_release() {
     reset();
     HOLD_ID.store(41, Ordering::SeqCst);
     FOLLOWING.store(FOLLOW_X | FOLLOW_Y, Ordering::SeqCst);
-    FOLLOWED_X.store(1100, Ordering::SeqCst);
+    FOLLOWED_X.store(1.1f64.to_bits(), Ordering::SeqCst);
     AXIS.store(1, Ordering::SeqCst);
     HOLDING.store(false, Ordering::SeqCst);
     remember_follow();
@@ -632,5 +632,29 @@ fn the_picture_starts_at_the_dead_zone_before_the_first_cell_step() {
     assert_eq!(followed().x, 0.0);
     assert_eq!(followed().y, 0.0);
     assert!(api::CALLS.with(|c| c.borrow().messages.iter().any(|m| m.0 == WM_DRAG)));
+    reset();
+}
+
+
+#[test]
+fn frame_batches_preserve_precision_timestamps_and_the_release_path() {
+    let _guard = INPUT_TESTS.lock().unwrap();
+    reset();
+    HOLD_ID.store(91, Ordering::SeqCst);
+    FOLLOWING.store(FOLLOW_X, Ordering::SeqCst);
+    HOLDING.store(true, Ordering::SeqCst);
+    let x=0.000123456789f64;
+    FOLLOWED_X.store(x.to_bits(),Ordering::SeqCst);
+    remember_follow();
+    HOLDING.store(false, Ordering::SeqCst);
+    remember_follow();
+    let frame=follow_frame(91).unwrap();
+    assert_eq!(frame.samples.len(),2);
+    assert_eq!(frame.hand.x,x);
+    assert!(frame.samples[0].at<=frame.samples[1].at);
+    assert!(!frame.samples[1].followed.holding);
+    assert!(follow_frame(91).unwrap().samples.is_empty());
+    assert_eq!(follow_hold(91).unwrap().path,frame.path);
+    forget_hold(91);
     reset();
 }

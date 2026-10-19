@@ -9,6 +9,16 @@ pub const SNAP: f32 = SLIDE_END;
 
 pub fn scale(depth: f32) -> f32 { 1.0 - 0.3 * depth.clamp(0.0, 1.0) }
 
+static COMMIT_SPEED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn configure(speed: crate::config::CommitSpeed) {
+    COMMIT_SPEED.store(speed as u8, std::sync::atomic::Ordering::Relaxed);
+}
+fn commit_omega(vertical: bool) -> f64 {
+    use crate::config::CommitSpeed;
+    let speed = match COMMIT_SPEED.load(std::sync::atomic::Ordering::Relaxed) {1=>CommitSpeed::Gentle,2=>CommitSpeed::Slow,_=>CommitSpeed::Default};
+    speed.omega(vertical)
+}
+
 /// Exact spring integration keeps the same curve when a frame is late.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Spring { pub p: f64, pub v: f64 }
@@ -30,6 +40,10 @@ impl Spring {
         self.v = v;
     }
     pub fn settled(&self, target: f64) -> bool { (self.p - target).abs() < 0.0005 && self.v.abs() < 0.005 }
+    pub fn commit(&mut self, target: f64, dt: f64, vertical: bool) {
+        self.advance(target, dt, commit_omega(vertical), 0.78);
+        if self.settled(target) { self.p = target; self.v = 0.0; }
+    }
     pub fn position(&mut self, target: f64, dt: f64, vertical: bool) {
         let (w, z) = if vertical { (32.0, 0.78) } else { (35.0, 0.78) };
         self.advance(target, dt, w, z);
@@ -71,14 +85,15 @@ impl Latch {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Glide { state: Spring, start: f32, pub vertical: bool }
+pub struct Glide { state: Spring, start: f32, pub vertical: bool, commit: bool }
 impl Glide {
     pub fn start(distance: f32, now: f32, _at_once: bool) -> Self {
-        Self { state: Spring { p: distance as f64, v: 0.0 }, start: now, vertical: false }
+        Self { state: Spring { p: distance as f64, v: 0.0 }, start: now, vertical: false, commit: true }
     }
     fn sample(&self, t: f32) -> Spring {
         let mut state = self.state;
-        state.position(0.0, (t - self.start).max(0.0) as f64, self.vertical);
+        if self.commit { state.commit(0.0, (t-self.start).max(0.0) as f64,self.vertical); }
+        else { state.position(0.0, (t-self.start).max(0.0) as f64,self.vertical); }
         state
     }
     pub fn at(&self, t: f32) -> f32 { self.sample(t).p as f32 }
@@ -87,12 +102,16 @@ impl Glide {
     pub fn settled(&self, t: f32) -> bool { self.sample(t).settled(0.0) }
     pub fn retarget(&mut self, jump: f32, now: f32, _duration: f32) {
         self.state = self.sample(now);
+        if self.state.settled(0.0) { self.commit = false; }
         self.state.p += jump as f64;
         self.start = now;
     }
+    pub fn committed(&mut self) { self.commit = true; }
+    pub fn following(&mut self) { self.commit = false; }
     pub fn release(&mut self, distance: f32, velocity: f32, now: f32) {
         self.retarget(distance, now, SNAP);
         self.state.v += velocity as f64;
+        self.commit = true;
     }
 }
 
@@ -112,21 +131,34 @@ impl Recede {
     pub fn depth(&self, t: f32) -> f32 { self.sample(t).p.clamp(0.0, 1.0) as f32 }
     pub fn settled(&self, t: f32) -> bool { t >= self.fall && self.sample(t).settled(0.0) }
     pub fn kick(&mut self, now: f32, velocity: f64) {
+        let now=now.max(self.start);
         self.state = self.sample(now); self.start = now; self.state.v += velocity;
     }
     pub fn moving(&mut self, now: f32, moving: bool) {
+        let now=now.max(self.start);
         self.state.advance(if moving { 1.0 } else { 0.0 }, (now - self.start).max(0.0) as f64, if moving { 22.0 } else { 14.0 }, 1.0);
         self.start = now;
         self.fall = if moving { f32::INFINITY } else { now };
     }
-    pub fn step(&mut self, now: f32, end: f32) { self.kick(now, 6.0); self.fall = end; }
+    pub fn step(&mut self, now: f32, end: f32) { self.kick(now, 6.0); self.fall = end.max(self.start); }
     pub fn hold(&mut self, now: f32) { self.kick(now, 0.0); self.fall = f32::INFINITY; }
-    pub fn release(&mut self, now: f32, end: f32) { self.kick(now, 0.0); self.fall = end.max(now); }
+    pub fn release(&mut self, now: f32, end: f32) { self.kick(now, 0.0); self.fall = end.max(self.start); }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optional_commit_speeds_reduce_the_60_hz_step_without_changing_the_target() {
+        let mut peaks=Vec::new();
+        for mode in [crate::config::CommitSpeed::Default,crate::config::CommitSpeed::Gentle,crate::config::CommitSpeed::Slow] {
+            let mut s=Spring::default(); let mut peak=0f64;
+            for _ in 0..120 { let old=s.p; s.advance(1.0,1.0/60.0,mode.omega(false),0.78);peak=peak.max((s.p-old).abs()); }
+            assert!(s.settled(1.0));peaks.push(peak);
+        }
+        assert!((peaks[0]-0.240406).abs()<0.000001);
+        assert!(peaks[0]>peaks[1] && peaks[1]>peaks[2]);
+    }
     #[test]
     fn distance_is_the_full_commit_threshold_and_edges_release_inward() {
         let mut l = Latch::default();

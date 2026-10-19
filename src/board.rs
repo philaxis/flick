@@ -46,8 +46,8 @@ use windows::{
                 DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             },
             Dwm::{
-                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
-                DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
+                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmRegisterThumbnail,
+                DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -346,6 +346,7 @@ struct TraceFrame {
     updates: usize,
     /// First selected thumbnail: handle, DWM destination/source, transformed tile.
     geometry: Option<(isize, RECT, RECT, Rect)>,
+    submitted_qpc_ms: f64,
 }
 
 /// The board's frames written to the CSV file `FLICK_TRACE` names: kept in
@@ -386,19 +387,19 @@ impl Trace {
         let mut out = String::new();
         let new = std::fs::metadata(&self.path).map_or(true, |m| m.len() == 0);
         if new {
-            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms,thumbnail_updates\n");
+            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms,thumbnail_updates,absolute_qpc_ms\n");
         }
         let geometry_path = self.path.with_extension("geometry.csv");
-        let mut geometry = if geometry_path.exists() { String::new() } else { "qpc_ms,hwnd,dest_l,dest_t,dest_r,dest_b,source_l,source_t,source_r,source_b,tile_l,tile_t,tile_r,tile_b\n".into() };
+        let mut geometry = if geometry_path.exists() { String::new() } else { "qpc_ms,hwnd,dest_l,dest_t,dest_r,dest_b,source_l,source_t,source_r,source_b,tile_l,tile_t,tile_r,tile_b,absolute_qpc_ms\n".into() };
         for f in self.frames.drain(..) {
             if let Some((hwnd, d, s, tile)) = f.geometry {
-                geometry.push_str(&format!("{:.3},{hwnd:x},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}\n", ms(f.at),
-                    d.left, d.top, d.right, d.bottom, s.left, s.top, s.right, s.bottom, tile.left, tile.top, tile.right, tile.bottom));
+                geometry.push_str(&format!("{:.3},{hwnd:x},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}\n", ms(f.at),
+                    d.left, d.top, d.right, d.bottom, s.left, s.top, s.right, s.bottom, tile.left, tile.top, tile.right, tile.bottom, f.submitted_qpc_ms));
             }
-            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3},{}\n",
+            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3},{},{:.3}\n",
                 ms(f.at), f.interval.map_or(String::new(), |i| format!("{:.3}", ms(i))),
                 if f.by_vblank { "vblank" } else { "timer" }, f.hand.0, f.hand.1, f.drawn.0, f.drawn.1, f.drawn.2,
-                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit), f.updates));
+                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit), f.updates, f.submitted_qpc_ms));
         }
         let written = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
             .and_then(|mut file| file.write_all(out.as_bytes()));
@@ -911,6 +912,11 @@ pub struct Board {
     /// being drawn; whether it is moving, with the cells beside the
     /// selection laid out and their live previews registered.
     strip: Strip,
+    #[cfg(feature = "motion-probe")]
+    probe_marker: Cell<Option<f32>>,
+    strip_frame: Option<Strip>,
+    strip_input: Option<(crate::input::Hand, bool)>,
+    strip_samples: Vec<(f64,f64,f64,usize)>,
     strip_epoch: Instant,
     strip_at: f32,
     strip_on: bool,
@@ -934,6 +940,7 @@ pub struct Board {
     popup_canvas: Option<Canvas>,
     popup_icons: HashMap<isize, Option<ID2D1Bitmap>>,
     text_cache: paint::TextCache,
+    paint_origin: std::cell::Cell<(f32, f32)>,
     thumbnail_state: RefCell<HashMap<isize, (RECT, RECT, u8, bool, u32)>>,
     thumbnail_updates: Cell<usize>,
     fonts: Option<Fonts>,
@@ -1081,6 +1088,11 @@ impl Board {
                 clock: FrameClock::default(),
                 vblank_frame: None,
                 strip: Strip::default(),
+                #[cfg(feature = "motion-probe")]
+                probe_marker: Cell::new(None),
+                strip_frame: None,
+                strip_input: None,
+                strip_samples: Vec::new(),
                 strip_epoch: Instant::now(),
                 strip_at: 0.0,
                 strip_on: false,
@@ -1098,6 +1110,7 @@ impl Board {
                 popup_canvas: None,
                 popup_icons: HashMap::new(),
                 text_cache: paint::TextCache::new()?,
+                paint_origin: std::cell::Cell::new((0.0, 0.0)),
                 thumbnail_state: RefCell::default(),
                 thumbnail_updates: Cell::new(0),
                 fonts: None,
@@ -1310,6 +1323,7 @@ impl Board {
         self.relayout();
         self.motion.moved(&before, &self.marks(), now);
         let t = self.strip_time(now);
+        self.strip_frame = None;
         self.strip.moved(&strip_before, &self.strip_marks, t);
         self.strip_at = t;
         self.strip_on |= self.strip.active(t);
@@ -1349,6 +1363,9 @@ impl Board {
     /// and its clock starts again from `now`.
     fn settle_strip(&mut self, now: Instant) {
         self.strip = Strip::default();
+        self.strip_frame = None;
+        self.strip_input = None;
+        self.strip_samples.clear();
         self.strip_epoch = now;
         self.strip_at = 0.0;
         self.strip_on = false;
@@ -1359,6 +1376,8 @@ impl Board {
     }
 
     /// How far the hand pulls the selection, in cells and rows.
+    fn drawn_strip(&self) -> &Strip { self.strip_frame.as_ref().unwrap_or(&self.strip) }
+
     fn strip_pull(&self, hand: (f32, f32)) -> (f32, f32) {
         let Some(at) = self.grid.find(&self.selected).filter(|_| hand != (0.0, 0.0)) else { return (0.0, 0.0) };
         hand_pull(&self.grid, at, hand)
@@ -1444,13 +1463,36 @@ impl Board {
     /// never from how many frames there were. Stops once all is in place
     /// and no hold goes on.
     fn tick_motion(&mut self, now: Instant, by_vblank: bool) {
-        let hand = crate::input::hand();
-        let holding = crate::input::holding();
+        let (hand, holding, axis, samples) = crate::input::board_frame();
+        let now = samples.last().map_or(now, |s| now.max(s.at));
         let dragging = self.press.as_ref().is_some_and(|press| press.dragging);
         let t = self.strip_time(now);
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
-        self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+        let changed_origin = self.strip_input.is_none_or(|(last, _)| last.counted_from != hand.counted_from);
+        if changed_origin { self.strip_samples.clear(); }
+        for sample in &samples {
+            let at = self.strip_time(sample.at);
+            let h = sample.hand;
+            self.strip.follow(self.strip_pull((h.along, h.across)), row, h.counted_from, sample.followed.holding, at);
+            if self.strip_samples.len() == 3 { self.strip_samples.remove(0); }
+            self.strip_samples.push((at as f64,h.along as f64,h.across as f64,sample.axis));
+        }
+        if samples.is_empty() && self.strip_input != Some((hand, holding)) {
+            self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+        }
+        self.strip_input = Some((hand, holding));
+        self.strip.advance_depth(t);
+        let mut frame = self.strip.clone();
+        if holding && !changed_origin {
+            if let Some(((x,y),at)) = crate::follow::resample(&self.strip_samples,t as f64) {
+                // Keep prediction inside this cell; only real input may cross a commit.
+                if x.floor() == (hand.along as f64).floor() && y.floor() == (hand.across as f64).floor() {
+                    frame.follow(self.strip_pull((x as f32,y as f32)),row,hand.counted_from,true,at as f32);
+                }
+            }
+        }
+        self.strip_frame = Some(frame);
 
         self.strip_at = t;
         let strip_moving = self.strip.active(t);
@@ -1460,7 +1502,7 @@ impl Board {
             self.register_thumbnails();
         }
         let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now) || strip_moving;
-        if holding { if let Some(axis) = crate::input::axis() { self.motion.lock_axis(axis); } }
+        if holding { if let Some(axis) = axis { self.motion.lock_axis(axis); } }
         {
             // Also submit the final frame after a drag or hold stops.
             let started = Instant::now();
@@ -1474,6 +1516,7 @@ impl Board {
             let submitted = started.elapsed();
             self.thumbnail_updates.set(0);
             let geometry = self.update_thumbnails();
+            if let Err(e) = crate::composition::commit(self.hwnd) { crate::app::log(&format!("board composition commit failed: {e}")); }
             let dwm = started.elapsed() - submitted;
             unsafe {
                 ValidateRect(self.hwnd, None);
@@ -1493,13 +1536,14 @@ impl Board {
                     by_vblank,
                     hand: (hand.along, hand.across),
                     drawn,
-                    depth: self.strip.depth(t),
+                    depth: self.drawn_strip().depth(t),
                     draw: took - dwm,
                     dwm,
                     submit: took - prepared,
                     thumbs: self.thumbs.len() + self.strip_thumbs.len(),
                     updates: self.thumbnail_updates.get(),
                     geometry,
+                    submitted_qpc_ms: crate::glide::qpc_ms(),
                 };
                 if let Some(trace) = &mut self.trace {
                     trace.record(frame, now);
@@ -1508,7 +1552,7 @@ impl Board {
             debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}, strip {:.3} back",
                 self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len(),
                 self.motion.rest.values().flatten().map(|spring| spring.offset.abs()).fold(0.0, f32::max), hand.along, hand.across,
-                self.motion.hand.values().next(), self.strip.depth(t));
+                self.motion.hand.values().next(), self.drawn_strip().depth(t));
         }
         if !moving && !holding && !dragging {
             debug_log!("board: motion settled after {} frames, drawing {:.2} ms a frame on average and {:.2} at most",
@@ -1516,6 +1560,8 @@ impl Board {
                 self.motion.slowest.as_secs_f32() * 1000.0);
             (self.motion.frames, self.motion.drawing, self.motion.slowest) = (0, Duration::ZERO, Duration::ZERO);
             self.stop_motion();
+            // Clear any blur trail of the last moving frame.
+            if crate::composition::trails_shown() { self.update_thumbnails(); }
             if was_strip {
                 self.settle_strip(now);
             }
@@ -1714,14 +1760,14 @@ impl Board {
     fn picture_place(&self, pos: Pos, m: usize) -> Place {
         let (Some(plate), Some(mark), true) = (self.plates.get(m), self.strip_marks.get(pos.row), self.strip_on) else { return Place::SAME };
         let t = self.strip_at;
-        let (x, y) = self.strip.offset(pos.row, t);
-        let size = strip::scale(self.strip.depth(t));
+        let (x, y) = self.drawn_strip().offset(pos.row, t);
+        let size = strip::scale(self.drawn_strip().depth(t));
         strip::place(plate, (mark.0 + pos.col as f32 + x, mark.1 + y), size, size)
     }
 
     fn picture_shade(&self, pos: Pos) -> f32 {
         let Some(mark) = self.strip_marks.get(pos.row) else { return 1.0 };
-        let (x, y) = self.strip.offset(pos.row, self.strip_at);
+        let (x, y) = self.drawn_strip().offset(pos.row, self.strip_at);
         strip::shade((mark.0 + pos.col as f32 + x).hypot(mark.1 + y))
     }
 
@@ -1732,8 +1778,8 @@ impl Board {
         let Some(at) = self.grid.find(&self.selected) else { return Place::SAME };
         let (Some(plate), Some(mark), true) = (self.plates.get(m), self.strip_marks.get(at.row), self.strip_on) else { return Place::SAME };
         let t = self.strip_at;
-        let spacing = strip::scale(self.strip.depth(t));
-        strip::place(plate, (0.0, mark.1 + self.strip.offset(at.row, t).1), strip::scale(self.strip.row_depth(t)), spacing)
+        let spacing = strip::scale(self.drawn_strip().depth(t));
+        strip::place(plate, (0.0, mark.1 + self.drawn_strip().offset(at.row, t).1), strip::scale(self.drawn_strip().row_depth(t)), spacing)
     }
 
     /// How a tile of the cell at `pos` that moves as `carried` is drawn,
@@ -2007,7 +2053,7 @@ impl Board {
             let given = strip::budget(&wanted.iter().map(Vec::len).collect::<Vec<_>>(), strip::MAX_THUMBS);
             for ((cell, hwnds), given) in self.strip_cells.iter().zip(&wanted).zip(given) {
                 for hwnd in &hwnds[..given] {
-                    if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, *hwnd) } {
+                    if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, *hwnd, crate::composition::board_enabled()) } {
                         self.strip_thumbs.push((cell.id.clone(), hwnd.0, thumb));
                     }
                 }
@@ -2016,7 +2062,7 @@ impl Board {
         let mut wanted: Vec<(HWND, bool)> = self.tile_windows().into_iter().map(|(w, everywhere)| (w.hwnd, everywhere)).collect();
         wanted.sort_by_key(|(_, everywhere)| *everywhere);
         for (hwnd, _) in wanted {
-            if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
+            if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, hwnd, crate::composition::board_enabled()) } {
                 self.thumbs.push((hwnd.0, thumb));
             }
         }
@@ -2034,7 +2080,7 @@ impl Board {
                 return *size;
             }
         }
-        let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().map(|s| {
+        let size = unsafe { crate::composition::source_size(thumb) }.ok().map(|s| {
             let mut outer = RECT::default();
             let mut visible = RECT::default();
             let queried = (s.cx.max(1) as f32, s.cy.max(1) as f32);
@@ -2162,6 +2208,7 @@ impl Board {
             let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
             RECT { left, top, right: (r.right - offset.0).round() as i32, bottom: (r.bottom - offset.1).round() as i32 }
         };
+        let mut precise = [0.0; 4];
         let mut props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
             opacity: 255,
@@ -2182,7 +2229,9 @@ impl Board {
                 let (tw, th) = size(&tile.thumb);
                 let (cx, cy) = self.cursor;
                 let w = tw.min(200.0 * self.scale);
-                props.rcDestination = to_rect(&fitted(&rect(cx - w / 2.0, cy - th / 2.0, w, th)));
+                let dest = fitted(&rect(cx - w / 2.0, cy - th / 2.0, w, th));
+                precise = [dest.left-offset.0,dest.top-offset.1,dest.right-offset.0,dest.bottom-offset.1];
+                props.rcDestination = to_rect(&dest);
                 props.opacity = 215;
             }
             (Some(tile), Some((place, clip, bright))) => {
@@ -2190,9 +2239,11 @@ impl Board {
                 // fills it; in one that had to be made wider or higher
                 // for its buttons the picture sits in the middle.
                 let dest = place.rect(&fitted(&tile.thumb));
+                precise = [dest.left-offset.0,dest.top-offset.1,dest.right-offset.0,dest.bottom-offset.1];
                 match (clip, source) {
                     (Some(clip), Some(source)) => match strip::clip(&dest, &clip, source) {
                         Some((shown, from)) => {
+                            precise = [shown.left-offset.0,shown.top-offset.1,shown.right-offset.0,shown.bottom-offset.1];
                             props.rcDestination = to_rect(&shown);
                             props.rcSource = RECT {
                                 left: from.left.round() as i32,
@@ -2223,7 +2274,7 @@ impl Board {
             let visible = props.fVisible.as_bool();
             let state = if visible { (props.rcDestination, props.rcSource, props.opacity, true, props.dwFlags) }
                 else { (RECT::default(), RECT::default(), 0, false, 0) };
-            if self.thumbnail_state.borrow().get(&thumb) != Some(&state) && DwmUpdateThumbnailProperties(thumb, &props).is_ok() {
+            if (crate::composition::needs_update(thumb) || self.thumbnail_state.borrow().get(&thumb) != Some(&state)) && crate::composition::update(thumb, &props, precise).is_ok() {
                 self.thumbnail_state.borrow_mut().insert(thumb, state);
                 self.thumbnail_updates.set(self.thumbnail_updates.get() + 1);
             }
@@ -2237,8 +2288,8 @@ impl Board {
         if let Some(i) = self.thumbs.iter().position(|&(h, _)| h == hwnd) {
             let (_, old) = self.thumbs.remove(i);
             unsafe {
-                let _ = DwmUnregisterThumbnail(old);
-                if let Ok(thumb) = DwmRegisterThumbnail(self.hwnd, HWND(hwnd)) {
+                let _ = crate::composition::unregister(old);
+                if let Ok(thumb) = crate::composition::register(self.hwnd, HWND(hwnd), crate::composition::board_enabled()) {
                     self.thumbs.push((hwnd, thumb));
                 }
             }
@@ -2610,6 +2661,21 @@ impl Board {
 
     /// Draws the board into the canvas; `None` when there is no canvas.
     fn draw_to_canvas(&mut self) -> Option<Result<()>> {
+        if self.open && crate::composition::board_enabled() {
+            if self.window_target.is_some() || self.canvas.is_some() { self.discard_target(); }
+            match unsafe { crate::composition::begin_paint(self.hwnd, self.size) } {
+                Ok((surface, target, offset)) => {
+                    self.paint_origin.set((offset.x as f32, offset.y as f32));
+                    if self.fonts.is_none() { self.fonts = make_fonts(self.scale).ok(); }
+                    self.load_icons(&target);
+                    unsafe { self.set_transform(&target, Matrix3x2::identity()); }
+                    let drawn = self.draw(&target);
+                    self.paint_origin.set((0.0, 0.0));
+                    return Some(unsafe { surface.EndDraw() }.and(drawn));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
         let target = self.ensure_canvas()?;
         if self.fonts.is_none() {
             self.text_cache.clear();
@@ -2635,10 +2701,11 @@ impl Board {
             None => return,
         }
         self.present_canvas();
+        let _ = crate::composition::commit(self.hwnd);
     }
 
     fn present_canvas(&mut self) {
-        if self.window_target.is_none() {
+        if self.window_target.is_none() && !crate::composition::board_enabled() {
             if let Some(canvas) = &self.canvas {
                 let (w, h) = canvas.dib.size;
                 unsafe {
@@ -2688,6 +2755,12 @@ impl Board {
         }
     }
 
+    unsafe fn set_transform(&self, target: &ID2D1RenderTarget, mut matrix: Matrix3x2) {
+        let origin = self.paint_origin.get();
+        matrix.M31 += origin.0; matrix.M32 += origin.1;
+        target.SetTransform(&matrix);
+    }
+
     fn draw(&self, target: &ID2D1RenderTarget) -> Result<()> {
         let Some(fonts) = &self.fonts else { return Ok(()) };
         unsafe {
@@ -2696,21 +2769,25 @@ impl Board {
         let p = Painter::cached(target, &self.text_cache)?;
         // The tiles are placed in the window's coordinates; each map, and the
         // label and the hint of the home monitor, in its monitor's own.
+        #[cfg(feature = "motion-probe")]
+        self.probe_marker.set(None);
         self.draw_tiles(&p, fonts);
         for map in &self.maps {
             unsafe {
-                target.SetTransform(&Matrix3x2::translation(map.area.left, map.area.top));
+                self.set_transform(target, Matrix3x2::translation(map.area.left, map.area.top));
             }
             self.draw_map(&p, fonts, map);
         }
         unsafe {
-            target.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
+            self.set_transform(target, Matrix3x2::translation(self.home.left, self.home.top));
         }
         self.draw_captions(&p, fonts);
         unsafe {
-            target.SetTransform(&Matrix3x2::identity());
+            self.set_transform(target, Matrix3x2::identity());
         }
         self.draw_popup(&p, fonts);
+        #[cfg(feature = "motion-probe")]
+        if let Some(x) = self.probe_marker.get() { p.fill_square(&rect(x-2.0,20.0,4.0,12.0),rgba(0.0,1.0,0.0,1.0)); }
         Ok(())
     }
 
@@ -2815,7 +2892,7 @@ impl Board {
     /// in the middle outlined, all moving as `tile_place` has it.
     fn draw_tiles(&self, p: &Painter, fonts: &Fonts) {
         let s = self.scale;
-        let depth = if self.strip_on { self.strip.depth(self.strip_at) } else { 0.0 };
+        let depth = if self.strip_on { self.drawn_strip().depth(self.strip_at) } else { 0.0 };
         let at = self.grid.find(&self.selected);
         if depth > 0.001 {
             for plate in &self.plates {
@@ -2899,6 +2976,12 @@ impl Board {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
                 if let Some(at) = place(Carried::of(window, *everywhere), &tile.frame) {
                     self.placed(p, at, || self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere)));
+                    #[cfg(feature = "motion-probe")]
+                    if window.title == "F motion 0" {
+                        let dest = at.rect(&tile.thumb);
+                        let x = (dest.left + dest.right) * 0.5;
+                        self.probe_marker.set(Some(x));
+                    }
                 }
             }
         }
@@ -2938,11 +3021,11 @@ impl Board {
             return draw();
         }
         unsafe {
-            p.target.SetTransform(&Matrix3x2 { M11: place.s, M12: 0.0, M21: 0.0, M22: place.s, M31: place.dx, M32: place.dy });
+            self.set_transform(p.target, Matrix3x2 { M11: place.s, M12: 0.0, M21: 0.0, M22: place.s, M31: place.dx, M32: place.dy });
         }
         draw();
         unsafe {
-            p.target.SetTransform(&Matrix3x2::identity());
+            self.set_transform(p.target, Matrix3x2::identity());
         }
     }
 
@@ -3031,11 +3114,11 @@ impl Board {
             return draw();
         }
         unsafe {
-            p.target.SetTransform(&Matrix3x2::translation(base.0 + by.0, base.1 + by.1));
+            self.set_transform(p.target, Matrix3x2::translation(base.0 + by.0, base.1 + by.1));
         }
         draw();
         unsafe {
-            p.target.SetTransform(&Matrix3x2::translation(base.0, base.1));
+            self.set_transform(p.target, Matrix3x2::translation(base.0, base.1));
         }
     }
 
@@ -3284,6 +3367,9 @@ impl Board {
             }
             // The strip `ms` into the move, with the cells beside both.
             self.strip = Strip::default();
+        self.strip_frame = None;
+        self.strip_input = None;
+        self.strip_samples.clear();
             self.strip.moved(&strip_before, &self.strip_marks, 0.0);
             self.strip_at = ms as f32 / 1000.0;
             self.strip_on = self.strip.active(self.strip_at);
@@ -3335,14 +3421,14 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, message: u32, wparam: WPARAM
 fn unregister_strip_thumbnails(thumbs: &mut Vec<(CellId, isize, isize)>) {
     for (_, _, thumb) in thumbs.drain(..) {
         unsafe {
-            let _ = DwmUnregisterThumbnail(thumb);
+            let _ = crate::composition::unregister(thumb);
         }
     }
 }
 
 fn unregister_thumbnails(thumbs: &mut Vec<(isize, isize)>) {
     for (_, thumb) in thumbs.drain(..) {
-        unsafe { let _ = DwmUnregisterThumbnail(thumb); }
+        unsafe { let _ = crate::composition::unregister(thumb); }
     }
 }
 

@@ -33,6 +33,8 @@ mod drive_pacing;
 #[cfg(windows)]
 #[path = "support/shelves.rs"]
 mod drive_shelves;
+#[path = "support/display.rs"]
+mod drive_display;
 
 #[cfg(windows)]
 fn main() {

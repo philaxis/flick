@@ -48,6 +48,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             std::fs::write(out.join("restored.txt"), "Original desktop, desktop order and cursor restored\n").unwrap();
         }
         "shelves" => unsafe { super::drive_shelves::run(out, flick.unwrap()); },
+        "display" => unsafe { super::drive_display::run(out, flick.unwrap()); },
         "pacing" => unsafe { super::drive_pacing::run(out, flick.unwrap()); },
         "run" | "motion" | "geometry" => unsafe {
             let geometry = mode == "geometry";

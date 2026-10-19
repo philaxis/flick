@@ -7,7 +7,7 @@
 //! the app, which answers with a new `View`.
 
 use crate::{
-    config::{Mouse, Touchpad},
+    config::{CommitSpeed, Mouse, Touchpad},
     paint::{self, accent, rect, white, Canvas, Painter, Rect},
     vd,
     i18n::text as tr,
@@ -57,7 +57,11 @@ const EDGES: (f32, f32) = (28.0, 628.0);
 /// The tab's rows, the first with the tabs themselves above it, and the
 /// link to the file below them.
 const TAB_ROWS: (f32, f32) = (5.0, 13.0);
-const FILE_ROW: f32 = 14.0;
+const FILE_ROW: f32 = 18.0;
+/// The experiments' heading; their switch and choice follow, then a note.
+const EXPERIMENT_ROW: f32 = 14.0;
+/// The commit springs offered, as `config::CommitSpeed` names them.
+const SPEEDS: [CommitSpeed; 3] = [CommitSpeed::Default, CommitSpeed::Gentle, CommitSpeed::Slow];
 /// How far the tab's controls stand in from its edges, and the room
 /// between its two ways.
 const INSET: f32 = 16.0;
@@ -84,6 +88,9 @@ pub struct View {
     pub mouse: Mouse,
     pub touchpad: Touchpad,
     pub touchpad_status: crate::touchpad::Status,
+    /// See `config::Experimental`.
+    pub motion_blur: bool,
+    pub commit_speed: CommitSpeed,
 }
 
 /// What the user asked for; carried out by the app.
@@ -130,6 +137,8 @@ enum Hit {
     Reverse,
     Touchpad,
     TouchpadSettings,
+    Blur,
+    Speed(usize),
     File,
 }
 
@@ -149,6 +158,8 @@ struct Layout {
     reverse: Rect,
     touchpad: Rect,
     touchpad_settings: Rect,
+    blur: Rect,
+    speeds: [Rect; 3],
     file: Rect,
 }
 
@@ -183,6 +194,8 @@ impl Layout {
             reverse: at(inner.1, TAB_ROWS.0 + 4.0, 44.0, 24.0),
             touchpad: at(inner.1, TAB_ROWS.0 + 5.0, 44.0, 24.0),
             touchpad_settings: rect(inner.0 * s, (row(TAB_ROWS.0 + 7.0) + 6.0) * s, 260.0 * s, 30.0 * s),
+            blur: right(EXPERIMENT_ROW + 1.0, 44.0, 24.0),
+            speeds: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 2.0, 90.0, 30.0)),
             file: rect(EDGES.0 * s, (row(FILE_ROW) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
@@ -200,6 +213,8 @@ impl Layout {
             controls.push((self.touchpad, Hit::Touchpad));
             if conflict { controls.push((self.touchpad_settings, Hit::TouchpadSettings)); }
         }
+        controls.push((self.blur, Hit::Blur));
+        controls.extend(self.speeds.iter().enumerate().map(|(i, r)| (*r, Hit::Speed(i))));
         controls.push((self.file, Hit::File));
         controls
     }
@@ -272,6 +287,8 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
         Hit::Reverse => if mouse { "mouse.reverse" } else { "touchpad.reverse" },
         Hit::Touchpad => "touchpad.three_finger",
         Hit::Minimap => "minimap",
+        Hit::Blur => "experimental.motion_blur",
+        Hit::Speed(_) => "experimental.commit_speed",
         _ => return None,
     })
 }
@@ -558,6 +575,7 @@ impl Settings {
             Hit::Reverse => hand.reverse,
             Hit::Touchpad => self.view.touchpad.three_finger,
             Hit::Minimap => self.view.minimap,
+            Hit::Blur => self.view.motion_blur,
             _ => return Action::None,
         };
         match key(self.tab, hit) {
@@ -657,7 +675,8 @@ impl Settings {
             Hit::Autostart => Action::Autostart(!self.view.autostart),
             Hit::Admin => Action::Admin(!self.view.admin),
             Hit::Tab(tab) => self.show(tab),
-            Hit::Follow(_) | Hit::Reverse | Hit::Touchpad | Hit::Minimap => self.toggle(hit),
+            Hit::Follow(_) | Hit::Reverse | Hit::Touchpad | Hit::Minimap | Hit::Blur => self.toggle(hit),
+            Hit::Speed(i) => Action::Set("experimental.commit_speed", format!("\"{}\"", SPEEDS[i].name())),
             Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
             Hit::File => Action::OpenFile,
             _ => Action::None,
@@ -826,6 +845,22 @@ impl Settings {
         if tab == Tab::Touchpad && view.touchpad_status == crate::touchpad::Status::Conflict {
             self.draw_button(&p, fonts, &layout.touchpad_settings, tr("Open Windows touchpad settings (W)", "Windows 터치패드 설정 열기 (W)", "打开 Windows 触摸板设置 (W)"), Hit::TouchpadSettings);
         }
+
+        // Ways to make motion look smoother; both start off.
+        p.text(tr("Experimental · smoother-looking motion", "실험 · 더 부드럽게 보이는 움직임", "实验 · 看起来更顺滑的运动"), &fonts.title, &row(EXPERIMENT_ROW), white(0.92));
+        label(EXPERIMENT_ROW + 1.0, tr("Motion blur trails on fast moves", "빠른 이동에 모션 블러 잔상", "快速移动时的动态模糊残影"));
+        self.draw_switch(&p, &layout.blur, view.motion_blur, Hit::Blur);
+        label(EXPERIMENT_ROW + 2.0, tr("Commit spring", "커밋 스프링", "切换弹簧"));
+        let names = [tr("Default", "기본", "默认"), tr("Gentle", "부드럽게", "柔和"), tr("Slow", "느리게", "缓慢")];
+        for (i, area) in layout.speeds.iter().enumerate() {
+            if view.commit_speed == SPEEDS[i] { p.fill(area, 7.0 * s, accent(0.95)); }
+            else { self.draw_button(&p, fonts, area, names[i], Hit::Speed(i)); continue; }
+            p.text(names[i], &fonts.button, area, white(1.0));
+        }
+        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle.",
+            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다.",
+            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。"),
+            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 3.0).top + ROWS.1 * s, ..row(EXPERIMENT_ROW + 3.0) }, white(0.62));
 
         let hot = self.hover == Hit::File;
         p.text(tr("More settings: config.toml", "추가 설정: config.toml", "更多设置：config.toml"), &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));

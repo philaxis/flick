@@ -95,7 +95,7 @@ impl Step {
         let dt = (now - self.began).max(0.0);
         let mut x = Spring { p: self.from.0, v: self.speed.0 };
         let mut y = Spring { p: self.from.1, v: self.speed.1 };
-        x.position(self.to.0 as f64, dt, false); y.position(self.to.1 as f64, dt, true);
+        x.commit(self.to.0 as f64, dt, false); y.commit(self.to.1 as f64, dt, true);
         let moving = (x.p - self.to.0 as f64).abs() > 0.01 || (y.p - self.to.1 as f64).abs() > 0.01;
         let mut depth = Spring { p: self.receded, v: self.depth_speed };
         depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
@@ -168,6 +168,7 @@ impl Label {
 pub struct Follow {
     pub rows: (i32, i32), pub cols: Vec<(i32, i32)>, pub row: i32,
     along: Vec<Spring>, columns: Vec<Latch>, vertical: Spring, rows_hand: Latch,
+    committing: Vec<bool>, row_committing: bool,
     depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool, path_cursor: usize,
 }
 impl Follow {
@@ -175,13 +176,15 @@ impl Follow {
         let n = (rows.1 - rows.0 + 1).max(1) as usize;
         Self { rows, cols, row: 0, along: vec![Spring::default(); n], columns: vec![Latch::default(); n],
             vertical: Spring::default(), rows_hand: Latch::default(), depth: Spring::default(),
-            last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0 }
+            committing: vec![false; n], row_committing: false, last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0 }
     }
     pub fn cols_of(&self, row: i32) -> (i32, i32) {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
     }
+    pub fn sampled_vertical(&self) -> f64 { self.vertical.p }
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
     pub fn selected(&self) -> (i32, i32) { (self.columns[(self.row - self.rows.0) as usize].cell, self.row) }
+    pub fn start_picture(&mut self) { self.depth = Spring::default(); }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
     pub fn reframe(&mut self, rows: (i32, i32), cols: Vec<(i32, i32)>, hand: (f64, f64), row_changed: bool) {
         if row_changed {
@@ -204,16 +207,23 @@ impl Follow {
         self.vertical = Spring { p: at.1, v: speed.1 }; self.depth = Spring { p: depth, v: depth_speed };
     }
     fn advance(&mut self, now: f64) -> ((f64, f64), bool) {
+        let now = now.max(self.last.unwrap_or(now));
         let dt = self.last.replace(now).map_or(0.0, |last| (now - last).max(0.0));
         let current = (self.row - self.rows.0) as usize;
         let mut moving = !self.released;
         for i in 0..self.along.len() {
             let target = if !self.released && self.axis == 0 && i == current { self.columns[i].target(self.cols[i]) } else { self.columns[i].cell as f64 };
-            self.along[i].position(target, dt, false);
+            if !self.released && (target-self.columns[i].cell as f64).abs()>1e-9 { self.committing[i]=false; }
+            if self.released || self.committing[i] { self.along[i].commit(target,dt,false); }
+            else { self.along[i].position(target,dt,false); }
+            if self.along[i].settled(self.columns[i].cell as f64) { self.committing[i]=false; }
             moving |= (self.along[i].p - self.columns[i].cell as f64).abs() > 0.01;
         }
         let target = if !self.released && self.axis == 1 { self.rows_hand.target(self.rows) } else { self.row as f64 };
-        self.vertical.position(target, dt, true);
+        if !self.released && (target-self.row as f64).abs()>1e-9 { self.row_committing=false; }
+        if self.released || self.row_committing { self.vertical.commit(target,dt,true); }
+        else { self.vertical.position(target,dt,true); }
+        if self.vertical.settled(self.row as f64) { self.row_committing=false; }
         moving |= (self.vertical.p - self.row as f64).abs() > 0.01;
         self.depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
         let done = self.released && self.vertical.settled(self.row as f64)
@@ -236,6 +246,9 @@ impl Follow {
             let i = (self.row - self.rows.0) as usize;
             self.columns[i].track(at.0, self.cols[i])
         };
+        if commits != 0 {
+            if axis == 1 { self.row_committing=true; } else { self.committing[(self.row-self.rows.0) as usize]=true; }
+        }
         self.depth.v += 5.0 * commits.abs() as f64;
         (self.offset(self.row), self.vertical.p)
     }
@@ -244,6 +257,7 @@ impl Follow {
         // The last straight leg keeps growing until the next turn.
         self.path_cursor = path.len().saturating_sub(1);
     }
+    pub fn consumed_path(&mut self, path: &[(f64, f64, usize)]) { self.path_cursor = path.len().saturating_sub(1); }
     pub fn finish_path(&mut self, path: &[(f64, f64, usize)]) -> (i32, i32) {
         self.track_path(0.0, path);
         self.let_go(0.0, self.hand)
@@ -253,6 +267,32 @@ impl Follow {
         (self.columns[(self.row - self.rows.0) as usize].cell, self.row)
     }
     pub fn settle(&mut self, now: f64) -> ((f64, f64), bool) { self.advance(now) }
+
+    /// Evaluate a frame without moving the real input timeline into the future.
+    pub fn sampled(&self, now: f64, prediction: Option<((f64, f64), f64)>) -> Self {
+        let mut frame = self.clone();
+        if let Some((at, at_time)) = prediction {
+            frame.track_locked(at_time, at, self.axis);
+            // Prediction is visual only and cannot cross a real latch/row boundary.
+            if frame.selected() != self.selected() || frame.row != self.row { frame = self.clone(); }
+        }
+        frame.advance(now);
+        frame
+    }
+
+}
+
+/// A short visual prediction; stale, stationary, reversed, or changed-axis input is not predicted.
+pub fn resample(samples: &[(f64, f64, f64, usize)], now: f64) -> Option<((f64,f64),f64)> {
+    let [a,b,c] = samples.get(samples.len().checked_sub(3)?..)? else {return None};
+    let dt = c.0-b.0;
+    let age = now-c.0;
+    if a.3 != b.3 || b.3 != c.3 || !(0.002..=0.020).contains(&dt) || age < 0.0 || age > 0.020 {return None;}
+    let d=(c.1-b.1,c.2-b.2);
+    if d.0*(b.1-a.1)+d.1*(b.2-a.2) <= 0.0 {return None;}
+    let horizon=age.min(dt*0.5).min(0.008);
+    // Retarget halfway through the prediction interval, then integrate to the frame.
+    Some(((c.1+d.0/dt*horizon*0.5,c.2+d.1/dt*horizon*0.5),c.0+horizon*0.5))
 }
 
 /// Keep reversals and axis turns even when thumbnail setup misses input frames.
@@ -285,6 +325,13 @@ mod tests {
             for (a, b) in leaving.0.into_iter().zip(returning.0) { assert!((a - b).abs() < 1e-9); }
             assert!((leaving.1 - returning.1).abs() < 1e-9);
         }
+    }
+    #[test]
+    fn preparing_the_first_picture_does_not_spend_the_dead_zone_zooming() {
+        let mut f=Follow::new((0,0),vec![(0,3)]);
+        f.track_locked(0.0,(0.0,0.0),0);f.track_locked(3.0,(0.01,0.0),0);
+        let (selected,offset)=(f.selected(),f.offset(0));
+        f.start_picture();assert_eq!(f.depth(),0.0);assert_eq!(f.selected(),selected);assert_eq!(f.offset(0),offset);
     }
     #[test]
     fn selected_size_changes_by_spring_and_cells_do_not_overlap() {
@@ -358,4 +405,38 @@ mod tests {
         f.track_locked(0.01, (8.0, 0.0), 0);
         assert_eq!(f.let_go(0.02, (8.0, 0.0)), (-1, 0));
     }
+    #[test]
+    fn timestamped_input_is_independent_of_render_batching() {
+        let run = |hz: u32| {
+            let mut f = Follow::new((0, 0), vec![(0, 4)]);
+            let mut event = 0;
+            for frame in 0..=hz {
+                let now = frame as f64 / hz as f64;
+                while event <= 125 && event as f64 / 125.0 <= now {
+                    let at = event as f64 / 125.0;
+                    f.track_locked(at, (at * 2.4, 0.0), 0);
+                    event += 1;
+                }
+                let _ = f.sampled(now, None);
+            }
+            (f.selected(),f.sampled(1.0,None).offset(0))
+        };
+        assert_eq!(run(60),run(144));
+        let mut f=Follow::new((0,0),vec![(0,2)]);
+        f.track_locked(0.0,(0.999,0.0),0);
+        let preview=f.sampled(0.02,Some(((1.001,0.0),0.01)));
+        assert_eq!(preview.selected(),(0,0));
+        assert_eq!(f.let_go(0.02,(0.999,0.0)),(0,0));
+    }
+    #[test]
+    fn visual_resampling_stops_at_zero_time_pause_reversal_and_stale_input() {
+        let steady=[(0.0,0.0,0.0,0),(0.008,0.008,0.0,0),(0.016,0.016,0.0,0)];
+        let predicted=resample(&steady,0.02).unwrap();
+        assert!((predicted.0.0-0.018).abs()<1e-9);
+        assert!(resample(&steady,0.1).is_none());
+        for last in [(0.008,0.016,0.0,0),(0.016,0.008,0.0,0),(0.016,0.004,0.0,0),(0.016,0.016,0.0,1)] {
+            assert!(resample(&[steady[0],steady[1],last],0.02).is_none());
+        }
+    }
+
 }

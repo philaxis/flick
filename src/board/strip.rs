@@ -133,7 +133,12 @@ pub fn place(plate: &Rect, at: (f32, f32), size: f32, spacing: f32) -> Place {
     let (cx, cy) = ((plate.left + plate.right) / 2.0, (plate.top + plate.bottom) / 2.0);
     let (px, py) = pitch(plate, spacing);
     let (ox, oy) = (cx + at.0 * px, cy + at.1 * py);
-    let place = Place { s: size, dx: (ox - size * cx).round(), dy: (oy - size * cy).round() };
+    #[cfg(windows)]
+    let precise = crate::composition::board_enabled();
+    #[cfg(not(windows))]
+    let precise = false;
+    let pixel = |v: f32| if precise { v } else { v.round() };
+    let place = Place { s: size, dx: pixel(ox - size * cx), dy: pixel(oy - size * cy) };
     if (size - 1.0).abs() < 1e-6 && place.dx == 0.0 && place.dy == 0.0 { Place::SAME } else { place }
 }
 
@@ -179,7 +184,7 @@ fn still(glide: &Glide, t: f32) -> bool {
 
 /// Where the strip is: what is left of each move, as `transition_curve`
 /// has it, and the hand.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Strip {
     /// How far back the cells are.
     recede: Recede,
@@ -196,6 +201,7 @@ pub struct Strip {
     hand_row: usize,
     counted_from: Option<u64>,
     holding: bool,
+    last_input: f32,
 }
 
 impl Strip {
@@ -210,6 +216,8 @@ impl Strip {
     /// still drawn where it was and goes on from there. Unless the hand
     /// holds the strip, the move recedes and comes forward again.
     pub fn moved(&mut self, before: &[(f32, f32)], after: &[(f32, f32)], now: f32) {
+        let now = now.max(self.last_input);
+        self.last_input = now;
         let slide = curve::SLIDE_END - curve::SLIDE_START;
         let mut end: Option<f32> = None;
         for (row, (was, is)) in before.iter().zip(after).enumerate() {
@@ -217,6 +225,7 @@ impl Strip {
             if jump.abs() > 1e-6 {
                 let glide = self.along_mut(row);
                 glide.retarget(jump, now, slide);
+                glide.committed();
                 end = Some(end.unwrap_or(0.0).max(glide.end()));
             }
         }
@@ -224,6 +233,7 @@ impl Strip {
         if rows.abs() > 1e-6 {
             self.across.vertical = true;
             self.across.retarget(rows, now, slide);
+            self.across.committed();
             end = Some(end.unwrap_or(0.0).max(self.across.end()));
             if self.holding {
                 self.row_recede.hold(now);
@@ -241,6 +251,8 @@ impl Strip {
     /// (cells), counted from `counted_from`. A hold recedes the strip; let
     /// go, it settles on the committed cell without predicting a fling.
     pub fn follow(&mut self, hand: (f32, f32), row: usize, counted_from: u64, holding: bool, now: f32) {
+        let now = now.max(self.last_input);
+        self.last_input = now;
         let hand = if holding { hand } else { (0.0, 0.0) };
         if holding && hand != (0.0, 0.0) && self.recede.settled(now) { self.recede.hold(now); }
         if holding && hand.1.abs() > 0.02 {
@@ -258,11 +270,19 @@ impl Strip {
         }
         self.across.vertical = true;
         self.across.retarget(hand.1 - old.1, now, curve::SNAP);
+        if holding && hand.0 != 0.0 { self.along_mut(row).following(); }
+        if holding && hand.1 != 0.0 { self.across.following(); }
+        if !holding && self.holding { self.along_mut(row).committed(); self.across.committed(); }
         (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
+        self.advance_depth(now);
+    }
+
+    /// Depth still settles on idle frames; translation targets only change on real input.
+    pub fn advance_depth(&mut self, now: f32) {
         let rows_moving = self.across.at(now).abs() > 0.01;
         let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01);
-        self.recede.moving(now, moving || holding && (hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
-        self.row_recede.moving(now, rows_moving || holding && hand.1.abs() > 0.01);
+        self.recede.moving(now, moving || self.holding && (self.hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
+        self.row_recede.moving(now, rows_moving || self.holding && self.hand.1.abs() > 0.01);
     }
 
     /// How far the cells of `row` are drawn from where they are laid out,
@@ -312,6 +332,17 @@ mod tests {
 
     /// Beside the selection: left, right, and where moving up or down
     /// would land, lined up under it; none past the ends.
+    #[test]
+    fn a_release_settles_without_more_input_reports() {
+        let mut strip=Strip::default();
+        strip.follow((0.0,0.0),0,0,true,0.0);
+        strip.follow((0.15,0.0),0,0,true,0.1);
+        strip.advance_depth(0.2);
+        strip.follow((0.0,0.0),0,0,false,0.21);
+        for frame in 14..120 {strip.advance_depth(frame as f32/60.0);}
+        assert!(strip.depth(2.0)<0.001);
+        assert!(!strip.active(2.0));
+    }
     #[test]
     fn neighbours_are_either_side_and_the_landing_cells_of_the_rows_around() {
         let g = grid(&[(3, 2), (4, 1), (1, 0)]);

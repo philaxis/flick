@@ -1691,6 +1691,8 @@ impl App {
             mouse: self.config.mouse,
             touchpad: self.config.touchpad,
             touchpad_status: crate::touchpad::status(),
+            motion_blur: self.config.experimental.motion_blur,
+            commit_speed: self.config.experimental.commit_speed,
         }
     }
 
@@ -1845,6 +1847,10 @@ impl App {
         if !unknown.is_empty() {
             warn(&format!("Unknown entries in trigger in config.toml: {}", unknown.join(", ")));
         }
+        crate::transition_curve::configure(config.experimental.commit_speed);
+        crate::composition::configure_blur(config.experimental.motion_blur);
+        crate::composition::configure(config.compositor);
+        self.glide.warm();
         crate::touchpad::poll(config.touchpad.three_finger);
         input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);
@@ -2706,6 +2712,8 @@ pub fn render_settings(path: &str, touchpad: bool) {
         mouse: config.mouse,
         touchpad: config.touchpad,
         touchpad_status: if touchpad { crate::touchpad::Status::Conflict } else { crate::touchpad::Status::Absent },
+        motion_blur: config.experimental.motion_blur,
+        commit_speed: config.experimental.commit_speed,
     };
     let tab = if touchpad { settings::Tab::Touchpad } else { settings::Tab::Mouse };
     if let Some((size, pixels)) = window.render_to_pixels(view, tab, 1.5) {

@@ -124,7 +124,7 @@ static STRETCH: AtomicU32 = AtomicU32::new(0);
 /// The cell the hand has come to, counted from the one the stretch began on,
 /// and how far it is from that cell, in thousandths of a cell.
 static ASKED: AtomicI32 = AtomicI32::new(0);
-static FRACTION: AtomicI32 = AtomicI32::new(0);
+static FRACTION: AtomicU32 = AtomicU32::new(0);
 /// What the app last said of a stretch (`slide_shown`): hold << 32 |
 /// stretch << 24 | cell << 16 | cells to the left << 8 | cells to the right.
 static SHOWN: AtomicU64 = AtomicU64::new(0);
@@ -136,7 +136,7 @@ const NO_ROOM: i32 = 0xFF;
 /// what the app last said (hold << 32 | row << 16 | rows above << 8 | rows
 /// below).
 static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
-static ROW_FRACTION: AtomicI32 = AtomicI32::new(0);
+static ROW_FRACTION: AtomicU32 = AtomicU32::new(0);
 static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
 /// The board is open: a hold begun now goes from row to row as the hand
 /// goes, not by notches (`Plane::linear`), as it does with none set.
@@ -154,14 +154,14 @@ static FOLLOWING: AtomicU32 = AtomicU32::new(0);
 pub const FOLLOW_X: u32 = 1;
 pub const FOLLOW_Y: u32 = 2;
 pub const FOLLOW_TOUCHPAD: u32 = 4;
-/// How far the hand went those ways in the hold, in thousandths of a cell
-/// (of a row up and down), kept once it is let go of.
-static FOLLOWED_X: AtomicI32 = AtomicI32::new(0);
-static FOLLOWED_Y: AtomicI32 = AtomicI32::new(0);
+/// Exact f64 cell coordinates, published as atomic bits and kept after release.
+static FOLLOWED_X: AtomicU64 = AtomicU64::new(0);
+static FOLLOWED_Y: AtomicU64 = AtomicU64::new(0);
 
 /// The app says when the board opens and closes.
 pub fn set_board_open(open: bool) {
     BOARD_OPEN.store(open, Ordering::SeqCst);
+    if !open { if let Ok(mut q) = BOARD_SAMPLES.lock() { q.clear(); } }
 }
 
 /// The wparam of `WM_SLIDE` and `WM_DRAG`.
@@ -256,6 +256,9 @@ pub struct Followed {
 // Releases must survive a subsequent press until the UI and renderer consume them.
 #[derive(Clone, Default)]
 pub struct FollowHold {
+    pub started: Option<Instant>,
+    pub samples: std::collections::VecDeque<TimedHand>,
+    pub overflowed: bool,
     pub hand: Followed,
     pub axis: usize,
     pub path: Vec<(f64, f64, usize)>,
@@ -264,15 +267,75 @@ static FOLLOW_HOLDS: Mutex<std::collections::BTreeMap<u32, FollowHold>> = Mutex:
 
 pub fn follow_hold(hold: u32) -> Option<FollowHold> { FOLLOW_HOLDS.lock().ok()?.get(&hold).cloned() }
 pub fn forget_hold(hold: u32) { if let Ok(mut holds) = FOLLOW_HOLDS.lock() { holds.remove(&hold); } }
+/// The renderer takes a batch once; semantic turn/commit history remains for the app.
+pub fn follow_frame(hold: u32) -> Option<FollowHold> {
+    let mut holds = FOLLOW_HOLDS.lock().ok()?;
+    let saved = holds.get_mut(&hold)?;
+    Some(FollowHold { hand: saved.hand, axis: saved.axis, path: saved.path.clone(), started: saved.started,
+        samples: std::mem::take(&mut saved.samples), overflowed: std::mem::take(&mut saved.overflowed) })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimedHand {
+    pub at: Instant,
+    #[allow(dead_code)] // OS/receipt/device clocks stay distinct for diagnostics.
+    pub os_ms: u32,
+    #[allow(dead_code)]
+    pub received: Instant,
+    #[allow(dead_code)]
+    pub scan_time: Option<u32>,
+    pub hand: Hand,
+    pub followed: Followed,
+    pub axis: usize,
+}
+thread_local! {
+    static SAMPLE_TIME: Cell<Option<(Instant, u32)>> = const { Cell::new(None) };
+    static LAST_SAMPLE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+static BOARD_SAMPLES: Mutex<std::collections::VecDeque<TimedHand>> = Mutex::new(std::collections::VecDeque::new());
+
+/// One immutable frame snapshot; old coordinate origins are never replayed into a new cell.
+pub fn board_frame() -> (Hand, bool, Option<usize>, Vec<TimedHand>) {
+    let mut queue = BOARD_SAMPLES.lock().unwrap();
+    let (current, holding, axis) = loop {
+        let before = WRITING.load(Ordering::SeqCst);
+        if before % 2 != 0 { std::hint::spin_loop(); continue; }
+        let state = (hand(), holding(), axis());
+        if before == WRITING.load(Ordering::SeqCst) { break state; }
+    };
+    let samples: Vec<TimedHand> = queue.drain(..).filter(|s| s.hand.counted_from == current.counted_from).collect();
+    let (current, holding) = samples.last().map_or((current, holding), |s| (s.hand, s.followed.holding));
+    (current, holding, axis, samples)
+}
+
 fn remember_follow() {
-    let hand = followed();
-    if hand.ways & (FOLLOW_X | FOLLOW_Y) == 0 { return; }
-    let axis = axis().unwrap_or(0);
+    let followed = followed();
+    let received = Instant::now();
+    let stamp = SAMPLE_TIME.get();
+    let os_ms = unsafe { GetMessageTime() } as u32;
+    // WM_INPUT has no hardware QPC: retain its ms stamp separately, integrate receipt QPC.
+    let at = stamp.map_or(received, |s|s.0);
+    let at = LAST_SAMPLE.replace(Some(at)).map_or(at, |last| last.max(at));
+    LAST_SAMPLE.set(Some(at));
+    let sample = TimedHand { at, received, scan_time: stamp.map(|s|s.1), os_ms,
+        hand: hand(), followed, axis: axis().unwrap_or(0) };
+    #[cfg(feature = "motion-probe")]
+    PROBE_HAND.with(|v| v.borrow_mut().push(sample));
+    if BOARD_OPEN.load(Ordering::SeqCst) {
+        if let Ok(mut queue) = BOARD_SAMPLES.lock() {
+            if queue.len() == 2048 { queue.pop_front(); }
+            queue.push_back(sample);
+        }
+    }
+    if followed.ways & (FOLLOW_X | FOLLOW_Y) == 0 { return; }
     if let Ok(mut holds) = FOLLOW_HOLDS.lock() {
-        let saved = holds.entry(hand.hold).or_default();
-        crate::follow::remember(&mut saved.path, (hand.x, hand.y, axis));
-        saved.hand = hand;
-        saved.axis = axis;
+        let saved = holds.entry(followed.hold).or_default();
+        saved.started.get_or_insert(sample.at);
+        if saved.samples.len() == 2048 { saved.samples.pop_front(); saved.overflowed = true; }
+        saved.samples.push_back(sample);
+        crate::follow::remember(&mut saved.path, (followed.x, followed.y, sample.axis));
+        saved.hand = followed;
+        saved.axis = sample.axis;
     }
 }
 
@@ -288,8 +351,8 @@ pub fn followed() -> Followed {
             hold: HOLD_ID.load(Ordering::SeqCst),
             holding: HOLDING.load(Ordering::SeqCst),
             ways: FOLLOWING.load(Ordering::SeqCst),
-            x: FOLLOWED_X.load(Ordering::SeqCst) as f64 / 1000.0,
-            y: FOLLOWED_Y.load(Ordering::SeqCst) as f64 / 1000.0,
+            x: f64::from_bits(FOLLOWED_X.load(Ordering::SeqCst)),
+            y: f64::from_bits(FOLLOWED_Y.load(Ordering::SeqCst)),
         };
         if WRITING.load(Ordering::SeqCst) == before {
             return followed;
@@ -313,9 +376,9 @@ pub fn hand() -> Hand {
         let holding = HOLDING.load(Ordering::SeqCst);
         let (hold, stretch) = (HOLD_ID.load(Ordering::SeqCst), STRETCH.load(Ordering::SeqCst));
         let (shown_raw, rows_raw) = (SHOWN.load(Ordering::SeqCst), ROWS_SHOWN.load(Ordering::SeqCst));
-        let along = (ASKED.load(Ordering::SeqCst) - shown().map_or(0, |(cell, _)| cell)) as f32 + FRACTION.load(Ordering::SeqCst) as f32 / 1000.0;
+        let along = (ASKED.load(Ordering::SeqCst) - shown().map_or(0, |(cell, _)| cell)) as f32 + f32::from_bits(FRACTION.load(Ordering::SeqCst));
         let across = (ROW_ASKED.load(Ordering::SeqCst) - rows_seen().map_or(0, |(row, _)| row)) as f32
-            + ROW_FRACTION.load(Ordering::SeqCst) as f32 / 1000.0;
+            + f32::from_bits(ROW_FRACTION.load(Ordering::SeqCst));
         if WRITING.load(Ordering::SeqCst) != before {
             continue;
         }
@@ -846,6 +909,7 @@ fn press(source: Source) {
         PRESSED_OVER.set(unsafe { (GetForegroundWindow().0, under_cursor().map_or(0, |window| window.0)) });
         listen_raw(true);
         WATCH_TIMER.set(unsafe { SetTimer(None, 0, WATCH_MS, Some(watch)) });
+        remember_follow();
     }
 }
 
@@ -988,6 +1052,8 @@ fn release(s: &Settings, source: Source) {
 }
 
 fn finish_release(s: &Settings, source: Source, tap: Option<bool>) {
+    #[cfg(feature = "motion-probe")]
+    probe_flush();
     let ended = HELD.with(|held| held.borrow_mut().release(source));
     debug_log!("up {source:?}{}", if ended { ": hold ends" } else { "" });
     if ended {
@@ -1173,7 +1239,10 @@ fn raw_mouse_input(raw: &RAWINPUT) {
 }
 
 fn touchpad_event(event: crate::touchpad::Event) {
-    if CAPTURING.load(Ordering::SeqCst) { return; }
+    let stamp = SAMPLE_TIME.replace(event.sampled_at.zip(event.scan_time));
+    #[cfg(feature = "motion-probe")]
+    let probe_delta = event.delta;
+    if CAPTURING.load(Ordering::SeqCst) { SAMPLE_TIME.set(stamp); return; }
     with_settings(|s| {
         if event.began {
             press(Source::Touchpad);
@@ -1240,6 +1309,9 @@ fn touchpad_event(event: crate::touchpad::Event) {
         }
         false
     });
+    #[cfg(feature = "motion-probe")]
+    probe_input("ptp", probe_delta.0, probe_delta.1);
+    SAMPLE_TIME.set(stamp);
 }
 
 /// Between touchpad steps the minimap leans as far as `Rails` gathered towards the next one,
@@ -1262,8 +1334,8 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
     let along = plane.cols.display(x as f32);
     let lean = plane.rows.display(y as f32);
     writing(|| {
-        FRACTION.store((along * 1000.0) as i32, Ordering::SeqCst);
-        ROW_FRACTION.store((lean * 1000.0) as i32, Ordering::SeqCst);
+        FRACTION.store(along.to_bits(), Ordering::SeqCst);
+        ROW_FRACTION.store(lean.to_bits(), Ordering::SeqCst);
         store_followed(s);
     });
     remember_follow();
@@ -1274,6 +1346,28 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
 }
 
 unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    #[cfg(feature = "motion-probe")]
+    if (message == WM_APP + 61 && wparam.0 <= 3) || (message == WM_APP + 62 && wparam.0 & 255 <= 3) {
+        thread_local! {
+            static REPLAY: RefCell<crate::touchpad::Gesture> = RefCell::default();
+            static REPLAY_CLOCK: RefCell<crate::touchpad::ScanClock> = RefCell::default();
+        }
+        // Test coordinates are signed thousandths of a centimetre; no cross-process pointers.
+        let x = lparam.0 as u32 as i32 as f64 / 1000.0;
+        let y = (lparam.0 as u64 >> 32) as u32 as i32 as f64 / 1000.0;
+        let contacts: Vec<_> = (0..(wparam.0 & 255)).map(|id| crate::touchpad::Contact {
+            id: id as u32, confident: true, x: x + id as f64 * 0.4, y,
+        }).collect();
+        let mut event = REPLAY.with(|g| g.borrow_mut().update(&contacts, GetMessageTime() as u32));
+        if message == WM_APP + 62 {
+            let scan=((wparam.0 >> 8) & 65535) as u32;
+            event.scan_time=Some(scan);
+            event.sampled_at=Some(REPLAY_CLOCK.with(|c| c.borrow_mut().stamp(scan,Instant::now())));
+            if contacts.is_empty() {REPLAY_CLOCK.with(|c| *c.borrow_mut()=Default::default());}
+        }
+        touchpad_event(event);
+        return LRESULT(0);
+    }
     if message == WM_INPUT {
         on_raw_input(HRAWINPUT(lparam.0));
     }
@@ -1298,6 +1392,8 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     let by: [i32; 2] = std::array::from_fn(|i| (lock.at[i] * step[i]).round() as i32 - (before[i] * step[i]).round() as i32);
     MOUSE_AXIS.set(lock);
     advance(s, by[0], by[1]);
+    #[cfg(feature = "motion-probe")]
+    probe_input("mouse", dx as f64, dy as f64);
 }
 
 /// Adds travel and emits steps.
@@ -1343,9 +1439,9 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
             STRETCH.fetch_add(1, Ordering::SeqCst);
         }
         ROW_ASKED.store(rows.cell(), Ordering::SeqCst);
-        ROW_FRACTION.store((rows.lean(step_y) * 1000.0) as i32, Ordering::SeqCst);
+        ROW_FRACTION.store(rows.lean(step_y).to_bits(), Ordering::SeqCst);
         ASKED.store(cols.cell(), Ordering::SeqCst);
-        FRACTION.store(cols.rest(step) * 1000 / step, Ordering::SeqCst);
+        FRACTION.store((cols.rest(step) as f32 / step as f32).to_bits(), Ordering::SeqCst);
         store_followed(s);
     });
     remember_follow();
@@ -1381,22 +1477,22 @@ fn following_axis_chosen() -> bool {
 fn store_followed(s: &Settings) {
     let following = FOLLOWING.load(Ordering::SeqCst);
     let ((x, y), (lean_x, lean_y)) = FOLLOWED.get();
-    let cells = |counts: i64, step: i32, lean: f64| counts as f32 / step.max(1) as f32 + lean as f32;
+    let cells = |counts: i64, step: i32, lean: f64| counts as f64 / step.max(1) as f64 + lean;
     // The minimap held back at each cell as the picture is (`follow::notched`).
     let plane = PLANE.get();
     if following & FOLLOW_X != 0 {
         let x = cells(x, s.step_x, lean_x);
-        FOLLOWED_X.store((x * 1000.0) as i32, Ordering::SeqCst);
-        FRACTION.store((plane.cols.display(x) * 1000.0) as i32, Ordering::SeqCst);
+        FOLLOWED_X.store(x.to_bits(), Ordering::SeqCst);
+        FRACTION.store(plane.cols.display(x as f32).to_bits(), Ordering::SeqCst);
     }
     if following & FOLLOW_Y != 0 {
         let y = cells(y, s.step_y, lean_y);
-        FOLLOWED_Y.store((y * 1000.0) as i32, Ordering::SeqCst);
+        FOLLOWED_Y.store(y.to_bits(), Ordering::SeqCst);
         let notch = match plane.rows {
             crate::slide::Rows::Notched(detent) => detent.notch(),
             crate::slide::Rows::Linear(slide) => slide.notch(),
         };
-        ROW_FRACTION.store((crate::slide::notch::position(y, notch as f32 / crate::slide::FIRMEST as f32) * 1000.0) as i32, Ordering::SeqCst);
+        ROW_FRACTION.store(crate::slide::notch::position(y as f32, notch as f32 / crate::slide::FIRMEST as f32).to_bits(), Ordering::SeqCst);
     }
 }
 
@@ -1683,4 +1779,40 @@ mod tests {
         // administrator gets it.
         assert!(hidden_by(8, 0, admin));
     }
+}
+
+
+#[cfg(feature = "motion-probe")]
+thread_local! { static PROBE_HAND: RefCell<Vec<TimedHand>> = const {RefCell::new(Vec::new())}; }
+#[cfg(feature = "motion-probe")]
+thread_local! { static PROBE_INPUT: RefCell<Vec<(i64, &'static str, f64, f64)>> = const {RefCell::new(Vec::new())}; }
+#[cfg(feature = "motion-probe")]
+fn probe_input(kind: &'static str, x: f64, y: f64) {
+    let mut at = 0;
+    unsafe { let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut at); }
+    PROBE_INPUT.with(|v| v.borrow_mut().push((at,kind,x,y)));
+}
+#[cfg(feature = "motion-probe")]
+fn probe_flush() {
+    use std::fmt::Write;
+    let Some(path) = std::env::var_os("FLICK_INPUT_TRACE") else {return};
+    PROBE_HAND.with(|v| {
+        if v.borrow().is_empty() {return;}
+        let mut tick=0;let mut frequency=0;
+        unsafe {let _=windows::Win32::System::Performance::QueryPerformanceCounter(&mut tick);let _=windows::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency);}
+        let now=Instant::now();
+        let file=std::path::Path::new(&path).with_extension("samples.csv");
+        let mut csv=std::fs::read_to_string(&file).unwrap_or_else(|_|"sample_qpc,received_qpc,os_ms,scan_time,x,y,axis,holding,hand_along,hand_across,counted_from\n".into());
+        for s in v.borrow_mut().drain(..) {
+            let stamp=|at:Instant|tick-(now.saturating_duration_since(at).as_secs_f64()*frequency as f64).round() as i64;
+            let _=writeln!(csv,"{},{},{},{},{:.9},{:.9},{},{},{:.9},{:.9},{}",stamp(s.at),stamp(s.received),s.os_ms,s.scan_time.map_or(String::new(),|s|s.to_string()),s.followed.x,s.followed.y,s.axis,s.followed.holding,s.hand.along,s.hand.across,s.hand.counted_from);
+        }
+        let _=std::fs::write(file,csv);
+    });
+    PROBE_INPUT.with(|v| {
+        if v.borrow().is_empty() { return; }
+        let mut csv = std::fs::read_to_string(&path).unwrap_or_else(|_| String::from("qpc,kind,dx,dy\n"));
+        for (at,kind,x,y) in v.borrow_mut().drain(..) {let _ = writeln!(csv,"{at},{kind},{x:.6},{y:.6}");}
+        let _ = std::fs::write(path,csv);
+    });
 }

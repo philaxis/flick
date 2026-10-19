@@ -26,6 +26,8 @@ mod board;
 #[cfg(windows)]
 mod glide;
 #[cfg(windows)]
+mod composition;
+#[cfg(windows)]
 mod guide;
 #[cfg(any(windows, test))]
 mod hold;
