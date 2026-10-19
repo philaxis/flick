@@ -19,6 +19,9 @@ pub struct Event {
     pub steps: Vec<Dir>,
     /// How far towards the next step each way, in steps (`Rails::progress`).
     pub progress: (f64, f64),
+    /// How far the hand is from the last step each way, in steps, for the
+    /// screen following it (`Rails::lean`).
+    pub lean: (f64, f64),
 }
 
 #[derive(Default)]
@@ -83,6 +86,7 @@ impl Gesture {
             event.delta = delta;
             event.steps = self.rails.travel((delta.0 * 10.0, delta.1 * 10.0), ms);
             event.progress = self.rails.progress();
+            event.lean = self.rails.lean();
         }
         self.previous = contacts.to_vec();
         event
@@ -184,6 +188,10 @@ pub struct Rails {
     last_ms: Option<u32>,
     /// Going slantwise: the axis recent movement keeps close to, and since when.
     near: Option<(usize, u32)>,
+    /// Travel towards a step dropped when a rail left its axis, in steps:
+    /// the screen following the hand stays where it was rather than going
+    /// back by it (`lean`).
+    kept: [f64; 2],
 }
 
 impl Default for Rails {
@@ -204,7 +212,26 @@ impl Rails {
             recent: [0.0; 2],
             last_ms: None,
             near: None,
+            kept: [0.0; 2],
         }
+    }
+
+    /// How far the hand is from the last step each way, in steps: what
+    /// gathered towards the next one (on the axes a rail ignores too), and
+    /// what a rail dropped, so that it never goes back of itself. Steps are
+    /// taken as `travel` says; this only places the screen between them.
+    pub fn lean(&self) -> (f64, f64) {
+        let [x, y] = [0, 1].map(|axis| self.gathered[axis] / self.step[axis] + self.kept[axis]);
+        match self.mode {
+            Mode::Judging => (self.kept[0], self.kept[1]),
+            _ => (x, y),
+        }
+    }
+
+    /// A rail drops what `axis` gathered towards a step.
+    fn drop_gathered(&mut self, axis: usize) {
+        self.kept[axis] += self.gathered[axis] / self.step[axis];
+        self.gathered[axis] = 0.0;
     }
 
     /// How far towards the next step each way, in steps; nothing on the axis a rail ignores.
@@ -259,7 +286,8 @@ impl Rails {
                 if self.off.abs() > channel && self.within(side, switch) {
                     // An L: the new way gathers from nothing, so the turn itself is no step.
                     self.mode = Mode::Rail(side);
-                    self.gathered = [0.0; 2];
+                    self.drop_gathered(0);
+                    self.drop_gathered(1);
                     (self.off, self.along) = (0.0, 0.0);
                     return steps;
                 }
@@ -278,7 +306,7 @@ impl Rails {
                     (Some(axis), Some((was, since))) if axis == was => {
                         if ms.wrapping_sub(since) >= RELOCK_MS {
                             self.mode = Mode::Rail(axis);
-                            self.gathered[1 - axis] = 0.0;
+                            self.drop_gathered(1 - axis);
                             (self.off, self.along) = (0.0, 0.0);
                             self.near = None;
                         }
@@ -538,6 +566,38 @@ mod tests {
         let steps = drive(&mut rails, &mut 0, path);
         assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Down)), (7, 0));
     }
+    /// The screen following the hand never goes back of itself: an L drops
+    /// what went towards a step from the steps, not from where the hand is.
+    #[test]
+    fn the_lean_never_goes_back_at_a_turn() {
+        let mut rails = Rails::default();
+        let mut ms = 0;
+        let mut last = (0.0, 0.0);
+        let mut steps = (0, 0);
+        let path: Vec<(f64, f64)> = line((0.0, 0.0), (16.0, 0.0), 0.5).into_iter().chain(line((16.0, 0.0), (16.0, 25.0), 0.5)).collect();
+        let mut previous = path[0];
+        for point in path {
+            for step in rails.travel((point.0 - previous.0, point.1 - previous.1), ms) {
+                match step {
+                    Dir::Right => steps.0 += 1,
+                    Dir::Down => steps.1 += 1,
+                    _ => panic!("{step:?}"),
+                }
+            }
+            previous = point;
+            ms += 8;
+            let lean = rails.lean();
+            let at = (steps.0 as f64 + lean.0, steps.1 as f64 + lean.1);
+            assert!(at.0 >= last.0 - 1e-9 && at.1 >= last.1 - 1e-9, "went back from {last:?} to {at:?}");
+            last = at;
+        }
+        // Across: 1.6 steps, the 0.6 kept through the turn; down 2 and a half
+        // less what the turn took to be seen.
+        assert_eq!(steps.0, 1);
+        assert!((last.0 - 1.6).abs() < 1e-6, "{last:?}");
+        assert!(last.1 > 1.0 && last.1 < 2.5 + 1e-9, "{last:?}");
+    }
+
     #[test]
     fn an_l_switches_axis_without_counting_the_turn() {
         let mut rails = Rails::default();

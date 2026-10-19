@@ -1143,6 +1143,12 @@ fn touchpad_event(event: crate::touchpad::Event) {
             // The pad judged which way each step goes (`touchpad::Rails`); a whole step each is
             // exactly one cell or row of the plane, so no mouse rounding comes into it.
             // `touchpad_reverse` turns the steps and the lean between them around alike.
+            // The lean the screen follows is the one after the steps before they are counted:
+            // counted with the one before, the hand would be a step on for a moment.
+            if event.ended.is_none() {
+                let (counts, _) = FOLLOWED.get();
+                FOLLOWED.set((counts, directed(event.lean, s.touchpad_reverse)));
+            }
             for step in &event.steps {
                 use crate::touchpad::Dir;
                 let (dx, dy) = match step {
@@ -1154,19 +1160,24 @@ fn touchpad_event(event: crate::touchpad::Event) {
                 let (dx, dy) = directed((dx, dy), s.touchpad_reverse);
                 advance(s, dx, dy);
             }
-            touchpad_lean(s, directed(event.progress, s.touchpad_reverse));
-            if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
+            // Lifted, the report has no lean: where the hand was stays, or the
+            // screen following it would go back to the last step as it is let go.
+            match event.ended {
+                Some(tap) => finish_release(s, Source::Touchpad, Some(tap)),
+                None => touchpad_lean(s, directed(event.progress, s.touchpad_reverse), directed(event.lean, s.touchpad_reverse)),
+            }
         }
         false
     });
 }
 
 /// Between touchpad steps the minimap leans as far as `Rails` gathered towards the next one,
-/// never past the end of a row or the first or last row.
-fn touchpad_lean(s: &Settings, (x, y): (f64, f64)) {
+/// never past the end of a row or the first or last row. The screen following the hand is
+/// `lean` past the steps (`Rails::lean`).
+fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
     // The screen following the hand gives a little past the ends itself.
     let (counts, _) = FOLLOWED.get();
-    FOLLOWED.set((counts, (x, y)));
+    FOLLOWED.set((counts, lean));
     let plane = PLANE.get();
     let at_wall = |p: f64, cell: i32, (before, after): (i32, i32)| (p < 0.0 && cell <= -before) || (p > 0.0 && cell >= after);
     let x = match shown() {

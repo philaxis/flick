@@ -277,6 +277,36 @@ fn a_followed_way_comes_to_no_cell_and_keeps_where_the_hand_is() {
     release(&s, Source::XButton2);
 }
 
+/// Three fingers lifted from the pad report no lean towards the next step: the
+/// screen following the hand must stay where the hand was, not go back to the last
+/// step (or where the hold began) as it is let go of, which flung it back.
+#[test]
+fn letting_go_of_the_touchpad_keeps_where_the_hand_was() {
+    let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    reset();
+    let s = Settings { touchpad_follow: FOLLOW_X | FOLLOW_Y, ..settings() };
+    SETTINGS.with(|slot| *slot.borrow_mut() = Some(s));
+    let hand = |x: f64| (0..3).map(|id| crate::touchpad::Contact { id, confident: true, x: x + id as f64, y: 2.0 }).collect::<Vec<_>>();
+    let mut gesture = crate::touchpad::Gesture::default();
+    let (mut ms, mut farthest) = (0, 0.0f64);
+    // 1.6 cm to the right: a step and six tenths of the next.
+    for i in 0..=32 {
+        touchpad_event(gesture.update(&hand(i as f64 * 0.05), ms));
+        ms += 8;
+        let at = followed();
+        assert!(at.holding, "{i}");
+        // Never back, not even for a moment as a step is counted.
+        assert!(at.x.abs() >= farthest - 1e-3, "back from {farthest} to {} at {i}", at.x);
+        farthest = farthest.max(at.x.abs());
+    }
+    let before = followed();
+    assert!((before.x.abs() - 1.6).abs() < 0.02, "{before:?}");
+    touchpad_event(gesture.update(&[], ms));
+    let after = followed();
+    assert!(!after.holding);
+    assert!((after.x - before.x).abs() < 1e-3 && (after.y - before.y).abs() < 1e-3, "{before:?} then {after:?}");
+}
+
 fn packet(kind: u32, len: usize) -> Vec<u8> {
     let mut packet = vec![0; len];
     packet[..4].copy_from_slice(&kind.to_le_bytes());
