@@ -692,6 +692,8 @@ fn hold(args: &[String]) {
             lpfnWndProc: Some(plain),
             hInstance: instance.into(),
             lpszClassName: class,
+            // An icon, as apps have, for the board to show on their previews.
+            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
             hbrBackground: CreateSolidBrush(COLORREF((n(0) | n(1) << 8 | n(2) << 16) as u32)),
             ..Default::default()
         });
