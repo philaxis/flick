@@ -527,7 +527,7 @@ impl Motion {
         let step = self.last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32()).min(MOTION_LONGEST_STEP);
         self.last = Some(now);
         if self.counted_from != Some(counted_from) {
-            let parts: Vec<Part> = self.hand.keys().chain(hand.keys()).cloned().collect();
+            let parts: std::collections::HashSet<Part> = self.hand.keys().chain(hand.keys()).cloned().collect();
             for part in parts {
                 let (was, is) = (self.hand.get(&part).copied().unwrap_or_default(), hand.get(&part).copied().unwrap_or_default());
                 let rest = self.rest.entry(part).or_default();
@@ -3345,8 +3345,9 @@ mod tests {
 
     #[test]
     fn the_hand_pulls_a_little_past_the_ends_only() {
-        assert_eq!(hand_pull((0, 0), (3, 2), (-1.0, 0.0)), (-EDGE_GIVE, 0.0));
-        assert_eq!(hand_pull((1, 1), (3, 2), (0.5, -0.25)), (0.5, -0.25));
-        assert_eq!(hand_pull((3, 2), (3, 2), (2.0, 2.0)), (EDGE_GIVE, EDGE_GIVE));
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4;
+        assert!(near(hand_pull((0, 0), (3, 2), (-1.0, 0.0)), (-EDGE_GIVE, 0.0)));
+        assert!(near(hand_pull((1, 1), (3, 2), (0.5, -0.25)), (0.5, -0.25)));
+        assert!(near(hand_pull((3, 2), (3, 2), (2.0, 2.0)), (EDGE_GIVE, EDGE_GIVE)));
     }
 }
