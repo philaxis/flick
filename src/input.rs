@@ -270,9 +270,7 @@ fn remember_follow() {
     let axis = axis().unwrap_or(0);
     if let Ok(mut holds) = FOLLOW_HOLDS.lock() {
         let saved = holds.entry(hand.hold).or_default();
-        // Only the last point of each straight leg matters to the row anchors.
-        if saved.path.last().is_some_and(|p| p.2 == axis) { saved.path.pop(); }
-        saved.path.push((hand.x, hand.y, axis));
+        crate::follow::remember(&mut saved.path, (hand.x, hand.y, axis));
         saved.hand = hand;
         saved.axis = axis;
     }

@@ -1,7 +1,5 @@
 //! Variant F on the desktop grid; the same springs drive the board and minimap.
 use crate::transition_curve::{Latch, Spring};
-pub const GIVE: f64 = 0.15;
-pub const RECEDE: f64 = 0.7;
 pub const GAP: f64 = 0.07;
 pub const GLOW: f64 = 0.55;
 pub const LIFT: f64 = 0.0;
@@ -196,7 +194,6 @@ impl Follow {
         self.depth.v += 5.0 * commits.abs() as f64;
         (self.offset(self.row), self.vertical.p)
     }
-    pub fn caught_up(&self, _at: (f64, f64), axis: usize) -> bool { self.axis == axis }
     pub fn finish_path(&mut self, path: &[(f64, f64, usize)]) -> (i32, i32) {
         for &(x, y, axis) in path { self.track_locked(0.0, (x, y), axis); }
         self.let_go(0.0, self.hand)
@@ -206,6 +203,16 @@ impl Follow {
         (self.columns[(self.row - self.rows.0) as usize].cell, self.row)
     }
     pub fn settle(&mut self, now: f64) -> ((f64, f64), bool) { self.advance(now) }
+}
+
+/// Keep reversals and axis turns even when thumbnail setup misses input frames.
+pub fn remember(path: &mut Vec<(f64, f64, usize)>, point: (f64, f64, usize)) {
+    if let Some(&last) = path.last() {
+        let before = path.get(path.len().saturating_sub(2)).filter(|_| path.len() > 1).copied().unwrap_or((0.0, 0.0, point.2));
+        let along = |p: (f64, f64, usize)| if point.2 == 0 { p.0 } else { p.1 };
+        if last.2 == point.2 && (along(last) - along(before)) * (along(point) - along(last)) >= 0.0 { path.pop(); }
+    }
+    path.push(point);
 }
 
 #[cfg(test)]
@@ -221,6 +228,14 @@ mod tests {
         for i in 3..250 { f.settle(i as f64 * 0.01); }
         assert!((f.offset(1) - 1.0).abs() < 1e-6 && f.offset(0).abs() < 1e-6);
         assert!(f.settle(3.0).1);
+    }
+    #[test]
+    fn compressed_input_keeps_turns_and_reversals() {
+        let mut path = Vec::new();
+        for point in [(0.0, 0.5, 1), (0.0, 1.0, 1), (0.5, 1.0, 0), (9.0, 1.0, 0), (8.0, 1.0, 0)] { remember(&mut path, point); }
+        assert_eq!(path, vec![(0.0, 1.0, 1), (9.0, 1.0, 0), (8.0, 1.0, 0)]);
+        let mut f = Follow::new((0, 2), vec![(0, 2); 3], (0.0, 0.0));
+        assert_eq!(f.finish_path(&path), (1, 1));
     }
     #[test]
     fn missed_frames_keep_commits_and_edge_reversal_responds() {

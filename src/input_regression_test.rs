@@ -287,7 +287,7 @@ fn letting_go_of_the_touchpad_keeps_where_the_hand_was() {
     let hand = |x: f64| (0..3).map(|id| crate::touchpad::Contact { id, confident: true, x: x + id as f64, y: 2.0 }).collect::<Vec<_>>();
     let mut gesture = crate::touchpad::Gesture::default();
     let (mut ms, mut farthest) = (0, 0.0f64);
-    // 1.6 cm to the right: a step and six tenths of the next.
+    // 1.6 cm, less the 3.5 mm landing/dead zone, normalized by 12 mm.
     for i in 0..=32 {
         touchpad_event(gesture.update(&hand(i as f64 * 0.05), ms));
         ms += 8;
@@ -298,7 +298,7 @@ fn letting_go_of_the_touchpad_keeps_where_the_hand_was() {
         farthest = farthest.max(at.x.abs());
     }
     let before = followed();
-    assert!((before.x.abs() - 1.3).abs() < 0.06, "{before:?}");
+    assert!((before.x.abs() - 1.25 / 1.2).abs() < 0.06, "{before:?}");
     touchpad_event(gesture.update(&[], ms));
     let after = followed();
     assert!(!after.holding);

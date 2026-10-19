@@ -189,8 +189,6 @@ pub struct Strip {
     hand: (f32, f32),
     hand_row: usize,
     counted_from: Option<u64>,
-    speed: (f32, f32),
-    heard: Option<f32>,
     holding: bool,
 }
 
@@ -240,7 +238,6 @@ impl Strip {
         let hand = if holding { hand } else { (0.0, 0.0) };
         if holding && !self.holding {
             self.recede.hold(now);
-            self.speed = (0.0, 0.0);
         }
         if holding && hand.1.abs() > 0.02 {
             self.row_recede.hold(now);
@@ -261,19 +258,7 @@ impl Strip {
             self.recede.release(now, now + 0.4);
             self.row_recede.release(now, now + 0.4);
         }
-        (self.hand, self.hand_row, self.counted_from, self.holding, self.heard) = (hand, row, Some(counted_from), holding, Some(now));
-    }
-
-    pub fn lock_axis(&mut self, axis: usize) {
-        if axis == 0 {
-            self.across = Glide::default();
-            self.hand.1 = 0.0;
-            self.speed.1 = 0.0;
-        } else {
-            self.along.fill(Glide::default());
-            self.hand.0 = 0.0;
-            self.speed.0 = 0.0;
-        }
+        (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
     }
 
     /// How far the cells of `row` are drawn from where they are laid out,
@@ -281,7 +266,7 @@ impl Strip {
     pub fn offset(&self, row: usize, t: f32) -> (f32, f32) {
         let along = self.along.get(row).map_or(0.0, |glide| glide.at(t));
         let hand = if row == self.hand_row { self.hand } else { (0.0, 0.0) };
-        (along - hand.0, self.across.at(t) - hand.1)
+        (along - hand.0, self.across.at(t) - self.hand.1)
     }
 
     pub fn depth(&self, t: f32) -> f32 {
@@ -308,7 +293,6 @@ mod tests {
     use crate::grid::Row;
     use crate::paint::rect;
 
-    const FRAME: f32 = 1.0 / 240.0;
 
     fn grid(rows: &[(usize, usize)]) -> Grid {
         let rows = rows.iter().enumerate().map(|(r, &(n, anchor))| {
@@ -390,9 +374,7 @@ mod tests {
         assert!(near(scale(1.0), RECEDE) && near(scale(0.0), 1.0));
     }
 
-    fn times(from: f32, until: f32) -> impl Iterator<Item = f32> {
-        (0..=((until - from) / FRAME).ceil() as usize).map(move |i| from + i as f32 * FRAME)
-    }
+
 
     #[test]
     fn both_axes_use_f_and_carry_speed_through_retargets() {

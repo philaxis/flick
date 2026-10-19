@@ -607,13 +607,9 @@ struct Session {
     began: Instant,
     /// Where the hand was last seen.
     hand: (f64, f64),
-    replay: std::collections::VecDeque<(f64, f64, usize)>,
+    path_cursor: usize,
     /// As drawn.
     shown: Option<Strip>,
-    /// Where the picture of the hold before was from where this one's is
-    /// (sideways, along the first row, and up and down), eased away in
-    /// `CARRY_TIME`, and how far it had receded, which this one goes on from.
-    receded_from: f64,
     /// The farthest up or down the strip went (`ROW_WINDOWS_JOIN`).
     farthest_y: f64,
     names: Vec<String>,
@@ -807,10 +803,12 @@ impl View {
                 }
                 let (hand, visible, began, farthest_y, trace) = (old.hand, old.visible, old.began, old.farthest_y, old.trace.take());
                 let follow = old.follow.clone();
+                let path_cursor = old.path_cursor;
                 let (screens, leftover) = old.retire(self.trace.as_deref());
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
                     new.follow = follow;
+                    new.path_cursor = path_cursor;
                     (new.hand, new.visible, new.began, new.farthest_y) = (hand, visible, began, farthest_y);
                     new.trace = trace.or(new.trace.take());
                 }
@@ -910,9 +908,8 @@ impl View {
             hide_after: None,
             began: Instant::now(),
             hand: (0.0, 0.0),
-            replay: crate::input::follow_hold(scene.hold).filter(|s| !s.hand.holding).map(|s| s.path.into()).unwrap_or_default(),
+            path_cursor: 0,
             shown: None,
-            receded_from: 0.0,
             farthest_y: 0.0,
             names: scene.names,
             label: Label::new(0),
@@ -1022,15 +1019,16 @@ impl View {
                 if hand.hold == session.hold {
                     session.hand = (hand.x, hand.y);
                 }
-                if !hand.holding && session.stats.frames == 0 && session.replay.is_empty() {
-                    if let Some(saved) = &saved { session.replay = saved.path.clone().into(); }
+                if let Some(saved) = &saved {
+                    for &(x, y, axis) in saved.path.iter().skip(session.path_cursor) {
+                        session.follow.track_locked(now, (x, y), axis);
+                    }
+                    // The last straight leg keeps growing until the next turn.
+                    session.path_cursor = saved.path.len().saturating_sub(1);
                 }
-                if let Some(&(x, y, axis)) = session.replay.front() {
-                    let at = session.follow.track_locked(now, (x, y), axis);
-                    if session.follow.caught_up((x, y), axis) { session.replay.pop_front(); }
+                if hand.hold == session.hold && hand.holding {
+                    let at = session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis));
                     (at, session.follow.depth(), false)
-                } else if hand.hold == session.hold && hand.holding {
-                    { let at = session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis)); (at, session.follow.depth(), false) }
                 } else {
                     let to = session.follow.let_go(now, session.hand);
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);

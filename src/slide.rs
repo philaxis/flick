@@ -77,7 +77,10 @@ impl Slide {
     /// of it meanwhile is taken back to that end, to push against.
     pub fn set_room(&mut self, left: i32, right: i32, step: i32) {
         self.room = Some((left, right));
-        if self.flick.is_none() { self.keep_in_row(step); }
+        if let Some(latch) = &mut self.flick {
+            latch.cell = latch.cell.clamp(-left, right);
+            self.cell = latch.cell;
+        } else { self.keep_in_row(step); }
     }
 
     fn keep_in_row(&mut self, step: i32) {

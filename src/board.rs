@@ -1974,7 +1974,8 @@ impl Board {
             // Layout uses visible frame bounds; DWM includes invisible resize borders.
             if unsafe { GetWindowRect(hwnd, &mut outer) }.is_ok()
                 && unsafe { DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut visible as *mut _ as _, std::mem::size_of::<RECT>() as u32) }.is_ok()
-                && outer.right - outer.left == s.cx && outer.bottom - outer.top == s.cy {
+                && outer.right - outer.left == s.cx && outer.bottom - outer.top == s.cy
+                && visible.right > visible.left && visible.bottom > visible.top {
                 Rect { left: (visible.left - outer.left).max(0) as f32, top: (visible.top - outer.top).max(0) as f32,
                     right: (visible.right - outer.left).min(s.cx) as f32, bottom: (visible.bottom - outer.top).min(s.cy) as f32 }
             } else { whole }
@@ -2074,8 +2075,7 @@ impl Board {
     /// went.
     #[allow(clippy::too_many_arguments)]
     fn put_thumbnail(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, offset: (f32, f32), dragged: bool, opacity: f32, placing: Option<(Place, Option<Rect>, f32)>) -> String {
-        // The size is rounded on its own, so that a moving picture does not
-        // grow and shrink by a pixel as its two edges round differently.
+        // Round the transformed edges exactly as the screen plate does.
         let to_rect = |r: &Rect| {
             let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
             RECT { left, top, right: (r.right - offset.0).round() as i32, bottom: (r.bottom - offset.1).round() as i32 }
@@ -2089,7 +2089,10 @@ impl Board {
         };
         let source_rect = tile.and_then(|tile| self.source_rect(thumb, tile.hwnd));
         let source = source_rect.as_ref().map(size);
-        if let Some(r) = source_rect { props.rcSource = to_rect(&r); props.dwFlags |= DWM_TNP_RECTSOURCE; }
+        if let Some(r) = source_rect {
+            props.rcSource = RECT { left: r.left.round() as i32, top: r.top.round() as i32, right: r.right.round() as i32, bottom: r.bottom.round() as i32 };
+            props.dwFlags |= DWM_TNP_RECTSOURCE;
+        }
         // The picture as large as fits into `w` by `h` without being
         // distorted or made larger than the window is.
         let fitted = |w: f32, h: f32| match source {

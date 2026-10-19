@@ -56,7 +56,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             let mut report = String::new();
             let mut failures = 0;
             for (follow, minimap) in [(true, false), (true, true), (false, true)] {
-                let config = format!("config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = {minimap}\nhotkeys = false\n[mouse]\nstep_x = 300\nstep_y = 300\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
+                let config = format!("config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = {minimap}\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
                 std::fs::write(cfg.join("config.toml"), config).unwrap();
                 goto(0);
                 let mut child = Command::new(flick.unwrap()).arg("--portable").env("FLICK_GLIDE_STATS", "1").env("FLICK_TRACE", out.join(format!("trace-{follow}-{minimap}.csv")))

@@ -53,8 +53,8 @@ sleep_after_minutes = 0
 [mouse]
 # Distances in raw mouse counts, not screen pixels; physical travel depends on mouse DPI.
 # follow_x/y also animate keyboard desktop shortcuts.
-step_x = 300
-step_y = 300
+step_x = 220
+step_y = 220
 notch_x = 40
 notch_y = 100
 follow_x = true
@@ -155,7 +155,7 @@ impl Default for Config {
 
 impl Default for Mouse {
     fn default() -> Self {
-        Mouse { step_x: 300, step_y: 300, notch_x: 40, notch_y: 100, follow_x: true, follow_y: true, reverse: false }
+        Mouse { step_x: 220, step_y: 220, notch_x: 40, notch_y: 100, follow_x: true, follow_y: true, reverse: false }
     }
 }
 
@@ -175,7 +175,7 @@ impl Default for Touchpad {
 }
 
 /// The version of the config file this one writes (`Config::config_version`).
-/// 3: Distance is the full commit threshold; old distances reset once to 300 counts / 12 mm.
+/// 3: Distance is the full commit threshold; old distances reset once to 220 counts / 12 mm.
 /// 2: sideways notches of 0 in a file of no version are the template of
 /// 0.6.0-pre.1, not the user's choice, and are read as 40 (`migrated`).
 pub const CONFIG_VERSION: u32 = 3;
@@ -207,9 +207,9 @@ fn migrated(text: &str) -> Result<(Config, Option<String>), toml::de::Error> {
         }
     }
     }
-    (config.mouse.step_x, config.mouse.step_y) = (300, 300);
+    (config.mouse.step_x, config.mouse.step_y) = (220, 220);
     (config.touchpad.step_x, config.touchpad.step_y) = (12.0, 12.0);
-    for (key, value) in [("mouse.step_x", "300"), ("mouse.step_y", "300"), ("touchpad.step_x", "12.0"), ("touchpad.step_y", "12.0")] {
+    for (key, value) in [("mouse.step_x", "220"), ("mouse.step_y", "220"), ("touchpad.step_x", "12.0"), ("touchpad.step_y", "12.0")] {
         file = with_value(&file, key, value);
     }
     config.config_version = CONFIG_VERSION;
@@ -417,7 +417,7 @@ mod tests {
         let (config, rewritten) = migrated(PRE1_CONFIG).unwrap();
         assert_eq!((config.mouse.notch_x, config.touchpad.notch_x, config.config_version), (40, 40, CONFIG_VERSION));
         let rewritten = rewritten.expect("the file is brought up to date");
-        assert!(rewritten.contains("three_finger = true") && rewritten.contains("step_x = 300"), "{rewritten}");
+        assert!(rewritten.contains("three_finger = true") && rewritten.contains("step_x = 220"), "{rewritten}");
         let (again, none) = migrated(&rewritten).unwrap();
         assert_eq!((again.mouse.notch_x, again.touchpad.notch_x), (40, 40));
         assert!(none.is_none(), "only once");
@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(parse("vertical_sticky = true").unwrap().mouse.notch_y, 100);
         // Where both are given, the new key is the one.
         let both = parse_as_is("step_x = 300\n[mouse]\nstep_x = 200\n").unwrap();
-        assert_eq!((both.mouse.step_x, both.mouse.step_y), (200, 300));
+        assert_eq!((both.mouse.step_x, both.mouse.step_y), (200, 220));
     }
 
     /// Every setting of either device written into a file, new or old, is
@@ -519,11 +519,11 @@ mod tests {
     fn distance_migration_runs_once_and_preserves_later_choices() {
         let old = "config_version = 2\nminimap = true\n[mouse]\nstep_x = 260\nstep_y = 400\nnotch_x = 0\n[touchpad]\nstep_x = 17.0\nstep_y = 12.0\n";
         let (c, text) = migrated(old).unwrap();
-        assert_eq!((c.mouse.step_x, c.mouse.step_y, c.mouse.notch_x), (300, 300, 0));
+        assert_eq!((c.mouse.step_x, c.mouse.step_y, c.mouse.notch_x), (220, 220, 0));
         assert!((c.touchpad.step_x - 12.0).abs() < 1e-9 && (c.touchpad.step_y - 12.0).abs() < 1e-9 && c.minimap);
         let text = with_value(&with_value(&text.unwrap(), "mouse.step_x", "170"), "touchpad.step_y", "6.5");
         let (c, rewrite) = migrated(&text).unwrap();
-        assert_eq!((c.mouse.step_x, c.mouse.step_y), (170, 300));
+        assert_eq!((c.mouse.step_x, c.mouse.step_y), (170, 220));
         assert!((c.touchpad.step_y - 6.5).abs() < 1e-9 && rewrite.is_none());
     }
 
@@ -560,6 +560,6 @@ mod tests {
         let added = with_value(&changed, "dwell_ms", "300");
         assert_eq!(added, format!("{changed}dwell_ms = 300\n"));
         let config = parse(&format!("{added}vertical_angle = 26.6\n")).unwrap();
-        assert_eq!((config.trigger.as_str(), config.mouse.step_x), ("f13", 300));
+        assert_eq!((config.trigger.as_str(), config.mouse.step_x), ("f13", 220));
     }
 }
