@@ -15,6 +15,9 @@ const OLD_DIRS: [&str; 2] = ["KanKan", "desk2d"];
 const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them at once.
 # Trigger, distances and the rest can also be changed in the window at tray icon → "Settings…".
 
+# Which version of this file it is, for bringing older ones up to date. Leave it as it is.
+config_version = 2
+
 # The button to hold while moving the mouse to go from cell to cell. Several can be listed with commas.
 #   Mouse: "xbutton1" (back), "xbutton2" (forward), "middle" (wheel button)
 #   Keyboard: "capslock", "scrolllock", "pause", "apps", "ralt", "rctrl", "f1" to "f24"
@@ -29,6 +32,10 @@ carry_modifier = "shift"
 
 # Ctrl+Alt+Win+arrows to move (add Shift to carry the window), Ctrl+Alt+Win+P for the pin menu of the active window
 hotkeys = true
+
+# The small map of the grid in the middle of the screen while moving. The screen itself shows the
+# desktops around while it follows the hand, so it is off unless turned on.
+minimap = false
 
 # Lets Windows compress or page out the memory of apps in a shelf not visited for this long (minutes).
 # Coming back may stutter for a moment. 0 turns it off.
@@ -83,12 +90,18 @@ const LEGACY: [(&str, &str, &str); 6] = [
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Which version of the file it is (`CONFIG_VERSION`); none before 2,
+    /// read as 0 (a new config is of this version).
+    #[serde(default)]
+    pub config_version: u32,
     pub trigger: String,
     /// Accepted from older config files; hover previews appear immediately.
     pub dwell_ms: u32,
     pub carry_modifier: String,
     pub hotkeys: bool,
     pub sleep_after_minutes: u32,
+    /// The minimap while moving (`overlay`).
+    pub minimap: bool,
     pub mouse: Mouse,
     pub touchpad: Touchpad,
 }
@@ -132,11 +145,13 @@ pub struct Touchpad {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            config_version: CONFIG_VERSION,
             trigger: "xbutton2".into(),
             dwell_ms: 500,
             carry_modifier: "shift".into(),
             hotkeys: true,
             sleep_after_minutes: 0,
+            minimap: false,
             mouse: Mouse::default(),
             touchpad: Touchpad::default(),
         }
@@ -164,11 +179,46 @@ impl Default for Touchpad {
     }
 }
 
+/// The version of the config file this one writes (`Config::config_version`).
+/// 2: sideways notches of 0 in a file of no version are the template of
+/// 0.6.0-pre.1, not the user's choice, and are read as 40 (`migrated`).
+pub const CONFIG_VERSION: u32 = 2;
+
 /// Reads a config file. Keys of earlier versions (`LEGACY`) are read as the
 /// ones that took their place, unless the file gives those too.
-/// Older templates wrote notch_x = 0 too. There is no record of whether
-/// the user chose Off, so preserve explicit zero; only missing keys get 40.
+#[cfg(test)]
 fn parse(text: &str) -> Result<Config, toml::de::Error> {
+    Ok(migrated(text)?.0)
+}
+
+/// `text` (a config file) read, and brought up to `CONFIG_VERSION`: the
+/// config, and the file as it is to be written again when that changed it.
+/// 0.6.0-pre.1 wrote sideways notches of 0 into every new file, with no
+/// version, so a 0 there is taken for 40 once; the version written with it,
+/// a 0 set from then on stays.
+fn migrated(text: &str) -> Result<(Config, Option<String>), toml::de::Error> {
+    let mut config = parse_as_is(text)?;
+    if config.config_version >= CONFIG_VERSION {
+        return Ok((config, None));
+    }
+    let mut file = text.to_owned();
+    for key in ["mouse.notch_x", "touchpad.notch_x"] {
+        let notch = if key.starts_with("mouse") { &mut config.mouse.notch_x } else { &mut config.touchpad.notch_x };
+        if *notch == 0 {
+            *notch = 40;
+            file = with_value(&file, key, "40");
+        }
+    }
+    config.config_version = CONFIG_VERSION;
+    Ok((config, Some(versioned(&file))))
+}
+
+/// `text` with the version of the file set to `CONFIG_VERSION`.
+fn versioned(text: &str) -> String {
+    with_value(text, "config_version", &CONFIG_VERSION.to_string())
+}
+
+fn parse_as_is(text: &str) -> Result<Config, toml::de::Error> {
     let mut file: toml::Table = toml::from_str(text)?;
     for (old, table, key) in LEGACY {
         let Some(value) = file.remove(old) else { continue };
@@ -210,8 +260,13 @@ fn state_path() -> PathBuf {
 pub fn load_config() -> (Config, Option<String>) {
     let path = config_path();
     match fs::read_to_string(&path) {
-        Ok(text) => match parse(&text) {
-            Ok(config) => (config, None),
+        Ok(text) => match migrated(&text) {
+            Ok((config, rewritten)) => {
+                if let Some(rewritten) = rewritten {
+                    let _ = fs::write(&path, rewritten);
+                }
+                (config, None)
+            }
             Err(e) => (Config::default(), Some(e.to_string())),
         },
         Err(_) => {
@@ -279,6 +334,12 @@ pub fn set_value(key: &str, value: &str) -> io::Result<()> {
     let path = config_path();
     let text = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
     fs::create_dir_all(dir())?;
+    // A value set in a file of no version yet is the user's: versioned, a
+    // sideways notch of 0 set now is not taken for the old template's.
+    let text = match parse_as_is(&text) {
+        Ok(config) if config.config_version < CONFIG_VERSION => versioned(&text),
+        _ => text,
+    };
     fs::write(path, with_value(&text, key, value))
 }
 
@@ -312,10 +373,7 @@ mod tests {
         for config in [Config::default(), parse(DEFAULT_CONFIG).unwrap(), parse("").unwrap(), parse(OLD_CONFIG).unwrap()] {
             assert_eq!((config.mouse.notch_x, config.touchpad.notch_x), (40, 40));
         }
-        // Old templates and a deliberate Off are indistinguishable; keep both.
-        let old = DEFAULT_CONFIG.replace("notch_x = 40", "notch_x = 0");
-        let saved = parse(&old).unwrap();
-        assert_eq!((saved.mouse.notch_x, saved.touchpad.notch_x), (0, 0));
+        // A deliberate Off in a versioned file stays off.
         let off = with_value(DEFAULT_CONFIG, "mouse.notch_x", "0");
         assert_eq!(parse(&off).unwrap().mouse.notch_x, 0);
         let sticky = parse("vertical_sticky = false\n[mouse]\nnotch_y = 70\n").unwrap();
@@ -343,6 +401,45 @@ mod tests {
         assert_eq!(reverse(parse(&mouse).unwrap()), (true, true));
         let touchpad = with_value(DEFAULT_CONFIG, "touchpad.reverse", "false");
         assert_eq!(reverse(parse(&touchpad).unwrap()), (false, false));
+    }
+
+    /// The file 0.6.0-pre.1 wrote: no version, sideways notches of 0.
+    const PRE1_CONFIG: &str = "trigger = \"xbutton2\"\nhotkeys = true\n\n[mouse]\nstep_x = 260\nnotch_x = 0\nnotch_y = 100\n\
+        follow_x = true\n\n[touchpad]\nthree_finger = true\nnotch_x = 0\nnotch_y = 100\n";
+
+    /// Its sideways notches of 0 are taken for 40 once, and the file is
+    /// rewritten with the version; a 0 set after that is the user's.
+    #[test]
+    fn the_pre1_template_notches_are_brought_up_once() {
+        let (config, rewritten) = migrated(PRE1_CONFIG).unwrap();
+        assert_eq!((config.mouse.notch_x, config.touchpad.notch_x, config.config_version), (40, 40, CONFIG_VERSION));
+        let rewritten = rewritten.expect("the file is brought up to date");
+        assert!(rewritten.contains("three_finger = true") && rewritten.contains("step_x = 260"), "{rewritten}");
+        let (again, none) = migrated(&rewritten).unwrap();
+        assert_eq!((again.mouse.notch_x, again.touchpad.notch_x), (40, 40));
+        assert!(none.is_none(), "only once");
+        // Set to 0 afterwards (as `set_value` writes it): stays 0.
+        let off = with_value(&rewritten, "touchpad.notch_x", "0");
+        let (off, none) = migrated(&off).unwrap();
+        assert_eq!((off.mouse.notch_x, off.touchpad.notch_x), (40, 0));
+        assert!(none.is_none());
+        // Other notches are left alone, and a new file needs nothing.
+        let firm = PRE1_CONFIG.replacen("notch_x = 0", "notch_x = 70", 1);
+        let (firm, _) = migrated(&firm).unwrap();
+        assert_eq!((firm.mouse.notch_x, firm.touchpad.notch_x), (70, 40));
+        assert!(migrated(DEFAULT_CONFIG).unwrap().1.is_none());
+        let unversioned_off = with_value("", "mouse.notch_x", "0");
+        assert_eq!(parse_as_is(&versioned(&unversioned_off)).unwrap().mouse.notch_x, 0);
+        assert_eq!(parse(&unversioned_off).unwrap().mouse.notch_x, 40);
+    }
+
+    /// The minimap is off unless turned on, old files too.
+    #[test]
+    fn the_minimap_is_off_unless_turned_on() {
+        assert!(!Config::default().minimap);
+        assert!(!parse(DEFAULT_CONFIG).unwrap().minimap);
+        assert!(!parse(OLD_CONFIG).unwrap().minimap && !parse(PRE1_CONFIG).unwrap().minimap);
+        assert!(parse(&with_value(DEFAULT_CONFIG, "minimap", "true")).unwrap().minimap);
     }
 
     /// A file of the version before each device had its own settings.

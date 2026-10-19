@@ -53,8 +53,8 @@ const ROWS: (f32, f32) = (14.0, 44.0);
 const EDGES: (f32, f32) = (28.0, 628.0);
 /// The tab's rows, the first with the tabs themselves above it, and the
 /// link to the file below them.
-const TAB_ROWS: (f32, f32) = (3.0, 11.0);
-const FILE_ROW: f32 = 12.0;
+const TAB_ROWS: (f32, f32) = (4.0, 12.0);
+const FILE_ROW: f32 = 13.0;
 /// How far the tab's controls stand in from its edges, and the room
 /// between its two ways.
 const INSET: f32 = 16.0;
@@ -76,7 +76,8 @@ pub struct View {
     /// Waiting for the user to press what the trigger should become.
     pub capturing: bool,
     pub autostart: bool,
-    /// See `Config::mouse`, `touchpad`.
+    /// See `Config::minimap`, `mouse`, `touchpad`.
+    pub minimap: bool,
     pub mouse: Mouse,
     pub touchpad: Touchpad,
     pub touchpad_status: crate::touchpad::Status,
@@ -116,6 +117,7 @@ enum Hit {
     Nothing,
     Trigger,
     Autostart,
+    Minimap,
     Tab(Tab),
     /// A way's distance, notches and following the hand.
     Step(usize),
@@ -131,6 +133,7 @@ enum Hit {
 struct Layout {
     trigger: Rect,
     autostart: Rect,
+    minimap: Rect,
     tabs: [Rect; 2],
     /// The tab's area under the tabs.
     panel: Rect,
@@ -163,6 +166,7 @@ impl Layout {
         Layout {
             trigger: right(0.0, 64.0, 30.0),
             autostart: right(1.0, 44.0, 24.0),
+            minimap: right(2.0, 44.0, 24.0),
             tabs: [tab(0.0), tab(1.0)],
             panel: rect(EDGES.0 * s, top * s, (EDGES.1 - EDGES.0) * s, (bottom - top) * s),
             columns: WAYS.map(|way| {
@@ -187,6 +191,7 @@ impl Layout {
         [
             (self.trigger, Hit::Trigger),
             (self.autostart, Hit::Autostart),
+            (self.minimap, Hit::Minimap),
             (self.tabs[0], Hit::Tab(Tab::Mouse)),
             (self.tabs[1], Hit::Tab(Tab::Touchpad)),
             (self.steps[0], Hit::Step(0)),
@@ -274,6 +279,7 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
         Hit::Follow(_) => if mouse { "mouse.follow_y" } else { "touchpad.follow_y" },
         Hit::Reverse => if mouse { "mouse.reverse" } else { "touchpad.reverse" },
         Hit::Touchpad => "touchpad.three_finger",
+        Hit::Minimap => "minimap",
         _ => return None,
     })
 }
@@ -516,6 +522,7 @@ impl Settings {
             Hit::Follow(way) => hand.follows[way],
             Hit::Reverse => hand.reverse,
             Hit::Touchpad => self.view.touchpad.three_finger,
+            Hit::Minimap => self.view.minimap,
             _ => return Action::None,
         };
         match key(self.tab, hit) {
@@ -614,7 +621,7 @@ impl Settings {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
             Hit::Tab(tab) => self.show(tab),
-            Hit::Follow(_) | Hit::Reverse | Hit::Touchpad => self.toggle(hit),
+            Hit::Follow(_) | Hit::Reverse | Hit::Touchpad | Hit::Minimap => self.toggle(hit),
             Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
             Hit::File => Action::OpenFile,
             _ => Action::None,
@@ -690,6 +697,9 @@ impl Settings {
 
         label(1.0, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
+
+        label(2.0, "Minimap while moving");
+        self.draw_switch(&p, &layout.minimap, view.minimap, Hit::Minimap);
 
         // The tabs, the one shown lit and joined to its area below.
         p.fill(&layout.panel, 10.0 * s, white(0.045));

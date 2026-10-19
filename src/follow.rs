@@ -16,7 +16,12 @@
 //! its size as the hand begins (`recede`), the strip slides along at that
 //! size, and the desktop come to comes forward to the whole screen again
 //! (`come_forward`). A single step (a hotkey) does all three in one
-//! (`Step`). Where each thing is drawn: `on_strip`.
+//! (`Step`). Where each thing is drawn: `on_strip`, `placed`.
+//!
+//! Only the row the hand is on goes sideways; the others stand with the
+//! cell a move there lands on in the middle (`Follow::along`). The desktop
+//! in the middle stands out (`emphasis`), and the name of the row is shown
+//! above while receded (`Label`).
 
 use crate::slide::notch;
 use std::collections::VecDeque;
@@ -116,6 +121,16 @@ pub fn ease_out_cubic(t: f64) -> f64 {
     1.0 - t * t * t
 }
 
+/// From 0 to 1 by `t` (0 to 1), beginning `slope` times as fast as on
+/// average (kept within 0 to 3, where it never goes back nor past 1) and
+/// stopping at the end. A slope of 3 is `ease_out_cubic`, 0 `smoothstep`.
+pub fn hermite(t: f64, slope: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    let slope = if slope.is_finite() { slope.clamp(0.0, 3.0) } else { 3.0 };
+    let (t2, t3) = (t * t, t * t * t);
+    (3.0 * t2 - 2.0 * t3) + slope * (t3 - 2.0 * t2 + t)
+}
+
 /// Settling once let go of: from where the picture was to a desktop.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Snap {
@@ -123,26 +138,49 @@ pub struct Snap {
     pub to: i32,
     pub began: f64,
     pub time: f64,
+    /// How fast it goes as it begins, desktops a second: the hand's, so it
+    /// goes on as fast as the hand went; at most three times as fast as on
+    /// average, and never back, so it never goes past the desktop or back
+    /// before going on. Without one (`None`) it eases out cubically, which
+    /// begins at three times its average speed.
+    pub speed: Option<f64>,
 }
 
 impl Snap {
+    pub fn new(from: f64, to: i32, began: f64, time: f64) -> Snap {
+        Snap { from, to, began, time, speed: None }
+    }
+
     pub fn at(&self, now: f64) -> f64 {
         if self.time <= 0.0 {
             return self.to as f64;
         }
-        let t = (now - self.began) / self.time;
-        self.from + (self.to as f64 - self.from) * ease_out_cubic(t)
+        let t = ((now - self.began) / self.time).clamp(0.0, 1.0);
+        let way = self.to as f64 - self.from;
+        match self.speed {
+            None => self.from + way * ease_out_cubic(t),
+            Some(speed) => self.from + way * hermite(t, speed * self.time / way),
+        }
     }
 
     pub fn done(&self, now: f64) -> bool {
-        now - self.began >= self.time
+        // A hair under, for the rounding of `now - began`.
+        now - self.began >= self.time - 1e-9
     }
 }
 
 /// How large the screen is while the strip slides, and the gap between
-/// two desktops on it, as a share of the screen.
-pub const RECEDE: f64 = 0.9;
-pub const GAP: f64 = 0.03;
+/// two desktops on it, as a share of the screen: far enough back that a
+/// desktop each way, slantwise too, is clearly in sight.
+pub const RECEDE: f64 = 0.6;
+pub const GAP: f64 = 0.07;
+/// The desktop in the middle, receded, is this much larger than the others
+/// (`placed`), as if in front of them; within the gap.
+pub const LIFT: f64 = 0.06;
+/// How much darker the desktops not in the middle are, receded.
+pub const DIM: f64 = 0.5;
+/// How bright the thin edge of light round the desktop in the middle is.
+pub const GLOW: f64 = 0.55;
 /// How long receding takes as a hold begins, and coming forward once the
 /// picture has settled.
 pub const RECEDE_TIME: f64 = 0.12;
@@ -166,6 +204,13 @@ pub fn ease_in_out_cubic(t: f64) -> f64 {
 /// How far the screen has receded (0 whole, 1 at `RECEDE`) `t` into a hold.
 pub fn recede(t: f64) -> f64 {
     smoothstep(t / RECEDE_TIME)
+}
+
+/// How far it has receded `t` into a hold that began receded `from`: on
+/// from there, as a hold that begins while the last one comes forward.
+pub fn recede_from(from: f64, t: f64) -> f64 {
+    let from = from.clamp(0.0, 1.0);
+    from + (1.0 - from) * recede(t)
 }
 
 /// How far it is still receded `t` after coming forward began.
@@ -193,6 +238,39 @@ pub fn on_strip(rect: [f64; 4], size: (f64, f64), scale: f64, apart: (f64, f64))
     [cx + (rect[0] - w / 2.0) * scale, cy + (rect[1] - h / 2.0) * scale, cx + (rect[2] - w / 2.0) * scale, cy + (rect[3] - h / 2.0) * scale]
 }
 
+/// As `on_strip`, the desktop `lift` times as large about its own middle
+/// (`emphasis`), the strip's spacing as it is.
+pub fn placed(rect: [f64; 4], size: (f64, f64), scale: f64, apart: (f64, f64), lift: f64) -> [f64; 4] {
+    let (w, h) = size;
+    let (cx, cy) = (w / 2.0 + apart.0 * w * (1.0 + GAP) * scale, h / 2.0 + apart.1 * h * (1.0 + GAP) * scale);
+    let size = scale * lift;
+    [cx + (rect[0] - w / 2.0) * size, cy + (rect[1] - h / 2.0) * size, cx + (rect[2] - w / 2.0) * size, cy + (rect[3] - h / 2.0) * size]
+}
+
+/// How much a desktop `apart` (sideways, up and down) from the middle of
+/// the screen is the one in the middle: 1 there, 0 a desktop or more away,
+/// shared out between those on either side as the strip goes from one to
+/// the next, so that standing out goes over from one to the next smoothly.
+pub fn emphasis(apart: (f64, f64)) -> f64 {
+    let near = |a: f64| (1.0 - a.abs()).clamp(0.0, 1.0);
+    smoothstep(near(apart.0) * near(apart.1))
+}
+
+/// What a desktop with `emphasis` looks like, the screen receded
+/// `receded`: how much larger (`placed`'s lift), and how dark (0 as it is,
+/// `DIM` at most). Whole, everything is as it is.
+pub fn standing_out(emphasis: f64, receded: f64) -> (f64, f64) {
+    let (emphasis, receded) = (emphasis.clamp(0.0, 1.0), receded.clamp(0.0, 1.0));
+    (1.0 + LIFT * emphasis * receded, DIM * (1.0 - emphasis) * receded)
+}
+
+/// Where a row stands sideways in a single step (`Step`), the strip at
+/// `(x, y)`: the row the strip is on goes with it, the others stand where
+/// they began; going from row to row, in between.
+pub fn step_along(x: f64, y: f64, row: i32) -> f64 {
+    x * (1.0 - (row as f64 - y).abs()).clamp(0.0, 1.0)
+}
+
 /// `a` going to `b` by `t` (0 to 1).
 pub fn between(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
@@ -209,17 +287,22 @@ pub struct Step {
     pub began: f64,
     /// How far receded it was as it began.
     pub receded: f64,
+    /// How fast the strip went as it began, desktops a second each way: a
+    /// step upon one goes on at the pace that one had, not from standing.
+    pub speed: (f64, f64),
 }
 
 impl Step {
     pub fn new(now: f64, to: (i32, i32)) -> Step {
-        Step { from: (0.0, 0.0), to, began: now, receded: 0.0 }
+        Step { from: (0.0, 0.0), to, began: now, receded: 0.0, speed: (0.0, 0.0) }
     }
 
-    /// One more step, to `to`, at `now`: from where this one is.
+    /// One more step, to `to`, at `now`: from where this one is, as fast.
     pub fn then(&self, now: f64, to: (i32, i32)) -> Step {
         let (at, receded) = self.at(now);
-        Step { from: at, to, began: now, receded }
+        let (ahead, _) = self.at(now + 1e-3);
+        let speed = ((ahead.0 - at.0) / 1e-3, (ahead.1 - at.1) / 1e-3);
+        Step { from: at, to, began: now, receded, speed }
     }
 
     /// Where the strip is and how far the screen has receded.
@@ -227,8 +310,16 @@ impl Step {
         let t = now - self.began;
         // Already receded, the strip slides at once.
         let (start, end) = if self.receded > 0.0 { (0.0, STEP_SLIDE.1 - STEP_SLIDE.0) } else { STEP_SLIDE };
-        let slid = ease_in_out_cubic((t - start) / (end - start));
-        let at = (self.from.0 + (self.to.0 as f64 - self.from.0) * slid, self.from.1 + (self.to.1 as f64 - self.from.1) * slid);
+        let s = (t - start) / (end - start);
+        let way = |from: f64, to: i32, speed: f64| {
+            let way = to as f64 - from;
+            if speed == 0.0 || way.abs() < 1e-9 {
+                from + way * ease_in_out_cubic(s)
+            } else {
+                from + way * hermite(s, speed * (end - start) / way)
+            }
+        };
+        let at = (way(self.from.0, self.to.0, self.speed.0), way(self.from.1, self.to.1, self.speed.1));
         let total = self.time();
         let rising = self.receded + (1.0 - self.receded) * smoothstep(t / RECEDE_TIME);
         let falling = smoothstep((total - t) / FORWARD_TIME);
@@ -242,6 +333,56 @@ impl Step {
     pub fn done(&self, now: f64) -> bool {
         // A hair under, for the rounding of `now - began`.
         now - self.began >= self.time() - 1e-9
+    }
+}
+
+/// How long the name of the row above the picture takes to go over to
+/// another row's, and how far the names slide as they do, in heights.
+pub const LABEL_TIME: f64 = 0.2;
+pub const LABEL_SLIDE: f64 = 0.4;
+
+/// The name of the row above the picture: the row the hand is on, or the
+/// picture settles on, the one before fading out as it comes in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Label {
+    pub row: i32,
+    pub was: Option<i32>,
+    pub since: f64,
+}
+
+/// A name shown: its row, how much of it shows (0 to 1), and how far it is
+/// from its place, in heights (below positive).
+pub type Name = (i32, f64, f64);
+
+impl Label {
+    pub fn new(row: i32) -> Label {
+        Label { row, was: None, since: f64::NEG_INFINITY }
+    }
+
+    fn progress(&self, now: f64) -> f64 {
+        ((now - self.since) / LABEL_TIME).clamp(0.0, 1.0)
+    }
+
+    /// The name shown is `row`'s from `now`. Back to the one going, it
+    /// comes back from as far as it went.
+    pub fn show(&mut self, now: f64, row: i32) {
+        if row == self.row {
+            return;
+        }
+        let done = self.progress(now);
+        let back = self.was == Some(row) && done < 1.0;
+        self.was = Some(self.row);
+        self.row = row;
+        self.since = if back { now - (1.0 - done) * LABEL_TIME } else { now };
+    }
+
+    /// The name coming (or there), and the one going, if any: the new one
+    /// comes from the way the hand goes, the old one goes the other way.
+    pub fn at(&self, now: f64) -> (Name, Option<Name>) {
+        let t = smoothstep(self.progress(now));
+        let Some(was) = self.was.filter(|_| t < 1.0) else { return ((self.row, 1.0, 0.0), None) };
+        let way = (self.row - was).signum() as f64;
+        ((self.row, t, way * (1.0 - t) * LABEL_SLIDE), Some((was, 1.0 - t, -way * t * LABEL_SLIDE)))
     }
 }
 
@@ -278,22 +419,59 @@ pub struct Way {
     pub snap: Option<Snap>,
 }
 
+/// Where a row stands sideways, in cells from the one a move there lands on.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Along {
+    /// Where the hand is along it, while it is the row the hand is on;
+    /// where it was left at (a cell) otherwise.
+    pub at: f64,
+    /// Where it is drawn.
+    pub shown: f64,
+    /// Going to the cell it was left nearest to, or settling.
+    pub snap: Option<Snap>,
+}
+
+/// Up and down travel past halfway to the next row before the hand is on
+/// it, sideways: less, and a hand going straight down crossing halfway with
+/// a little wobble would go to and fro between the two.
+const ROW_SWITCH: f64 = 0.08;
+/// How long a row come to takes to catch up with where the hand is along
+/// it: what the hand went towards the next cell of the row left goes on in
+/// the row come to, eased in rather than in a jump.
+const ROW_CATCH: f64 = 0.2;
+
 /// Both ways of a hold. Sideways the desktops there are depend on the row
 /// (rows differ in length): `cols[row - rows.0]` for each row from
 /// `rows.0` to `rows.1`, counted from the one the hold began on.
+///
+/// Only the row the hand is on goes sideways with it (`row`): a row come
+/// to goes on from where it stands (the cell a move there lands on, at
+/// first), the hand going along it from there; the row left goes to the
+/// cell it is nearest to and stands there.
 #[derive(Clone, Debug)]
 pub struct Follow {
     pub rows: (i32, i32),
     pub cols: Vec<(i32, i32)>,
     pub x: Way,
     pub y: Way,
+    /// The row the hand is on.
+    pub row: i32,
+    /// Where the hand was sideways (from where the hold began) where the
+    /// row it is on is at 0.
+    base: f64,
+    /// Each row, from `rows.0`.
+    pub along: Vec<Along>,
+    /// How far the row the hand is on was from where it is to be as it
+    /// was come to, and when (`ROW_CATCH`).
+    catch: Option<(f64, f64)>,
 }
 
 impl Follow {
     /// `firm`: the notches sideways and up and down (`firmness`).
     pub fn new(rows: (i32, i32), cols: Vec<(i32, i32)>, firm: (f64, f64)) -> Follow {
         let way = |firm| Way { firm, ..Way::default() };
-        Follow { rows, cols, x: way(firm.0), y: way(firm.1) }
+        let along = vec![Along::default(); (rows.1 - rows.0 + 1).max(1) as usize];
+        Follow { rows, cols, x: way(firm.0), y: way(firm.1), row: 0, base: 0.0, along, catch: None }
     }
 
     /// The desktops along row `row` (counted from the first).
@@ -302,27 +480,99 @@ impl Follow {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
     }
 
-    /// The hand is at `at` (desktops each way) at `now`: where the picture is.
+    fn along_mut(&mut self, row: i32) -> &mut Along {
+        let at = (row.clamp(self.rows.0, self.rows.1) - self.rows.0) as usize;
+        &mut self.along[at]
+    }
+
+    /// Where row `row` is drawn sideways: the cell along it in the middle.
+    pub fn offset(&self, row: i32) -> f64 {
+        if !(self.rows.0..=self.rows.1).contains(&row) {
+            return 0.0;
+        }
+        self.along.get((row - self.rows.0) as usize).map_or(0.0, |along| along.shown)
+    }
+
+    /// The hand comes to row `to` at `now`, `hand` sideways: the row left
+    /// goes to the cell nearest where it is, the hand goes on along `to`
+    /// from where that stands, with what it went past that cell.
+    fn come_to_row(&mut self, now: f64, to: i32, hand: f64) {
+        let (left, cols) = (self.row, self.cols_of(self.row));
+        let old = self.along_mut(left);
+        let cell = old.at.round().clamp(cols.0 as f64, cols.1 as f64) as i32;
+        let past = old.at - cell as f64;
+        let time = snap_time(old.shown, cell as f64, 0.0);
+        (old.at, old.snap) = (cell as f64, (time > 0.0).then(|| Snap::new(old.shown, cell, now, time)));
+        self.row = to;
+        let (cols, firm) = (self.cols_of(to), self.x.firm);
+        let new = self.along_mut(to);
+        let was = new.shown;
+        new.at += past;
+        let (at, goal) = (new.at, shown(new.at, cols, firm));
+        self.base = hand - at;
+        self.catch = Some((was - goal, now));
+    }
+
+    /// Rows going to where they stand, or settling.
+    fn ease(&mut self, now: f64) {
+        for along in &mut self.along {
+            if let Some(snap) = along.snap {
+                along.shown = snap.at(now);
+            }
+        }
+    }
+
+    /// The hand is at `at` (desktops each way) at `now`: where the picture
+    /// is, sideways along the row it is on, and up and down.
     pub fn track(&mut self, now: f64, at: (f64, f64)) -> (f64, f64) {
         self.x.history.add(now, at.0);
         self.y.history.add(now, at.1);
         self.y.shown = shown(at.1, self.rows, self.y.firm);
-        let row = at.1.round() as i32;
-        self.x.shown = shown(at.0, self.cols_of(row), self.x.firm);
+        let nearest = self.y.shown.round().clamp(self.rows.0 as f64, self.rows.1 as f64) as i32;
+        if nearest != self.row && (self.y.shown - self.row as f64).abs() > 0.5 + ROW_SWITCH {
+            self.come_to_row(now, nearest, at.0);
+        }
+        let (row, firm) = (self.row, self.x.firm);
+        let cols = self.cols_of(row);
+        let hand = at.0 - self.base;
+        let behind = match self.catch {
+            Some((by, since)) if now - since < ROW_CATCH => by * (1.0 - smoothstep((now - since) / ROW_CATCH)),
+            _ => {
+                self.catch = None;
+                0.0
+            }
+        };
+        let along = self.along_mut(row);
+        (along.at, along.shown, along.snap) = (hand, shown(hand, cols, firm) + behind, None);
+        self.x.shown = along.shown;
+        self.ease(now);
         (self.x.shown, self.y.shown)
     }
 
     /// Let go of with the hand at `at`: the desktop it settles on, sideways
-    /// and up and down; settling starts.
+    /// (along its row) and up and down; settling starts.
     pub fn let_go(&mut self, now: f64, at: (f64, f64)) -> (i32, i32) {
         self.track(now, at);
         let row = landing(at.1, self.y.history.speed(), self.rows);
-        let col = landing(at.0, self.x.history.speed(), self.cols_of(row));
-        for (way, to) in [(&mut self.x, col), (&mut self.y, row)] {
-            let speed = way.history.speed();
-            let time = snap_time(way.shown, to as f64, speed);
-            way.snap = Some(Snap { from: way.shown, to, began: now, time });
-        }
+        let speed = self.x.history.speed();
+        let col = if row == self.row {
+            landing(self.along_mut(row).at, speed, self.cols_of(row))
+        } else {
+            // Flung on to another row: the cell it stands with.
+            self.come_to_row(now, row, at.0);
+            let cols = self.cols_of(row);
+            self.along_mut(row).at.round().clamp(cols.0 as f64, cols.1 as f64) as i32
+        };
+        let speed = if row == self.row { speed } else { 0.0 };
+        let along = self.along_mut(row);
+        let time = snap_time(along.shown, col as f64, speed);
+        let x = Snap { speed: Some(speed), ..Snap::new(along.shown, col, now, time) };
+        along.snap = Some(x);
+        self.x.shown = along.shown;
+        self.x.snap = Some(x);
+        let speed = self.y.history.speed();
+        let time = snap_time(self.y.shown, row as f64, speed);
+        self.y.snap = Some(Snap { speed: Some(speed), ..Snap::new(self.y.shown, row, now, time) });
         (col, row)
     }
 
@@ -335,6 +585,7 @@ impl Follow {
                 done &= snap.done(now);
             }
         }
+        self.ease(now);
         ((self.x.shown, self.y.shown), done)
     }
 }
@@ -425,7 +676,7 @@ mod tests {
         }
         // Fast to go far is shorter than slowly.
         assert!(snap_time(0.7, 1.0, 6.0) < snap_time(0.7, 1.0, 0.0));
-        let snap = Snap { from: 0.4, to: 1, began: 10.0, time: 0.3 };
+        let snap = Snap::new(0.4, 1, 10.0, 0.3);
         assert!(near(snap.at(10.0), 0.4));
         assert!(near(snap.at(10.3), 1.0) && snap.done(10.3) && !snap.done(10.29));
         assert!(near(snap.at(11.0), 1.0));
@@ -463,14 +714,18 @@ mod tests {
         let screen = [0.0, 0.0, 1000.0, 600.0];
         assert_eq!(on_strip(screen, size, 1.0, (0.0, 0.0)), screen);
         let small = on_strip(screen, size, RECEDE, (0.0, 0.0));
-        assert!((small[0] - 50.0).abs() < 1e-9 && (small[3] - 570.0).abs() < 1e-9);
+        assert!((small[0] - 500.0 * (1.0 - RECEDE)).abs() < 1e-9 && (small[3] - 300.0 * (1.0 + RECEDE)).abs() < 1e-9);
         let right = on_strip(screen, size, RECEDE, (1.0, 0.0));
         let gap = right[0] - small[2];
         assert!((gap - GAP * 1000.0 * RECEDE).abs() < 1e-9, "{gap}");
-        // A desktop next along is just in sight at the edge, past the gap.
-        assert!(right[0] < 1000.0 && right[0] > 950.0);
+        // A desktop next along each way, slantwise too, is clearly in sight:
+        // more than a tenth of the screen of it.
+        assert!(right[0] < 900.0, "{right:?}");
         let below = on_strip(screen, size, RECEDE, (0.0, 1.0));
         assert!((below[1] - small[3] - GAP * 600.0 * RECEDE).abs() < 1e-9);
+        assert!(below[1] < 540.0, "{below:?}");
+        let slantwise = on_strip(screen, size, RECEDE, (-1.0, -1.0));
+        assert!(slantwise[2] > 100.0 && slantwise[3] > 60.0, "{slantwise:?}");
         // A window keeps its place on its desktop.
         let window = [100.0, 100.0, 300.0, 200.0];
         let drawn = on_strip(window, size, RECEDE, (0.0, 0.0));
@@ -478,7 +733,7 @@ mod tests {
         assert_eq!(on_strip(window, size, 1.0, (0.0, 0.0)), window);
         assert_eq!(between(window, screen, 0.0), window);
         assert_eq!(between(window, screen, 1.0), screen);
-        assert_eq!((scale(0.0), scale(1.0)), (1.0, RECEDE));
+        assert!((scale(0.0) - 1.0).abs() < 1e-12 && (scale(1.0) - RECEDE).abs() < 1e-12);
         assert_eq!((recede(0.0), recede(RECEDE_TIME), come_forward(0.0), come_forward(FORWARD_TIME)), (0.0, 1.0, 1.0, 0.0));
         assert!(forward_after(0.3) < 0.3 && forward_after(0.0) == 0.0);
     }
@@ -522,18 +777,26 @@ mod tests {
         let mut follow = Follow::new((-1, 1), cols.clone(), (0.0, 0.0));
         let at = follow.track(0.0, (0.4, 0.3));
         assert!(near(at.0, 0.4) && near(at.1, 0.3));
-        // In the row below the right end is nearer.
-        let at = follow.track(0.016, (1.4, 0.7));
-        assert!(at.0 > 1.0 && at.0 < 1.0 + GIVE);
+        // On to the row below, sideways from where it stands with what went
+        // past the cell the row left is nearest to; on along it to its end.
+        follow.track(0.016, (0.4, 0.7));
+        assert_eq!(follow.row, 1);
         for i in 0..20 {
-            follow.track(0.032 + i as f64 * 0.016, (1.4, 0.7));
+            follow.track(0.032 + i as f64 * 0.016, (0.4 + i as f64 * 0.1, 0.7));
         }
-        let to = follow.let_go(0.4, (1.4, 0.7));
+        let at = follow.track(0.4, (2.4, 0.7));
+        assert!(at.0 > 1.0 && at.0 < 1.0 + GIVE, "{at:?}");
+        for i in 0..20 {
+            follow.track(0.416 + i as f64 * 0.016, (2.4, 0.7));
+        }
+        let to = follow.let_go(0.8, (2.4, 0.7));
         assert_eq!(to, (1, 1));
-        let ((x, y), done) = follow.settle(0.4);
+        let ((x, y), done) = follow.settle(0.8);
         assert!(!done && x > 1.0 && y < 1.0);
-        let ((x, y), done) = follow.settle(0.4 + SNAP_MAX);
+        let ((x, y), done) = follow.settle(0.8 + SNAP_MAX + 1e-9);
         assert!(done && near(x, 1.0) && near(y, 1.0));
+        // The row left stands at the cell it was nearest to.
+        assert!(near(follow.offset(0), 0.0));
         // Flung right in the middle row from a little way: the next desktop.
         let mut flung = Follow::new((-1, 1), cols, (0.24, 1.0));
         for i in 0..8 {
@@ -544,5 +807,204 @@ mod tests {
         let mut still = Follow::new((0, 0), vec![(0, 0)], (0.0, 0.0));
         assert_eq!(still.let_go(0.0, (0.0, 0.0)), (0, 0));
         assert!(still.settle(0.0).1);
+    }
+
+    /// Going sideways along a row moves that row only; the rows above and
+    /// below stand still. Only going to another row moves them, up and
+    /// down, and none of them ever jumps from one frame to the next.
+    #[test]
+    fn only_the_row_the_hand_is_on_goes_sideways() {
+        let cols = vec![(-2, 2), (-1, 3), (-3, 1)];
+        let mut follow = Follow::new((-1, 1), cols, (0.4, 1.0));
+        let mut now = 0.0;
+        let mut last: Option<[f64; 3]> = None;
+        let mut frame = |follow: &mut Follow, at: (f64, f64), now: f64| {
+            follow.track(now, at);
+            let rows = [follow.offset(-1), follow.offset(0), follow.offset(1)];
+            if let Some(last) = last {
+                for (a, b) in last.iter().zip(rows) {
+                    assert!((a - b).abs() < 0.12, "a row jumped from {last:?} to {rows:?} at {at:?}");
+                }
+            }
+            last = Some(rows);
+            rows
+        };
+        // Right along the first row: the others stay where they began.
+        for i in 0..=60 {
+            now += 0.016;
+            let rows = frame(&mut follow, (i as f64 * 0.025, 0.0), now);
+            assert!(rows[0].abs() < 1e-12 && rows[2].abs() < 1e-12, "{rows:?}");
+        }
+        assert!((follow.offset(0) - 1.5).abs() < 0.2);
+        // Down, the hand still: the row left goes to its nearest cell and
+        // stands there; the row come to goes on from where it stands.
+        for i in 0..=60 {
+            now += 0.016;
+            frame(&mut follow, (1.5, i as f64 * 0.02), now);
+        }
+        assert_eq!(follow.row, 1);
+        for _ in 0..30 {
+            now += 0.016;
+            frame(&mut follow, (1.5, 1.2), now);
+        }
+        let stood = follow.offset(0);
+        assert!((stood - 2.0).abs() < 1e-9 || (stood - 1.0).abs() < 1e-9, "{stood}");
+        assert!(follow.offset(-1).abs() < 1e-12);
+        let below = follow.offset(1);
+        assert!(below.abs() < 0.6, "the row below went on from where it stood: {below}");
+        // Sideways along it now: the row above stays where it was left.
+        for i in 0..=40 {
+            now += 0.016;
+            frame(&mut follow, (1.5 - i as f64 * 0.025, 1.2), now);
+            assert!((follow.offset(0) - stood).abs() < 1e-12 && follow.offset(-1).abs() < 1e-12);
+        }
+        assert!(follow.offset(1) < below - 0.5);
+    }
+
+    /// Back on a row left, the hand goes on along it from where it stood.
+    #[test]
+    fn a_row_come_back_to_goes_on_from_where_it_stood() {
+        let mut follow = Follow::new((0, 1), vec![(0, 4), (0, 4)], (0.0, 0.0));
+        let mut now = 0.0;
+        for (x, y) in [(1.0, 0.0), (2.0, 0.0), (2.0, 0.7), (2.0, 1.0), (3.0, 1.0), (3.0, 0.3), (3.0, 0.0)] {
+            for _ in 0..30 {
+                now += 0.016;
+                follow.track(now, (x, y));
+            }
+        }
+        assert_eq!(follow.row, 0);
+        // The first row stood at 2, the second went one along (to 1).
+        assert!((follow.offset(0) - 2.0).abs() < 1e-6 && (follow.offset(1) - 1.0).abs() < 1e-6);
+        assert_eq!(follow.let_go(now, (3.0, 0.0)), (2, 0));
+    }
+
+    /// Flung down from a row gone along: on to the row below, at the cell
+    /// it stands with, not where the hand is along the first.
+    #[test]
+    fn flung_to_another_row_it_lands_where_that_row_stands() {
+        let mut follow = Follow::new((0, 1), vec![(0, 4), (0, 4)], (0.0, 0.0));
+        for i in 0..20 {
+            follow.track(i as f64 * 0.016, (2.0, 0.0));
+        }
+        for i in 0..8 {
+            follow.track(0.32 + i as f64 * 0.016, (2.0, i as f64 * 0.04));
+        }
+        assert_eq!(follow.let_go(0.45, (2.0, 0.3)), (0, 1));
+    }
+
+    /// Settling goes on as fast as the hand went, whatever time it takes,
+    /// never back and never past the desktop.
+    #[test]
+    fn settling_begins_at_the_speed_of_the_hand() {
+        assert!((hermite(0.3, 3.0) - ease_out_cubic(0.3)).abs() < 1e-12);
+        assert!((hermite(0.3, 0.0) - smoothstep(0.3)).abs() < 1e-12);
+        for slope in [-2.0, 0.0, 0.7, 3.0, 9.0, f64::INFINITY] {
+            let mut last = 0.0;
+            for i in 0..=100 {
+                let at = hermite(i as f64 / 100.0, slope);
+                assert!(at >= last - 1e-12 && at <= 1.0 + 1e-12, "{slope} {i}");
+                last = at;
+            }
+            assert!((last - 1.0).abs() < 1e-12);
+        }
+        // Slowly let go of short of the next desktop: begins at the hand's speed.
+        let snap = Snap { speed: Some(1.0), ..Snap::new(0.7, 1, 0.0, SNAP_MIN) };
+        let speed = (snap.at(1e-4) - snap.at(0.0)) / 1e-4;
+        assert!((speed - 1.0).abs() < 0.01, "{speed}");
+        assert!((snap.at(SNAP_MIN) - 1.0).abs() < 1e-9 && snap.done(SNAP_MIN + 1e-9));
+    }
+
+    /// A step upon a step goes on at the pace that one had.
+    #[test]
+    fn a_step_upon_a_step_keeps_its_pace() {
+        let step = Step::new(0.0, (1, 0));
+        let now = 0.2;
+        let pace = |step: &Step, now: f64| (step.at(now + 1e-4).0 .0 - step.at(now).0 .0) / 1e-4;
+        let before = pace(&step, now);
+        let again = step.then(now, (2, 0));
+        let after = pace(&again, now);
+        assert!(before > 1.0 && (after - before).abs() < before * 0.05, "{before} then {after}");
+        assert!((again.at(now + again.time()).0 .0 - 2.0).abs() < 1e-9);
+    }
+
+    /// The desktop in the middle stands out: as large as it is and lit, the
+    /// others smaller and darker; going from one to the next, it goes over
+    /// smoothly; whole, nothing stands out.
+    #[test]
+    fn the_desktop_in_the_middle_stands_out() {
+        assert!((emphasis((0.0, 0.0)) - 1.0).abs() < 1e-12);
+        for apart in [(1.0, 0.0), (0.0, -1.0), (1.0, 1.0), (-2.0, 0.3)] {
+            assert!(emphasis(apart).abs() < 1e-12, "{apart:?}");
+        }
+        // Halfway the two share it alike; it never jumps.
+        assert!((emphasis((0.5, 0.0)) - emphasis((-0.5, 0.0))).abs() < 1e-12);
+        let mut last = emphasis((-1.0, 0.0));
+        for i in -100..=100 {
+            let e = emphasis((i as f64 / 100.0, 0.0));
+            assert!((e - last).abs() < 0.05, "{i}");
+            last = e;
+        }
+        let (lift, dark) = standing_out(1.0, 1.0);
+        assert!((lift - (1.0 + LIFT)).abs() < 1e-12 && dark.abs() < 1e-12);
+        let (lift, dark) = standing_out(0.0, 1.0);
+        assert!((lift - 1.0).abs() < 1e-12 && (dark - DIM).abs() < 1e-12);
+        let (lift, dark) = standing_out(0.3, 0.0);
+        assert!((lift - 1.0).abs() < 1e-12 && dark.abs() < 1e-12);
+        // Larger, it stays clear of the desktops beside it.
+        let size = (1000.0, 600.0);
+        let screen = [0.0, 0.0, 1000.0, 600.0];
+        let middle = placed(screen, size, RECEDE, (0.0, 0.0), 1.0 + LIFT);
+        let right = placed(screen, size, RECEDE, (1.0, 0.0), 1.0);
+        let below = placed(screen, size, RECEDE, (0.0, 1.0), 1.0);
+        assert!(middle[2] < right[0] - 5.0 && middle[3] < below[1] - 3.0, "{middle:?} {right:?} {below:?}");
+        assert!((middle[0] + middle[2] - 1000.0).abs() < 1e-9, "about its own middle");
+        assert_eq!(placed(screen, size, 1.0, (0.0, 0.0), 1.0), screen);
+    }
+
+    /// The name of the row goes over to the next one's, the new one coming
+    /// from the way the hand goes; back halfway, from as far as it went.
+    #[test]
+    fn the_row_name_goes_over_smoothly() {
+        let mut label = Label::new(0);
+        assert_eq!(label.at(0.0), ((0, 1.0, 0.0), None));
+        label.show(1.0, 0);
+        assert_eq!(label.at(1.0), ((0, 1.0, 0.0), None));
+        label.show(1.0, 1);
+        let ((row, shown, slide), going) = label.at(1.0);
+        assert!(row == 1 && shown.abs() < 1e-9 && slide > 0.0);
+        let (was, gone, _) = going.unwrap();
+        assert!(was == 0 && (gone - 1.0).abs() < 1e-9);
+        let ((_, half, _), going) = label.at(1.0 + LABEL_TIME / 2.0);
+        assert!((half - 0.5).abs() < 1e-9 && (going.unwrap().1 - 0.5).abs() < 1e-9);
+        // Back to the first halfway: it is as far as it was, coming back.
+        label.show(1.0 + LABEL_TIME / 2.0, 0);
+        let ((row, shown, slide), _) = label.at(1.0 + LABEL_TIME / 2.0);
+        assert!(row == 0 && (shown - 0.5).abs() < 1e-9 && slide < 0.0, "{shown} {slide}");
+        let (done, going) = label.at(10.0);
+        assert!(done == (0, 1.0, 0.0) && going.is_none());
+        let mut last = 0.0;
+        for i in 0..=20 {
+            let ((_, shown, _), _) = label.at(1.0 + LABEL_TIME / 2.0 + i as f64 * LABEL_TIME / 20.0);
+            assert!(shown >= last - 1e-12);
+            last = shown;
+        }
+    }
+
+    /// A hold begun while the last one comes forward goes on receding from
+    /// as far as that one had.
+    #[test]
+    fn a_hold_upon_a_hold_recedes_on_from_where_it_was() {
+        assert!((recede_from(0.0, 0.05) - recede(0.05)).abs() < 1e-12);
+        assert!((recede_from(0.6, 0.0) - 0.6).abs() < 1e-12);
+        assert!((recede_from(0.6, RECEDE_TIME) - 1.0).abs() < 1e-12);
+        assert!(recede_from(0.6, 0.03) > 0.6);
+    }
+
+    /// In a single step the row the strip is on goes, the others stand.
+    #[test]
+    fn in_a_step_other_rows_stand() {
+        assert!((step_along(0.6, 0.0, 0) - 0.6).abs() < 1e-12);
+        assert!(step_along(0.6, 0.0, 1).abs() < 1e-12 && step_along(0.6, 0.0, -1).abs() < 1e-12);
+        assert!((step_along(1.0, 0.5, 1) - 0.5).abs() < 1e-12);
     }
 }

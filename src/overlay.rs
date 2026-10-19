@@ -49,12 +49,12 @@ use windows::{
 
 const WINDOW_CLASS: PCWSTR = w!("flick.overlay");
 
-const CELL_W: f32 = 46.0;
-const CELL_H: f32 = 30.0;
-const GAP: f32 = 7.0;
-const PAD: f32 = 20.0;
+const CELL_W: f32 = 34.0;
+const CELL_H: f32 = 22.0;
+const GAP: f32 = 5.0;
+const PAD: f32 = 10.0;
 /// Room under the grid for the shelf name.
-const TITLE_H: f32 = 26.0;
+const TITLE_H: f32 = 20.0;
 /// Settling and fade time scales, in seconds.
 const SETTLE_TAU: f32 = 0.045;
 const FADE_TAU: f32 = 0.025;
@@ -695,7 +695,7 @@ impl Overlay {
     fn draw(&self, canvas: &Dib) -> Result<()> {
         let s = self.scale;
         let (w, h) = (canvas.size.0 as f32, canvas.size.1 as f32);
-        let (cw, ch, radius) = (CELL_W * s, CELL_H * s, 7.0 * s);
+        let (cw, ch, radius) = (CELL_W * s, CELL_H * s, 5.0 * s);
         let (reach_x, reach_y) = self.view.reach();
         // The middle of the highlight, and cells `apart` (sideways, down) from it.
         let (mx, my) = (w / 2.0, (PAD + reach_y as f32 * (CELL_H + GAP)) * s + ch / 2.0);
@@ -711,8 +711,8 @@ impl Overlay {
 
         // Panel with a hairline border.
         let panel = rect(0.5, 0.5, w - 1.0, h - 1.0);
-        p.fill(&panel, 16.0 * s, rgba(0.075, 0.08, 0.095, 0.86));
-        p.stroke(&panel, 16.0 * s, 1.0, white(0.10));
+        p.fill(&panel, 11.0 * s, rgba(0.075, 0.08, 0.095, 0.86));
+        p.stroke(&panel, 11.0 * s, 1.0, white(0.10));
 
         let mut emphasised = Vec::new();
         for (r, row) in self.view.rows.iter().enumerate() {
@@ -945,7 +945,7 @@ fn log_frame(view: &View, camera: &Camera, hand: Hand) {
 }
 
 fn text_format(scale: f32) -> Result<IDWriteTextFormat> {
-    paint::text_format(&paint::dwrite_factory()?, 13.0 * scale, 600, DWRITE_TEXT_ALIGNMENT_CENTER)
+    paint::text_format(&paint::dwrite_factory()?, 11.5 * scale, 600, DWRITE_TEXT_ALIGNMENT_CENTER)
 }
 
 /// What the app asks of the minimap.
@@ -961,6 +961,8 @@ enum Request {
 /// matter what the app is doing.
 pub struct Minimap {
     requests: mpsc::Sender<Request>,
+    /// Shown at all (`Config::minimap`).
+    enabled: std::cell::Cell<bool>,
 }
 
 impl Minimap {
@@ -995,11 +997,21 @@ impl Minimap {
                 }
             }
         });
-        Minimap { requests }
+        Minimap { requests, enabled: std::cell::Cell::new(false) }
+    }
+
+    /// Whether the minimap is shown at all; turned off, it goes at once.
+    pub fn set_enabled(&self, enabled: bool) {
+        if !enabled && self.enabled.get() {
+            self.hide_after(0);
+        }
+        self.enabled.set(enabled);
     }
 
     pub fn show(&self, view: View, from: Option<Pos>) {
-        let _ = self.requests.send(Request::Show(view, from));
+        if self.enabled.get() {
+            let _ = self.requests.send(Request::Show(view, from));
+        }
     }
 
     pub fn update(&self, view: View) {

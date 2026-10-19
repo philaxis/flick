@@ -26,6 +26,8 @@
 
 **The screen follows the hand.** With *Follows the hand* on (the default, set for each way), the desktops slide along with the mouse or the fingers as on a Mac, the next ones coming into view, and the desktop changes once, when you let go: to the nearest one, or on to where a quick flick carries it. Windows pinned to every shelf stay put, and windows pinned to a shelf stay put sideways. Turned off, each desktop is gone to at once as the hand reaches it. The same settings are under `[mouse]` and `[touchpad]` in config.toml; a config.toml from an earlier version is read as the mouse settings.
 
+**The screen shows where you are.** While you move, the screen steps back so that a desktop each way, slantwise too, is in sight; the one in the middle stands out, a little larger and brighter than the rest, and the shelf’s name shows at the top. Moving along a shelf slides that shelf only; the shelves above and below stay where they are. The small minimap that used to come up while moving is off by default: turn on *Minimap while moving* in Settings (or `minimap = true` in config.toml) to have it back.
+
 ## Get started
 
 1. Download with the button above and run it. It installs itself and starts with Windows.

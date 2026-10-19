@@ -1114,7 +1114,13 @@ impl App {
         nearest.sort_by_key(|&at| (shots[at].0, at));
         let kept: HashSet<usize> = nearest.into_iter().take(glide::MOST_THUMBNAILS).collect();
         let shots = shots.into_iter().enumerate().filter(|(at, _)| kept.contains(at)).map(|(_, (_, shot))| shot).rev().collect();
-        Some(Scene { hold, rows, cols, firm, shots })
+        let names = (rows.0..=rows.1)
+            .map(|row| {
+                let at = (from.row as i32 + row) as usize;
+                crate::grid::row_title(&self.grid.rows[at].name, at)
+            })
+            .collect();
+        Some(Scene { hold, rows, cols, firm, shots, names })
     }
 
     /// Hold `hold` began to move: the picture follows it the ways it is set
@@ -1679,6 +1685,7 @@ impl App {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
             capturing: self.capturing,
             autostart: self.autostart,
+            minimap: self.config.minimap,
             mouse: self.config.mouse,
             touchpad: self.config.touchpad,
             touchpad_status: crate::touchpad::status(),
@@ -1833,6 +1840,7 @@ impl App {
                 SetTimer(self.hwnd, SLEEP_TIMER_ID, 60_000, None);
             }
         }
+        self.minimap.set_enabled(config.minimap);
         self.config = config;
         self.refresh_settings();
         if crate::touchpad::status() == crate::touchpad::Status::Conflict && !self.settings.is_open() {
@@ -2685,6 +2693,7 @@ pub fn render_settings(path: &str, touchpad: bool) {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
         autostart: true,
+        minimap: config.minimap,
         mouse: config.mouse,
         touchpad: config.touchpad,
         touchpad_status: if touchpad { crate::touchpad::Status::Conflict } else { crate::touchpad::Status::Absent },
