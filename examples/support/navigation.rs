@@ -91,23 +91,39 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 report += &format!("follow={follow} minimap={minimap} keyboard-trigger: {} actual={got}\n", got == ids[1]);
                 failures += usize::from(got != ids[1]);
                 // Fifty physical button taps interleaved with holds, 100 ms apart.
-                let mut latencies = Vec::new();
+                let measuring = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let running = measuring.clone();
+                let window = app.0;
+                let sampler = std::thread::spawn(move || {
+                    let mut latencies = Vec::new();
+                    let mut timeouts = 0;
+                    while running.load(std::sync::atomic::Ordering::Relaxed) {
+                        let before = Instant::now();
+                        let answered = SendMessageTimeoutW(windows::Win32::Foundation::HWND(window), WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2500, None).0 != 0;
+                        latencies.push(before.elapsed().as_millis());
+                        timeouts += usize::from(!answered);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    (latencies, timeouts)
+                });
+                let started = Instant::now();
                 for i in 0..50 {
                     mouse(MOUSEEVENTF_XDOWN, 0, 0);
                     wait(10);
                     if i % 3 == 0 { stroke(if i % 2 == 0 { 90 } else { -90 }, 3, 20); }
                     mouse(MOUSEEVENTF_XUP, 0, 0);
-                    wait(70);
-                    let before = Instant::now();
-                    let answered = SendMessageTimeoutW(app, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2500, None).0 != 0;
-                    latencies.push(before.elapsed().as_millis());
-                    if !answered { report += &format!("follow={follow} minimap={minimap} UI timeout at tap {i}\n"); }
+                    if let Some(left) = Duration::from_millis((i + 1) * 100).checked_sub(started.elapsed()) { std::thread::sleep(left); }
                 }
+                let elapsed = started.elapsed().as_millis();
+                wait(2000);
+                measuring.store(false, std::sync::atomic::Ordering::Relaxed);
+                let (mut latencies, timeouts) = sampler.join().unwrap();
                 let board = FindWindowW(w!("flick.board"), None);
                 let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0));
                 wait(2000);
                 latencies.sort();
-                report += &format!("follow={follow} minimap={minimap} 50 taps: UI p95={}ms max={}ms alive={}\n", latencies[47], latencies[49], child.try_wait().unwrap().is_none());
+                report += &format!("follow={follow} minimap={minimap} 50 taps in {elapsed}ms: UI p95={}ms max={}ms timeouts={timeouts} alive={}\n", latencies[latencies.len() * 95 / 100], latencies.last().unwrap(), child.try_wait().unwrap().is_none());
+                failures += usize::from(timeouts != 0 || child.try_wait().unwrap().is_some());
                 let _ = child.kill();
                 let _ = child.wait();
                 wait(500);
@@ -116,6 +132,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             report += &format!("navigation failures: {failures}\n");
             std::fs::write(out.join("report.txt"), &report).unwrap();
             print!("{report}");
+            assert_eq!(failures, 0, "navigation probe failed; see report.txt");
         },
         _ => panic!("navigation stage|run|unstage <out> [flick]"),
     }
