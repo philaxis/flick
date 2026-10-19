@@ -137,6 +137,15 @@ pub fn place(plate: &Rect, at: (f32, f32), size: f32, spacing: f32) -> Place {
     if (size - 1.0).abs() < 1e-6 && place.dx == 0.0 && place.dy == 0.0 { Place::SAME } else { place }
 }
 
+/// Fit the visible frame, then extend to the full DWM source including resize borders.
+pub fn fit_source(tile: &Rect, frame: &Rect, full: (f32, f32)) -> Rect {
+    let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
+    let s = ((tile.right - tile.left) / w).min((tile.bottom - tile.top) / h).min(1.0);
+    let left = (tile.left + tile.right) / 2.0 - (frame.left + w / 2.0) * s;
+    let top = (tile.top + tile.bottom) / 2.0 - (frame.top + h / 2.0) * s;
+    Rect { left, top, right: left + full.0 * s, bottom: top + full.1 * s }
+}
+
 /// What of `dest` shows inside `within`, and which part of a picture of
 /// `source` size that is.
 pub fn clip(dest: &Rect, within: &Rect, source: (f32, f32)) -> Option<(Rect, Rect)> {
@@ -359,6 +368,21 @@ mod tests {
         assert_eq!(shown, rect(50.0, 20.0, 50.0, 50.0));
         assert!(near(source.left, 0.0) && near(source.right, 500.0) && near(source.bottom, 500.0));
         assert!(clip(&rect(120.0, 0.0, 50.0, 50.0), &within, (10.0, 10.0)).is_none());
+    }
+
+    #[test]
+    fn source_borders_share_the_tiles_uniform_transform() {
+        for full in [(800.0, 300.0), (300.0, 700.0)] {
+            let frame = rect(9.0, 0.0, full.0 - 18.0, full.1 - 9.0);
+            let slot = rect(100.0, 100.0, 1000.0, 800.0);
+            let full_rect = fit_source(&slot, &frame, full);
+            let transform = Place { s: 0.7, dx: 13.0, dy: -21.0 };
+            let dest = transform.rect(&full_rect);
+            let visible = rect(dest.left + frame.left * 0.7, dest.top, (frame.right - frame.left) * 0.7, frame.bottom * 0.7);
+            assert!(((visible.left + visible.right) / 2.0 - (600.0 * 0.7 + 13.0)).abs() < 1e-4);
+            assert!(((visible.top + visible.bottom) / 2.0 - (500.0 * 0.7 - 21.0)).abs() < 1e-4);
+            assert!((visible.bottom - (transform.rect(&rect(full_rect.left + 9.0, full_rect.top, full.0 - 18.0, full.1 - 9.0))).bottom).abs() < 1e-4);
+        }
     }
 
     #[test]

@@ -883,6 +883,9 @@ struct Fonts {
     centered: IDWriteTextFormat,
 }
 
+#[derive(Clone, Copy)]
+struct ThumbnailSource { full: (f32, f32), frame: Rect }
+
 pub struct Board {
     hwnd: HWND,
     /// An owned window keeps the panel above the main DWM previews without
@@ -920,7 +923,7 @@ pub struct Board {
     areas: Vec<Rect>,
     plates: Vec<Rect>,
     /// How large each thumbnail's window is, asked of DWM once while moving.
-    source_sizes: RefCell<HashMap<isize, Option<Rect>>>,
+    source_sizes: RefCell<HashMap<isize, Option<ThumbnailSource>>>,
     trace: Option<Trace>,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
@@ -1985,7 +1988,7 @@ impl Board {
 
     /// How large the window of `thumb` is. Asked of DWM once while the
     /// strip moves, every time otherwise (a window may change size).
-    fn source_rect(&self, thumb: isize, hwnd: HWND) -> Option<Rect> {
+    fn source_rect(&self, thumb: isize, hwnd: HWND) -> Option<ThumbnailSource> {
         if self.strip_on {
             if let Some(size) = self.source_sizes.borrow().get(&thumb) {
                 return *size;
@@ -1994,15 +1997,23 @@ impl Board {
         let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().map(|s| {
             let mut outer = RECT::default();
             let mut visible = RECT::default();
-            let whole = rect(0.0, 0.0, s.cx.max(1) as f32, s.cy.max(1) as f32);
-            // Layout uses visible frame bounds; DWM includes invisible resize borders.
+            let queried = (s.cx.max(1) as f32, s.cy.max(1) as f32);
+            let mut full = queried;
+            let mut frame = rect(0.0, 0.0, full.0, full.1);
             if unsafe { GetWindowRect(hwnd, &mut outer) }.is_ok()
                 && unsafe { DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut visible as *mut _ as _, std::mem::size_of::<RECT>() as u32) }.is_ok()
-                && outer.right - outer.left == s.cx && outer.bottom - outer.top == s.cy
                 && visible.right > visible.left && visible.bottom > visible.top {
-                Rect { left: (visible.left - outer.left).max(0) as f32, top: (visible.top - outer.top).max(0) as f32,
-                    right: (visible.right - outer.left).min(s.cx) as f32, bottom: (visible.bottom - outer.top).min(s.cy) as f32 }
-            } else { whole }
+                let outer_size = (outer.right - outer.left, outer.bottom - outer.top);
+                let visible_size = (visible.right - visible.left, visible.bottom - visible.top);
+                // DWM can report visible size while rcSource still includes resize borders.
+                if outer_size == (s.cx, s.cy) || visible_size == (s.cx, s.cy) {
+                    full = (outer_size.0.max(1) as f32, outer_size.1.max(1) as f32);
+                    frame = Rect { left: (visible.left - outer.left).max(0) as f32, top: (visible.top - outer.top).max(0) as f32,
+                        right: (visible.right - outer.left).min(outer_size.0) as f32, bottom: (visible.bottom - outer.top).min(outer_size.1) as f32 };
+                }
+            }
+            if frame.right <= frame.left || frame.bottom <= frame.top { frame = rect(0.0, 0.0, full.0, full.1); }
+            ThumbnailSource { full, frame }
         });
         if self.strip_on {
             self.source_sizes.borrow_mut().insert(thumb, size);
@@ -2118,47 +2129,36 @@ impl Board {
             fSourceClientAreaOnly: false.into(),
             ..Default::default()
         };
-        let source_rect = tile.and_then(|tile| self.source_rect(thumb, tile.hwnd));
-        let source = source_rect.as_ref().map(size);
-        if let Some(r) = source_rect {
-            props.rcSource = RECT { left: r.left.round() as i32, top: r.top.round() as i32, right: r.right.round() as i32, bottom: r.bottom.round() as i32 };
+        let source_frame = tile.and_then(|tile| self.source_rect(thumb, tile.hwnd));
+        let source = source_frame.map(|source| source.full);
+        if let Some((w, h)) = source {
+            props.rcSource = RECT { left: 0, top: 0, right: w.round() as i32, bottom: h.round() as i32 };
             props.dwFlags |= DWM_TNP_RECTSOURCE;
         }
-        // The picture as large as fits into `w` by `h` without being
-        // distorted or made larger than the window is.
-        let fitted = |w: f32, h: f32| match source {
-            Some((sw, sh)) => {
-                let scale = (w / sw).min(h / sh).min(1.0);
-                (sw * scale, sh * scale)
-            }
-            None => (w, h),
-        };
+        let fitted = |slot: &Rect| source_frame.map_or(*slot, |source| strip::fit_source(slot, &source.frame, source.full));
         match (tile, placing) {
             (Some(tile), _) if dragged => {
                 // Follows the cursor, small enough to see the map under it.
                 let (tw, th) = size(&tile.thumb);
                 let (cx, cy) = self.cursor;
-                let (w, h) = fitted(tw.min(200.0 * self.scale), th);
-                props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
+                let w = tw.min(200.0 * self.scale);
+                props.rcDestination = to_rect(&fitted(&rect(cx - w / 2.0, cy - th / 2.0, w, th)));
                 props.opacity = 215;
             }
             (Some(tile), Some((place, clip, bright))) => {
                 // A tile has the shape of its window and the picture
                 // fills it; in one that had to be made wider or higher
                 // for its buttons the picture sits in the middle.
-                let (tw, th) = size(&tile.thumb);
-                let (w, h) = fitted(tw, th);
-                let (cx, cy) = centre(&tile.thumb);
-                let dest = place.rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
+                let dest = place.rect(&fitted(&tile.thumb));
                 match (clip, source) {
                     (Some(clip), Some(source)) => match strip::clip(&dest, &clip, source) {
                         Some((shown, from)) => {
                             props.rcDestination = to_rect(&shown);
                             props.rcSource = RECT {
-                                left: (from.left + source_rect.unwrap().left).round() as i32,
-                                top: (from.top + source_rect.unwrap().top).round() as i32,
-                                right: (from.right + source_rect.unwrap().left).round() as i32,
-                                bottom: (from.bottom + source_rect.unwrap().top).round() as i32,
+                                left: from.left.round() as i32,
+                                top: from.top.round() as i32,
+                                right: from.right.round() as i32,
+                                bottom: from.bottom.round() as i32,
                             };
                             props.dwFlags |= DWM_TNP_RECTSOURCE;
                         }

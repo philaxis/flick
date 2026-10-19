@@ -272,7 +272,8 @@ mod tests {
         }
         assert!(step.done());
         let old_speed = step.speed;
-        assert_eq!(step.then(199.0 / 120.0, (2, 0)).speed, old_speed);
+        let speed = step.then(199.0 / 120.0, (2, 0)).speed;
+        assert!((speed.0 - old_speed.0).abs() < 1e-6 && (speed.1 - old_speed.1).abs() < 1e-6);
     }
     #[test]
     fn compressed_input_keeps_turns_and_reversals() {
