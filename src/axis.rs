@@ -78,8 +78,7 @@ impl Picture {
         let goal = if turning { target[self.axis].round() } else { target[self.axis] };
         let distance = goal - self.at[self.axis];
         // Catch up without skipping the beginning, even after slow thumbnail setup.
-        let amount = 1.0 - (-dt / 0.035).exp();
-        self.at[self.axis] += (distance * amount).clamp(-8.0 * dt, 8.0 * dt);
+        self.at[self.axis] += distance.clamp(-8.0 * dt, 8.0 * dt);
         if turning && distance.abs() < 0.001 {
             self.at[self.axis] = goal;
             self.axis = axis;
@@ -108,6 +107,16 @@ mod tests {
             if lock.axis == Some(1) { turned = true; assert!((lock.at[0] - lock.at[0].round()).abs() < 1e-9); }
         }
         assert!(turned && lock.at[1] < -1.0);
+    }
+    #[test]
+    fn ordinary_dragging_tracks_one_to_one_after_the_first_frame() {
+        let mut picture = Picture::default();
+        assert_eq!(picture.track([0.4, 0.0], 0, 0.0), [0.0; 2]);
+        for frame in 1..100 {
+            let wanted = 0.4 + frame as f64 / 120.0;
+            let at = picture.track([wanted, 0.0], 0, frame as f64 / 120.0);
+            if frame >= 8 { assert!((at[0] - wanted).abs() < 1e-9); }
+        }
     }
     #[test]
     fn noisy_diagonals_and_turns_never_draw_two_fractional_axes() {

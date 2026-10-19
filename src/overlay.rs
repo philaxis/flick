@@ -648,6 +648,7 @@ impl Overlay {
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
         if let Some(drawn) = crate::glide::drawn() {
+            self.view.title.clone_from(&drawn.title);
             self.camera.follow(&self.view, &drawn);
         } else {
             self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
@@ -1411,7 +1412,7 @@ mod tests {
     #[test]
     fn a_followed_move_from_the_third_row_slides_the_second_row() {
         let view = View { rows: vec![vec![CellView::default(); 3]; 3], cur: Some(Pos { row: 2, col: 0 }), ..Default::default() };
-        let drawn = crate::glide::Drawn { origin: view.cur.unwrap(), anchors: vec![0; 3], rows: (-2, 0), along: vec![0.0, 0.4, 0.0], y: -1.0 };
+        let drawn = crate::glide::Drawn { title: "Shelf 2".into(), origin: view.cur.unwrap(), anchors: vec![0; 3], rows: (-2, 0), along: vec![0.0, 0.4, 0.0], y: -1.0 };
         let (xs, y) = Camera::follow_goals(&view, &drawn);
         assert!(xs[0].abs() < 1e-6 && (xs[1] + 0.4).abs() < 1e-6 && xs[2].abs() < 1e-6);
         assert!((y + 1.0).abs() < 1e-6);

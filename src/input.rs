@@ -1232,7 +1232,7 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
         store_followed(s);
     });
     remember_follow();
-    if !DRAGGING.get() && (x.abs() * s.step_x as f64 >= DRAG_SHOWS as f64 || y.abs() * s.step_y as f64 >= DRAG_SHOWS as f64) {
+    if !DRAGGING.get() && (following_axis_chosen() || x.abs() * s.step_x as f64 >= DRAG_SHOWS as f64 || y.abs() * s.step_y as f64 >= DRAG_SHOWS as f64) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(STRETCH.load(Ordering::SeqCst), 0));
     }
@@ -1327,11 +1327,16 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
         post(s, WM_SLIDE, slide_wparam(stretch, cols.cell()));
     }
     let far = |counts: i64| counts.abs() >= DRAG_SHOWS as i64;
-    if !DRAGGING.get() && (STEPPED.get() || cols.raw_rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS || far(fx) || far(fy)) {
+    if !DRAGGING.get() && (following_axis_chosen() || STEPPED.get() || cols.raw_rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS || far(fx) || far(fy)) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(stretch, 0));
     }
     debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.raw_rest(step), rows.gathered(step_y));
+}
+
+// Prepare the zero-position picture as soon as the dead zone chooses an axis.
+fn following_axis_chosen() -> bool {
+    FOLLOWING.load(Ordering::SeqCst) & (FOLLOW_X | FOLLOW_Y) != 0 && axis().is_some()
 }
 
 /// Writes how far the hand went the ways the screen follows, and the

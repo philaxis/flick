@@ -741,6 +741,7 @@ fn new_window(area: RECT) -> Option<HWND> {
 /// The minimap uses the exact displayed rows rather than the hold's origin row.
 #[derive(Clone)]
 pub struct Drawn {
+    pub title: String,
     pub origin: crate::grid::Pos,
     pub anchors: Vec<usize>,
     pub rows: (i32, i32),
@@ -1101,7 +1102,7 @@ impl View {
             moves = draw(session, &strip);
             session.stats.updates += moves;
             session.shown = Some(strip.clone());
-            *DRAWN.lock().unwrap() = Some(Drawn { origin: session.origin, anchors: session.anchors.clone(), rows: session.follow.rows, along: strip.along.clone(), y: strip.y });
+            *DRAWN.lock().unwrap() = Some(Drawn { title: session.called(row), origin: session.origin, anchors: session.anchors.clone(), rows: session.follow.rows, along: strip.along.clone(), y: strip.y });
         }
         if self.ink.is_none() {
             self.ink = Ink::new();

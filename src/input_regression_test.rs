@@ -589,3 +589,17 @@ fn a_new_press_does_not_replace_the_previous_release() {
     assert!(follow_hold(41).is_none());
     reset();
 }
+
+#[test]
+fn the_picture_starts_at_the_dead_zone_before_the_first_cell_step() {
+    let _guard = INPUT_TESTS.lock().unwrap();
+    reset();
+    FOLLOWING.store(FOLLOW_X | FOLLOW_Y, Ordering::SeqCst);
+    AXIS.store(1, Ordering::SeqCst);
+    advance(&settings(), 0, 0);
+    assert!(DRAGGING.get());
+    assert_eq!(followed().x, 0.0);
+    assert_eq!(followed().y, 0.0);
+    assert!(api::CALLS.with(|c| c.borrow().messages.iter().any(|m| m.0 == WM_DRAG)));
+    reset();
+}
