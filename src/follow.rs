@@ -240,7 +240,8 @@ impl Step {
     }
 
     pub fn done(&self, now: f64) -> bool {
-        now - self.began >= self.time()
+        // A hair under, for the rounding of `now - began`.
+        now - self.began >= self.time() - 1e-9
     }
 }
 
