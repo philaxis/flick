@@ -139,7 +139,7 @@ static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
 static ROW_FRACTION: AtomicI32 = AtomicI32::new(0);
 static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
 /// The board is open: a hold begun now goes from row to row as the hand
-/// goes, not by notches (`Plane::linear`).
+/// goes, not by notches (`Plane::linear`), as it does with none set.
 static BOARD_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// The app says when the board opens and closes.
@@ -363,13 +363,18 @@ struct Settings {
     target: isize,
     triggers: Vec<Trigger>,
     /// How far the hand goes from one cell to the next, and from one row to
-    /// the next: farther, so that rows are not changed by the way.
+    /// the next: farther, so that rows are not changed by the way. In mouse
+    /// counts; a touchpad step (`touchpad::Rails`) is one of either.
     step_x: i32,
     step_y: i32,
     /// The desktops go against the hand on the mouse and on three fingers
-    /// (`Config::mouse_reverse`, `touchpad_reverse`).
+    /// (`Config::mouse.reverse`, `touchpad.reverse`).
     mouse_reverse: bool,
     touchpad_reverse: bool,
+    /// How firm the notches up and down are on each, 0 for none
+    /// (`Config::mouse.notch_y`, `touchpad.notch_y`, `Plane::notched`).
+    mouse_notch_y: u32,
+    touchpad_notch_y: u32,
 }
 
 impl Settings {
@@ -523,11 +528,14 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
     *SHARED.lock().unwrap() = Some(Settings {
         target: target.0,
         triggers,
-        step_x: config.step_x.max(20),
-        step_y: config.step_y.max(20),
-        mouse_reverse: config.mouse_reverse,
-        touchpad_reverse: config.touchpad_reverse,
+        step_x: config.mouse.step_x.max(20),
+        step_y: config.mouse.step_y.max(20),
+        mouse_reverse: config.mouse.reverse,
+        touchpad_reverse: config.touchpad.reverse,
+        mouse_notch_y: config.mouse.notch_y,
+        touchpad_notch_y: config.touchpad.notch_y,
     });
+    crate::touchpad::set_step_mm(config.touchpad.step_x, config.touchpad.step_y);
     match THREAD.load(Ordering::SeqCst) {
         0 => {
             std::thread::spawn(hook_thread);
@@ -701,7 +709,17 @@ fn press(source: Source) {
             ROW_ASKED.store(0, Ordering::SeqCst);
             ROW_FRACTION.store(0, Ordering::SeqCst);
         });
-        PLANE.set(if BOARD_OPEN.load(Ordering::SeqCst) { Plane::linear() } else { Plane::new() });
+        // Up and down by the notches of the hand that began the hold, the
+        // mouse's for a button or key; on the board after the hand.
+        let notch = SETTINGS.with(|slot| {
+            let s = slot.try_borrow().ok()?;
+            let s = s.as_ref()?;
+            Some(if source == Source::Touchpad { s.touchpad_notch_y } else { s.mouse_notch_y })
+        });
+        PLANE.set(match notch.unwrap_or(crate::slide::FIRMEST) {
+            _ if BOARD_OPEN.load(Ordering::SeqCst) => Plane::linear(),
+            notch => Plane::notched(notch),
+        });
         DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
@@ -1080,7 +1098,7 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64)) {
         _ => y,
     };
     let lean = match plane.rows {
-        crate::slide::Rows::Notched(_) => y * crate::slide::LEAN as f64,
+        crate::slide::Rows::Notched(detent) => y * detent.most() as f64,
         crate::slide::Rows::Linear(_) => y,
     };
     writing(|| {
@@ -1426,7 +1444,7 @@ mod tests {
 
     #[test]
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
-        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true };
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true, mouse_notch_y: 100, touchpad_notch_y: 100 };
         let info = MSLLHOOKSTRUCT::default();
         TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });

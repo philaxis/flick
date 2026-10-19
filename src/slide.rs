@@ -95,8 +95,10 @@ const TURN_TENTHS: i32 = 1;
 /// spaced, never so much that one fling goes two rows.
 const CARRY_TENTHS: i32 = 5;
 /// How far the minimap leans towards the next row, at most, before the hand
-/// gets there, in rows.
+/// gets there, in rows: with notches at their firmest.
 pub const LEAN: f32 = 0.12;
+/// The firmest notches (`Detent::firm`).
+pub const FIRMEST: u32 = 100;
 
 /// Up and down in a hold, the way a mouse wheel goes by its notches: travel
 /// is gathered, and a row is come to each time it reaches a whole `step`, no
@@ -114,11 +116,27 @@ pub struct Detent {
     row: i32,
     /// Rows above and below the first, once the app has said.
     room: Option<(i32, i32)>,
+    /// How far the minimap leans at most, in rows (`LEAN` at the firmest).
+    most: f32,
 }
 
 impl Detent {
     pub const fn new() -> Detent {
-        Detent { gathered: 0, back: 0, row: 0, room: None }
+        Detent { gathered: 0, back: 0, row: 0, room: None, most: LEAN }
+    }
+
+    /// Notches `notch` firm, 1 to `FIRMEST` (`Config::mouse.notch_y`): the
+    /// row still comes only once the whole step is gone, but the softer they
+    /// are the farther the minimap leans towards it meanwhile, nearly as
+    /// far as the hand has gone at the softest.
+    pub fn firm(notch: u32) -> Detent {
+        let firm = notch.min(FIRMEST) as f32 / FIRMEST as f32;
+        Detent { most: 1.0 - (1.0 - LEAN) * firm, ..Detent::new() }
+    }
+
+    /// How far the minimap leans at most, in rows.
+    pub fn most(&self) -> f32 {
+        self.most
     }
 
     pub fn cell(&self) -> i32 {
@@ -132,7 +150,7 @@ impl Detent {
 
     /// How far the minimap leans towards the next row, in rows.
     pub fn lean(&self, step: i32) -> f32 {
-        self.gathered as f32 / step.max(1) as f32 * LEAN
+        self.gathered as f32 / step.max(1) as f32 * self.most
     }
 
     pub fn set_room(&mut self, up: i32, down: i32) {
@@ -254,9 +272,19 @@ impl Plane {
         Plane { cols: Slide::new(), rows: Rows::Notched(Detent::new()) }
     }
 
-    /// A hold begun with the board open: up and down follows the hand.
+    /// A hold begun with the board open, or with no notches up and down
+    /// (`notched(0)`): up and down follows the hand.
     pub const fn linear() -> Plane {
         Plane { cols: Slide::new(), rows: Rows::Linear(Slide::new()) }
+    }
+
+    /// Up and down by notches `notch` firm (`Detent::firm`); none follows
+    /// the hand (`linear`).
+    pub fn notched(notch: u32) -> Plane {
+        match notch {
+            0 => Plane::linear(),
+            notch => Plane { cols: Slide::new(), rows: Rows::Notched(Detent::firm(notch)) },
+        }
     }
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
@@ -406,5 +434,25 @@ mod tests {
         assert_eq!(wall.rows.cell(), 1);
         assert!(wall.travel(0, -320, steps).row);
         assert_eq!(wall.rows.cell(), 0);
+    }
+
+    /// How firm the notches up and down are: the row comes after the whole
+    /// step all the same, the minimap leaning farther the softer they are;
+    /// none at all follows the hand as on the board.
+    #[test]
+    fn notches_lean_more_the_softer_they_are() {
+        let steps = (260, 400);
+        let lean = |notch: u32| {
+            let mut plane = Plane::notched(notch);
+            assert!(!plane.travel(0, 399, steps).row, "notch {notch}");
+            assert!(plane.travel(0, 1, steps).row, "notch {notch}");
+            let mut plane = Plane::notched(notch);
+            plane.travel(0, 200, steps);
+            plane.rows.lean(steps.1)
+        };
+        assert!((lean(FIRMEST) - LEAN / 2.0).abs() < 1e-6);
+        assert!(lean(50) > lean(FIRMEST) && lean(1) > lean(50) && lean(1) < 0.5);
+        let mut none = Plane::notched(0);
+        assert!(none.travel(0, 240, steps).row);
     }
 }

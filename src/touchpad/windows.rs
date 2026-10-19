@@ -139,7 +139,7 @@ pub fn poll(enabled: bool) -> Status {
             };
             let why = match status {
                 Status::Absent => format!("no precision touchpad collection (HID 0D/05); {}", inventory()),
-                Status::Off => "three_finger_touchpad is false in config.toml".to_owned(),
+                Status::Off => "three_finger is false under [touchpad] in config.toml".to_owned(),
                 Status::Conflict => format!("Windows {}", conflict.unwrap_or_default()),
                 Status::Unavailable => "no touchpad collection could be parsed".to_owned(),
                 Status::Active => format!("reading {} of {} touchpad collection(s)", readers.len(), handles.len()),

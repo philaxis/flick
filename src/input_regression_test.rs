@@ -104,6 +104,8 @@ fn settings() -> Settings {
         step_y: 400,
         mouse_reverse: false,
         touchpad_reverse: true,
+        mouse_notch_y: 100,
+        touchpad_notch_y: 100,
     }
 }
 
@@ -286,7 +288,7 @@ fn raw_outcome(bytes: &[u8], holding: bool, baseline: bool) -> Outcome {
 #[test]
 fn feature_off_matches_pre_feature_hook_and_raw_packets_byte_for_byte() {
     let _guard = INPUT_TESTS.lock().unwrap();
-    assert!(!Config::default().three_finger_touchpad);
+    assert!(!Config::default().touchpad.three_finger);
     let offset = std::mem::offset_of!(RAWINPUT, data);
     let mut mouse = packet(RIM_TYPEMOUSE.0, std::mem::size_of::<RAWINPUT>());
     mouse[offset + std::mem::offset_of!(windows::Win32::UI::Input::RAWMOUSE, lLastX)..][..4]

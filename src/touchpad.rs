@@ -1,5 +1,7 @@
 //! Three-finger gestures in centimetres; Windows report decoding lives separately.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Contact {
     pub id: u32,
@@ -75,7 +77,7 @@ impl Gesture {
             && contacts.iter().all(|c| c.confident)
         {
             self.held = true;
-            self.rails = Rails::default();
+            self.rails = Rails::new(step_mm());
             event.began = true;
         } else if self.held {
             event.delta = delta;
@@ -96,8 +98,25 @@ pub enum Dir {
     Down,
 }
 
-/// Pad travel for one step either way, in mm (the 1 cm a step always was).
+/// Pad travel for one step either way, in mm (the 1 cm a step always was), unless set otherwise.
 pub const STEP_MM: f64 = 10.0;
+/// Pad travel for one step sideways and up and down as set (`Config::touchpad`), in hundredths of
+/// a mm; none set is `STEP_MM`.
+static STEP_SET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Sets the pad travel for one step sideways and up and down, from the next hold on.
+pub fn set_step_mm(x: f64, y: f64) {
+    for (set, mm) in STEP_SET.iter().zip([x, y]) {
+        set.store((mm.max(1.0) * 100.0).round() as u32, Ordering::Relaxed);
+    }
+}
+
+fn step_mm() -> [f64; 2] {
+    [0, 1].map(|axis| match STEP_SET[axis].load(Ordering::Relaxed) {
+        0 => STEP_MM,
+        hundredths => hundredths as f64 / 100.0,
+    })
+}
 /// Travel from where the hold began before its way is judged: well under a step, so none is lost.
 pub const JUDGE_MM: f64 = 3.0;
 // Moving along a row is easy and changing row is deliberate: an unclear start goes across, and
@@ -146,11 +165,14 @@ enum Mode {
 /// to go straight on one axis however crooked its fingers go. After Chromium's snap scroll
 /// channel and libinput's fading direction vector for scroll axis locking.
 ///
-/// Each axis gathers travel and steps once it reaches a whole `STEP_MM`, keeping what goes past.
+/// Each axis gathers travel and steps once it reaches a whole step (`STEP_MM` unless set), keeping
+/// what goes past.
 /// Turning back has to gather a whole step from nothing again, so a hand resting on the edge of a
 /// step does not take it to and fro.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Rails {
+    /// Travel for one step on each axis (x, y), in mm.
+    step: [f64; 2],
     mode: Mode,
     /// Travel gathered towards the next step on each axis (x, y).
     gathered: [f64; 2],
@@ -164,10 +186,30 @@ pub struct Rails {
     near: Option<(usize, u32)>,
 }
 
+impl Default for Rails {
+    fn default() -> Self {
+        Rails::new([STEP_MM; 2])
+    }
+}
+
 impl Rails {
+    /// `step`: travel for one step sideways and up and down, in mm.
+    pub fn new(step: [f64; 2]) -> Rails {
+        Rails {
+            step,
+            mode: Mode::default(),
+            gathered: [0.0; 2],
+            off: 0.0,
+            along: 0.0,
+            recent: [0.0; 2],
+            last_ms: None,
+            near: None,
+        }
+    }
+
     /// How far towards the next step each way, in steps; nothing on the axis a rail ignores.
     pub fn progress(&self) -> (f64, f64) {
-        let [x, y] = self.gathered.map(|g| g / STEP_MM);
+        let [x, y] = [self.gathered[0] / self.step[0], self.gathered[1] / self.step[1]];
         match self.mode {
             Mode::Judging => (0.0, 0.0),
             Mode::Rail(0) => (x, 0.0),
@@ -257,11 +299,12 @@ impl Rails {
 
     fn step(&mut self, axis: usize, d: f64, steps: &mut Vec<Dir>) {
         // What a step leaves over lies its own way, so turning back passes nothing before a whole step.
+        let step = self.step[axis];
         let g = &mut self.gathered[axis];
         *g += d;
-        while g.abs() >= STEP_MM {
+        while g.abs() >= step {
             let way = g.signum();
-            *g -= way * STEP_MM;
+            *g -= way * step;
             steps.push(match (axis, way > 0.0) {
                 (0, false) => Dir::Left,
                 (0, true) => Dir::Right,
@@ -446,6 +489,18 @@ mod tests {
         let mut rails = Rails::default();
         let path = (0..=122).map(|i| (-(i as f64) * 0.5, 4.0 * ((i as f64 * 0.5 / 40.0 * std::f64::consts::TAU).cos() - 1.0)));
         assert_eq!(drive(&mut rails, &mut 0, path), vec![Dir::Left; 6]);
+    }
+    /// Each way has its own distance per step, set in mm.
+    #[test]
+    fn each_way_steps_at_its_own_distance() {
+        let mut rails = Rails::new([5.0, 20.0]);
+        let mut ms = 0;
+        assert_eq!(drive(&mut rails, &mut ms, line((0.0, 0.0), (22.0, 0.0), 0.5)), vec![Dir::Right; 4]);
+        assert!((rails.progress().0 - 0.4).abs() < 1e-9);
+        let mut rails = Rails::new([5.0, 20.0]);
+        let steps = drive(&mut rails, &mut ms, line((0.0, 0.0), (0.0, 50.0), 0.5));
+        assert_eq!(steps, vec![Dir::Down; 2]);
+        assert!((rails.progress().1 - 0.5).abs() < 1e-9);
     }
     #[test]
     fn slantwise_goes_both_ways_and_steady_straight_travel_locks_again() {

@@ -1434,13 +1434,9 @@ impl App {
         settings::View {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
             capturing: self.capturing,
-            step_x: self.config.step_x,
-            step_y: self.config.step_y,
-            sticky: self.config.vertical_sticky,
             autostart: self.autostart,
-            touchpad: self.config.three_finger_touchpad,
-            mouse_reverse: self.config.mouse_reverse,
-            touchpad_reverse: self.config.touchpad_reverse,
+            mouse: self.config.mouse,
+            touchpad: self.config.touchpad,
             touchpad_status: crate::touchpad::status(),
         }
     }
@@ -1545,9 +1541,9 @@ impl App {
     fn settings_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match self.settings.handle(message, wparam, lparam)? {
             settings::Action::None => {}
-            settings::Action::Try { step_x, step_y } => {
+            settings::Action::Try { mouse, touchpad } => {
                 // Felt at once while dragging; written when the drag ends.
-                let config = Config { step_x, step_y, ..self.config.clone() };
+                let config = Config { mouse, touchpad, ..self.config.clone() };
                 input::install(self.hwnd, triggers(&config).0, &config);
             }
             settings::Action::Set(key, value) => self.set_config(key, &value),
@@ -1584,7 +1580,7 @@ impl App {
         if !unknown.is_empty() {
             warn(&format!("Unknown entries in trigger in config.toml: {}", unknown.join(", ")));
         }
-        crate::touchpad::poll(config.three_finger_touchpad);
+        crate::touchpad::poll(config.touchpad.three_finger);
         input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);
         unsafe {
@@ -1841,7 +1837,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(|app| {
                 app.apply_saved_config();
                 let before = crate::touchpad::status();
-                let status = crate::touchpad::poll(app.config.three_finger_touchpad);
+                let status = crate::touchpad::poll(app.config.touchpad.three_finger);
                 if status != before {
                     app.refresh_settings();
                     if status == crate::touchpad::Status::Conflict { app.open_settings(); }
@@ -2411,22 +2407,21 @@ pub fn render_guide(path: &str, seconds: f32) {
     }
 }
 
-pub fn render_settings(path: &str) {
+/// Renders the settings window with the default config into `path` (see
+/// `write_raw`), on the touchpad's tab with `touchpad`.
+pub fn render_settings(path: &str, touchpad: bool) {
     let Ok(mut window) = Settings::new(wndproc, Default::default()) else { return };
     let config = Config::default();
     let view = settings::View {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
-        step_x: config.step_x,
-        step_y: config.step_y,
-        sticky: config.vertical_sticky,
         autostart: true,
-        touchpad: false,
-        mouse_reverse: config.mouse_reverse,
-        touchpad_reverse: config.touchpad_reverse,
-        touchpad_status: crate::touchpad::Status::Absent,
+        mouse: config.mouse,
+        touchpad: config.touchpad,
+        touchpad_status: if touchpad { crate::touchpad::Status::Conflict } else { crate::touchpad::Status::Absent },
     };
-    if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
+    let tab = if touchpad { settings::Tab::Touchpad } else { settings::Tab::Mouse };
+    if let Some((size, pixels)) = window.render_to_pixels(view, tab, 1.5) {
         write_raw(path, size, &pixels);
     }
 }

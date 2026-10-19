@@ -20,7 +20,9 @@
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
 
-**Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop. By default the desktops go the other way from the fingers, as if pushing the screen like scrolling; “Reverse touchpad direction” in Settings turns this off, and “Reverse mouse direction” does the same for the mouse (off by default).
+**Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop. By default the desktops go the other way from the fingers, as if pushing the screen like scrolling; the mouse follows the hand.
+
+**Mouse and touchpad each their own way.** Settings has a tab for each, *Mouse* and *Touchpad*. In each you set sideways (along a row) and up and down (to another row) apart: how far to move for one desktop (pixels for the mouse, millimetres for the touchpad) and how firmly each desktop holds until you have moved that far (*Notch*; Off follows the hand evenly). *Reverse direction* turns that hand around. The same settings are under `[mouse]` and `[touchpad]` in config.toml; a config.toml from an earlier version is read as the mouse settings.
 
 ## Get started
 
