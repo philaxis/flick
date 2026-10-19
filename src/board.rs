@@ -6,8 +6,10 @@
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
 //! not touch desktops itself; input is turned into an `Action` for the app.
 
+mod strip;
+
 use crate::{
-    grid::{self, CellId, Dir, Grid, Row},
+    grid::{self, CellId, Dir, Grid, Pos, Row},
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Painter, Rect},
     tiles::{self, Space},
     usage,
@@ -17,8 +19,14 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
+    io::Write as _,
+    sync::{
+        atomic::{AtomicBool, AtomicIsize, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
+use strip::{Place, Strip};
 use windows::{
     core::{w, Error, Result},
     Foundation::Numerics::Matrix3x2,
@@ -29,7 +37,7 @@ use windows::{
                 Common::{
                     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
                 },
-                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_PROPERTIES,
+                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_PROPERTIES,
             },
             DirectWrite::{
                 IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -38,10 +46,13 @@ use windows::{
             Dwm::{
                 DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-                DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+                DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
-            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{BitBlt, CreateRoundRectRgn, DeleteObject, GdiFlush, GetDC, InvalidateRect, ReleaseDC, SetWindowRgn, ValidateRect, SRCCOPY},
+            Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_OUTPUT_DESC},
+            Gdi::{
+                BitBlt, CreateRoundRectRgn, DeleteObject, GdiFlush, GetDC, InvalidateRect, MonitorFromPoint, ReleaseDC, SetWindowRgn,
+                ValidateRect, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
+            },
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -56,7 +67,7 @@ use windows::{
                 },
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DrawIconEx, GetClassLongPtrW, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
+                CreateWindowExW, DefWindowProcW, PostMessageW, WM_APP, DrawIconEx, GetClassLongPtrW, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, SetLayeredWindowAttributes, ShowWindow, LWA_ALPHA, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
                 GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOREDRAW, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
@@ -226,8 +237,6 @@ const MOTION_LONGEST_STEP: f32 = 0.064;
 const SETTLED: f32 = 0.5;
 /// A near-target spring must also be this slow (px/s) before its tail is cut.
 const SETTLED_SPEED: f32 = SETTLED * MOTION_OMEGA;
-/// How far the tiles of a cell just gone to come in from, unscaled.
-const ARRIVE: f32 = 40.0;
 /// How far past the first and last cell the hand can pull a row, in cells,
 /// as in the minimap (`overlay::EDGE_GIVE`).
 const EDGE_GIVE: f32 = 0.16;
@@ -235,6 +244,235 @@ const EDGE_GIVE: f32 = 0.16;
 const NAME_LENGTH: usize = 24;
 /// Sent after the cursor leaves a window that called `TrackMouseEvent`.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Posted to the board by its `FrameClock` after a vblank while it moves.
+const WM_BOARD_FRAME: u32 = WM_APP + 40;
+/// After a frame brought by a vblank, how long the motion timer's own
+/// ticks are not drawn: only when vblanks stop coming does it draw.
+const VBLANK_TRUSTED: Duration = Duration::from_millis(40);
+
+/// Wakes the board at each vblank of the primary monitor while it moves,
+/// so that it draws once a refresh, in step with the screen, and never
+/// waits for one on the UI thread (`WaitForVBlank` has no timeout and
+/// blocks only this clock's own thread). At most one wake-up is waiting
+/// in the board's queue at a time.
+#[derive(Default)]
+struct FrameClock {
+    shared: Arc<ClockShared>,
+    thread: Option<std::thread::Thread>,
+}
+
+#[derive(Default)]
+struct ClockShared {
+    running: AtomicBool,
+    posted: AtomicBool,
+    /// Find the primary monitor's output again (the board was opened anew).
+    fresh: AtomicBool,
+    hwnd: AtomicIsize,
+}
+
+impl FrameClock {
+    fn start(&mut self, hwnd: HWND) {
+        let shared = &self.shared;
+        shared.hwnd.store(hwnd.0, Ordering::SeqCst);
+        shared.running.store(true, Ordering::SeqCst);
+        match &self.thread {
+            Some(thread) => thread.unpark(),
+            None => {
+                let shared = self.shared.clone();
+                self.thread = std::thread::Builder::new()
+                    .name("board vblank".into())
+                    .spawn(move || clock_loop(&shared))
+                    .ok()
+                    .map(|handle| handle.thread().clone());
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.shared.running.store(false, Ordering::SeqCst);
+        self.shared.posted.store(false, Ordering::SeqCst);
+    }
+
+    /// The board took the wake-up out of its queue.
+    fn frame_taken(&self) {
+        self.shared.posted.store(false, Ordering::SeqCst);
+    }
+
+    fn refresh(&self) {
+        self.shared.fresh.store(true, Ordering::SeqCst);
+    }
+}
+
+fn clock_loop(shared: &ClockShared) {
+    let mut output: Option<IDXGIOutput> = None;
+    loop {
+        while !shared.running.load(Ordering::SeqCst) {
+            std::thread::park();
+        }
+        if shared.fresh.swap(false, Ordering::SeqCst) {
+            output = None;
+        }
+        if output.is_none() {
+            output = primary_output();
+        }
+        let waited = output.as_ref().is_some_and(|output| unsafe { output.WaitForVBlank() }.is_ok());
+        if !waited {
+            // The motion timer draws meanwhile; try again a little later.
+            output = None;
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        if shared.running.load(Ordering::SeqCst) && !shared.posted.swap(true, Ordering::SeqCst) {
+            let hwnd = HWND(shared.hwnd.load(Ordering::SeqCst));
+            if unsafe { PostMessageW(hwnd, WM_BOARD_FRAME, WPARAM(0), LPARAM(0)) }.is_err() {
+                shared.posted.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// The DXGI output showing the primary monitor.
+fn primary_output() -> Option<IDXGIOutput> {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut a = 0;
+        while let Ok(adapter) = factory.EnumAdapters(a) {
+            let mut o = 0;
+            while let Ok(output) = adapter.EnumOutputs(o) {
+                let mut desc = DXGI_OUTPUT_DESC::default();
+                if output.GetDesc(&mut desc).is_ok() && desc.AttachedToDesktop.as_bool() && desc.Monitor == monitor {
+                    return Some(output);
+                }
+                o += 1;
+            }
+            a += 1;
+        }
+    }
+    None
+}
+
+/// One drawn frame of the board's motion, as `FLICK_TRACE` has it.
+struct TraceFrame {
+    at: Duration,
+    interval: Option<Duration>,
+    by_vblank: bool,
+    /// The hand as the input thread has it (`input::Hand`), in cells.
+    hand: (f32, f32),
+    /// Where the selected cell's picture is drawn on the home monitor (its
+    /// top left corner, px) and its size, and how far back the strip is.
+    drawn: (f32, f32, f32),
+    depth: f32,
+    draw: Duration,
+    dwm: Duration,
+    thumbs: usize,
+}
+
+/// The board's frames written to the CSV file `FLICK_TRACE` names: kept in
+/// memory while it moves, and written in one go once it is still, so that
+/// no file is touched while drawing.
+struct Trace {
+    path: std::path::PathBuf,
+    frames: Vec<TraceFrame>,
+    last: Option<Instant>,
+}
+
+/// What every trace's times are counted from (`Instant` is the
+/// performance counter).
+fn trace_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+impl Trace {
+    fn from_env() -> Option<Trace> {
+        let path = std::env::var_os("FLICK_TRACE").filter(|path| !path.is_empty())?;
+        trace_epoch();
+        Some(Trace { path: path.into(), frames: Vec::new(), last: None })
+    }
+
+    fn record(&mut self, frame: TraceFrame, started: Instant) {
+        let interval = self.last.map(|last| started.saturating_duration_since(last));
+        self.last = Some(started);
+        self.frames.push(TraceFrame { interval, ..frame });
+    }
+
+    fn flush(&mut self) {
+        self.last = None;
+        if self.frames.is_empty() {
+            return;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut out = String::new();
+        let new = std::fs::metadata(&self.path).map_or(true, |m| m.len() == 0);
+        if new {
+            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails\n");
+        }
+        for f in self.frames.drain(..) {
+            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{}\n",
+                ms(f.at), f.interval.map_or(String::new(), |i| format!("{:.3}", ms(i))),
+                if f.by_vblank { "vblank" } else { "timer" }, f.hand.0, f.hand.1, f.drawn.0, f.drawn.1, f.drawn.2,
+                f.depth, ms(f.draw), ms(f.dwm), f.thumbs));
+        }
+        let written = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
+            .and_then(|mut file| file.write_all(out.as_bytes()));
+        if let Err(e) = written {
+            crate::app::log(&format!("board trace not written: {e}"));
+        }
+    }
+}
+
+/// A cell's windows laid out as when it is the one selected: their tiles,
+/// the headings of the parts they are in, and where the cell says it has
+/// none of its own.
+#[derive(Default)]
+struct CellTiles {
+    tiles: Vec<TileLayout>,
+    sections: Vec<(Rect, Rect, &'static str)>,
+    area: Rect,
+}
+
+/// A cell beside the selection, shown while the strip moves.
+struct StripCell {
+    id: CellId,
+    pos: Pos,
+    cell: CellTiles,
+}
+
+/// What a tile moves with when the selection moves.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Carried {
+    /// On every desktop: it never moves.
+    Fixed,
+    /// Pinned to its row: it stays while the selection moves in the row.
+    Row,
+    /// The cell's own.
+    Own,
+}
+
+impl Carried {
+    fn of(window: &WindowModel, everywhere: bool) -> Carried {
+        if everywhere { Carried::Fixed } else if window.follows { Carried::Row } else { Carried::Own }
+    }
+
+    fn of_section(name: &str) -> Carried {
+        match name {
+            "All rows" => Carried::Fixed,
+            "This row" => Carried::Row,
+            _ => Carried::Own,
+        }
+    }
+
+    /// Whether a cell beside the selection, in the selected row or not,
+    /// shows it: what moves with the selection is shown once, there.
+    fn beside(self, in_selected_row: bool) -> bool {
+        match self {
+            Carried::Fixed => false,
+            Carried::Row => !in_selected_row,
+            Carried::Own => true,
+        }
+    }
+}
 
 fn contains(r: &Rect, x: f32, y: f32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
@@ -487,8 +725,6 @@ enum Part {
     Spine(usize),
     /// The frame of the selected cell, on a monitor's map.
     Selection(usize),
-    /// A tile, by its window.
-    Tile(isize),
 }
 
 /// One axis of a critically damped spring, relative to its target, in px and px/s.
@@ -542,18 +778,13 @@ impl Motion {
     }
 
     /// The parts were laid out at `before` and are now at `after`: each is
-    /// still drawn where it was and eases from there. A part new to the
-    /// layout comes in from `arrive` when it is a tile; anything else
-    /// that came or went has nothing to ease from.
-    fn moved(&mut self, before: &HashMap<Part, (f32, f32)>, after: &HashMap<Part, (f32, f32)>, arrive: (f32, f32), now: Instant) {
+    /// still drawn where it was and eases from there. A part that came or
+    /// went has nothing to ease from.
+    fn moved(&mut self, before: &HashMap<Part, (f32, f32)>, after: &HashMap<Part, (f32, f32)>, now: Instant) {
         self.elapse(now);
         let rest = after.iter().filter_map(|(part, at)| {
             let mut left = self.rest.get(part).copied().unwrap_or_default();
-            let jump = match before.get(part) {
-                Some(was) => (was.0 - at.0, was.1 - at.1),
-                None if matches!(part, Part::Tile(_)) => arrive,
-                None => (0.0, 0.0),
-            };
+            let jump = before.get(part).map_or((0.0, 0.0), |was| (was.0 - at.0, was.1 - at.1));
             left[0].offset += jump.0;
             left[1].offset += jump.1;
             (!left.iter().all(|spring| spring.settled())).then(|| (part.clone(), left))
@@ -695,6 +926,31 @@ pub struct Board {
     /// and following the held trigger; drawn by `MOTION_TIMER_ID` meanwhile.
     motion: Motion,
     motion_timer: bool,
+    /// Brings the frames of the motion at each vblank.
+    clock: FrameClock,
+    /// When the last frame brought by a vblank was drawn.
+    vblank_frame: Option<Instant>,
+    /// The preview area as a strip of desktops while the selection moves
+    /// (`strip`), in seconds from `strip_epoch`; the time of the frame
+    /// being drawn; whether it is moving, with the cells beside the
+    /// selection laid out and their live previews registered.
+    strip: Strip,
+    strip_epoch: Instant,
+    strip_at: f32,
+    strip_on: bool,
+    strip_cells: Vec<StripCell>,
+    /// (cell, source window, thumbnail handle) of the cells beside.
+    strip_thumbs: Vec<(CellId, isize, isize)>,
+    /// Where each row's column 0 is from the selection (`strip::marks`).
+    strip_marks: Vec<(f32, f32)>,
+    /// Per monitor (as `monitors`), where the tiles go, and the plate the
+    /// strip moves in: that, but for the part of the windows on every
+    /// desktop.
+    areas: Vec<Rect>,
+    plates: Vec<Rect>,
+    /// How large each thumbnail's window is, asked of DWM once while moving.
+    source_sizes: RefCell<HashMap<isize, Option<(f32, f32)>>>,
+    trace: Option<Trace>,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
@@ -839,6 +1095,19 @@ impl Board {
                 popup_timer: None,
                 motion: Motion::default(),
                 motion_timer: false,
+                clock: FrameClock::default(),
+                vblank_frame: None,
+                strip: Strip::default(),
+                strip_epoch: Instant::now(),
+                strip_at: 0.0,
+                strip_on: false,
+                strip_cells: Vec::new(),
+                strip_thumbs: Vec::new(),
+                strip_marks: Vec::new(),
+                areas: Vec::new(),
+                plates: Vec::new(),
+                source_sizes: RefCell::new(HashMap::new()),
+                trace: Trace::from_env(),
                 factory: paint::d2d_factory()?,
                 canvas: None,
                 fonts: None,
@@ -933,6 +1202,8 @@ impl Board {
         self.press = None;
         self.hide_popup();
         self.motion.stop();
+        self.settle_strip(Instant::now());
+        self.clock.refresh();
         self.refused = None;
         self.stop_editing();
         self.open = true;
@@ -956,9 +1227,13 @@ impl Board {
         }
         self.press = None;
         self.hide_popup();
-        // What changed is not a move: it is shown as it is.
+        // What changed is not a move: it is shown as it is. A strip that
+        // moves goes on (a hold may be under way), with its cells anew.
         self.motion.stop();
         self.relayout();
+        if self.strip_on {
+            self.lay_out_strip(None);
+        }
         self.hover_under_cursor();
         self.register_thumbnails();
         self.update_popup(Instant::now());
@@ -992,6 +1267,8 @@ impl Board {
         self.open = false;
         crate::input::set_board_open(false);
         self.hide_popup();
+        self.stop_motion();
+        self.settle_strip(Instant::now());
         self.clear_thumbnails();
         self.icons.clear();
         // A picture the size of every screen together, of no use until the
@@ -1018,32 +1295,65 @@ impl Board {
     pub fn select(&mut self, id: CellId, grid: Grid) {
         let now = Instant::now();
         let before = self.marks();
-        let arrive = self.arrival(&grid, &id);
+        let (strip_before, from) = (self.strip_marks.clone(), self.grid.find(&self.selected));
         self.grid = grid;
         self.selected = id;
         self.hide_popup();
         self.relayout();
-        self.motion.moved(&before, &self.marks(), arrive, now);
+        self.motion.moved(&before, &self.marks(), now);
+        let t = self.strip_time(now);
+        self.strip.moved(&strip_before, &self.strip_marks, t);
+        self.strip_at = t;
+        self.strip_on |= self.strip.active(t);
+        if self.strip_on {
+            self.lay_out_strip(from);
+        }
         self.hover_under_cursor();
         self.register_thumbnails();
-        if self.motion.is_moving() {
-            // The preview comes up over the cell under the cursor once it is in place.
+        if self.motion.is_moving() || self.strip_on {
+            // The preview comes up over the cell under the cursor once it
+            // is in place; the frames draw it meanwhile, at each vblank.
             self.start_motion();
         } else {
             self.update_popup(now);
+            self.invalidate();
         }
-        self.invalidate();
     }
 
-    /// Where the tiles of `to` come in from: the side of the move.
-    fn arrival(&self, grid: &Grid, to: &str) -> (f32, f32) {
-        let distance = ARRIVE * self.scale;
-        let sign = |a: usize, b: usize| b.cmp(&a) as i32 as f32;
-        match (self.grid.find(&self.selected), grid.find(to)) {
-            (Some(from), Some(to)) if from.row != to.row => (0.0, sign(from.row, to.row) * distance),
-            (Some(from), Some(to)) => (sign(from.col, to.col) * distance, 0.0),
-            _ => (0.0, 0.0),
-        }
+    /// Seconds into the strip's motion.
+    fn strip_time(&self, now: Instant) -> f32 {
+        now.saturating_duration_since(self.strip_epoch).as_secs_f32()
+    }
+
+    /// Lays out the cells beside the selection, and those beside `from`
+    /// where it moved from.
+    fn lay_out_strip(&mut self, from: Option<Pos>) {
+        let Some(to) = self.grid.find(&self.selected) else {
+            self.strip_cells.clear();
+            return;
+        };
+        self.strip_cells = strip::shown(&self.grid, from, to).into_iter()
+            .map(|(id, pos)| StripCell { cell: self.lay_out_cell(&id), id, pos })
+            .collect();
+    }
+
+    /// The strip is still: the cells beside go, with their live previews,
+    /// and its clock starts again from `now`.
+    fn settle_strip(&mut self, now: Instant) {
+        self.strip = Strip::default();
+        self.strip_epoch = now;
+        self.strip_at = 0.0;
+        self.strip_on = false;
+        self.strip_cells.clear();
+        unregister_strip_thumbnails(&mut self.strip_thumbs);
+        self.source_sizes.borrow_mut().clear();
+    }
+
+    /// How far the hand pulls the selection, in cells and rows.
+    fn strip_pull(&self, hand: (f32, f32)) -> (f32, f32) {
+        let Some(at) = self.grid.find(&self.selected).filter(|_| hand != (0.0, 0.0)) else { return (0.0, 0.0) };
+        let cells = self.grid.rows.get(at.row).map_or(1, |row| row.cells.len());
+        hand_pull((at.col, at.row), (cells.saturating_sub(1), self.grid.rows.len().saturating_sub(1)), hand)
     }
 
     /// The held trigger began a hold over the open board: its rows follow
@@ -1060,11 +1370,17 @@ impl Board {
                 SetTimer(self.hwnd, MOTION_TIMER_ID, MOTION_MS, None);
             }
             self.motion_timer = true;
+            self.clock.start(self.hwnd);
         }
     }
 
     fn stop_motion(&mut self) {
         self.motion.stop();
+        self.clock.stop();
+        self.vblank_frame = None;
+        if let Some(trace) = &mut self.trace {
+            trace.flush();
+        }
         if self.motion_timer {
             unsafe {
                 let _ = KillTimer(self.hwnd, MOTION_TIMER_ID);
@@ -1092,9 +1408,6 @@ impl Board {
                 }
             }
         }
-        for tile in &self.tiles {
-            marks.insert(Part::Tile(tile.hwnd.0), corner(&tile.frame));
-        }
         marks
     }
 
@@ -1117,15 +1430,31 @@ impl Board {
         parts
     }
 
-    /// One frame of the motion: follows the hand, eases what jumped, and
-    /// draws. Stops once all is in place and no hold goes on.
-    fn tick_motion(&mut self, now: Instant) {
+    /// One frame of the motion at `now`, brought by a vblank or by the
+    /// timer standing in for one: follows the hand, eases what jumped,
+    /// moves the strip, and draws. Where everything is comes from the time,
+    /// never from how many frames there were. Stops once all is in place
+    /// and no hold goes on.
+    fn tick_motion(&mut self, now: Instant, by_vblank: bool) {
         let hand = crate::input::hand();
-        let was_moving = self.motion.is_moving();
-        let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now);
+        let holding = crate::input::holding();
+        let t = self.strip_time(now);
+        let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
+        let was_strip = self.strip_on;
+        self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+        self.strip_at = t;
+        let strip_moving = self.strip.active(t);
+        if strip_moving && !self.strip_on {
+            self.strip_on = true;
+            self.lay_out_strip(None);
+            self.register_thumbnails();
+        }
+        let was_moving = self.motion.is_moving() || was_strip;
+        let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now) || strip_moving;
         if was_moving || moving {
             let started = Instant::now();
             self.update_thumbnails();
+            let dwm = started.elapsed();
             self.paint();
             unsafe {
                 ValidateRect(self.hwnd, None);
@@ -1134,17 +1463,40 @@ impl Board {
             self.motion.frames += 1;
             self.motion.drawing += took;
             self.motion.slowest = self.motion.slowest.max(took);
-            debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}",
+            if self.trace.is_some() {
+                let drawn = self.selected_place(self.home_index()).map_or((0.0, 0.0, 1.0), |(place, plate)| {
+                    let r = place.rect(&plate);
+                    (r.left, r.top, place.s)
+                });
+                let frame = TraceFrame {
+                    at: now.saturating_duration_since(trace_epoch()),
+                    interval: None,
+                    by_vblank,
+                    hand: (hand.along, hand.across),
+                    drawn,
+                    depth: self.strip.depth(t),
+                    draw: took - dwm,
+                    dwm,
+                    thumbs: self.thumbs.len() + self.strip_thumbs.len(),
+                };
+                if let Some(trace) = &mut self.trace {
+                    trace.record(frame, now);
+                }
+            }
+            debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}, strip {:.3} back",
                 self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len(),
                 self.motion.rest.values().flatten().map(|spring| spring.offset.abs()).fold(0.0, f32::max), hand.along, hand.across,
-                self.motion.hand.values().next());
+                self.motion.hand.values().next(), self.strip.depth(t));
         }
-        if !moving && !crate::input::holding() {
+        if !moving && !holding {
             debug_log!("board: motion settled after {} frames, drawing {:.2} ms a frame on average and {:.2} at most",
                 self.motion.frames, self.motion.drawing.as_secs_f32() * 1000.0 / self.motion.frames.max(1) as f32,
                 self.motion.slowest.as_secs_f32() * 1000.0);
             (self.motion.frames, self.motion.drawing, self.motion.slowest) = (0, Duration::ZERO, Duration::ZERO);
             self.stop_motion();
+            if was_strip {
+                self.settle_strip(now);
+            }
             if was_moving {
                 self.hover_under_cursor();
                 self.update_popup(now);
@@ -1252,41 +1604,35 @@ impl Board {
         // Each row is shifted so that the cell a vertical move would land on
         // sits in the same column for all rows.
         let anchors: Vec<usize> = self.grid.rows.iter().map(Row::anchor).collect();
-        let windows = self.tile_windows();
-        let weights = self.model.window_weights(&self.selected, &self.grid);
-        let mut tiles = Vec::new();
-        let mut tiles_area = Rect::default();
-        let mut sections = Vec::new();
         let mut maps = Vec::new();
+        let mut areas = Vec::new();
         for (m, monitor) in self.monitors.iter().enumerate() {
             let is_home = *monitor == self.home;
             let (w, h) = size(monitor);
             let layout = layout_map(&self.model, &anchors, (w, h - FOOTER * s), s);
             // The home monitor has the cell's label above its tiles.
-            let area = Rect {
+            areas.push(Rect {
                 left: monitor.left + margin,
                 top: monitor.top + if is_home { 64.0 * s } else { margin },
                 right: monitor.right - margin,
                 bottom: monitor.top + layout.top - 26.0 * s,
-            };
-            let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
-            // The part of the windows on every desktop is the same in every row.
-            let row_most = self.model.rows.iter()
-                .map(|row| row.cells.iter().flat_map(|cell| &cell.windows).filter(|w| w.follows && self.monitor_of(w) == m).count())
-                .max().unwrap_or(0);
-            for (part, name, group) in split_area(&here, row_most, &area, s) {
-                if let Some(name) = name {
-                    sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, part, name));
-                }
-                // The part of the cell's own windows comes last.
-                if is_home {
-                    tiles_area = part;
-                }
-                tiles.extend(layout_tiles(&group, &part, s, &weights));
-            }
+            });
             maps.push(Map { monitor: m, area: *monitor, layout });
         }
         maps.sort_by_key(|map| map.area != self.home);
+        self.plates = areas.clone();
+        self.areas = areas;
+        let selected = self.selected.clone();
+        let CellTiles { tiles, sections, area: tiles_area } = self.lay_out_cell(&selected);
+        // The strip moves in what is left of the area beside the part of
+        // the windows on every desktop, which never moves.
+        for (m, plate) in self.plates.iter_mut().enumerate() {
+            let monitor = self.monitors[m];
+            for (_, part, _) in sections.iter().filter(|(_, part, name)| *name == "All rows" && contains(&monitor, centre(part).0, centre(part).1)) {
+                plate.left = plate.left.max(part.right + 14.0 * s);
+            }
+        }
+        self.strip_marks = self.grid.find(&self.selected).map_or_else(Vec::new, |at| strip::marks(&self.grid, at));
         self.label = rect(margin, 22.0 * s, size(&self.home).0 - 2.0 * margin, 30.0 * s);
         #[cfg(feature = "debug-log")]
         if self.open {
@@ -1307,6 +1653,84 @@ impl Board {
         self.sections = sections;
         self.tiles_area = tiles_area;
         self.maps = maps;
+    }
+
+    /// The windows of cell `id` laid out as when it is selected, in the
+    /// areas `relayout` found for each monitor.
+    fn lay_out_cell(&self, id: &str) -> CellTiles {
+        let s = self.scale;
+        let windows = self.model.tile_windows(id);
+        let weights = self.model.window_weights(id, &self.grid);
+        let mut out = CellTiles::default();
+        for (m, monitor) in self.monitors.iter().enumerate() {
+            let Some(area) = self.areas.get(m) else { continue };
+            let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
+            // The part of the windows on every desktop is the same in every row.
+            let row_most = self.model.rows.iter()
+                .map(|row| row.cells.iter().flat_map(|cell| &cell.windows).filter(|w| w.follows && self.monitor_of(w) == m).count())
+                .max().unwrap_or(0);
+            for (part, name, group) in split_area(&here, row_most, area, s) {
+                if let Some(name) = name {
+                    out.sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, part, name));
+                }
+                // The part of the cell's own windows comes last.
+                if *monitor == self.home {
+                    out.area = part;
+                }
+                out.tiles.extend(layout_tiles(&group, &part, s, &weights));
+            }
+        }
+        out
+    }
+
+    /// The monitor a thing laid out at `r` is on, as `monitors` counts them.
+    fn monitor_at(&self, r: &Rect) -> usize {
+        let (x, y) = centre(r);
+        self.monitors.iter().position(|m| contains(m, x, y)).unwrap_or_else(|| self.home_index())
+    }
+
+    /// How the picture of the cell at `pos` is drawn on monitor `m` in
+    /// the frame being drawn.
+    fn picture_place(&self, pos: Pos, m: usize) -> Place {
+        let (Some(plate), Some(mark), true) = (self.plates.get(m), self.strip_marks.get(pos.row), self.strip_on) else { return Place::SAME };
+        let t = self.strip_at;
+        let (x, y) = self.strip.offset(pos.row, t);
+        let size = strip::scale(self.strip.depth(t));
+        strip::place(plate, (mark.0 + pos.col as f32 + x, mark.1 + y), size, size)
+    }
+
+    /// How the windows pinned to the selected row are drawn on monitor
+    /// `m`: still while the selection moves in the row, going back and
+    /// along with it to another.
+    fn row_place(&self, m: usize) -> Place {
+        let Some(at) = self.grid.find(&self.selected) else { return Place::SAME };
+        let (Some(plate), Some(mark), true) = (self.plates.get(m), self.strip_marks.get(at.row), self.strip_on) else { return Place::SAME };
+        let t = self.strip_at;
+        let spacing = strip::scale(self.strip.depth(t));
+        strip::place(plate, (0.0, mark.1 + self.strip.offset(at.row, t).1), strip::scale(self.strip.row_depth(t)), spacing)
+    }
+
+    /// How a tile of the cell at `pos` that moves as `carried` is drawn,
+    /// and the plate it is cut off at; `None` when it is not shown there.
+    fn tile_place(&self, pos: Pos, carried: Carried, tile: &Rect) -> Option<(Place, Option<Rect>)> {
+        let m = self.monitor_at(tile);
+        let selected = self.grid.find(&self.selected);
+        let middle = selected == Some(pos);
+        if !middle && !carried.beside(selected.is_some_and(|at| at.row == pos.row)) {
+            return None;
+        }
+        let place = match carried {
+            Carried::Fixed => Place::SAME,
+            Carried::Row if middle => self.row_place(m),
+            _ => self.picture_place(pos, m),
+        };
+        Some((place, (!place.is_same()).then(|| self.plates[m])))
+    }
+
+    /// The selected cell's picture on monitor `m` and its plate.
+    fn selected_place(&self, m: usize) -> Option<(Place, Rect)> {
+        let at = self.grid.find(&self.selected)?;
+        Some((self.picture_place(at, m), *self.plates.get(m)?))
     }
 
     /// The map of the monitor the point is on (the home one otherwise), with
@@ -1529,19 +1953,58 @@ impl Board {
     }
 
     fn clear_thumbnails(&mut self) {
+        unregister_strip_thumbnails(&mut self.strip_thumbs);
         unregister_thumbnails(&mut self.thumbs);
+        self.source_sizes.borrow_mut().clear();
     }
 
-    /// Registers a live thumbnail for every tile.
+    /// Registers a live thumbnail for every tile and, while the strip
+    /// moves, for as many of the tiles of the cells beside as
+    /// `strip::MAX_THUMBS` allows. Thumbnails stack in the order they are
+    /// registered: those beside go under the selected cell's, and the
+    /// windows on every desktop, which never move, over everything.
     fn register_thumbnails(&mut self) {
         self.clear_thumbnails();
-        let wanted: Vec<HWND> = self.tile_windows().into_iter().map(|(w, _)| w.hwnd).collect();
-        for hwnd in wanted {
+        if self.strip_on {
+            let wanted: Vec<Vec<HWND>> = self.strip_cells.iter().map(|cell| {
+                let windows = self.model.tile_windows(&cell.id);
+                cell.cell.tiles.iter()
+                    .filter(|tile| windows.iter().any(|(w, everywhere)| w.hwnd == tile.hwnd && self.tile_place(cell.pos, Carried::of(w, *everywhere), &tile.frame).is_some()))
+                    .map(|tile| tile.hwnd)
+                    .collect()
+            }).collect();
+            let given = strip::budget(&wanted.iter().map(Vec::len).collect::<Vec<_>>(), strip::MAX_THUMBS);
+            for ((cell, hwnds), given) in self.strip_cells.iter().zip(&wanted).zip(given) {
+                for hwnd in &hwnds[..given] {
+                    if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, *hwnd) } {
+                        self.strip_thumbs.push((cell.id.clone(), hwnd.0, thumb));
+                    }
+                }
+            }
+        }
+        let mut wanted: Vec<(HWND, bool)> = self.tile_windows().into_iter().map(|(w, everywhere)| (w.hwnd, everywhere)).collect();
+        wanted.sort_by_key(|(_, everywhere)| *everywhere);
+        for (hwnd, _) in wanted {
             if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
                 self.thumbs.push((hwnd.0, thumb));
             }
         }
         self.update_thumbnails();
+    }
+
+    /// How large the window of `thumb` is. Asked of DWM once while the
+    /// strip moves, every time otherwise (a window may change size).
+    fn source_size(&self, thumb: isize) -> Option<(f32, f32)> {
+        if self.strip_on {
+            if let Some(size) = self.source_sizes.borrow().get(&thumb) {
+                return *size;
+            }
+        }
+        let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().map(|s| (s.cx.max(1) as f32, s.cy.max(1) as f32));
+        if self.strip_on {
+            self.source_sizes.borrow_mut().insert(thumb, size);
+        }
+        size
     }
 
     fn dragged_window(&self) -> Option<isize> {
@@ -1580,82 +2043,134 @@ impl Board {
         }
     }
 
-    /// Puts every thumbnail where its tile is, or under the cursor while its
-    /// window is being dragged.
+    /// Puts every thumbnail where its tile is drawn, or under the cursor
+    /// while its window is being dragged.
     fn update_thumbnails(&self) {
-        let shift = |hwnd| self.motion.offset(&Part::Tile(hwnd));
-        self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window(), 1.0, &shift);
-        if let Some(popup) = &self.popup {
-            self.place_thumbnails(&self.popup_thumbs, &popup.tiles, &self.model.popup_windows(&popup.id),
-                (popup.frame.left.round(), popup.frame.top.round()), None, self.popup_alpha, &|_| (0.0, 0.0));
-        }
-    }
-
-    /// `shift` says how far each tile is drawn from where it is laid out.
-    #[allow(clippy::too_many_arguments)]
-    fn place_thumbnails(&self, thumbs: &[(isize, isize)], tiles: &[TileLayout], windows: &[(&WindowModel, bool)], offset: (f32, f32), dragged: Option<isize>, opacity: f32, shift: &dyn Fn(isize) -> (f32, f32)) {
-        let to_rect = |r: &Rect| RECT {
-            left: (r.left - offset.0).round() as i32,
-            top: (r.top - offset.1).round() as i32,
-            right: (r.right - offset.0).round() as i32,
-            bottom: (r.bottom - offset.1).round() as i32,
+        let at = self.grid.find(&self.selected);
+        let windows = self.tile_windows();
+        let depth = if self.strip_on { self.strip.depth(self.strip_at) } else { 0.0 };
+        let placing = |hwnd: isize| {
+            let (window, everywhere) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd)?;
+            let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd)?;
+            let Some(at) = at else { return Some((Place::SAME, None, 1.0)) };
+            let (place, clip) = self.tile_place(at, Carried::of(window, *everywhere), &tile.frame)?;
+            Some((place, clip, 1.0))
         };
         #[cfg(feature = "debug-log")]
         let mut placed = Vec::new();
-        for &(hwnd, thumb) in thumbs {
-            let mut props = DWM_THUMBNAIL_PROPERTIES {
-                dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
-                opacity: 255,
-                fVisible: true.into(),
-                fSourceClientAreaOnly: false.into(),
-                ..Default::default()
-            };
-            let source = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok();
-            // The picture as large as fits into `w` by `h` without being
-            // distorted or made larger than the window is.
-            let fitted = |w: f32, h: f32| match source {
-                Some(source) => {
-                    let (sw, sh) = (source.cx.max(1) as f32, source.cy.max(1) as f32);
-                    let scale = (w / sw).min(h / sh).min(1.0);
-                    (sw * scale, sh * scale)
-                }
-                None => (w, h),
-            };
-            match tiles.iter().find(|tile| tile.hwnd.0 == hwnd) {
-                Some(tile) if dragged == Some(hwnd) => {
-                    // Follows the cursor, small enough to see the map under it.
-                    let (tw, th) = size(&tile.thumb);
-                    let (cx, cy) = self.cursor;
-                    let (w, h) = fitted(tw.min(200.0 * self.scale), th);
-                    props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
-                    props.opacity = 215;
-                }
-                Some(tile) => {
-                    // A tile has the shape of its window and the picture
-                    // fills it; in one that had to be made wider or higher
-                    // for its buttons the picture sits in the middle.
-                    let (tw, th) = size(&tile.thumb);
-                    let (w, h) = fitted(tw, th);
-                    let ((cx, cy), (dx, dy)) = (centre(&tile.thumb), shift(hwnd));
-                    let (cx, cy) = (cx + dx, cy + dy);
-                    props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
-                    // A minimized window shows what it last looked like, faded.
-                    // (Without a kept picture the source is only a sliver.)
-                    if windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized) {
-                        props.opacity = 150;
-                        props.fVisible = source.is_some_and(|source| source.cy >= 80).into();
-                    }
-                }
-                None => props.fVisible = false.into(),
-            }
-            unsafe {
-                props.opacity = (props.opacity as f32 * opacity).round() as u8;
-                let _ = DwmUpdateThumbnailProperties(thumb, &props);
-            }
+        for &(hwnd, thumb) in &self.thumbs {
+            let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd);
+            let minimized = windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized);
+            let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), self.dragged_window() == Some(hwnd), 1.0, placing(hwnd));
             #[cfg(feature = "debug-log")]
-            placed.push(format!("{hwnd:x}={},{},{},{}", props.rcDestination.left, props.rcDestination.top, props.rcDestination.right, props.rcDestination.bottom));
+            placed.push(format!("{hwnd:x}={_shown}"));
+        }
+        for (id, hwnd, thumb) in &self.strip_thumbs {
+            let Some(cell) = self.strip_cells.iter().find(|cell| cell.id == *id) else {
+                self.put_thumbnail(*thumb, None, false, (0.0, 0.0), false, 1.0, None);
+                continue;
+            };
+            let windows = self.model.tile_windows(id);
+            let window = windows.iter().find(|(w, _)| w.hwnd.0 == *hwnd);
+            let tile = cell.cell.tiles.iter().find(|tile| tile.hwnd.0 == *hwnd);
+            let placing = window.zip(tile).and_then(|((w, everywhere), tile)| self.tile_place(cell.pos, Carried::of(w, *everywhere), &tile.frame))
+                .map(|(place, clip)| (place, clip, strip::shade(depth, false)));
+            self.put_thumbnail(*thumb, tile, window.is_some_and(|(w, _)| w.minimized), (0.0, 0.0), false, 1.0, placing);
         }
         debug_log!("board: thumbnails {}", placed.join(" "));
+        if let Some(popup) = &self.popup {
+            let windows = self.model.popup_windows(&popup.id);
+            let offset = (popup.frame.left.round(), popup.frame.top.round());
+            for &(hwnd, thumb) in &self.popup_thumbs {
+                let tile = popup.tiles.iter().find(|tile| tile.hwnd.0 == hwnd);
+                let minimized = windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized);
+                self.put_thumbnail(thumb, tile, minimized, offset, false, self.popup_alpha, Some((Place::SAME, None, 1.0)));
+            }
+        }
+    }
+
+    /// Shows the live picture `thumb` of a tile's window where the tile is
+    /// drawn (`placing`: how it is moved, where it is cut off, how bright),
+    /// or under the cursor while `dragged`; hides it with no tile or no
+    /// place. `offset` is where the window it is shown in is. Says where it
+    /// went.
+    #[allow(clippy::too_many_arguments)]
+    fn put_thumbnail(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, offset: (f32, f32), dragged: bool, opacity: f32, placing: Option<(Place, Option<Rect>, f32)>) -> String {
+        // The size is rounded on its own, so that a moving picture does not
+        // grow and shrink by a pixel as its two edges round differently.
+        let to_rect = |r: &Rect| {
+            let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
+            let (w, h) = ((r.right - r.left).round() as i32, (r.bottom - r.top).round() as i32);
+            RECT { left, top, right: left + w, bottom: top + h }
+        };
+        let mut props = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+            opacity: 255,
+            fVisible: true.into(),
+            fSourceClientAreaOnly: false.into(),
+            ..Default::default()
+        };
+        let source = self.source_size(thumb);
+        // The picture as large as fits into `w` by `h` without being
+        // distorted or made larger than the window is.
+        let fitted = |w: f32, h: f32| match source {
+            Some((sw, sh)) => {
+                let scale = (w / sw).min(h / sh).min(1.0);
+                (sw * scale, sh * scale)
+            }
+            None => (w, h),
+        };
+        match (tile, placing) {
+            (Some(tile), _) if dragged => {
+                // Follows the cursor, small enough to see the map under it.
+                let (tw, th) = size(&tile.thumb);
+                let (cx, cy) = self.cursor;
+                let (w, h) = fitted(tw.min(200.0 * self.scale), th);
+                props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
+                props.opacity = 215;
+            }
+            (Some(tile), Some((place, clip, bright))) => {
+                // A tile has the shape of its window and the picture
+                // fills it; in one that had to be made wider or higher
+                // for its buttons the picture sits in the middle.
+                let (tw, th) = size(&tile.thumb);
+                let (w, h) = fitted(tw, th);
+                let (cx, cy) = centre(&tile.thumb);
+                let dest = place.rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
+                match (clip, source) {
+                    (Some(clip), Some(source)) => match strip::clip(&dest, &clip, source) {
+                        Some((shown, from)) => {
+                            props.rcDestination = to_rect(&shown);
+                            props.rcSource = RECT {
+                                left: from.left.round() as i32,
+                                top: from.top.round() as i32,
+                                right: from.right.round() as i32,
+                                bottom: from.bottom.round() as i32,
+                            };
+                            props.dwFlags |= DWM_TNP_RECTSOURCE;
+                        }
+                        None => props.fVisible = false.into(),
+                    },
+                    _ => props.rcDestination = to_rect(&dest),
+                }
+                // A minimized window shows what it last looked like, faded.
+                // (Without a kept picture the source is only a sliver.)
+                if minimized {
+                    props.opacity = 150;
+                    if !source.is_some_and(|(_, sh)| sh >= 80.0) {
+                        props.fVisible = false.into();
+                    }
+                }
+                props.opacity = (props.opacity as f32 * bright).round() as u8;
+            }
+            _ => props.fVisible = false.into(),
+        }
+        unsafe {
+            props.opacity = (props.opacity as f32 * opacity).round() as u8;
+            let _ = DwmUpdateThumbnailProperties(thumb, &props);
+        }
+        let r = props.rcDestination;
+        format!("{},{},{},{}", r.left, r.top, r.right, r.bottom)
     }
 
     /// Thumbnails stack in registration order; re-register the one that will
@@ -1683,7 +2198,11 @@ impl Board {
         let (x, y) = ((lparam.0 & 0xFFFF) as i16 as f32, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32);
         Some(match message {
             WM_PAINT => {
-                self.paint();
+                // While it moves, the next frame draws it all within a
+                // refresh; drawing here as well would come between frames.
+                if !self.motion_timer {
+                    self.paint();
+                }
                 unsafe {
                     ValidateRect(self.hwnd, None);
                 }
@@ -1735,7 +2254,20 @@ impl Board {
                 Action::None
             }
             WM_TIMER if wparam.0 == MOTION_TIMER_ID => {
-                self.tick_motion(Instant::now());
+                // Draws only when vblanks stopped coming (`FrameClock`).
+                let now = Instant::now();
+                if !self.vblank_frame.is_some_and(|at| now.saturating_duration_since(at) < VBLANK_TRUSTED) {
+                    self.tick_motion(now, false);
+                }
+                Action::None
+            }
+            WM_BOARD_FRAME => {
+                self.clock.frame_taken();
+                if self.motion_timer {
+                    let now = Instant::now();
+                    self.vblank_frame = Some(now);
+                    self.tick_motion(now, true);
+                }
                 Action::None
             }
             WM_TIMER if wparam.0 == ON_TOP_TIMER_ID => {
@@ -2182,44 +2714,141 @@ impl Board {
         }
     }
 
-    /// The selected cell's windows as large titled previews.
+    /// The selected cell's windows as large titled previews. While the
+    /// selection moves, the preview area is a strip of desktops: a faint
+    /// plate round it, the cells beside at its edges, darker, and the cell
+    /// in the middle outlined, all moving as `tile_place` has it.
     fn draw_tiles(&self, p: &Painter, fonts: &Fonts) {
-        let windows = self.tile_windows();
-        let in_parts = !self.sections.is_empty();
-        if if in_parts { !windows.iter().any(|(w, everywhere)| !everywhere && !w.follows) } else { self.tiles.is_empty() } {
-            p.text("No windows in this cell", &fonts.centered, &self.tiles_area, white(0.28));
-        }
         let s = self.scale;
-        for (head, part, name) in &self.sections {
-            let panel = Rect { left: part.left - 10.0 * s, top: head.top - 6.0 * s, right: part.right + 10.0 * s, bottom: part.bottom + 8.0 * s };
-            match *name {
-                // What stays on every desktop is on screen wherever the user
-                // goes: its part stands out from the rest, in its pin's colour.
-                "All rows" => {
-                    p.fill(&panel, 12.0 * s, everywhere(0.08));
-                    p.stroke(&panel, 12.0 * s, 1.2 * s, everywhere(0.55));
-                    let (_, cy) = centre(&Rect { bottom: head.bottom - 4.0 * s, ..*head });
-                    p.disc((head.left + 4.0 * s, cy), 4.0 * s, everywhere(1.0));
-                    let text = Rect { left: head.left + 14.0 * s, ..*head };
-                    p.text("All rows · on every desktop", &fonts.title, &text, everywhere(1.0));
+        let depth = if self.strip_on { self.strip.depth(self.strip_at) } else { 0.0 };
+        let at = self.grid.find(&self.selected);
+        if depth > 0.001 {
+            for plate in &self.plates {
+                let frame = grow(plate, 10.0 * s);
+                p.fill(&frame, 16.0 * s, white(0.035 * depth));
+                p.stroke(&frame, 16.0 * s, 1.0 * s, white(0.16 * depth));
+            }
+        }
+        for m in 0..self.plates.len() {
+            if self.strip_on {
+                unsafe {
+                    p.target.PushAxisAlignedClip(&self.plates[m], D2D1_ANTIALIAS_MODE_ALIASED);
                 }
-                "This row" => {
-                    p.fill(&panel, 12.0 * s, accent(0.04));
-                    p.stroke(&panel, 12.0 * s, 1.0 * s, accent(0.30));
-                    p.text("This row · on every cell of it", &fonts.small, head, accent(0.85));
-                }
-                _ => {
-                    p.text(name, &fonts.small, head, white(0.45));
-                    p.fill_square(&Rect { top: head.bottom - 5.0 * s, bottom: head.bottom - 4.0 * s, ..*head }, white(0.08));
+            }
+            for cell in &self.strip_cells {
+                self.draw_picture(p, fonts, m, cell.pos, &cell.id, &cell.cell, depth);
+            }
+            if let Some(at) = at {
+                let selected = CellTiles { tiles: Vec::new(), sections: Vec::new(), area: self.tiles_area };
+                self.draw_picture(p, fonts, m, at, &self.selected, &selected, depth);
+            }
+            if self.strip_on {
+                unsafe {
+                    p.target.PopAxisAlignedClip();
                 }
             }
         }
-        for tile in &self.tiles {
-            if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
-                self.shifted(p, (0.0, 0.0), self.motion.offset(&Part::Tile(tile.hwnd.0)), || {
-                    self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere));
-                });
+        // What is on every desktop never moves, and is over all that does.
+        self.draw_group(p, fonts, &self.selected, &self.sections, &self.tiles, |carried, _| (carried == Carried::Fixed).then_some(Place::SAME));
+        if at.is_none() {
+            self.draw_group(p, fonts, &self.selected, &self.sections, &self.tiles, |carried, _| (carried != Carried::Fixed).then_some(Place::SAME));
+        }
+    }
+
+    /// The picture of the cell `id` at `pos` on monitor `m`: its panel, its
+    /// windows that move with it, and its outline. The selected cell's
+    /// layout is the board's own (`cell` gives only where it says it is empty).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_picture(&self, p: &Painter, fonts: &Fonts, m: usize, pos: Pos, id: &str, cell: &CellTiles, depth: f32) {
+        let s = self.scale;
+        let middle = id == self.selected;
+        let (tiles, sections) = if middle { (&self.tiles, &self.sections) } else { (&cell.tiles, &cell.sections) };
+        let place = self.picture_place(pos, m);
+        let plate = self.plates[m];
+        let on_m = |r: &Rect| self.monitor_at(r) == m;
+        if depth > 0.001 {
+            self.placed(p, place, || p.fill(&plate, 14.0 * s / place.s, rgba(0.075, 0.08, 0.10, depth)));
+        }
+        let shows = |carried: Carried, r: &Rect| {
+            let place = self.tile_place(pos, carried, r)?;
+            (carried != Carried::Fixed && on_m(r)).then_some(place.0)
+        };
+        self.draw_group(p, fonts, id, sections, tiles, shows);
+        let windows = self.model.tile_windows(id);
+        if !windows.iter().any(|(w, everywhere)| Carried::of(w, *everywhere) == Carried::Own) && on_m(&cell.area) {
+            let text = if middle { "No windows in this cell" } else { "No windows" };
+            self.placed(p, place, || p.text(text, &fonts.centered, &cell.area, white(0.28)));
+        }
+        if depth > 0.001 {
+            self.placed(p, place, || {
+                if middle {
+                    p.stroke(&grow(&plate, 1.0 * s / place.s), 14.0 * s / place.s, 1.5 * s / place.s, accent(0.85 * depth));
+                } else {
+                    // Darker than the middle, its live previews as well (`strip::shade`).
+                    p.fill(&plate, 14.0 * s / place.s, rgba(0.0, 0.0, 0.0, strip::DIM * depth));
+                    p.stroke(&plate, 14.0 * s / place.s, 1.0 * s / place.s, white(0.10 * depth));
+                }
+            });
+        }
+    }
+
+    /// The sections and tiles of cell `id` for which `place` says how
+    /// they are drawn.
+    fn draw_group(&self, p: &Painter, fonts: &Fonts, id: &str, sections: &[(Rect, Rect, &'static str)], tiles: &[TileLayout], place: impl Fn(Carried, &Rect) -> Option<Place>) {
+        for (head, part, name) in sections {
+            if let Some(at) = place(Carried::of_section(name), part) {
+                self.placed(p, at, || self.draw_section(p, fonts, head, part, name));
             }
+        }
+        let windows = self.model.tile_windows(id);
+        for tile in tiles {
+            if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
+                if let Some(at) = place(Carried::of(window, *everywhere), &tile.frame) {
+                    self.placed(p, at, || self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere)));
+                }
+            }
+        }
+    }
+
+    /// A part the tiles are in, with its heading.
+    fn draw_section(&self, p: &Painter, fonts: &Fonts, head: &Rect, part: &Rect, name: &str) {
+        let s = self.scale;
+        let panel = Rect { left: part.left - 10.0 * s, top: head.top - 6.0 * s, right: part.right + 10.0 * s, bottom: part.bottom + 8.0 * s };
+        match name {
+            // What stays on every desktop is on screen wherever the user
+            // goes: its part stands out from the rest, in its pin's colour.
+            "All rows" => {
+                p.fill(&panel, 12.0 * s, everywhere(0.08));
+                p.stroke(&panel, 12.0 * s, 1.2 * s, everywhere(0.55));
+                let (_, cy) = centre(&Rect { bottom: head.bottom - 4.0 * s, ..*head });
+                p.disc((head.left + 4.0 * s, cy), 4.0 * s, everywhere(1.0));
+                let text = Rect { left: head.left + 14.0 * s, ..*head };
+                p.text("All rows · on every desktop", &fonts.title, &text, everywhere(1.0));
+            }
+            "This row" => {
+                p.fill(&panel, 12.0 * s, accent(0.04));
+                p.stroke(&panel, 12.0 * s, 1.0 * s, accent(0.30));
+                p.text("This row · on every cell of it", &fonts.small, head, accent(0.85));
+            }
+            _ => {
+                p.text(name, &fonts.small, head, white(0.45));
+                p.fill_square(&Rect { top: head.bottom - 5.0 * s, bottom: head.bottom - 4.0 * s, ..*head }, white(0.08));
+            }
+        }
+    }
+
+    /// Draws with everything moved as `place` says, the target having no
+    /// transform before and after.
+    fn placed(&self, p: &Painter, place: Place, draw: impl FnOnce()) {
+        if place.is_same() {
+            return draw();
+        }
+        unsafe {
+            p.target.SetTransform(&Matrix3x2 { M11: place.s, M12: 0.0, M21: 0.0, M22: place.s, M31: place.dx, M32: place.dy });
+        }
+        draw();
+        unsafe {
+            p.target.SetTransform(&Matrix3x2::identity());
         }
     }
 
@@ -2546,17 +3175,26 @@ impl Board {
             self.selected = self.grid.id_at(from)?.clone();
             self.grid.visit(&self.selected);
             self.relayout();
-            let (before, arrive) = (self.marks(), self.arrival(&grid, &current));
+            let (before, strip_before) = (self.marks(), self.strip_marks.clone());
             (self.selected, self.grid) = (current, grid);
             self.relayout();
-            self.motion.moved(&before, &self.marks(), arrive, now);
+            self.motion.moved(&before, &self.marks(), now);
             let mut at = now;
             while at < now + Duration::from_millis(ms) {
                 at = (at + Duration::from_millis(MOTION_MS as u64)).min(now + Duration::from_millis(ms));
                 self.motion.advance(HashMap::new(), 0, at);
             }
-            debug_log!("board: rendered {ms} ms into a move, {:?}", self.motion.rest);
+            // The strip `ms` into the move, with the cells beside both.
+            self.strip = Strip::default();
+            self.strip.moved(&strip_before, &self.strip_marks, 0.0);
+            self.strip_at = ms as f32 / 1000.0;
+            self.strip_on = self.strip.active(self.strip_at);
+            if self.strip_on {
+                self.lay_out_strip(Some(from));
+            }
+            debug_log!("board: rendered {ms} ms into a move, {:?}, strip {:?}", self.motion.rest, self.strip);
         } else {
+            self.settle_strip(now);
             self.relayout();
         }
         let point_at = |board: &mut Self, pos: Option<grid::Pos>| {
@@ -2593,6 +3231,14 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, message: u32, wparam: WPARAM
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+fn unregister_strip_thumbnails(thumbs: &mut Vec<(CellId, isize, isize)>) {
+    for (_, _, thumb) in thumbs.drain(..) {
+        unsafe {
+            let _ = DwmUnregisterThumbnail(thumb);
+        }
     }
 }
 
@@ -3032,15 +3678,15 @@ mod tests {
     }
 
     #[test]
-    fn popup_retargeting_preserves_spring_velocity_and_matches_tile_arrival() {
+    fn popup_retargeting_preserves_spring_velocity_and_matches_the_map() {
         let now = Instant::now();
         let a = rect(10.0, 20.0, 500.0, 100.0);
-        let b = rect(a.left + ARRIVE, a.top, 500.0, 100.0);
+        let b = rect(a.left + 40.0, a.top, 500.0, 100.0);
         let mut animation = PopupAnimation::new(a, a, now);
         animation.glide_to(b, b, now);
         let mut motion = Motion::default();
-        let tile = Part::Tile(1);
-        motion.moved(&HashMap::new(), &HashMap::from([(tile.clone(), (0.0, 0.0))]), (ARRIVE, 0.0), now);
+        let tile = Part::Row(0, "a".into());
+        motion.moved(&HashMap::from([(tile.clone(), (40.0, 0.0))]), &HashMap::from([(tile.clone(), (0.0, 0.0))]), now);
         for ms in [40, 80, 120, 160, 200, 240, 280, 320, 400] {
             let at = now + Duration::from_millis(ms);
             motion.advance(HashMap::new(), 0, at);
@@ -3398,12 +4044,12 @@ mod tests {
             let before = HashMap::from([(part.clone(), jump)]);
             let after = HashMap::from([(part.clone(), (0.0, 0.0))]);
             let mut motion = Motion::default();
-            motion.moved(&before, &after, (0.0, 0.0), now);
+            motion.moved(&before, &after, now);
             let at = now + Duration::from_millis(48);
             motion.advance(HashMap::new(), 0, at);
             let was = motion.rest[&part];
             assert!(was.iter().any(|spring| spring.velocity != 0.0));
-            motion.moved(&before, &after, (0.0, 0.0), at);
+            motion.moved(&before, &after, at);
             let is = motion.rest[&part];
             assert_eq!(is.map(|spring| spring.velocity), was.map(|spring| spring.velocity));
             assert_eq!(motion.offset(&part), (was[0].offset + jump.0, was[1].offset + jump.1));
@@ -3415,7 +4061,7 @@ mod tests {
         let now = Instant::now();
         let row = Part::Row(0, "a".into());
         let mut motion = Motion::default();
-        motion.moved(&HashMap::from([(row.clone(), (100.0, 0.0))]), &HashMap::from([(row.clone(), (0.0, 0.0))]), (0.0, 0.0), now);
+        motion.moved(&HashMap::from([(row.clone(), (100.0, 0.0))]), &HashMap::from([(row.clone(), (0.0, 0.0))]), now);
         motion.advance(HashMap::new(), 0, now + Duration::from_millis(500));
         let expected = Spring { offset: 100.0, velocity: 0.0 }.sample(MOTION_LONGEST_STEP).offset;
         assert!((motion.offset(&row).0 - expected).abs() < 0.0001);
@@ -3427,24 +4073,23 @@ mod tests {
         assert_eq!(motion.offset(&row), (0.0, 0.0));
     }
 
-    /// Tiles shown before and after stay; those new to the board come in
-    /// from the side moved to; a part that jumps again mid-way goes on from
+    /// A part that stays where it was stays; one new to the layout has
+    /// nothing to ease from; one that jumps again mid-way goes on from
     /// where it is drawn.
     #[test]
-    fn kept_tiles_stay_and_new_ones_come_in_from_the_side() {
+    fn kept_parts_stay_and_new_ones_have_nothing_to_ease_from() {
         let now = Instant::now();
-        let (kept, new, moved) = (Part::Tile(1), Part::Tile(2), Part::Tile(3));
+        let (kept, new, moved) = (Part::Spine(0), Part::Names(0), Part::Selection(0));
         let before = HashMap::from([(kept.clone(), (10.0, 10.0)), (moved.clone(), (100.0, 0.0))]);
         let after = HashMap::from([(kept.clone(), (10.0, 10.0)), (new.clone(), (50.0, 50.0)), (moved.clone(), (60.0, 0.0))]);
         let mut motion = Motion::default();
-        motion.moved(&before, &after, (40.0, 0.0), now);
+        motion.moved(&before, &after, now);
         assert_eq!(motion.offset(&kept), (0.0, 0.0));
-        assert_eq!(motion.offset(&new), (40.0, 0.0));
+        assert_eq!(motion.offset(&new), (0.0, 0.0));
         assert_eq!(motion.offset(&moved), (40.0, 0.0));
         let again = HashMap::from([(moved.clone(), (0.0, 0.0))]);
-        motion.moved(&after, &again, (0.0, 40.0), now);
+        motion.moved(&after, &again, now);
         assert_eq!(motion.offset(&moved), (100.0, 0.0));
-        assert_eq!(motion.offset(&new), (0.0, 0.0), "gone from the board");
     }
 
     /// The row follows the hand between cells, and when the app gets to the
@@ -3464,7 +4109,7 @@ mod tests {
         // The hand is past the cell; the app has not got there yet.
         motion.advance(HashMap::from([(row.clone(), (-1.02 * pitch, 0.0))]), 1, now);
         let was = drawn(&motion, 0.0);
-        motion.moved(&HashMap::from([(row.clone(), (0.0, 0.0))]), &HashMap::from([(row.clone(), (-pitch, 0.0))]), (0.0, 0.0), now);
+        motion.moved(&HashMap::from([(row.clone(), (0.0, 0.0))]), &HashMap::from([(row.clone(), (-pitch, 0.0))]), now);
         assert!((drawn(&motion, -pitch) - was).abs() < 0.01);
         motion.advance(HashMap::from([(row.clone(), (-0.02 * pitch, 0.0))]), 2, now);
         assert!((drawn(&motion, -pitch) - was).abs() < 0.01);
@@ -3495,7 +4140,7 @@ mod tests {
                 let confirm = at + Duration::from_millis(16);
                 let moved = |motion: &mut Motion| motion.moved(
                     &HashMap::from([(part.clone(), point(0.0))]),
-                    &HashMap::from([(part.clone(), point(sign * 100.0))]), (0.0, 0.0), confirm);
+                    &HashMap::from([(part.clone(), point(sign * 100.0))]), confirm);
                 let counted = |motion: &mut Motion| { motion.advance(
                     HashMap::from([(part.clone(), point(-sign * 10.0))]), 2, confirm); };
                 if hand_first { counted(&mut motion); moved(&mut motion); }
