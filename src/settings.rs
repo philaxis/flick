@@ -185,20 +185,20 @@ impl Layout {
         let touchpad = tab == Tab::Touchpad;
         let none = Rect::default();
         [
-            (&self.trigger, Hit::Trigger),
-            (&self.autostart, Hit::Autostart),
-            (&self.tabs[0], Hit::Tab(Tab::Mouse)),
-            (&self.tabs[1], Hit::Tab(Tab::Touchpad)),
-            (&self.steps[0], Hit::Step(0)),
-            (&self.steps[1], Hit::Step(1)),
-            (&self.notches[0], Hit::Notch(0)),
-            (&self.notches[1], Hit::Notch(1)),
-            (&self.follows[0], Hit::Follow(0)),
-            (&self.follows[1], Hit::Follow(1)),
-            (&self.reverse, Hit::Reverse),
-            (if touchpad { &self.touchpad } else { &none }, Hit::Touchpad),
-            (if touchpad { &self.touchpad_settings } else { &none }, Hit::TouchpadSettings),
-            (&self.file, Hit::File),
+            (self.trigger, Hit::Trigger),
+            (self.autostart, Hit::Autostart),
+            (self.tabs[0], Hit::Tab(Tab::Mouse)),
+            (self.tabs[1], Hit::Tab(Tab::Touchpad)),
+            (self.steps[0], Hit::Step(0)),
+            (self.steps[1], Hit::Step(1)),
+            (self.notches[0], Hit::Notch(0)),
+            (self.notches[1], Hit::Notch(1)),
+            (self.follows[0], Hit::Follow(0)),
+            (self.follows[1], Hit::Follow(1)),
+            (self.reverse, Hit::Reverse),
+            (if touchpad { self.touchpad } else { none }, Hit::Touchpad),
+            (if touchpad { self.touchpad_settings } else { none }, Hit::TouchpadSettings),
+            (self.file, Hit::File),
         ]
         .into_iter()
         .find(|(area, _)| inside(area))

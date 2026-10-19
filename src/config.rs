@@ -267,6 +267,14 @@ fn with_value(text: &str, key: &str, value: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+/// Sets one value in the config file, keeping everything else in it.
+pub fn set_value(key: &str, value: &str) -> io::Result<()> {
+    let path = config_path();
+    let text = fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_CONFIG.to_owned());
+    fs::create_dir_all(dir())?;
+    fs::write(path, with_value(&text, key, value))
+}
+
 /// When the config file was last written, to notice the user saving it.
 pub fn config_modified() -> Option<SystemTime> {
     fs::metadata(config_path()).and_then(|file| file.modified()).ok()
