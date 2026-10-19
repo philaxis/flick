@@ -44,7 +44,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
 /// Below the last row, the link to the file and a margin.
-const SIZE: (f32, f32) = (400.0, ROWS.0 + (9.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
+const SIZE: (f32, f32) = (400.0, ROWS.0 + (10.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
 /// Whether up and down has settings of its own (a flick or a distance, and
 /// how much). Not now: rows go by distance, a distance of their own. The
 /// switch is kept hidden, and its key in config.toml read and left alone,
@@ -72,6 +72,8 @@ pub struct View {
     pub sticky: bool,
     pub autostart: bool,
     pub touchpad: bool,
+    /// See `Config::touchpad_reverse`.
+    pub touchpad_reverse: bool,
     pub touchpad_status: crate::touchpad::Status,
 }
 
@@ -102,6 +104,7 @@ enum Hit {
     StepY,
     Autostart,
     Touchpad,
+    TouchpadReverse,
     TouchpadSettings,
     File,
 }
@@ -114,6 +117,7 @@ struct Layout {
     step_y: Rect,
     autostart: Rect,
     touchpad: Rect,
+    touchpad_reverse: Rect,
     touchpad_settings: Rect,
     file: Rect,
 }
@@ -135,8 +139,9 @@ impl Layout {
             step_y: slider(if UP_AND_DOWN_OF_ITS_OWN { 3.0 } else { 2.0 }),
             autostart: right(4.0 - up, 44.0, 24.0),
             touchpad: right(5.0 - up, 44.0, 24.0),
-            touchpad_settings: rect(EDGES.0 * s, (row(8.0 - up) + 4.0) * s, 240.0 * s, 30.0 * s),
-            file: rect(EDGES.0 * s, (row(9.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
+            touchpad_reverse: right(6.0 - up, 44.0, 24.0),
+            touchpad_settings: rect(EDGES.0 * s, (row(9.0 - up) + 4.0) * s, 240.0 * s, 30.0 * s),
+            file: rect(EDGES.0 * s, (row(10.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -150,6 +155,7 @@ impl Layout {
             (&self.step_y, Hit::StepY),
             (&self.autostart, Hit::Autostart),
             (&self.touchpad, Hit::Touchpad),
+            (&self.touchpad_reverse, Hit::TouchpadReverse),
             (&self.touchpad_settings, Hit::TouchpadSettings),
             (&self.file, Hit::File),
         ]
@@ -338,6 +344,8 @@ impl Settings {
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => Action::Close,
             WM_KEYDOWN if wparam.0 == 0x54 && !self.view.capturing =>
                 Action::Set("three_finger_touchpad", (!self.view.touchpad).to_string()),
+            WM_KEYDOWN if wparam.0 == 0x52 && !self.view.capturing =>
+                Action::Set("touchpad_reverse", (!self.view.touchpad_reverse).to_string()),
             WM_KEYDOWN if wparam.0 == 0x57 && self.view.touchpad_status == crate::touchpad::Status::Conflict =>
                 Action::TouchpadSettings,
             WM_DPICHANGED => {
@@ -440,6 +448,7 @@ impl Settings {
             Hit::Mode(sticky) if sticky != self.view.sticky => Action::Set("vertical_sticky", sticky.to_string()),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
             Hit::Touchpad => Action::Set("three_finger_touchpad", (!self.view.touchpad).to_string()),
+            Hit::TouchpadReverse => Action::Set("touchpad_reverse", (!self.view.touchpad_reverse).to_string()),
             Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
             Hit::File => Action::OpenFile,
             _ => Action::None,
@@ -542,6 +551,8 @@ impl Settings {
 
         label(5.0 - up, "Three-finger touchpad (T)");
         self.draw_switch(&p, &layout.touchpad, view.touchpad, Hit::Touchpad);
+        label(6.0 - up, "Reverse direction (R)");
+        self.draw_switch(&p, &layout.touchpad_reverse, view.touchpad_reverse, Hit::TouchpadReverse);
         let notice = match view.touchpad_status {
             crate::touchpad::Status::Absent => "No precision touchpad detected",
             crate::touchpad::Status::Off => "Off. Enable to use three fingers as the trigger.",
@@ -549,7 +560,7 @@ impl Settings {
             crate::touchpad::Status::Conflict => crate::touchpad::NOTICE,
             crate::touchpad::Status::Unavailable => "Touchpad reports could not be read on this device.",
         };
-        let area = Rect { bottom: row(8.0 - up).top, ..row(6.0 - up) };
+        let area = Rect { bottom: row(9.0 - up).top, ..row(7.0 - up) };
         p.text(notice, &fonts.notice, &area, white(0.62));
         if view.touchpad_status == crate::touchpad::Status::Conflict {
             self.draw_button(&p, fonts, &layout.touchpad_settings, "Open Windows touchpad settings (W)", Hit::TouchpadSettings);

@@ -366,6 +366,8 @@ struct Settings {
     /// the next: farther, so that rows are not changed by the way.
     step_x: i32,
     step_y: i32,
+    /// Three fingers move the desktops against the hand (`Config::touchpad_reverse`).
+    touchpad_reverse: bool,
 }
 
 impl Settings {
@@ -522,6 +524,7 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         triggers,
         step_x: config.step_x.max(20),
         step_y: config.step_y.max(20),
+        touchpad_reverse: config.touchpad_reverse,
     });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
@@ -1042,7 +1045,8 @@ fn touchpad_event(event: crate::touchpad::Event) {
         }
         if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
             let rest = TOUCHPAD_REST.get();
-            let (x, y) = (rest.0 + event.delta.0 * s.step_x as f64, rest.1 + event.delta.1 * s.step_y as f64);
+            let delta = crate::touchpad::directed(event.delta, s.touchpad_reverse);
+            let (x, y) = (rest.0 + delta.0 * s.step_x as f64, rest.1 + delta.1 * s.step_y as f64);
             let (dx, dy) = (x as i32, y as i32);
             TOUCHPAD_REST.set((x - dx as f64, y - dy as f64));
             if dx != 0 || dy != 0 { travel(s, dx, dy); }
@@ -1365,7 +1369,7 @@ mod tests {
 
     #[test]
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
-        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400 };
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, touchpad_reverse: true };
         let info = MSLLHOOKSTRUCT::default();
         TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });
