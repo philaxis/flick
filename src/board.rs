@@ -1600,6 +1600,8 @@ impl Board {
             right: (r.right - offset.0).round() as i32,
             bottom: (r.bottom - offset.1).round() as i32,
         };
+        #[cfg(feature = "debug-log")]
+        let mut placed = Vec::new();
         for &(hwnd, thumb) in thumbs {
             let mut props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
@@ -1650,7 +1652,10 @@ impl Board {
                 props.opacity = (props.opacity as f32 * opacity).round() as u8;
                 let _ = DwmUpdateThumbnailProperties(thumb, &props);
             }
+            #[cfg(feature = "debug-log")]
+            placed.push(format!("{hwnd:x}={},{},{},{}", props.rcDestination.left, props.rcDestination.top, props.rcDestination.right, props.rcDestination.bottom));
         }
+        debug_log!("board: thumbnails {}", placed.join(" "));
     }
 
     /// Thumbnails stack in registration order; re-register the one that will

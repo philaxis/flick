@@ -10,6 +10,8 @@
 //!   drive post <class> <message> <wparam> <lparam> | client <class>
 //!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND> | mem
 //!   drive desk | mkdesk | rmdesk <desktop id prefix>
+//!   drive hold <r> <g> <b> <title> <x> <y> <w> <h> <seconds>
+//!   drive pinprobe <flick exe> <out dir>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -45,6 +47,8 @@ fn main() {
             let _ = PostMessageW(app, message, WPARAM(wparam), LPARAM(0));
         };
         match args.get(1).map(String::as_str) {
+            Some("hold") => hold(&args[2..]),
+            Some("pinprobe") => pinprobe(&args[2], &args[3]),
             Some("clickprobe") => boardstress(0, 0, "post", "still"),
             Some("boardstress") => boardstress(args[2].parse().unwrap(), args[3].parse().unwrap(), &args[4], &args[5]),
             Some("step") => post(WM_APP + 1, args[2].parse().unwrap()),
@@ -642,6 +646,226 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
             println!("remove temporary desktop: {:?}", vdapi::remove_desktop(desktop, current));
         }
         assert!(alive && completed == cycles && CLICKS.load(Ordering::Relaxed) == 3, "stress or click delivery failed");
+    }
+}
+
+/// A plain window of one colour, kept up for a while: something whose live
+/// preview can be found on the screen by its colour.
+#[cfg(windows)]
+fn hold(args: &[String]) {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::{Foundation::COLORREF, Graphics::Gdi::CreateSolidBrush, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*};
+    let n = |i: usize| args[i].parse::<i32>().unwrap();
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap();
+        let class = w!("flick.test.hold");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            hbrBackground: CreateSolidBrush(COLORREF((n(0) | n(1) << 8 | n(2) << 16) as u32)),
+            ..Default::default()
+        });
+        let window = CreateWindowExW(WINDOW_EX_STYLE(0), class, &HSTRING::from(args[3].as_str()), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            n(4), n(5), n(6), n(7), None, None, instance, None);
+        assert!(window.0 != 0);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(n(8) as u64);
+        let mut message = MSG::default();
+        while std::time::Instant::now() < until && IsWindow(window).as_bool() {
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// Opens the board over windows pinned to every desktop and to their row,
+/// moves the selection about, and records, for every screen capture it can
+/// take meanwhile, where the preview of each kind of window is (found by its
+/// colour): `pinprobe.csv` in `out`, with a few full captures and the
+/// app's debug log. The grid, the desktops and the pins are as they were
+/// afterwards.
+#[cfg(windows)]
+fn pinprobe(flick: &str, out: &str) {
+    use std::time::{Duration, Instant};
+    use windows::core::{w, HSTRING};
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        Graphics::Gdi::*,
+        System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+        UI::WindowsAndMessaging::*,
+    };
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        assert!(vdapi::select(false).is_some());
+        if FindWindowW(w!("flick.main"), None).0 != 0 {
+            println!("RESULT another Flick is running; not probing");
+            return;
+        }
+        let home = vdapi::get_current_desktop().unwrap();
+        let made: Vec<_> = (0..4).map(|_| vdapi::create_desktop().unwrap()).collect();
+        let me = std::env::current_exe().unwrap();
+        let row_exe = out.join("probe-row.exe");
+        std::fs::copy(&me, &row_exe).unwrap();
+        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        let spawn = |exe: &std::path::Path, rgb: &str, title: &str, x: i32, y: i32, w: i32, h: i32| {
+            let mut args: Vec<String> = vec!["hold".into()];
+            args.extend(rgb.split(' ').map(String::from));
+            args.extend([title.to_owned(), x.to_string(), y.to_string(), w.to_string(), h.to_string(), "150".into()]);
+            std::process::Command::new(exe).args(args).spawn().unwrap()
+        };
+        let mut holds = vec![
+            spawn(&me, "255 0 255", "AllProbe", sw / 10, sh / 10, sw * 2 / 5, sh * 2 / 5),
+            spawn(&row_exe, "0 255 255", "RowProbe", sw / 5, sh / 5, sw * 2 / 5, sh * 2 / 5),
+            spawn(&me, "255 255 0", "CellProbe", sw / 3, sh / 4, sw / 2, sh / 2),
+            spawn(&me, "0 255 0", "NextProbe", sw / 4, sh / 4, sw / 3, sh / 3),
+        ];
+        let find = |title: &str| {
+            for _ in 0..200 {
+                let window = FindWindowW(w!("flick.test.hold"), &HSTRING::from(title));
+                if window.0 != 0 {
+                    return window;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            panic!("{title} did not come up");
+        };
+        let (all, next) = (find("AllProbe"), find("NextProbe"));
+        let _ = (find("RowProbe"), find("CellProbe"));
+        println!("pin AllProbe: {:?}, NextProbe to the next cell: {:?}", vdapi::pin_window(all), vdapi::move_window_to_desktop(made[0], next));
+
+        // The grid: this desktop and two made ones in a row, two more below.
+        let dir = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("Flick");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state.json");
+        let saved = std::fs::read(&state).ok();
+        let others: Vec<String> = vdapi::get_desktops().unwrap().into_iter().map(|d| d.id())
+            .filter(|id| *id != home.id() && !made.iter().any(|d| d.id() == *id)).collect();
+        let mut first = vec![home.id(), made[0].id(), made[1].id()];
+        first.extend(others);
+        let grid = serde_json::json!({
+            "rows": [{"name": "Probe", "cells": first, "last": null}, {"name": "Below", "cells": [made[2].id(), made[3].id()], "last": null}],
+            "follow_apps": ["probe-row.exe"],
+            "guide_seen": true,
+        });
+        std::fs::write(&state, serde_json::to_string_pretty(&grid).unwrap()).unwrap();
+        let _ = std::fs::remove_file(dir.join("debug-log.txt"));
+
+        let mut app = std::process::Command::new(flick).arg("--portable").spawn().unwrap();
+        let mut main = HWND(0);
+        for _ in 0..200 {
+            main = FindWindowW(w!("flick.main"), None);
+            if main.0 != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(2500));
+        let _ = PostMessageW(main, WM_APP + 2, WPARAM(0), LPARAM(0));
+        std::thread::sleep(Duration::from_millis(1500));
+        let board = FindWindowW(w!("flick.board"), None);
+        println!("flick {:x} board {:x} visible {}", main.0, board.0, IsWindowVisible(board).as_bool());
+
+        // Captures, and the box of each colour in them.
+        let (x0, y0) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let (w, h) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(screen);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+        SelectObject(dc, bitmap);
+        let pixels = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+        let colours: [(&str, fn(u8, u8, u8) -> bool); 4] = [
+            ("all", |r, g, b| r > 235 && g < 20 && b > 235),
+            ("row", |r, g, b| r < 20 && g > 235 && b > 235),
+            ("cell", |r, g, b| r > 235 && g > 235 && b < 20),
+            ("next", |r, g, b| r < 20 && g > 235 && b < 20),
+        ];
+        let mut csv = String::from("label,frame,t_ms,capture_ms");
+        for (name, _) in &colours {
+            csv += &format!(",{name}_l,{name}_t,{name}_r,{name}_b,{name}_n");
+        }
+        csv += "\n";
+        let plan: [(&str, &[(u64, usize)], u64); 7] = [
+            ("right", &[(0, 1)], 700),
+            ("right2", &[(0, 1)], 700),
+            ("left", &[(0, 0)], 700),
+            ("left2", &[(0, 0)], 700),
+            ("down", &[(0, 3)], 700),
+            ("up", &[(0, 2)], 700),
+            ("rapid", &[(0, 1), (120, 1), (240, 0)], 900),
+        ];
+        for (label, steps, ms) in plan {
+            let started = Instant::now();
+            let mut posted = 0;
+            let mut frame = 0;
+            let mut saved_shot = false;
+            while started.elapsed() < Duration::from_millis(ms) {
+                while posted < steps.len() && started.elapsed() >= Duration::from_millis(steps[posted].0) {
+                    let _ = PostMessageW(main, WM_APP + 1, WPARAM(steps[posted].1), LPARAM(0));
+                    posted += 1;
+                }
+                let t = started.elapsed();
+                let _ = BitBlt(dc, 0, 0, w, h, screen, x0, y0, SRCCOPY);
+                let capture = started.elapsed() - t;
+                let mut boxes = [(i32::MAX, i32::MAX, -1, -1, 0u32); 4];
+                for y in 0..h {
+                    let line = &pixels[(y * w * 4) as usize..((y + 1) * w * 4) as usize];
+                    for x in 0..w {
+                        let p = &line[(x * 4) as usize..(x * 4 + 3) as usize];
+                        for (i, (_, is)) in colours.iter().enumerate() {
+                            if is(p[2], p[1], p[0]) {
+                                let b = &mut boxes[i];
+                                *b = (b.0.min(x), b.1.min(y), b.2.max(x + 1), b.3.max(y + 1), b.4 + 1);
+                            }
+                        }
+                    }
+                }
+                csv += &format!("{label},{frame},{:.1},{:.1}", t.as_secs_f64() * 1000.0, capture.as_secs_f64() * 1000.0);
+                for b in boxes {
+                    csv += &if b.4 == 0 { ",,,,,0".to_owned() } else { format!(",{},{},{},{},{}", b.0, b.1, b.2, b.3, b.4) };
+                }
+                csv += "\n";
+                if !saved_shot && (label == "right" || label == "down") && t >= Duration::from_millis(150) || frame == 0 && label == "right" {
+                    saved_shot = frame != 0;
+                    let mut raw = Vec::with_capacity(pixels.len() + 8);
+                    raw.extend_from_slice(&w.to_le_bytes());
+                    raw.extend_from_slice(&h.to_le_bytes());
+                    raw.extend_from_slice(pixels);
+                    std::fs::write(out.join(format!("{label}-{frame}-{}ms.raw", t.as_millis())), raw).unwrap();
+                }
+                frame += 1;
+            }
+            println!("{label}: {frame} captures");
+        }
+        std::fs::write(out.join("pinprobe.csv"), csv).unwrap();
+
+        // Everything back as it was.
+        let _ = app.kill();
+        let _ = app.wait();
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = vdapi::switch_desktop(home);
+        println!("unpin: {:?}", vdapi::unpin_window(all));
+        for hold in &mut holds {
+            let _ = hold.kill();
+        }
+        for desktop in made {
+            let _ = vdapi::remove_desktop(desktop, home);
+        }
+        let _ = std::fs::copy(dir.join("debug-log.txt"), out.join("debug-log.txt"));
+        match saved {
+            Some(saved) => std::fs::write(&state, saved).unwrap(),
+            None => { let _ = std::fs::remove_file(&state); }
+        }
+        println!("RESULT probe done");
     }
 }
 
