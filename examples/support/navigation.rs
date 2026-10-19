@@ -12,6 +12,11 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
     match mode {
         "stage" => {
             std::fs::write(out.join("home.txt"), vdapi::get_current_desktop().unwrap().id()).unwrap();
+            let original: Vec<_> = vdapi::get_desktops().unwrap().into_iter().map(|d| d.id()).collect();
+            std::fs::write(out.join("original.txt"), original.join("\n")).unwrap();
+            let mut cursor = windows::Win32::Foundation::POINT::default();
+            unsafe { GetCursorPos(&mut cursor).unwrap(); }
+            std::fs::write(out.join("cursor.txt"), format!("{} {}", cursor.x, cursor.y)).unwrap();
             let mut ids = Vec::new();
             for _ in 0..6 {
                 ids.push(vdapi::create_desktop().unwrap().id());
@@ -34,7 +39,15 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     vdapi::remove_desktop(*desktop, home).unwrap();
                 }
             }
+            let restored: Vec<_> = vdapi::get_desktops().unwrap().into_iter().map(|d| d.id()).collect();
+            assert_eq!(restored.join("\n"), std::fs::read_to_string(out.join("original.txt")).unwrap());
+            assert_eq!(vdapi::get_current_desktop().unwrap().id(), home.id());
+            let cursor = std::fs::read_to_string(out.join("cursor.txt")).unwrap();
+            let xy: Vec<i32> = cursor.split_whitespace().map(|n| n.parse().unwrap()).collect();
+            unsafe { SetCursorPos(xy[0], xy[1]).unwrap(); }
+            std::fs::write(out.join("restored.txt"), "Original desktop, desktop order and cursor restored\n").unwrap();
         }
+        "shelves" => unsafe { super::drive_shelves::run(out, flick.unwrap()); },
         "pacing" => unsafe { super::drive_pacing::run(out, flick.unwrap()); },
         "run" | "motion" | "geometry" => unsafe {
             let geometry = mode == "geometry";

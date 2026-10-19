@@ -98,9 +98,6 @@ const BANNER_TOP: f32 = 14.0;
 const BANNER_TEXT: f32 = 13.0;
 /// Room either side of the name in its box.
 const BANNER_PAD: f32 = 14.0;
-/// Up and down travel after which windows going along their row recede and
-/// slide with it, as the rest does; before, they stay where they are.
-const ROW_WINDOWS_JOIN: f64 = 0.15;
 
 /// Where a window is drawn as the picture moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -591,7 +588,7 @@ struct Session {
     hand: (f64, f64),
     /// As drawn.
     shown: Option<Strip>,
-    /// The farthest up or down the strip went (`ROW_WINDOWS_JOIN`).
+    /// The farthest up or down the strip went, for shelf windows joining it.
     farthest_y: f64,
     focus: follow::Focus,
     names: Vec<String>,
@@ -1273,9 +1270,6 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
     let scale = follow::scale(strip.receded);
     let sight = in_sight(&session.follow, strip, &session.focus);
     let rows = session.follow.rows;
-    // Windows going along their row stay where they are until the strip
-    // has gone up or down a little, then go with it.
-    let with_row = (session.farthest_y / ROW_WINDOWS_JOIN).min(1.0);
     let mut empty = Veil::default();
     for (index, screen) in session.screens.iter_mut().enumerate() {
         let size = (screen.area.right - screen.area.left, screen.area.bottom - screen.area.top);
@@ -1323,12 +1317,7 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
                 let (lift, _) = follow::standing_out(session.focus.at(col, row), strip.receded);
                 (follow::placed(edges, whole, scale, apart, lift), 1.0)
             }
-            Place::Row(row) => {
-                let at = follow::between(edges, follow::on_strip(edges, whole, scale, (0.0, row as f64 - strip.y)), with_row);
-                // Gone with a row not in the middle, as dark as it is.
-                let near = (1.0 - (row as f64 - strip.y).abs()).clamp(0.0, 1.0);
-                (at, 1.0 - follow::DIM * (1.0 - near) * strip.receded * with_row)
-            }
+            Place::Row(row) => follow::row_window(edges, whole, row, strip.y, strip.receded, session.farthest_y),
             Place::Fixed => (edges, 1.0),
         };
         moved += thumb.draw(Some(at), size, opacity(shown)) as u32;

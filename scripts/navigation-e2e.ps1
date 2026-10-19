@@ -3,6 +3,7 @@ param([string]$Mode = 'run')
 $ErrorActionPreference = 'Stop'
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $flick = Join-Path $target 'release\Flick.exe'
+Write-Output "FLICK_SHA256=$((Get-FileHash $flick).Hash)"
 cargo build --release --locked --example drive
 if ($LASTEXITCODE) { throw 'driver build failed' }
 $drive = Join-Path $target 'release\examples\drive.exe'
@@ -25,13 +26,23 @@ try {
     if ($probeExit) { Write-Warning 'Probe failed; collecting its trace before reporting the result' }
 } finally {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process drive -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $drive -and $_.MainWindowTitle -in @('F wide', 'F tall') } | Stop-Process -Force
+    Get-Process drive,shelf-app -ErrorAction SilentlyContinue | Where-Object { ($_.Path -eq $drive -and ($_.MainWindowTitle -in @('F wide', 'F tall') -or $_.MainWindowTitle -like 'Shelf *')) -or $_.Path -eq (Join-Path $out 'shelf-app.exe') } | Stop-Process -Force
+    & $drive xbutton up
+    & $drive key up 11 12 5B 77
     Start-Sleep 1
     & $drive navigation unstage $out
+    $restoreExit = $LASTEXITCODE
     foreach ($f in 'config.toml', 'state.json') {
         Remove-Item "$cfg\$f" -ErrorAction SilentlyContinue
         if (Test-Path "$backup\$f") { Copy-Item "$backup\$f" $cfg }
     }
+    foreach ($f in 'config.toml', 'state.json') {
+        if (Test-Path "$backup\$f") {
+            if ((Get-FileHash "$backup\$f").Hash -ne (Get-FileHash "$cfg\$f").Hash) { throw "Restore mismatch: $f" }
+        } elseif (Test-Path "$cfg\$f") { throw "Unexpected restored file: $f" }
+    }
+    if ($restoreExit) { throw 'Desktop restoration failed' }
+    Add-Content "$out\restored.txt" 'Original config.toml and state.json restored byte for byte'
     if (Test-Path "$cfg\log.txt") { Get-Content "$cfg\log.txt" | Select-Object -Skip $logStart | Set-Content "$out\log.txt" }
     if ($was) { Start-Process $was }
 }

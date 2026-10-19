@@ -24,6 +24,18 @@ pub fn placed(rect: [f64; 4], size: (f64, f64), scale: f64, apart: (f64, f64), l
     [cx + (rect[0] - w / 2.0) * size, cy + (rect[1] - h / 2.0) * size, cx + (rect[2] - w / 2.0) * size, cy + (rect[3] - h / 2.0) * size]
 }
 
+// Vertical travel before the starting shelf's windows fully join its motion.
+const ROW_WINDOWS_JOIN: f64 = 0.15;
+
+/// Shelf followers stay in front only on the starting row; other rows enter with the strip.
+pub fn row_window(rect: [f64; 4], size: (f64, f64), row: i32, y: f64, depth: f64, farthest_y: f64) -> ([f64; 4], f64) {
+    let join = if row == 0 { (farthest_y / ROW_WINDOWS_JOIN).min(1.0) } else { 1.0 };
+    let apart = row as f64 - y;
+    let at = between(rect, on_strip(rect, size, scale(depth), (0.0, apart)), join);
+    let near = (1.0 - apart.abs()).clamp(0.0, 1.0);
+    (at, 1.0 - DIM * (1.0 - near) * depth * join)
+}
+
 /// Selection weights follow their own springs, independent of the hand's lean.
 #[derive(Clone, Debug)]
 pub struct Focus { cells: Vec<((i32, i32), Spring)>, last: f64 }
@@ -257,6 +269,24 @@ pub fn remember(path: &mut Vec<(f64, f64, usize)>, point: (f64, f64, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shelf_windows_stay_with_their_row_and_return_from_offscreen() {
+        let rect = [100.0, 100.0, 400.0, 300.0];
+        let size = (1000.0, 800.0);
+        assert_eq!(row_window(rect, size, 0, 0.0, 1.0, 0.0), (rect, 1.0));
+        for row in [-1, 1] {
+            let (away, _) = row_window(rect, size, row, 0.0, 0.0, 0.0);
+            assert!(away[3] <= 0.0 || away[1] >= size.1);
+            assert_eq!(row_window(rect, size, row, row as f64, 0.0, 1.0), (rect, 1.0));
+        }
+        // The same shelf's departing and returning positions agree in the strip.
+        for t in [0.2, 0.4, 0.6, 0.8] {
+            let leaving = row_window(rect, size, 0, -t, 1.0, t);
+            let returning = row_window(rect, size, 1, 1.0 - t, 1.0, 1.0 - t);
+            for (a, b) in leaving.0.into_iter().zip(returning.0) { assert!((a - b).abs() < 1e-9); }
+            assert!((leaving.1 - returning.1).abs() < 1e-9);
+        }
+    }
     #[test]
     fn selected_size_changes_by_spring_and_cells_do_not_overlap() {
         let mut focus = Focus::default();

@@ -571,7 +571,9 @@ impl App {
         }
         for window in vd::windows(&desktops.current) {
             if window.desktop != to && row.contains(&window.desktop) && self.follows(&window) {
-                let _ = vdapi::move_window_to_desktop(target, window.hwnd);
+                if let Err(error) = vdapi::move_window_to_desktop(target, window.hwnd) {
+                    log(&format!("moving shelf window {:x} to {to} failed: {error:?}", window.hwnd.0));
+                }
             }
         }
     }
@@ -1077,9 +1079,15 @@ impl App {
         for window in vd::shown_windows(&desktops.current) {
             let place = if window.desktop.is_empty() || carried == Some(window.hwnd) {
                 Place::Fixed
+            } else if self.follows(&window) {
+                // A shelf's last cell can differ from its anchor while the board is open.
+                let Some(pos) = self.grid.find(&window.desktop) else { continue };
+                let row = pos.row as i32 - from.row as i32;
+                if row < rows.0 || row > rows.1 { continue; }
+                Place::Row(row)
             } else {
                 let Some(&(row, col)) = cells.get(window.desktop.as_str()) else { continue };
-                if sideways && self.follows(&window) { Place::Row(row) } else { Place::Cell(row, col) }
+                Place::Cell(row, col)
             };
             let far = match place {
                 Place::Fixed => 0,

@@ -11,6 +11,8 @@
 //!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND> | mem
 //!   drive desk | mkdesk | rmdesk <desktop id prefix>
 //!   drive hold <r> <g> <b> <title> <x> <y> <w> <h> <seconds>
+//!   drive holds <hold arguments>...  (several windows in one process)
+//!   drive navigation shelves <out dir> <flick exe>
 //!   drive pinprobe <flick exe> <out dir>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
@@ -27,6 +29,10 @@ mod drive_navigation;
 #[cfg(windows)]
 #[path = "support/pacing.rs"]
 mod drive_pacing;
+
+#[cfg(windows)]
+#[path = "support/shelves.rs"]
+mod drive_shelves;
 
 #[cfg(windows)]
 fn main() {
@@ -57,6 +63,12 @@ fn main() {
         match args.get(1).map(String::as_str) {
             Some("navigation") => drive_navigation::navigation(&args[2], std::path::Path::new(&args[3]), args.get(4).map(String::as_str)),
             Some("hold") => hold(&args[2..]),
+            Some("holds") => {
+                assert!(!args[2..].is_empty() && args[2..].len() % 9 == 0);
+                std::thread::scope(|threads| {
+                    for window in args[2..].chunks_exact(9) { threads.spawn(move || hold(window)); }
+                });
+            },
             Some("pinprobe") => pinprobe(&args[2], &args[3]),
             Some("clickprobe") => boardstress(0, 0, "post", "still"),
             Some("boardstress") => boardstress(args[2].parse().unwrap(), args[3].parse().unwrap(), &args[4], &args[5]),
