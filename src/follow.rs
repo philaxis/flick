@@ -514,6 +514,22 @@ impl Follow {
         (self.x.shown, self.y.shown)
     }
 
+    pub fn caught_up(&self, at: (f64, f64), axis: usize) -> bool {
+        self.picture.axis() == axis && (self.picture.at[axis] - [at.0, at.1][axis]).abs() < 0.005
+    }
+
+    /// A released hold the renderer never sampled still keeps every turn.
+    pub fn finish_path(&mut self, path: &[(f64, f64, usize)]) -> (i32, i32) {
+        for (i, &(x, y, axis)) in path.iter().enumerate() {
+            self.active_axis = axis;
+            self.track(i as f64, (x, y));
+        }
+        let Some(&(x, y, _)) = path.last() else { return (0, 0) };
+        // No measured release velocity is available for an unrendered hold.
+        self.track(path.len() as f64, (x, y));
+        self.let_go(path.len() as f64, (x, y))
+    }
+
     /// Let go of with the hand at `at`: the desktop it settles on, sideways
     /// (along its row) and up and down; settling starts.
     pub fn let_go(&mut self, now: f64, at: (f64, f64)) -> (i32, i32) {
@@ -878,5 +894,17 @@ mod tests {
         assert!((step_along(0.6, 0.0, 0) - 0.6).abs() < 1e-12);
         assert!(step_along(0.6, 0.0, 1).abs() < 1e-12 && step_along(0.6, 0.0, -1).abs() < 1e-12);
         assert!((step_along(1.0, 0.5, 1) - 0.5).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod missed_frames {
+    use super::*;
+    #[test]
+    fn a_release_before_the_first_frame_preserves_its_row_and_column() {
+        let mut follow = Follow::new((-2, 0), vec![(0, 2); 3], (0.4, 1.0));
+        assert_eq!(follow.finish_path(&[(0.0, -1.0, 1), (1.1, -1.0, 0)]), (1, -1));
+        let mut follow = Follow::new((-2, 0), vec![(0, 2); 3], (0.4, 1.0));
+        assert_eq!(follow.finish_path(&[(1.1, 0.0, 0)]), (1, 0));
     }
 }

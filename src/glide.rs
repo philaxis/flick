@@ -602,6 +602,7 @@ struct Session {
     began: Instant,
     /// Where the hand was last seen.
     hand: (f64, f64),
+    replay: std::collections::VecDeque<(f64, f64, usize)>,
     /// As drawn.
     shown: Option<Strip>,
     /// Where the picture of the hold before was from where this one's is
@@ -897,6 +898,7 @@ impl View {
             phase,
             began: Instant::now(),
             hand: (0.0, 0.0),
+            replay: crate::input::follow_hold(scene.hold).filter(|s| !s.hand.holding).map(|s| s.path.into()).unwrap_or_default(),
             shown: None,
             receded_from: 0.0,
             farthest_y: 0.0,
@@ -1013,12 +1015,17 @@ impl View {
         // in a single step (`follow::step_along`).
         let ((x, y), receded, stepping) = match session.phase {
             Phase::Following => {
-                let hand = crate::input::followed();
+                let saved = crate::input::follow_hold(session.hold);
+                let hand = saved.as_ref().map_or_else(crate::input::followed, |s| s.hand);
                 if hand.hold == session.hold {
                     session.hand = (hand.x, hand.y);
                 }
-                if hand.hold == session.hold && hand.holding {
-                    (session.follow.track_locked(now, session.hand, crate::input::axis().unwrap_or(0)), receding, false)
+                if let Some(&(x, y, axis)) = session.replay.front() {
+                    let at = session.follow.track_locked(now, (x, y), axis);
+                    if session.follow.caught_up((x, y), axis) { session.replay.pop_front(); }
+                    (at, receding, false)
+                } else if hand.hold == session.hold && hand.holding {
+                    (session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis)), receding, false)
                 } else {
                     let to = session.follow.let_go(now, session.hand);
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
@@ -1137,7 +1144,7 @@ impl View {
             };
             let strip = session.shown.as_ref().cloned().unwrap_or_default();
             let along = strip.along(session.follow.rows, session.follow.row);
-            let vblank = if paced.flushed { "dwm" } else if paced.timer.is_some() { "timer" } else { "none" };
+            let vblank = if paced.flushed { "dxgi" } else if paced.timer.is_some() { "timer" } else { "none" };
             trace.lines.push(format!(
                 "{},{at:.3},{gap:.3},{vblank},{:.3},{:.3},{phase},{:.4},{:.4},{along:.4},{:.4},{:.4},{work_ms:.3},{drawn_in:.3},{moves},{}",
                 session.hold,

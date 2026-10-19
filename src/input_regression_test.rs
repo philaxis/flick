@@ -130,6 +130,9 @@ fn reset() {
     DRAGGING.set(false);
     STRAYED.set(((0, 0), 0));
     PLANE.set(Plane::new());
+    MOUSE_AXIS.set(crate::axis::Lock::default());
+    FOLLOW_HOLDS.lock().unwrap().clear();
+    AXIS.store(0, Ordering::SeqCst);
     LAST_ABSOLUTE.set(None);
     LAST_CLICK.set(None);
     LAST_TAP.set(None);
@@ -562,4 +565,27 @@ fn enabled_raw_reads_once_into_a_bounded_stack_buffer_and_skips_idle_mouse_keys(
             });
         }
     }
+}
+
+#[test]
+fn a_new_press_does_not_replace_the_previous_release() {
+    let _guard = INPUT_TESTS.lock().unwrap();
+    reset();
+    HOLD_ID.store(41, Ordering::SeqCst);
+    FOLLOWING.store(FOLLOW_X | FOLLOW_Y, Ordering::SeqCst);
+    FOLLOWED_X.store(1100, Ordering::SeqCst);
+    AXIS.store(1, Ordering::SeqCst);
+    HOLDING.store(false, Ordering::SeqCst);
+    remember_follow();
+    HOLD_ID.store(42, Ordering::SeqCst);
+    FOLLOWED_X.store(0, Ordering::SeqCst);
+    HOLDING.store(true, Ordering::SeqCst);
+    remember_follow();
+    let old = follow_hold(41).unwrap();
+    assert!(!old.hand.holding);
+    assert!((old.hand.x - 1.1).abs() < 1e-9);
+    assert_eq!(follow_hold(42).unwrap().hand.x, 0.0);
+    forget_hold(41);
+    assert!(follow_hold(41).is_none());
+    reset();
 }

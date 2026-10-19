@@ -253,6 +253,31 @@ pub struct Followed {
     pub y: f64,
 }
 
+// Releases must survive a subsequent press until the UI and renderer consume them.
+#[derive(Clone, Default)]
+pub struct FollowHold {
+    pub hand: Followed,
+    pub axis: usize,
+    pub path: Vec<(f64, f64, usize)>,
+}
+static FOLLOW_HOLDS: Mutex<std::collections::BTreeMap<u32, FollowHold>> = Mutex::new(std::collections::BTreeMap::new());
+
+pub fn follow_hold(hold: u32) -> Option<FollowHold> { FOLLOW_HOLDS.lock().ok()?.get(&hold).cloned() }
+pub fn forget_hold(hold: u32) { if let Ok(mut holds) = FOLLOW_HOLDS.lock() { holds.remove(&hold); } }
+fn remember_follow() {
+    let hand = followed();
+    if hand.ways & (FOLLOW_X | FOLLOW_Y) == 0 { return; }
+    let axis = axis().unwrap_or(0);
+    if let Ok(mut holds) = FOLLOW_HOLDS.lock() {
+        let saved = holds.entry(hand.hold).or_default();
+        // Only the last point of each straight leg matters to the row anchors.
+        if saved.path.last().is_some_and(|p| p.2 == axis) { saved.path.pop(); }
+        saved.path.push((hand.x, hand.y, axis));
+        saved.hand = hand;
+        saved.axis = axis;
+    }
+}
+
 /// Where the hand is, or was let go of, in the last hold.
 pub fn followed() -> Followed {
     loop {
@@ -823,6 +848,7 @@ fn press(source: Source) {
 /// Stops what a hold keeps going: the raw input and the watching over it.
 fn stop_listening() {
     HOLDING.store(false, Ordering::SeqCst);
+    remember_follow();
     listen_raw(false);
     let timer = WATCH_TIMER.replace(0);
     if timer != 0 {
@@ -1205,6 +1231,7 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
         ROW_FRACTION.store((lean * 1000.0) as i32, Ordering::SeqCst);
         store_followed(s);
     });
+    remember_follow();
     if !DRAGGING.get() && (x.abs() * s.step_x as f64 >= DRAG_SHOWS as f64 || y.abs() * s.step_y as f64 >= DRAG_SHOWS as f64) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(STRETCH.load(Ordering::SeqCst), 0));
@@ -1285,6 +1312,7 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
         FRACTION.store(cols.rest(step) * 1000 / step, Ordering::SeqCst);
         store_followed(s);
     });
+    remember_follow();
     let stretch = STRETCH.load(Ordering::SeqCst);
     if moved.row {
         // The app is told of the new stretch below, once it is on the row.

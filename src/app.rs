@@ -208,6 +208,7 @@ struct App {
 /// A hold the screen follows (`input::followed`).
 struct Gliding {
     hold: u32,
+    fallback: Option<follow::Follow>,
     /// The cell the picture counts from: where the hold began, or where the
     /// app went since a way the hand is not followed.
     origin: String,
@@ -1126,7 +1127,8 @@ impl App {
     /// Hold `hold` began to move: the picture follows it the ways it is set
     /// to. A hold before it still settling goes where it was settling, now.
     fn glide_begin(&mut self, hold: u32) {
-        let hand = input::followed();
+        let Some(saved) = input::follow_hold(hold) else { return };
+        let hand = saved.hand;
         if hand.hold != hold || hand.ways & (input::FOLLOW_X | input::FOLLOW_Y) == 0 || self.board.is_open() {
             return;
         }
@@ -1139,17 +1141,20 @@ impl App {
         let Some(desktops) = self.sync() else { return };
         let origin = self.heading(&desktops);
         let Some(scene) = self.glide_scene(&desktops, &origin, hold, hand.ways) else { return };
+        let fallback = follow::Follow::new(scene.rows, scene.cols.clone(), scene.firm);
         self.glide.begin(scene);
-        self.gliding = Some(Gliding { hold, origin, landing: None, step: None, carry: false });
+        self.gliding = Some(Gliding { hold, fallback: Some(fallback), origin, landing: None, step: None, carry: false });
     }
 
     /// A glide still settling, or a step still under way, as a new one
     /// begins: it goes where it was going, now.
-    fn glide_finish(&mut self, old: Gliding) {
+    fn glide_finish(&mut self, mut old: Gliding) {
+        let saved = input::follow_hold(old.hold);
+        input::forget_hold(old.hold);
         if old.landing.is_some() {
             return;
         }
-        if let Some(to) = old.step.or_else(|| glide::decided(old.hold)) {
+        if let Some(to) = old.step.or_else(|| glide::decided(old.hold)).or_else(|| Some(old.fallback.as_mut()?.finish_path(&saved?.path))) {
             self.glide_go(&old.origin, to, old.carry);
         }
     }
@@ -1193,7 +1198,7 @@ impl App {
         let hold = STEPS.fetch_add(1, Ordering::SeqCst) | 0x8000_0000;
         let Some(scene) = self.glide_scene(&desktops, &origin, hold, input::FOLLOW_X | input::FOLLOW_Y) else { return false };
         self.glide.step(scene, by);
-        self.gliding = Some(Gliding { hold, origin, landing: None, step: Some(by), carry });
+        self.gliding = Some(Gliding { hold, fallback: None, origin, landing: None, step: Some(by), carry });
         let view = self.view(&id);
         self.minimap.show(view, Some(from));
         true
@@ -1243,6 +1248,7 @@ impl App {
     /// The picture of hold `hold` settled on `to`: Windows goes there, and
     /// the picture goes once it is.
     fn glide_settled(&mut self, hold: u32, to: (i32, i32)) {
+        input::forget_hold(hold);
         let Some((origin, carry)) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.carry)) else { return };
         match self.glide_go(&origin, to, carry) {
             Some(id) => {
@@ -1973,7 +1979,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 input::slide_shown(hold, stretch, on, Some(room));
             }
             if message == WM_DRAG {
-                with_app(|app| app.glide_begin(hold));
+                if with_app(|app| app.glide_begin(hold)).is_none() {
+                    let _ = PostMessageW(hwnd, message, wparam, lparam);
+                }
             }
             debug_log!("app: slide {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
         }
@@ -2002,6 +2010,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             debug_log!("app: rows {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
         }
         WM_CLICK => {
+            input::forget_hold(lparam.0 as u32);
             #[cfg(feature = "debug-log")]
             let started = Instant::now();
             let taken = with_app(App::toggle_board);
@@ -2010,6 +2019,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_RELEASE => {
             let heard = with_app(|app| {
+                if !app.gliding.as_ref().is_some_and(|g| g.hold == lparam.0 as u32) { input::forget_hold(lparam.0 as u32); }
                 app.finish_gesture();
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });
@@ -2073,14 +2083,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             });
         }
         WM_TIMER if wparam.0 == ONWARD_TIMER_ID => {
-            let _ = KillTimer(hwnd, ONWARD_TIMER_ID);
-            with_app(App::go_on);
+            with_app(|app| {
+                let _ = KillTimer(hwnd, ONWARD_TIMER_ID);
+                app.go_on();
+            });
         }
         WM_TIMER if wparam.0 == FLIGHT_TIMER_ID => {
-            let _ = KillTimer(hwnd, FLIGHT_TIMER_ID);
             with_app(|app| {
-                debug_log!("app: Windows did not tell of the switch, taken as made");
                 if let Some(now) = Desktops::read().map(|d| d.current) {
+                    let _ = KillTimer(hwnd, FLIGHT_TIMER_ID);
+                    debug_log!("app: switch recovery read the current desktop");
                     if !app.land(&now) {
                         app.desktop_changed(&now);
                     }
