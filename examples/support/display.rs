@@ -204,6 +204,13 @@ pub unsafe fn run(out: &Path, flick: &str) {
         wait(1200);
         let app=FindWindowW(w!("flick.main"),None); assert!(app.0!=0);
         if mode=="board" {PostMessageW(app,WM_APP+2,WPARAM(0),LPARAM(0)).unwrap();wait(700);assert!(IsWindowVisible(FindWindowW(w!("flick.board"),None)).as_bool());}
+        let mut gpu=if std::env::var_os("FLICK_GPU_TRACE").is_some() {
+            let file=out.join(format!("{label}-gpu.csv"));
+            let job=Command::new("powershell.exe").args(["-NoProfile","-File","scripts/gpu-motion.ps1","-FlickPid",&child.id().to_string(),"-CapturePid",&std::process::id().to_string(),"-Output"])
+                .arg(&file).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let began=Instant::now();while !file.with_extension("ready").exists() && began.elapsed()<Duration::from_secs(8) {wait(20);}
+            Some(job)
+        } else {None};
         let capture=Capture::new().unwrap();
         // Drain setup before injecting; AccumulatedFrames remains visible in the CSV.
         let initial=capture.frame(false).unwrap();
@@ -221,6 +228,7 @@ pub unsafe fn run(out: &Path, flick: &str) {
             }
         }
         worker.join().unwrap();
+        if let Some(job)=&mut gpu { let _=job.wait(); }
         if let Some(raw)=capture.sample.into_inner() {std::fs::write(out.join(format!("{label}.raw")),raw).unwrap();}
         std::fs::write(out.join(format!("{label}-display.csv")),csv).unwrap();
         if mode=="board" {PostMessageW(FindWindowW(w!("flick.board"),None),WM_KEYDOWN,WPARAM(0x1b),LPARAM(0)).unwrap();wait(300);}

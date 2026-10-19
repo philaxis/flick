@@ -20,12 +20,13 @@ $logStart = if (Test-Path "$cfg\log.txt") { (Get-Content "$cfg\log.txt").Count }
 try {
     & $drive navigation stage $out
     if ($LASTEXITCODE) { throw 'stage failed' }
-    if ($Mode -in @('matrix','final-matrix')) {
+    if ($Mode -in @('matrix','final-matrix','gpu')) {
         $probeExit = 0
-        $variants = if ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
+        $variants = if ($Mode -eq 'gpu') { @('timed','blur') } elseif ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
         foreach ($variant in $variants) {
             Write-Output "VARIANT=$variant"
-            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR -ErrorAction SilentlyContinue
+            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE -ErrorAction SilentlyContinue
+            if ($Mode -eq 'gpu') { $env:FLICK_GPU_TRACE='1'; $env:FLICK_SHORT_PROBE='1' }
             $exe = $flick
             if ($variant -eq 'baseline') { $exe = Join-Path (Get-Location) 'baseline.exe' }
             if ($variant -eq 'blur') { $env:FLICK_PROBE_BLUR='1' }
@@ -37,7 +38,7 @@ try {
             & $drive navigation display $folder $exe
             if ($LASTEXITCODE) { $probeExit=$LASTEXITCODE; break }
         }
-        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR -ErrorAction SilentlyContinue
+        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE -ErrorAction SilentlyContinue
     } else {
         & $drive navigation $Mode $out $flick
         $probeExit = $LASTEXITCODE
