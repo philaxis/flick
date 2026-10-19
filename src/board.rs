@@ -1977,19 +1977,28 @@ impl Board {
                 self.thumbs.push((hwnd.0, thumb));
             }
         }
-        if let Some(sheet) = &self.sheet {
-            let previews = self.thumbs.iter().copied().chain(self.strip_thumbs.iter().map(|(_, hwnd, thumb)| (*hwnd, *thumb)));
-            for (_, thumb) in previews.filter(|(hwnd, _)| sheet.slot(*hwnd).is_some()) {
-                if let Ok(badge) = unsafe { crate::composition::register(self.hwnd, sheet.hwnd, crate::composition::board_enabled()) } {
-                    self.badges.insert(thumb, badge);
-                }
-            }
-        }
+        self.register_badges();
         self.update_thumbnails();
         // Keep the old pictures until their replacements are visible.
         unregister_badges(&mut old_badges);
         unregister_strip_thumbnails(&mut old_strip);
         unregister_thumbnails(&mut old);
+    }
+
+    /// Registers the icon of every preview that has none yet and whose icon
+    /// is on the sheet, over all the previews. Says whether there was one.
+    fn register_badges(&mut self) -> bool {
+        let Some(sheet) = &self.sheet else { return false };
+        let previews = self.thumbs.iter().copied().chain(self.strip_thumbs.iter().map(|(_, hwnd, thumb)| (*hwnd, *thumb)));
+        let wanted: Vec<isize> = previews.filter(|(hwnd, thumb)| !self.badges.contains_key(thumb) && sheet.slot(*hwnd).is_some()).map(|(_, thumb)| thumb).collect();
+        let mut added = false;
+        for thumb in wanted {
+            if let Ok(badge) = unsafe { crate::composition::register(self.hwnd, sheet.hwnd, crate::composition::board_enabled()) } {
+                self.badges.insert(thumb, badge);
+                added = true;
+            }
+        }
+        added
     }
 
     /// How large the window of `thumb` is. Asked of DWM once while the
@@ -2787,6 +2796,10 @@ impl Board {
             if let Err(e) = sheet.update() {
                 crate::app::log(&format!("board icon sheet: {e}"));
             }
+        }
+        // The previews are registered before their icons are first loaded.
+        if self.open && self.register_badges() {
+            self.update_thumbnails();
         }
     }
 
