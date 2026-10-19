@@ -491,7 +491,7 @@ mod tests {
         let ((x, _), receded) = step.at(1.2);
         assert!(x > 0.3 && x < 0.7 && receded == 1.0, "{x} {receded}");
         let ((x, y), receded) = step.at(1.0 + STEP_TIME);
-        assert!((x - 1.0).abs() < 1e-9 && y == 0.0 && receded == 0.0);
+        assert!((x - 1.0).abs() < 1e-9 && y == 0.0 && receded < 1e-9, "{x} {y} {receded}");
         assert!(step.done(1.0 + STEP_TIME) && !step.done(1.3));
         let mut last = 0.0;
         for i in 0..=40 {

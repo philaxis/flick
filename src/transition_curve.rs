@@ -266,7 +266,7 @@ mod tests {
             let (a, b) = (glide.at(t), glide.at(t + FRAME));
             assert!((a - b).abs() <= glide.velocity(t).abs().max(glide.velocity(t + FRAME).abs()) * FRAME * 1.5 + 1e-5, "{t}");
             assert!((glide.velocity(t) - glide.velocity(t + FRAME)).abs() < 0.5, "{t}");
-            assert!((step_at(t).0 - step_at(t + FRAME).0).abs() < 0.004, "{t}");
+            assert!((step_at(t).0 - step_at(t + FRAME).0).abs() <= 1.5 * (1.0 - RECEDE_SCALE) / STEP_RECEDE * FRAME * 1.01, "{t}");
         }
     }
 
