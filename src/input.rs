@@ -145,6 +145,11 @@ static BOARD_OPEN: AtomicBool = AtomicBool::new(false);
 /// `FOLLOW_Y`, and `FOLLOW_TOUCHPAD` when three fingers began it). Those
 /// ways come to no cell while held: the app is told nothing of them, and
 /// reads where the hand is instead (`followed`).
+static AXIS: AtomicU32 = AtomicU32::new(0);
+
+/// Chosen axis of the last hold; none until the dead zone is crossed.
+pub fn axis() -> Option<usize> { AXIS.load(Ordering::SeqCst).checked_sub(1).map(|a| a as usize) }
+
 static FOLLOWING: AtomicU32 = AtomicU32::new(0);
 pub const FOLLOW_X: u32 = 1;
 pub const FOLLOW_Y: u32 = 2;
@@ -295,6 +300,7 @@ pub fn hand() -> Hand {
         for part in [shown_raw, rows_raw] {
             counted_from = counted_from.rotate_left(17) ^ part.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         }
+        let (along, across) = match axis() { Some(0) => (along, 0.0), Some(1) => (0.0, across), _ => (0.0, 0.0) };
         return if holding { Hand { along, across, counted_from } } else { Hand { counted_from, ..Hand::default() } };
     }
 }
@@ -544,6 +550,7 @@ thread_local! {
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     /// Where the hand is up and down in this hold, and along the row in this
     /// stretch of it.
+    static MOUSE_AXIS: Cell<crate::axis::Lock> = Cell::new(crate::axis::Lock::default());
     static PLANE: Cell<Plane> = const { Cell::new(Plane::new()) };
     /// How far the hand went the ways the screen follows in this hold: in
     /// counts, and on the touchpad, towards the next step (`touchpad_lean`).
@@ -779,6 +786,8 @@ fn press(source: Source) {
             FOLLOWED_Y.store(0, Ordering::SeqCst);
         });
         FOLLOWED.set(((0, 0), (0.0, 0.0)));
+        MOUSE_AXIS.set(crate::axis::Lock::default());
+        AXIS.store(0, Ordering::SeqCst);
         // Up and down by the notches of the hand that began the hold, the
         // mouse's for a button or key; on the board after the hand. The
         // screen follows it the ways set for that hand, never on the board.
@@ -1140,6 +1149,7 @@ fn touchpad_event(event: crate::touchpad::Event) {
             press(Source::Touchpad);
         }
         if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
+            if event.ended.is_none() { AXIS.store(event.axis.map_or(0, |a| a as u32 + 1), Ordering::SeqCst); }
             // The pad judged which way each step goes (`touchpad::Rails`); a whole step each is
             // exactly one cell or row of the plane, so no mouse rounding comes into it.
             // `touchpad_reverse` turns the steps and the lean between them around alike.
@@ -1217,7 +1227,14 @@ fn directed<T: std::ops::Neg<Output = T>>(delta: (T, T), reverse: bool) -> (T, T
 /// Mouse travel, the other way round with `mouse_reverse`.
 fn travel(s: &Settings, dx: i32, dy: i32) {
     let (dx, dy) = directed((dx, dy), s.mouse_reverse);
-    advance(s, dx, dy);
+    let mut lock = MOUSE_AXIS.get();
+    let before = lock.at;
+    let step = [s.step_x as f64, s.step_y as f64];
+    lock.travel([dx as f64, dy as f64], step, 12.0, unsafe { GetMessageTime() } as u32);
+    AXIS.store(lock.axis.map_or(0, |a| a as u32 + 1), Ordering::SeqCst);
+    let by: [i32; 2] = std::array::from_fn(|i| (lock.at[i] * step[i]).round() as i32 - (before[i] * step[i]).round() as i32);
+    MOUSE_AXIS.set(lock);
+    advance(s, by[0], by[1]);
 }
 
 /// Adds travel and emits steps.
@@ -1227,7 +1244,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
 /// (by notches, `Detent`; on the board one per `step_y` as the hand goes),
 /// sideways travel moving the
 /// hand along the row only and up and down travel from row to row only, so a
-/// hand going slantwise does both at once. The app is told of the row or the
+/// hand has already been locked to one axis. The app is told of the row or the
 /// cell the hand has come to whenever that is another one (`WM_ROWS`,
 /// `WM_SLIDE`): where the hand is, not that it took a step, so an app that
 /// was busy meanwhile goes straight to where the hand is by then rather than

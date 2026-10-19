@@ -65,8 +65,8 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 assert!(app.0 != 0, "Flick did not start");
                 for (label, start, moves, target) in [
                     ("mouse-right", 0, vec![(300, 12)], 1),
-                    ("mouse-up-then-right", 4, vec![(8, -440), (330, 5)], 3),
-                    ("mouse-right-then-up", 4, vec![(300, 10), (5, -600)], 2),
+                    ("mouse-up-then-right", 4, vec![(8, -440), (500, 5)], 3),
+                    ("mouse-right-then-up", 4, vec![(300, 10), (5, -1000)], 3),
                 ] {
                     goto(start);
                     mouse(MOUSEEVENTF_XDOWN, 0, 0);

@@ -150,6 +150,7 @@ struct Camera {
     pace_y: f32,
     /// What the goal was last worked out from, but for the hand's place.
     counted_from: Option<(u64, u64)>,
+    followed: Option<(u32, Pos)>,
 }
 
 impl Camera {
@@ -161,6 +162,44 @@ impl Camera {
         xs[cur.row] = -(cur.col as f32 + hand.0).clamp(-EDGE_GIVE, last_col + EDGE_GIVE);
         let last_row = view.rows.len().saturating_sub(1) as f32;
         (xs, -(cur.row as f32 + hand.1).clamp(-EDGE_GIVE, last_row + EDGE_GIVE))
+    }
+
+    fn lock_axis(&mut self, axis: usize) {
+        if axis == 0 {
+            self.rest_y = Spring::default();
+            self.put_y = 0.0;
+            self.pace_y = 0.0;
+        } else {
+            self.rest_x.fill(Spring::default());
+            self.put_x.fill(0.0);
+            self.pace_x.fill(0.0);
+        }
+    }
+
+    fn follow_goals(view: &View, origin: Pos, drawn: &crate::glide::Drawn) -> (Vec<f32>, f32) {
+        let xs = (0..view.rows.len()).map(|row| {
+            let relative = row as i32 - origin.row as i32;
+            let base = if row == origin.row { origin.col } else { view.anchor(row) };
+            let along = usize::try_from(relative - drawn.rows.0).ok().and_then(|i| drawn.along.get(i)).copied().unwrap_or(0.0);
+            -(base as f32 + along as f32)
+        }).collect();
+        (xs, -(origin.row as f32 + drawn.y as f32))
+    }
+
+    fn follow(&mut self, view: &View, drawn: &crate::glide::Drawn) {
+        if self.followed.map(|f| f.0) != Some(drawn.hold) {
+            self.followed = view.cur.map(|origin| (drawn.hold, origin));
+        }
+        let Some((_, origin)) = self.followed else { return };
+        let (xs, y) = Self::follow_goals(view, origin, drawn);
+        self.rest_x = vec![Spring::default(); xs.len()];
+        self.put_x = vec![0.0; xs.len()];
+        self.pace_x = vec![0.0; xs.len()];
+        self.rest_y = Spring::default();
+        self.put_y = 0.0;
+        self.pace_y = 0.0;
+        self.goal_x = xs;
+        self.goal_y = y;
     }
 
     /// Starts over with the grid as it was with the user on `from`, so that
@@ -368,22 +407,22 @@ fn output_for_monitor(monitor: HMONITOR) -> Option<IDXGIOutput> {
     None
 }
 
-struct FramePacer {
+pub(crate) struct FramePacer {
     timer: HANDLE,
     vblank: Option<VBlank>,
     monitor: HMONITOR,
-    period: Duration,
+    pub(crate) period: Duration,
 }
 
 impl FramePacer {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let timer = unsafe { CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)? };
         Ok(Self { timer, vblank: None, monitor: HMONITOR(0), period: Duration::from_secs_f64(1.0 / 60.0) })
     }
 
     /// Pace to the primary overlay's monitor; all its other windows show
     /// the same frame. Read the current mode again for each new hold.
-    fn place(&mut self, area: RECT) {
+    pub(crate) fn place(&mut self, area: RECT) {
         unsafe {
             self.monitor = MonitorFromPoint(POINT { x: (area.left + area.right) / 2, y: (area.top + area.bottom) / 2 }, MONITOR_DEFAULTTONEAREST);
             let mut info = MONITORINFOEXW::default();
@@ -404,7 +443,7 @@ impl FramePacer {
 
     /// Give DXGI at most two refresh intervals, including drawing time.
     /// On failure or an early vblank, the timer finishes this frame.
-    fn wait(&mut self, frame: Instant) -> Result<(Duration, bool)> {
+    pub(crate) fn wait(&mut self, frame: Instant) -> Result<(Duration, bool)> {
         let deadline = frame + self.period * 2;
         if Instant::now() >= deadline {
             return Ok((Duration::ZERO, false));
@@ -576,7 +615,12 @@ impl Overlay {
         let hiding = self.hide_at.is_some_and(|at| now >= at);
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
-        self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
+        if let Some(drawn) = crate::glide::drawn().filter(|d| d.hold == crate::input::followed().hold) {
+            self.camera.follow(&self.view, &drawn);
+        } else {
+            self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
+            if crate::input::holding() { if let Some(axis) = crate::input::axis() { self.camera.lock_axis(axis); } }
+        }
         #[cfg(feature = "debug-log")]
         if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.offset.abs() > 0.001 {
             // Frame by frame where the grid is drawn while it follows the hand.
@@ -979,11 +1023,16 @@ impl Minimap {
                 Request::HideAfter(ms) => overlay.hide_after(ms),
             };
             loop {
+                unsafe {
+                    let mut message = MSG::default();
+                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() { DispatchMessageW(&message); }
+                }
                 // Nothing on screen: sleep until asked for something.
                 if !overlay.is_visible() {
-                    match inbox.recv() {
+                    match inbox.recv_timeout(Duration::from_millis(16)) {
                         Ok(request) => apply(&mut overlay, request),
-                        Err(_) => return,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
                 }
                 while let Ok(request) = inbox.try_recv() {
@@ -1328,4 +1377,13 @@ mod tests {
         let (xs, y) = before.unwrap();
         assert!((y + 2.0).abs() < 0.01 && (xs[1] + 1.0).abs() < 0.01 && (xs[2] + 2.0).abs() < 0.01, "ends at {xs:?} {y}");
     }
+    #[test]
+    fn a_followed_move_from_the_third_row_slides_the_second_row() {
+        let view = View { rows: vec![vec![CellView::default(); 3]; 3], cur: Some(Pos { row: 2, col: 0 }), ..Default::default() };
+        let drawn = crate::glide::Drawn { hold: 1, rows: (-2, 0), along: vec![0.0, 0.4, 0.0], y: -1.0 };
+        let (xs, y) = Camera::follow_goals(&view, view.cur.unwrap(), &drawn);
+        assert!(xs[0].abs() < 1e-6 && (xs[1] + 0.4).abs() < 1e-6 && xs[2].abs() < 1e-6);
+        assert!((y + 1.0).abs() < 1e-6);
+    }
+
 }

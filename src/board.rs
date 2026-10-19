@@ -821,6 +821,11 @@ impl Motion {
         self.is_moving()
     }
 
+    fn lock_axis(&mut self, axis: usize) {
+        for rest in self.rest.values_mut() { rest[1 - axis] = Spring::default(); }
+        for hand in self.hand.values_mut() { if axis == 0 { hand.1 = 0.0; } else { hand.0 = 0.0; } }
+    }
+
     fn stop(&mut self) {
         self.rest.clear();
         self.hand.clear();
@@ -1271,9 +1276,7 @@ impl Board {
         self.settle_strip(Instant::now());
         self.clear_thumbnails();
         self.icons.clear();
-        // A picture the size of every screen together, of no use until the
-        // board is opened again.
-        self.canvas = None;
+        // Keep the D2D target for repeated trigger presses; ensure_canvas handles resizing.
         self.press = None;
         self.stop_motion();
         unsafe {
@@ -1442,6 +1445,7 @@ impl Board {
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
         self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+        if holding { if let Some(axis) = crate::input::axis() { self.strip.lock_axis(axis); } }
         self.strip_at = t;
         let strip_moving = self.strip.active(t);
         if strip_moving && !self.strip_on {
@@ -1451,6 +1455,7 @@ impl Board {
         }
         let was_moving = self.motion.is_moving() || was_strip;
         let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now) || strip_moving;
+        if holding { if let Some(axis) = crate::input::axis() { self.motion.lock_axis(axis); } }
         if was_moving || moving {
             let started = Instant::now();
             self.update_thumbnails();

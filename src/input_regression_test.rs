@@ -240,7 +240,7 @@ fn a_new_touchpad_source_clears_old_bits_even_when_another_trigger_holds() {
 fn a_followed_way_comes_to_no_cell_and_keeps_where_the_hand_is() {
     let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let posted = |message: u32| api::CALLS.with(|c| c.borrow().messages.iter().filter(|(m, _)| *m == message).count());
-    for (ways, rows) in [(FOLLOW_X | FOLLOW_Y, 0), (FOLLOW_X, 1)] {
+    for (ways, rows) in [(FOLLOW_X | FOLLOW_Y, 0), (FOLLOW_X, 0)] {
         reset();
         let s = Settings { mouse_follow: ways, ..settings() };
         SETTINGS.with(|slot| *slot.borrow_mut() = Some(s.clone()));
@@ -250,18 +250,12 @@ fn a_followed_way_comes_to_no_cell_and_keeps_where_the_hand_is() {
             travel(&s, 39, 45);
         }
         let at = followed();
-        assert!(at.holding && (at.x - 1.5).abs() < 0.01, "{at:?}");
+        assert!(at.holding && (at.x - 1.35).abs() < 0.01, "{at:?}");
         assert_eq!(posted(WM_SLIDE), 0);
         assert_eq!(posted(WM_ROWS), rows);
         assert_eq!(posted(WM_DRAG), 1 + rows);
-        if ways & FOLLOW_Y != 0 {
-            assert!((at.y - 450.0 / 400.0).abs() < 0.01, "{at:?}");
-            // The minimap held back at the row as the picture is.
-            let held = crate::slide::notch::position(at.y as f32, 1.0);
-            assert!((hand().across - held).abs() < 0.01 && held < at.y as f32, "{held}");
-        } else {
-            assert_eq!(at.y, 0.0);
-        }
+        assert_eq!(at.y, 0.0);
+        assert_eq!(hand().across, 0.0);
         release(&s, Source::XButton2);
         let after = followed();
         assert!(!after.holding && after.x == at.x && after.y == at.y);
@@ -272,6 +266,7 @@ fn a_followed_way_comes_to_no_cell_and_keeps_where_the_hand_is() {
     let s = settings();
     press(Source::XButton2);
     assert_eq!(followed().ways, 0);
+    travel(&s, 12, 0);
     travel(&s, 300, 0);
     assert_eq!((posted(WM_SLIDE), followed().x), (1, 0.0));
     release(&s, Source::XButton2);
@@ -300,7 +295,7 @@ fn letting_go_of_the_touchpad_keeps_where_the_hand_was() {
         farthest = farthest.max(at.x.abs());
     }
     let before = followed();
-    assert!((before.x.abs() - 1.6).abs() < 0.02, "{before:?}");
+    assert!((before.x.abs() - 1.3).abs() < 0.06, "{before:?}");
     touchpad_event(gesture.update(&[], ms));
     let after = followed();
     assert!(!after.holding);

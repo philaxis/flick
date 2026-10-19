@@ -4,6 +4,8 @@
 #[macro_use]
 mod debuglog;
 
+#[cfg(any(windows, test))]
+mod axis;
 mod config;
 #[cfg(any(windows, test))]
 mod follow;

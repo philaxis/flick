@@ -31,7 +31,7 @@ use windows::{
                 EnumWindows, FindWindowExW, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
                 IsIconic, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
-                ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+                ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOMOVE,
                 SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SMTO_ABORTIFHUNG, WINDOWPLACEMENT, WM_CLOSE, WM_NULL,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
@@ -215,7 +215,7 @@ pub fn stack(order: &[HWND]) {
     let mut after = HWND_TOPMOST;
     for &hwnd in order {
         unsafe {
-            let _ = SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            let _ = SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         }
         after = hwnd;
     }

@@ -37,7 +37,7 @@ use std::{
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, COLORREF, FILETIME, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
+        Foundation::{COLORREF, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::{
             Direct2D::{Common::D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE},
             DirectWrite::{IDWriteFactory, IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS},
@@ -47,8 +47,7 @@ use windows::{
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Gdi::{
-                EnumDisplaySettingsW, GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, DEVMODEW,
-                ENUM_CURRENT_SETTINGS, HBRUSH, WHITE_BRUSH,
+                GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
             },
         },
         System::{
@@ -56,8 +55,7 @@ use windows::{
             LibraryLoader::GetModuleHandleW,
             Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
             Threading::{
-                CreateWaitableTimerExW, GetCurrentProcessId, GetCurrentThread, GetThreadTimes, SetWaitableTimerEx,
-                WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+                GetCurrentProcessId, GetCurrentThread, GetThreadTimes,
             },
         },
         UI::WindowsAndMessaging::{
@@ -65,7 +63,7 @@ use windows::{
             GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, PeekMessageW, PostMessageW, RegisterClassW,
             SetLayeredWindowAttributes, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, LWA_ALPHA, MSG,
             PM_REMOVE, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-            SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WNDCLASSW, WS_EX_LAYERED,
+            SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WNDCLASSW, WS_EX_LAYERED,
             WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
         },
     },
@@ -93,9 +91,6 @@ const WALLS: usize = 9;
 /// Desktops with an edge of light at once, at most: the four the middle of
 /// the screen is between.
 const LIT: usize = 4;
-/// How long the picture of a hold begun while the last one's was still up
-/// takes to go from where that one was to where this one is.
-const CARRY_TIME: f64 = 0.25;
 /// The name of the row above the picture: its window's size and its place
 /// below the top of the screen, unscaled, and the size of its letters.
 const BANNER: (f32, f32) = (560.0, 30.0);
@@ -612,7 +607,6 @@ struct Session {
     /// Where the picture of the hold before was from where this one's is
     /// (sideways, along the first row, and up and down), eased away in
     /// `CARRY_TIME`, and how far it had receded, which this one goes on from.
-    carry: (f64, f64),
     receded_from: f64,
     /// The farthest up or down the strip went (`ROW_WINDOWS_JOIN`).
     farthest_y: f64,
@@ -654,7 +648,7 @@ impl Session {
 struct View {
     app: HWND,
     session: Option<Session>,
-    timer: HANDLE,
+    pacer: crate::overlay::FramePacer,
     period: Duration,
     frame: Instant,
     paints: Option<Paints>,
@@ -678,16 +672,21 @@ fn run(app: HWND, inbox: mpsc::Receiver<Request>) {
             });
         }
     }
-    let Ok(timer) = (unsafe { CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0) }) else {
-        return crate::app::log("the sliding picture has no timer");
+    let Ok(pacer) = crate::overlay::FramePacer::new() else {
+        return crate::app::log("the sliding picture has no frame clock");
     };
     let trace = std::env::var_os("FLICK_TRACE").filter(|path| !path.is_empty()).map(std::path::PathBuf::from);
-    let mut view = View { app, session: None, timer, period: refresh_period(), frame: Instant::now(), paints: None, ink: None, trace };
+    let mut view = View { app, session: None, pacer, period: Duration::from_secs_f64(1.0 / 60.0), frame: Instant::now(), paints: None, ink: None, trace };
     loop {
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() { DispatchMessageW(&message); }
+        }
         if view.session.is_none() {
-            match inbox.recv() {
+            match inbox.recv_timeout(Duration::from_millis(16)) {
                 Ok(request) => view.take(request),
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
         while let Ok(request) = inbox.try_recv() {
@@ -697,16 +696,6 @@ fn run(app: HWND, inbox: mpsc::Receiver<Request>) {
             view.tick();
         }
     }
-    unsafe {
-        let _ = CloseHandle(view.timer);
-    }
-}
-
-/// How long one refresh of the screen takes.
-fn refresh_period() -> Duration {
-    let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
-    let hz = unsafe { EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool().then_some(mode.dmDisplayFrequency);
-    Duration::from_secs_f64(1.0 / hz.filter(|hz| *hz > 1).unwrap_or(60) as f64)
 }
 
 fn thread_cpu() -> f64 {
@@ -743,6 +732,17 @@ fn new_window(area: RECT) -> Option<HWND> {
     }
 }
 
+/// The minimap uses the exact displayed rows rather than the hold's origin row.
+#[derive(Clone)]
+pub struct Drawn {
+    pub hold: u32,
+    pub rows: (i32, i32),
+    pub along: Vec<f64>,
+    pub y: f64,
+}
+static DRAWN: std::sync::Mutex<Option<Drawn>> = std::sync::Mutex::new(None);
+pub fn drawn() -> Option<Drawn> { DRAWN.lock().ok()?.clone() }
+
 /// The minimap's windows, to keep them above the picture.
 fn minimap_windows() -> Vec<HWND> {
     unsafe extern "system" fn each(hwnd: HWND, out: LPARAM) -> windows::Win32::Foundation::BOOL {
@@ -770,11 +770,11 @@ impl View {
             Request::Begin(scene) => {
                 // Monitors as they were are kept, so the picture stays up
                 // from one hold to the next, going on from where it was.
-                let (carry, receded) = self.carried();
+                let (_, receded) = self.carried();
                 let (screens, leftover) = self.session.take().map(Session::retire).unwrap_or_default();
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
-                    (new.carry, new.receded_from) = (carry, receded);
+                    new.receded_from = receded;
                 }
             }
             Request::Step(scene, to) => {
@@ -898,7 +898,6 @@ impl View {
             began: Instant::now(),
             hand: (0.0, 0.0),
             shown: None,
-            carry: (0.0, 0.0),
             receded_from: 0.0,
             farthest_y: 0.0,
             names: scene.names,
@@ -908,7 +907,19 @@ impl View {
             stats,
             trace,
         });
-        self.period = refresh_period();
+        // Every overlay is drawn together: the fastest covered output supplies
+        // the clock, so a secondary 120 Hz screen is never capped at 60 Hz.
+        let mut fastest = None;
+        for monitor in &monitors {
+            self.pacer.place(monitor.work);
+            if fastest.as_ref().map_or(true, |(_, period)| self.pacer.period < *period) {
+                fastest = Some((monitor.work, self.pacer.period));
+            }
+        }
+        if let Some((area, period)) = fastest {
+            self.pacer.place(area);
+            self.period = period;
+        }
         self.frame = Instant::now();
     }
 
@@ -931,6 +942,7 @@ impl View {
     /// is on screen.
     fn finish(&mut self, flushed: bool) {
         let Some(session) = self.session.take() else { return };
+        *DRAWN.lock().unwrap() = None;
         if flushed {
             unsafe {
                 let _ = DwmFlush();
@@ -1006,7 +1018,7 @@ impl View {
                     session.hand = (hand.x, hand.y);
                 }
                 if hand.hold == session.hold && hand.holding {
-                    (session.follow.track(now, session.hand), receding, false)
+                    (session.follow.track_locked(now, session.hand, crate::input::axis().unwrap_or(0)), receding, false)
                 } else {
                     let to = session.follow.let_go(now, session.hand);
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
@@ -1052,17 +1064,14 @@ impl View {
         let strip = match session.phase {
             Phase::Arriving(..) => session.shown.clone().unwrap_or_default(),
             _ => {
-                // What is left of where the picture of the hold before was.
-                let left = 1.0 - follow::ease_out_cubic(now / CARRY_TIME);
-                let (carry_x, carry_y) = if stepping { (0.0, 0.0) } else { (session.carry.0 * left, session.carry.1 * left) };
                 let rows = session.follow.rows;
                 let along = (rows.0..=rows.1)
                     .map(|row| {
                         let along = if stepping { follow::step_along(x, y, row) } else { session.follow.offset(row) };
-                        along + if row == 0 { carry_x } else { 0.0 }
+                        along
                     })
                     .collect();
-                Strip { y: y + carry_y, along, receded }
+                Strip { y, along, receded }
             }
         };
         // The row whose name is shown: the one the hand is on, or the one
@@ -1080,6 +1089,7 @@ impl View {
             moves = draw(session, &strip);
             session.stats.updates += moves;
             session.shown = Some(strip.clone());
+            *DRAWN.lock().unwrap() = Some(Drawn { hold: session.hold, rows: session.follow.rows, along: strip.along.clone(), y: strip.y });
         }
         if self.ink.is_none() {
             self.ink = Ink::new();
@@ -1101,7 +1111,7 @@ impl View {
                     let _ = SetWindowPos(banner.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
                 }
                 for minimap in minimap_windows() {
-                    let _ = SetWindowPos(minimap, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    let _ = SetWindowPos(minimap, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
                 }
             }
         }
@@ -1146,24 +1156,11 @@ impl View {
     /// idle display), the rest of a refresh's time.
     fn pace(&mut self) -> Paced {
         let before = Instant::now();
-        let flushed = unsafe { DwmFlush() }.is_ok();
-        let flush = before.elapsed();
-        let mut paced = Paced { flushed: flushed && flush.as_secs_f64() * 1000.0 >= 0.5, flush: flush.as_secs_f64() * 1000.0, timer: None };
-        let next = self.frame + self.period;
-        let left = next.saturating_duration_since(Instant::now());
-        if left > self.period / 2 {
-            let due = -(left.as_nanos().div_ceil(100) as i64);
-            let waiting = Instant::now();
-            unsafe {
-                if SetWaitableTimerEx(self.timer, &due, 0, None, None, None, 0).is_ok() {
-                    WaitForSingleObject(self.timer, left.as_millis() as u32 + 2);
-                }
-            }
-            paced.timer = Some(waiting.elapsed().as_secs_f64() * 1000.0);
-        }
+        let (fallback, vblank) = self.pacer.wait(self.frame).unwrap_or_default();
         self.frame = Instant::now();
-        paced
+        Paced { flushed: vblank, flush: before.elapsed().as_secs_f64() * 1000.0, timer: (!fallback.is_zero()).then_some(fallback.as_secs_f64() * 1000.0) }
     }
+
 }
 
 /// Adds `lines` to the trace at `path`, with the names of the columns

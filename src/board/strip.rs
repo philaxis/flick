@@ -278,6 +278,18 @@ impl Strip {
         (self.hand, self.hand_row, self.counted_from, self.holding, self.heard) = (hand, row, Some(counted_from), holding, Some(now));
     }
 
+    pub fn lock_axis(&mut self, axis: usize) {
+        if axis == 0 {
+            self.across = Glide::default();
+            self.hand.1 = 0.0;
+            self.speed.1 = 0.0;
+        } else {
+            self.along.fill(Glide::default());
+            self.hand.0 = 0.0;
+            self.speed.0 = 0.0;
+        }
+    }
+
     /// How far the cells of `row` are drawn from where they are laid out,
     /// in cells.
     pub fn offset(&self, row: usize, t: f32) -> (f32, f32) {
