@@ -483,8 +483,14 @@ impl Follow {
 
     /// All renderers consume the same serial path, including delayed frames.
     pub fn track_locked(&mut self, now: f64, at: (f64, f64), axis: usize) -> (f64, f64) {
-        self.active_axis = axis;
-        let at = self.picture.track([at.0, at.1], axis, now);
+        let cols = self.cols_of(self.row);
+        let target = if axis == 0 {
+            [at.0, at.1.round().clamp(self.rows.0 as f64, self.rows.1 as f64)]
+        } else {
+            [(at.0 - self.base).round().clamp(cols.0 as f64, cols.1 as f64) + self.base, at.1]
+        };
+        let at = self.picture.track(target, axis, now);
+        self.active_axis = self.picture.axis();
         self.track(now, (at[0], at[1]))
     }
 

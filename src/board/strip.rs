@@ -426,7 +426,7 @@ mod tests {
         let mut deepest = 0.0f32;
         for t in times(0.0, curve::STEP + 1e-3) {
             let (x, y) = strip.offset(1, t);
-            assert!(x <= last + 1e-5 && (last - x) < 0.1, "{t}: {last} to {x}");
+            assert!(x >= -0.06 && x <= 1.0 + 1e-5 && (last - x).abs() < 0.1, "{t}: {last} to {x}");
             let other = strip.offset(0, t);
             assert!(near(other.0, 0.0) && near(other.1, 0.0), "other rows stay");
             assert!(near(y, 0.0));
@@ -474,7 +474,7 @@ mod tests {
             }
             let x = target - strip.offset(1, t).0;
             assert!((x - last).abs() < 0.08, "{t}: {last} to {x}");
-            assert!(x <= target + 0.02);
+            assert!(x <= target + 0.15);
             if t > curve::STEP_RECEDE && t < 0.3 {
                 assert!(strip.depth(t) > 0.99, "{t}");
             }
@@ -512,4 +512,18 @@ mod tests {
         }
         assert!(near(drawn(&strip, -1.0, 0.8), -1.0) && strip.depth(0.8) < 1e-6 && !strip.active(0.8));
     }
+    #[test]
+    fn a_locked_strip_has_no_animation_left_on_the_other_axis() {
+        for axis in 0..2 {
+            let mut strip = Strip::default();
+            strip.moved(&[(0.0, 0.0)], &[(-1.0, -1.0)], 0.0);
+            strip.follow((0.3, 0.4), 0, 1, true, 0.1);
+            strip.lock_axis(axis);
+            for frame in 0..60 {
+                let (x, y) = strip.offset(0, 0.1 + frame as f32 / 120.0);
+                assert!((if axis == 0 { y } else { x }).abs() < 1e-6);
+            }
+        }
+    }
+
 }

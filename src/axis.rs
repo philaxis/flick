@@ -71,10 +71,11 @@ pub struct Picture {
 }
 
 impl Picture {
+    pub fn axis(&self) -> usize { self.axis }
     pub fn track(&mut self, target: [f64; 2], axis: usize, now: f64) -> [f64; 2] {
         let dt = self.last.replace(now).map_or(0.0, |last| (now - last).clamp(0.0, 1.0 / 30.0));
         let turning = self.axis != axis;
-        let goal = if turning { self.at[self.axis].round() } else { target[self.axis] };
+        let goal = if turning { target[self.axis].round() } else { target[self.axis] };
         let distance = goal - self.at[self.axis];
         // Catch up without skipping the beginning, even after slow thumbnail setup.
         let amount = 1.0 - (-dt / 0.035).exp();
