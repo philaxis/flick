@@ -48,6 +48,57 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             std::fs::write(out.join("restored.txt"), "Original desktop, desktop order and cursor restored\n").unwrap();
         }
         "shelves" => unsafe { super::drive_shelves::run(out, flick.unwrap()); },
+        // A shelf turned in one hold stays turned: shown and arrived at there in the next.
+        "cube" => unsafe {
+            let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();
+            let ids: Vec<_> = ids.lines().collect();
+            let all = vdapi::get_desktops().unwrap();
+            let current = || vdapi::get_current_desktop().unwrap().id();
+            let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg.join("state.json")).unwrap()).unwrap();
+            let rows = state["rows"].as_array_mut().unwrap();
+            rows[0] = serde_json::json!({"name": "Cube 1", "cells": [ids[0]], "last": ids[0]});
+            rows[1] = serde_json::json!({"name": "Cube 2", "cells": [ids[1], ids[2], ids[3]], "last": ids[1]});
+            rows[2] = serde_json::json!({"name": "Cube 3", "cells": [ids[4], ids[5]], "last": ids[4]});
+            std::fs::write(cfg.join("state.json"), state.to_string()).unwrap();
+            std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = true\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = true\nfollow_y = true\nreverse = false\n").unwrap();
+            vdapi::switch_desktop(*all.iter().find(|d| d.id() == ids[4]).unwrap()).unwrap();
+            wait(1200);
+            let mouse = |flags, dx, dy| {
+                let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: 2, dwFlags: flags, ..Default::default() } } };
+                assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
+            };
+            let stroke = |dx: i32, dy: i32| {
+                for i in 1..=30 { mouse(MOUSEEVENTF_MOVE, dx * i / 30 - dx * (i - 1) / 30, dy * i / 30 - dy * (i - 1) / 30); wait(15); }
+                wait(250);
+            };
+            let mut child = Command::new(flick.unwrap()).arg("--portable").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            wait(3000);
+            assert!(FindWindowW(w!("flick.main"), None).0 != 0, "Flick did not start");
+            let mut report = String::new();
+            // Shelf 3 up to shelf 2, two cells along it, back down to shelf 3, in one hold.
+            mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
+            for (dx, dy) in [(4, -340), (600, 4), (4, 340)] { stroke(dx, dy); }
+            mouse(MOUSEEVENTF_XUP, 0, 0); wait(2400);
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg.join("state.json")).unwrap()).unwrap();
+            let back = current() == ids[4];
+            let kept = saved["rows"][1]["last"] == ids[3];
+            report += &format!("back-on-shelf-3: {back}\nshelf-2-saved-turned: {kept} last={}\n", saved["rows"][1]["last"]);
+            // The next hold shows shelf 2 at that cell and arrives there.
+            mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
+            stroke(4, -340); wait(700);
+            let _ = Command::new(std::env::current_exe().unwrap()).args(["shot", out.join("cube-held-up.raw").to_str().unwrap()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            mouse(MOUSEEVENTF_XUP, 0, 0); wait(2400);
+            let got = current();
+            let arrived = got == ids[3];
+            report += &format!("next-hold-arrives-turned: {arrived} expected={} actual={got}\n", ids[3]);
+            let _ = child.kill();
+            let _ = child.wait();
+            let failures = [back, kept, arrived].iter().filter(|ok| !**ok).count();
+            report += &format!("navigation failures: {failures}\n");
+            std::fs::write(out.join("report.txt"), &report).unwrap();
+            print!("{report}");
+            assert_eq!(failures, 0, "cube probe failed; see report.txt");
+        },
         "pacing" => unsafe { super::drive_pacing::run(out, flick.unwrap()); },
         "run" | "motion" | "geometry" => unsafe {
             let geometry = mode == "geometry";
