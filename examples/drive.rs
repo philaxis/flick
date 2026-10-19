@@ -21,6 +21,10 @@
 mod vdapi;
 
 #[cfg(windows)]
+#[path = "support/navigation.rs"]
+mod drive_navigation;
+
+#[cfg(windows)]
 fn main() {
     use windows::{
         core::w,
@@ -47,6 +51,7 @@ fn main() {
             let _ = PostMessageW(app, message, WPARAM(wparam), LPARAM(0));
         };
         match args.get(1).map(String::as_str) {
+            Some("navigation") => drive_navigation::navigation(&args[2], std::path::Path::new(&args[3]), args.get(4).map(String::as_str)),
             Some("hold") => hold(&args[2..]),
             Some("pinprobe") => pinprobe(&args[2], &args[3]),
             Some("clickprobe") => boardstress(0, 0, "post", "still"),
