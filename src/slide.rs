@@ -8,6 +8,9 @@
 //! mouse wheel does (`Detent`), but on the board, where it follows the hand
 //! as sideways does (`Rows::Linear`).
 
+#[path = "notch.rs"]
+pub mod notch;
+
 /// A cell is come to once the hand is this much nearer it than the one
 /// before, in tenths of the way between them: a little past halfway, so that
 /// a hand resting at the half does not flip to and fro.
@@ -22,6 +25,7 @@ const WALL_GIVE_TENTHS: i32 = 2;
 pub struct Slide {
     /// How far the hand is from the cell it set out from, rightwards.
     x: i32,
+    notch: u32,
     /// The cell it has come to, counted from that one likewise.
     cell: i32,
     /// How many cells the row has to the left and to the right of the cell
@@ -31,15 +35,31 @@ pub struct Slide {
 
 impl Slide {
     pub const fn new() -> Slide {
-        Slide { x: 0, cell: 0, room: None }
+        Slide { x: 0, notch: notch::DEFAULT_X, cell: 0, room: None }
     }
 
     pub fn cell(&self) -> i32 {
         self.cell
     }
 
-    /// How far the hand is from the cell it has come to.
+    pub const fn firm(notch: u32) -> Slide {
+        Slide { notch, ..Slide::new() }
+    }
+
+    /// Display travel from the selected cell, in counts. Periodicity keeps
+    /// cell + rest / step continuous when the selection changes its reference.
     pub fn rest(&self, step: i32) -> i32 {
+        let step = step.max(1);
+        (self.display(self.raw_rest(step) as f32 / step as f32) * step as f32).round() as i32
+    }
+
+    /// Fractional travel from a touchpad or any other hand in cell units.
+    pub fn display(&self, progress: f32) -> f32 {
+        notch::position(progress, self.notch as f32 / 100.0)
+    }
+
+    /// Unmapped counts, for selection, carrying travel and showing a drag.
+    pub fn raw_rest(&self, step: i32) -> i32 {
         self.x - self.cell * step
     }
 
@@ -73,8 +93,8 @@ impl Slide {
         }
         self.x = self.x.saturating_add(dx);
         self.keep_in_row(step);
-        while may_step && self.rest(step).abs() * 10 >= step * STEP_AT_TENTHS {
-            self.cell += self.rest(step).signum();
+        while may_step && self.raw_rest(step).abs() * 10 >= step * STEP_AT_TENTHS {
+            self.cell += self.raw_rest(step).signum();
         }
     }
 
@@ -82,7 +102,7 @@ impl Slide {
     /// on from it as it is now from this one: what it went towards the next
     /// cell is not lost, and no cell come to here is come to again.
     pub fn carried_on(&self, step: i32) -> Slide {
-        Slide { x: self.rest(step), cell: 0, room: None }
+        Slide { x: self.raw_rest(step), cell: 0, room: None, notch: self.notch }
     }
 }
 
@@ -97,7 +117,7 @@ const CARRY_TENTHS: i32 = 5;
 /// How far the minimap leans towards the next row, at most, before the hand
 /// gets there, in rows: with notches at their firmest.
 pub const LEAN: f32 = 0.12;
-/// The firmest notches (`Detent::firm`).
+/// A full notch; touchpad vertical travel can compose two (`notch`).
 pub const FIRMEST: u32 = 100;
 
 /// Up and down in a hold, the way a mouse wheel goes by its notches: travel
@@ -118,20 +138,21 @@ pub struct Detent {
     room: Option<(i32, i32)>,
     /// How far the minimap leans at most, in rows (`LEAN` at the firmest).
     most: f32,
+    notch: u32,
 }
 
 impl Detent {
     pub const fn new() -> Detent {
-        Detent { gathered: 0, back: 0, row: 0, room: None, most: LEAN }
+        Detent { gathered: 0, back: 0, row: 0, room: None, most: LEAN, notch: FIRMEST }
     }
 
-    /// Notches `notch` firm, 1 to `FIRMEST` (`Config::mouse.notch_y`): the
+    /// Notches `notch` firm, 1 to twice `FIRMEST` (`Config::mouse.notch_y`): the
     /// row still comes only once the whole step is gone, but the softer they
     /// are the farther the minimap leans towards it meanwhile, nearly as
     /// far as the hand has gone at the softest.
     pub fn firm(notch: u32) -> Detent {
-        let firm = notch.min(FIRMEST) as f32 / FIRMEST as f32;
-        Detent { most: 1.0 - (1.0 - LEAN) * firm, ..Detent::new() }
+        let firm = (notch as f32 / FIRMEST as f32).min(notch::MAX_STRENGTH);
+        Detent { notch, most: (1.0 - (1.0 - LEAN) * firm.min(1.0)) / firm.max(1.0), ..Detent::new() }
     }
 
     /// How far the minimap leans at most, in rows.
@@ -150,7 +171,12 @@ impl Detent {
 
     /// How far the minimap leans towards the next row, in rows.
     pub fn lean(&self, step: i32) -> f32 {
-        self.gathered as f32 / step.max(1) as f32 * self.most
+        self.display(self.gathered as f32 / step.max(1) as f32)
+    }
+
+    pub fn display(&self, progress: f32) -> f32 {
+        // Keep the old lean-and-snap range; only the approach within it bends.
+        notch::position(progress, self.notch as f32 / FIRMEST as f32) * self.most()
     }
 
     pub fn set_room(&mut self, up: i32, down: i32) {
@@ -216,7 +242,7 @@ impl Rows {
     pub fn gathered(&self, step: i32) -> i32 {
         match self {
             Rows::Notched(detent) => detent.gathered(),
-            Rows::Linear(slide) => slide.rest(step),
+            Rows::Linear(slide) => slide.raw_rest(step),
         }
     }
 
@@ -225,6 +251,14 @@ impl Rows {
         match self {
             Rows::Notched(detent) => detent.lean(step),
             Rows::Linear(slide) => slide.rest(step) as f32 / step.max(1) as f32,
+        }
+    }
+
+    /// The same display mapping for fractional touchpad travel.
+    pub fn display(&self, progress: f32) -> f32 {
+        match self {
+            Rows::Notched(detent) => detent.display(progress),
+            Rows::Linear(slide) => slide.display(progress),
         }
     }
 
@@ -275,7 +309,7 @@ impl Plane {
     /// A hold begun with the board open, or with no notches up and down
     /// (`notched(0)`): up and down follows the hand.
     pub const fn linear() -> Plane {
-        Plane { cols: Slide::new(), rows: Rows::Linear(Slide::new()) }
+        Plane { cols: Slide::new(), rows: Rows::Linear(Slide::firm(0)) }
     }
 
     /// Up and down by notches `notch` firm (`Detent::firm`); none follows
@@ -285,6 +319,17 @@ impl Plane {
             0 => Plane::linear(),
             notch => Plane { cols: Slide::new(), rows: Rows::Notched(Detent::firm(notch)) },
         }
+    }
+
+    /// Device settings, with the board keeping its existing row selection
+    /// rule while sharing the display notch. Off still follows the hand evenly.
+    pub fn configured(notch_x: u32, notch_y: u32, board: bool) -> Plane {
+        let mut plane = if board { Plane::linear() } else { Plane::notched(notch_y) };
+        plane.cols = Slide::firm(notch_x);
+        if board {
+            plane.rows = Rows::Linear(Slide::firm(notch_y));
+        }
+        plane
     }
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
@@ -304,6 +349,52 @@ impl Plane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_notches_leave_selection_and_rebasing_alone() {
+        let step = 1000;
+        for notch in [0, 40, 100, 200] {
+            let mut plain = Slide::firm(0);
+            let mut shown = Slide::firm(notch);
+            for dx in [100, 499, 1, 300, 400, -701, -1200, 1, 300] {
+                plain.travel(dx, step, true);
+                shown.travel(dx, step, true);
+                assert_eq!(shown.cell(), plain.cell());
+                assert_eq!(shown.raw_rest(step), plain.raw_rest(step));
+                let expected = notch::position(shown.x as f32 / step as f32, notch as f32 / 100.0);
+                let actual = shown.cell() as f32 + shown.rest(step) as f32 / step as f32;
+                assert!((actual - expected).abs() <= 0.00051);
+                let carried = shown.carried_on(step);
+                assert_eq!(carried.raw_rest(step), shown.raw_rest(step));
+                assert_eq!(carried.rest(step), shown.rest(step));
+            }
+            shown.set_room(1, 1, step);
+            shown.travel(10000, step, true);
+            assert_eq!(shown.raw_rest(step), 200);
+            assert_eq!(shown.rest(step), (notch::position(0.2, notch as f32 / 100.0) * step as f32).round() as i32);
+        }
+    }
+
+    #[test]
+    fn both_views_share_notches_and_touchpad_rows_hold_more_firmly() {
+        let steps = (1000, 1000);
+        let mut mouse = Plane::configured(40, 100, false);
+        let mut pad = Plane::configured(40, 100 * notch::TOUCHPAD_VERTICAL_SCALE, false);
+        let mut board = Plane::configured(40, 100, true);
+        for plane in [&mut mouse, &mut pad, &mut board] {
+            assert_eq!(plane.travel(200, 200, steps), Moved::default());
+            assert!(plane.cols.rest(steps.0) < plane.cols.raw_rest(steps.0));
+        }
+        assert_eq!(mouse.cols.rest(steps.0), board.cols.rest(steps.0));
+        assert!(pad.rows.lean(steps.1) < mouse.rows.lean(steps.1));
+        assert!(board.rows.lean(steps.1) < 0.2);
+        for plane in [&mut mouse, &mut pad] {
+            assert!(!plane.travel(0, 799, steps).row);
+            assert!(plane.travel(0, 1, steps).row);
+            assert_eq!(plane.rows.lean(steps.1), 0.0);
+        }
+        assert!(board.travel(0, 400, steps).row);
+    }
 
     fn after(moves: impl IntoIterator<Item = i32>) -> i32 {
         let mut slide = Slide::new();
@@ -344,7 +435,7 @@ mod tests {
         assert_eq!(late.cell(), 3);
         late.set_room(0, 1, 260);
         for slide in [&mut known, &mut late] {
-            assert_eq!((slide.cell(), slide.rest(260)), (1, 52));
+            assert_eq!((slide.cell(), slide.raw_rest(260)), (1, 52));
             slide.travel(-155, 260, true);
             assert_eq!(slide.cell(), 1);
             slide.travel(-1, 260, true);

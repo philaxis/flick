@@ -376,9 +376,11 @@ struct Settings {
     /// (`Config::mouse.reverse`, `touchpad.reverse`).
     mouse_reverse: bool,
     touchpad_reverse: bool,
-    /// How firm the notches up and down are on each, 0 for none
+    /// How firm the notches in either direction are on each, 0 for none
     /// (`Config::mouse.notch_y`, `touchpad.notch_y`, `Plane::notched`).
+    mouse_notch_x: u32,
     mouse_notch_y: u32,
+    touchpad_notch_x: u32,
     touchpad_notch_y: u32,
 }
 
@@ -537,7 +539,9 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         step_y: config.mouse.step_y.max(20),
         mouse_reverse: config.mouse.reverse,
         touchpad_reverse: config.touchpad.reverse,
+        mouse_notch_x: config.mouse.notch_x,
         mouse_notch_y: config.mouse.notch_y,
+        touchpad_notch_x: config.touchpad.notch_x,
         touchpad_notch_y: config.touchpad.notch_y,
     });
     crate::touchpad::set_step_mm(config.touchpad.step_x, config.touchpad.step_y);
@@ -719,12 +723,14 @@ fn press(source: Source) {
         let notch = SETTINGS.with(|slot| {
             let s = slot.try_borrow().ok()?;
             let s = s.as_ref()?;
-            Some(if source == Source::Touchpad { s.touchpad_notch_y } else { s.mouse_notch_y })
+            Some(if source == Source::Touchpad {
+                (s.touchpad_notch_x, s.touchpad_notch_y.saturating_mul(crate::slide::notch::TOUCHPAD_VERTICAL_SCALE))
+            } else {
+                (s.mouse_notch_x, s.mouse_notch_y)
+            })
         });
-        PLANE.set(match notch.unwrap_or(crate::slide::FIRMEST) {
-            _ if BOARD_OPEN.load(Ordering::SeqCst) => Plane::linear(),
-            notch => Plane::notched(notch),
-        });
+        let (notch_x, notch_y) = notch.unwrap_or((crate::slide::notch::DEFAULT_X, crate::slide::FIRMEST));
+        PLANE.set(Plane::configured(notch_x, notch_y, BOARD_OPEN.load(Ordering::SeqCst)));
         DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
@@ -1102,12 +1108,10 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64)) {
         Some((_, room)) if at_wall(y, plane.rows.cell(), room) => 0.0,
         _ => y,
     };
-    let lean = match plane.rows {
-        crate::slide::Rows::Notched(detent) => y * detent.most() as f64,
-        crate::slide::Rows::Linear(_) => y,
-    };
+    let along = plane.cols.display(x as f32);
+    let lean = plane.rows.display(y as f32);
     writing(|| {
-        FRACTION.store((x * 1000.0) as i32, Ordering::SeqCst);
+        FRACTION.store((along * 1000.0) as i32, Ordering::SeqCst);
         ROW_FRACTION.store((lean * 1000.0) as i32, Ordering::SeqCst);
     });
     if !DRAGGING.get() && (x.abs() * s.step_x as f64 >= DRAG_SHOWS as f64 || y.abs() * s.step_y as f64 >= DRAG_SHOWS as f64) {
@@ -1187,11 +1191,11 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
         debug_log!("slide: cell {} of stretch {stretch}", cols.cell());
         post(s, WM_SLIDE, slide_wparam(stretch, cols.cell()));
     }
-    if !DRAGGING.get() && (STEPPED.get() || cols.rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS) {
+    if !DRAGGING.get() && (STEPPED.get() || cols.raw_rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(stretch, 0));
     }
-    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.rest(step), rows.gathered(step_y));
+    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.raw_rest(step), rows.gathered(step_y));
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.
@@ -1449,7 +1453,7 @@ mod tests {
 
     #[test]
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
-        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true, mouse_notch_y: 100, touchpad_notch_y: 100 };
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true, mouse_notch_x: 40, mouse_notch_y: 100, touchpad_notch_x: 40, touchpad_notch_y: 100 };
         let info = MSLLHOOKSTRUCT::default();
         TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });

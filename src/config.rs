@@ -36,8 +36,10 @@ sleep_after_minutes = 0
 
 # Each device on its own. _x is sideways (along a shelf), _y is up and down (from shelf to shelf).
 #   step: how far to move for one cell sideways or one shelf up or down. The longer vertical distance keeps you from changing shelf by accident.
-#   notch: 0 to 100, how firmly each cell or shelf holds until the whole distance is moved, like the notches of a wheel.
-#     0 follows the hand evenly. Sideways is always even for now.
+#   notch: 0 to 100, how firmly the displayed hand holds near each cell or shelf.
+#     0 follows the hand evenly. Sideways selection still changes a little past halfway.
+#     Vertical notches keep the whole-distance shelf step and lean then snap.
+#     Touchpad vertical strength is doubled: 100 composes two monotone notches.
 #   follow: the screen moves along with the hand between desktops (not used yet).
 #   reverse: with true the desktops go the other way from the hand, as if pushing the screen like scrolling content on a touchpad; with false they follow it.
 #     Keyboard shortcuts are not affected.
@@ -46,7 +48,7 @@ sleep_after_minutes = 0
 # Distances in pixels.
 step_x = 260
 step_y = 400
-notch_x = 0
+notch_x = 40
 notch_y = 100
 follow_x = true
 follow_y = true
@@ -58,7 +60,7 @@ three_finger = false
 # Distances in millimetres on the pad.
 step_x = 10.0
 step_y = 10.0
-notch_x = 0
+notch_x = 40
 notch_y = 100
 follow_x = true
 follow_y = true
@@ -98,7 +100,7 @@ pub struct Mouse {
     pub step_x: i32,
     pub step_y: i32,
     /// How firmly a cell or row holds, 0 to 100 (`Detent`); 0 follows the
-    /// hand evenly (`Slide`). Sideways is not notched yet, whatever it says.
+    /// hand evenly (`Slide`). Sideways changes the display, not selection.
     pub notch_x: u32,
     pub notch_y: u32,
     /// The screen moving along with the hand between desktops. Kept, not
@@ -140,7 +142,7 @@ impl Default for Config {
 
 impl Default for Mouse {
     fn default() -> Self {
-        Mouse { step_x: 260, step_y: 400, notch_x: 0, notch_y: 100, follow_x: true, follow_y: true, reverse: false }
+        Mouse { step_x: 260, step_y: 400, notch_x: 40, notch_y: 100, follow_x: true, follow_y: true, reverse: false }
     }
 }
 
@@ -150,7 +152,7 @@ impl Default for Touchpad {
             three_finger: false,
             step_x: crate::touchpad::STEP_MM,
             step_y: crate::touchpad::STEP_MM,
-            notch_x: 0,
+            notch_x: 40,
             notch_y: 100,
             follow_x: true,
             follow_y: true,
@@ -161,6 +163,8 @@ impl Default for Touchpad {
 
 /// Reads a config file. Keys of earlier versions (`LEGACY`) are read as the
 /// ones that took their place, unless the file gives those too.
+/// Older templates wrote notch_x = 0 too. There is no record of whether
+/// the user chose Off, so preserve explicit zero; only missing keys get 40.
 fn parse(text: &str) -> Result<Config, toml::de::Error> {
     let mut file: toml::Table = toml::from_str(text)?;
     for (old, table, key) in LEGACY {
@@ -299,6 +303,21 @@ pub fn save_grid(grid: &Grid) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_notches_default_to_forty_but_saved_off_stays_off() {
+        for config in [Config::default(), parse(DEFAULT_CONFIG).unwrap(), parse("").unwrap(), parse(OLD_CONFIG).unwrap()] {
+            assert_eq!((config.mouse.notch_x, config.touchpad.notch_x), (40, 40));
+        }
+        // Old templates and a deliberate Off are indistinguishable; keep both.
+        let old = DEFAULT_CONFIG.replace("notch_x = 40", "notch_x = 0");
+        let saved = parse(&old).unwrap();
+        assert_eq!((saved.mouse.notch_x, saved.touchpad.notch_x), (0, 0));
+        let off = with_value(DEFAULT_CONFIG, "mouse.notch_x", "0");
+        assert_eq!(parse(&off).unwrap().mouse.notch_x, 0);
+        let sticky = parse("vertical_sticky = false\n[mouse]\nnotch_y = 70\n").unwrap();
+        assert_eq!((sticky.mouse.notch_x, sticky.mouse.notch_y), (40, 70));
+    }
 
     #[test]
     fn touchpad_is_opt_in_for_new_and_existing_configs() {
