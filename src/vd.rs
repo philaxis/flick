@@ -31,7 +31,7 @@ use windows::{
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
                 IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
                 ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOMOVE,
-                SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_CLOSE,
+                SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, SC_CLOSE, WM_SYSCOMMAND,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
@@ -146,11 +146,13 @@ pub fn focus_top_window_of(id: &str) {
     force_foreground(top.unwrap_or_else(|| unsafe { GetShellWindow() }));
 }
 
-/// Asks a window to close, as its own close button would.
+/// Asks a window to close, as its own close button would: through the
+/// system menu's Close, which apps that keep running in the tray (KakaoTalk)
+/// answer by hiding the window, where a bare WM_CLOSE can quit them whole.
 /// False when Windows would not pass the request on, as it does not to a
 /// window run as administrator from an app that is not.
 pub fn ask_to_close(hwnd: HWND) -> bool {
-    unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
+    unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) }.is_ok()
 }
 
 /// Whether a window is kept above the others ("always on top").
