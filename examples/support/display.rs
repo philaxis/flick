@@ -76,6 +76,12 @@ impl Capture {
     }
 }
 
+fn write_frame(csv: &mut String, (info,boxes,centers,ms): (DXGI_OUTDUPL_FRAME_INFO,[(i32,i32,i32,i32,u32);4],[f64;4],f64)) {
+    write!(csv,"{},{},{ms:.3}",info.LastPresentTime,info.AccumulatedFrames).unwrap();
+    for b in boxes {write!(csv,",{},{},{},{},{}",b.0,b.1,b.2,b.3,b.4).unwrap();}
+    for x in centers {write!(csv,",{x:.6}").unwrap();}csv.push('\n');
+}
+
 // Long runs isolate fixtures from desktop icons; y subsampling preserves x precision.
 fn scan_line(line: &[u8], y: u32, boxes: &mut [(i32,i32,i32,i32,u32);4], mass: &mut [u64;4], moment: &mut [u64;4]) {
     let width=line.len() as u32/4;
@@ -200,19 +206,18 @@ pub unsafe fn run(out: &Path, flick: &str) {
         if mode=="board" {PostMessageW(app,WM_APP+2,WPARAM(0),LPARAM(0)).unwrap();wait(700);assert!(IsWindowVisible(FindWindowW(w!("flick.board"),None)).as_bool());}
         let capture=Capture::new().unwrap();
         // Drain setup before injecting; AccumulatedFrames remains visible in the CSV.
-        let _=capture.frame(false).unwrap();
+        let initial=capture.frame(false).unwrap();
         let (k,s,path)=(kind.to_owned(),scenario.to_owned(),out.join(format!("{label}-input.csv")));
         let device_clock=!Path::new(flick).file_name().unwrap().to_string_lossy().eq_ignore_ascii_case("baseline.exe");
         let worker=std::thread::spawn(move||input(&k,&s,&path,6.0,frequency,device_clock));
         let start=Instant::now();
         let mut csv=String::from("qpc,accumulated,capture_ms,magenta_l,magenta_t,magenta_r,magenta_b,magenta_n,cyan_l,cyan_t,cyan_r,cyan_b,cyan_n,yellow_l,yellow_t,yellow_r,yellow_b,yellow_n,marker_l,marker_t,marker_r,marker_b,marker_n,magenta_x,cyan_x,yellow_x,marker_x\n");
+        if let Some(frame)=initial { write_frame(&mut csv,frame); }
         let(mut frames,mut missed)=(0,0);
         while start.elapsed()<Duration::from_millis(7200) {
             if let Some((info,boxes,centers,ms))=capture.frame(kind=="mouse" && scenario=="fast" && start.elapsed()>Duration::from_millis(1000)).unwrap() {
                 frames+=1;missed+=info.AccumulatedFrames.saturating_sub(1);
-                write!(csv,"{},{},{ms:.3}",info.LastPresentTime,info.AccumulatedFrames).unwrap();
-                for b in boxes {write!(csv,",{},{},{},{},{}",b.0,b.1,b.2,b.3,b.4).unwrap();}
-                for x in centers {write!(csv,",{x:.6}").unwrap();}csv.push('\n');
+                write_frame(&mut csv,(info,boxes,centers,ms));
             }
         }
         worker.join().unwrap();

@@ -84,7 +84,9 @@ def report(folder):
             if int(b['marker_n']) and pos(b,'magenta') is not None:
                 marker_errors.append(abs(pos(b,'magenta')-pos(b,'marker')))
         first = None
-        initial = next((r for r in frames if int(r['qpc']) >= start and pos(r,'magenta') is not None), None)
+        initial = next((r for r in reversed(frames) if int(r['qpc']) <= start and pos(r,'magenta') is not None), None)
+        if initial is None:
+            initial = next((r for r in frames if int(r['qpc']) >= start and pos(r,'magenta') is not None), None)
         if initial:
             base = pos(initial,'magenta')
             changed = next((r for r in active if pos(r,'magenta') is not None and abs(pos(r,'magenta')-base) >= 1), None)
