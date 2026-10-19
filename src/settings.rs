@@ -741,8 +741,8 @@ impl Settings {
                 }
             }
         };
-        let first = if tab == Tab::Mouse { 5.0 } else { 6.0 };
-        let area = Rect { top: inner(TAB_ROWS.0 + first).top + 10.0 * s, bottom: inner(TAB_ROWS.0 + 7.0).bottom, ..inner(0.0) };
+        // A row of its own under the switches, the button in the next.
+        let area = inner(TAB_ROWS.0 + if tab == Tab::Mouse { 5.0 } else { 6.0 });
         p.text(notice, &fonts.notice, &area, white(0.62));
         if tab == Tab::Touchpad && view.touchpad_status == crate::touchpad::Status::Conflict {
             self.draw_button(&p, fonts, &layout.touchpad_settings, "Open Windows touchpad settings (W)", Hit::TouchpadSettings);
