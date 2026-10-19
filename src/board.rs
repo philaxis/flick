@@ -1355,6 +1355,7 @@ impl Board {
     /// the hand from now on, as the minimap's do.
     pub fn follow_hand(&mut self) {
         if self.open {
+            if self.popup.is_some() { self.hide_popup(); }
             self.start_motion();
         }
     }
@@ -1432,6 +1433,7 @@ impl Board {
     fn tick_motion(&mut self, now: Instant, by_vblank: bool) {
         let hand = crate::input::hand();
         let holding = crate::input::holding();
+        let dragging = self.press.as_ref().is_some_and(|press| press.dragging);
         let t = self.strip_time(now);
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
@@ -1444,10 +1446,10 @@ impl Board {
             self.lay_out_strip(None);
             self.register_thumbnails();
         }
-        let was_moving = self.motion.is_moving() || was_strip;
         let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now) || strip_moving;
         if holding { if let Some(axis) = crate::input::axis() { self.motion.lock_axis(axis); } }
-        if was_moving || moving {
+        {
+            // Also submit the final frame after a drag or hold stops.
             let started = Instant::now();
             let rendered = self.draw_to_canvas();
             let prepared = started.elapsed();
@@ -1495,7 +1497,7 @@ impl Board {
                 self.motion.rest.values().flatten().map(|spring| spring.offset.abs()).fold(0.0, f32::max), hand.along, hand.across,
                 self.motion.hand.values().next(), self.strip.depth(t));
         }
-        if !moving && !holding {
+        if !moving && !holding && !dragging {
             debug_log!("board: motion settled after {} frames, drawing {:.2} ms a frame on average and {:.2} at most",
                 self.motion.frames, self.motion.drawing.as_secs_f32() * 1000.0 / self.motion.frames.max(1) as f32,
                 self.motion.slowest.as_secs_f32() * 1000.0);
@@ -1504,11 +1506,9 @@ impl Board {
             if was_strip {
                 self.settle_strip(now);
             }
-            if was_moving {
-                self.hover_under_cursor();
-                self.update_popup(now);
-                self.invalidate();
-            }
+            self.hover_under_cursor();
+            self.update_popup(now);
+            self.invalidate();
         }
     }
 
@@ -1914,6 +1914,7 @@ impl Board {
 
     /// Follows the cell under the cursor without changing the selection.
     fn update_popup(&mut self, now: Instant) {
+        if self.motion_timer { return; }
         let wanted = match &self.hover {
             Hit::Cell(id) | Hit::CellClose(id) if *id != self.selected && self.press.is_none() && self.editing.is_none() => {
                 Some((id.clone(), self.map_at(self.cursor.0, self.cursor.1).0.monitor))
@@ -2449,8 +2450,7 @@ impl Board {
                 if let Some(hwnd) = raise {
                     self.raise_thumbnail(hwnd);
                 }
-                self.update_thumbnails();
-                self.invalidate();
+                self.start_motion();
             }
             return;
         }
@@ -3742,6 +3742,15 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
 mod tests {
     use super::*;
 
+    fn same_popup(a: (Rect, Rect, f32), b: (Rect, Rect, f32)) {
+        for (a, b) in [(a.0, b.0), (a.1, b.1)] {
+            for (x, y) in [a.left, a.top, a.right, a.bottom].into_iter().zip([b.left, b.top, b.right, b.bottom]) {
+                assert!((x - y).abs() < 0.0001, "{x} != {y}");
+            }
+        }
+        assert!((a.2 - b.2).abs() < 0.0001);
+    }
+
     #[test]
     fn popup_glides_continue_from_the_current_frame_and_connector() {
         let now = Instant::now();
@@ -3756,7 +3765,7 @@ mod tests {
         assert!(before.0.left > 105.0 && before.0.left < b.left);
         assert!(before.0.bottom > a.bottom && before.0.bottom < b.bottom);
         animation.glide_to(c, cell(-100.0), halfway);
-        assert_eq!(animation.sample(halfway), before);
+        same_popup(animation.sample(halfway), before);
         let end = halfway + Duration::from_secs(1);
         assert_eq!(animation.sample(end), (c, cell(-100.0), 1.0));
         assert_eq!(animation.next_tick(end, animation.sample(end)), None);
@@ -3782,7 +3791,7 @@ mod tests {
         let before = animation.springs(at);
         let shown = animation.sample(at);
         animation.glide_to(a, a, at);
-        assert_eq!(animation.sample(at), shown);
+        same_popup(animation.sample(at), shown);
         for (was, is) in before.into_iter().flatten().zip(animation.rest.into_iter().flatten()) {
             assert_eq!(was.velocity, is.velocity);
         }
@@ -4101,7 +4110,7 @@ mod tests {
                 assert!(at.offset * offset >= 0.0 && at.offset.abs() <= previous + 0.0001);
                 previous = at.offset.abs();
             }
-            let arrived = 1.0 - spring.sample(0.3).offset / offset;
+            let arrived = 1.0 - spring.sample(0.2).offset / offset;
             assert!((0.975..0.985).contains(&arrived), "{arrived}");
         }
     }

@@ -143,7 +143,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     let mut windows = Vec::new();
                     for (title, rgb, width, height, dest) in [("F wide", [255, 255, 0], 800, 300, 0), ("F tall", [0, 255, 255], 300, 700, 1)] {
                         let args = ["hold".to_owned(), rgb[0].to_string(), rgb[1].to_string(), rgb[2].to_string(), title.into(), "200".into(), "120".into(), width.to_string(), height.to_string(), "90".into()];
-                        windows.push(Command::new(&me).args(args).spawn().unwrap());
+                        windows.push(Command::new(&me).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
                         wait(400);
                         let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title));
                         vdapi::move_window_to_desktop(*all.iter().find(|d| d.id() == ids[dest]).unwrap(), hwnd).unwrap();

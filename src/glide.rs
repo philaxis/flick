@@ -47,7 +47,7 @@ use windows::{
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Gdi::{
-                GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
+                FillRect, GetDC, ReleaseDC, GdiFlush, GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
             },
         },
         System::{
@@ -347,7 +347,7 @@ struct Paints {
 
 impl Paints {
     fn new() -> Option<Paints> {
-        let make = |class: PCWSTR| unsafe {
+        let make = |class: PCWSTR, white: bool| unsafe {
             let (x, y) = (GetSystemMetrics(SM_XVIRTUALSCREEN) - 200, GetSystemMetrics(SM_YVIRTUALSCREEN) - 200);
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
@@ -367,11 +367,17 @@ impl Paints {
                 return None;
             }
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Off-screen source windows may never receive WM_PAINT; seed the
+            // redirected surface before DWM stretches it into shades and edges.
+            let dc = GetDC(hwnd);
+            FillRect(dc, &RECT { left: 0, top: 0, right: 16, bottom: 16 }, HBRUSH(GetStockObject(if white { WHITE_BRUSH } else { BLACK_BRUSH }).0));
+            ReleaseDC(hwnd, dc);
+            let _ = GdiFlush();
             let _ = crate::vdapi::pin_window(hwnd);
             Some(hwnd)
         };
-        let black = make(WINDOW_CLASS)?;
-        let Some(white) = make(WHITE_CLASS) else {
+        let black = make(WINDOW_CLASS, false)?;
+        let Some(white) = make(WHITE_CLASS, true) else {
             unsafe {
                 let _ = DestroyWindow(black);
             }
