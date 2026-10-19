@@ -40,7 +40,9 @@ sleep_after_minutes = 0
 #     0 follows the hand evenly. Sideways selection still changes a little past halfway.
 #     Vertical notches keep the whole-distance shelf step and lean then snap.
 #     Touchpad vertical strength is doubled: 100 composes two monotone notches.
-#   follow: the screen moves along with the hand between desktops (not used yet).
+#   follow: the screen moves along with the hand between desktops, and the desktop changes once, on letting go:
+#     to the nearest one, or on to where a quick flick carries it.
+#     Off, each desktop is gone to at once as the hand comes to it.
 #   reverse: with true the desktops go the other way from the hand, as if pushing the screen like scrolling content on a touchpad; with false they follow it.
 #     Keyboard shortcuts are not affected.
 
@@ -100,11 +102,12 @@ pub struct Mouse {
     pub step_x: i32,
     pub step_y: i32,
     /// How firmly a cell or row holds, 0 to 100 (`Detent`); 0 follows the
-    /// hand evenly (`Slide`). Sideways changes the display, not selection.
+    /// hand evenly (`Slide`). Sideways changes the display, not selection; following
+    /// the hand, the picture holds back the same way (`follow`).
     pub notch_x: u32,
     pub notch_y: u32,
-    /// The screen moving along with the hand between desktops. Kept, not
-    /// acted on yet.
+    /// The screen moving along with the hand between desktops, the desktop
+    /// changing once, on letting go (`follow`).
     pub follow_x: bool,
     pub follow_y: bool,
     /// The desktops go against the hand.

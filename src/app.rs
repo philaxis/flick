@@ -5,6 +5,8 @@ use crate::{
     admin,
     board::{Action, Board, CellModel, Model, RowModel, WindowModel},
     config::{self, Config},
+    follow,
+    glide::{self, Glide, Place, Scene, Shot, WM_GLIDE_SETTLED, WM_GLIDE_TARGET},
     guide::{self, Guide},
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
@@ -179,6 +181,10 @@ struct App {
     sliding: Option<((u32, u8), String)>,
     /// The hold going up and down, and the row it began on.
     rowing: Option<(u32, usize)>,
+    /// The picture of the desktops following the hand (`glide`), and the
+    /// hold it follows.
+    glide: Glide,
+    gliding: Option<Gliding>,
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
     following: HashSet<isize>,
@@ -198,6 +204,23 @@ struct App {
     /// The message Explorer broadcasts when the taskbar is (re)created.
     taskbar_created: u32,
 }
+
+/// A hold the screen follows (`input::followed`).
+struct Gliding {
+    hold: u32,
+    /// The cell the picture counts from: where the hold began, or where the
+    /// app went since a way the hand is not followed.
+    origin: String,
+    /// The cell it settled on, until Windows is there.
+    landing: Option<String>,
+    /// For steps (hotkeys), not holds: the desktop stepped to, and whether
+    /// the active window goes along.
+    step: Option<(i32, i32)>,
+    carry: bool,
+}
+
+/// Steps are numbered apart from holds (`Gliding::hold`).
+static STEPS: AtomicU32 = AtomicU32::new(0x8000_0000);
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -353,6 +376,8 @@ impl App {
             focus_on_arrival: None,
             sliding: None,
             rowing: None,
+            glide: Glide::spawn(hwnd),
+            gliding: None,
             following: HashSet::new(),
             pending_menu: None,
             pending_row_menu: None,
@@ -767,6 +792,9 @@ impl App {
             }
             return true;
         }
+        if self.glide_step(dir, carry) {
+            return true;
+        }
         let Some(desktops) = self.sync() else { return true };
         let heading = self.heading(&desktops);
         let Some(from) = self.grid.find(&heading) else { return true };
@@ -823,6 +851,7 @@ impl App {
                 Some(id) if on != from => {
                     debug_log!("app: slide to {to:?}: from row {} cell {} to cell {}", from.row, from.col, on.col);
                     self.go(&desktops, from, &id, carry);
+                    self.glide_moved(key.0, &id);
                 }
                 // Nothing to go to: before the first cell, or pushing at the
                 // end of the row. The minimap shows where one is. Cells are
@@ -863,6 +892,7 @@ impl App {
                 Some(id) if on.row != from.row => {
                     debug_log!("app: rows to {to:+}: from row {} to row {} cell {}", from.row, on.row, on.col);
                     self.go(&desktops, from, &id, carry);
+                    self.glide_moved(hold, &id);
                 }
                 // Above the first row or below the last: the minimap shows
                 // where one is.
@@ -1024,8 +1054,217 @@ impl App {
         }
     }
 
+    // ---- the screen following the hand ----------------------------------------
+
+    /// The cell `to` (sideways, up and down) from `origin`, as a picture of a
+    /// hold counts them: along a row from the cell a move there lands on.
+    fn glide_cell(&self, origin: &str, (col, row): (i32, i32)) -> Option<String> {
+        let from = self.grid.find(origin)?;
+        let line = self.grid.rows.get(usize::try_from(from.row as i32 + row).ok()?)?;
+        let reference = if row == 0 { from.col } else { line.anchor() };
+        line.cells.get(usize::try_from(reference as i32 + col).ok()?).cloned()
+    }
+
+    /// What hold `hold` shows going `ways` (`input::FOLLOW_X` and the like)
+    /// from `origin`: the desktops it can go to, and their windows.
+    fn glide_scene(&self, desktops: &Desktops, origin: &str, hold: u32, ways: u32) -> Option<Scene> {
+        let from = self.grid.find(origin)?;
+        let (sideways, across) = (ways & input::FOLLOW_X != 0, ways & input::FOLLOW_Y != 0);
+        let last = self.grid.rows.len() as i32 - 1;
+        let rows = if across { (-(from.row as i32), last - from.row as i32) } else { (0, 0) };
+        let mut cols = Vec::new();
+        let mut cells: HashMap<&str, (i32, i32)> = HashMap::new();
+        for row in rows.0..=rows.1 {
+            let line = &self.grid.rows[(from.row as i32 + row) as usize];
+            let reference = if row == 0 { from.col } else { line.anchor() } as i32;
+            let span = if sideways { (-reference, line.cells.len() as i32 - 1 - reference) } else { (0, 0) };
+            cols.push(span);
+            for col in span.0..=span.1 {
+                if let Some(id) = line.cells.get((reference + col) as usize) {
+                    cells.insert(id, (row, col));
+                }
+            }
+        }
+        let touchpad = ways & input::FOLLOW_TOUCHPAD != 0;
+        let (notch_x, notch_y) = if touchpad {
+            (self.config.touchpad.notch_x, self.config.touchpad.notch_y)
+        } else {
+            (self.config.mouse.notch_x, self.config.mouse.notch_y)
+        };
+        let firm = (follow::firmness(notch_x, touchpad, false), follow::firmness(notch_y, touchpad, true));
+        // A window carried along stays where it is, as one on every desktop.
+        let carried = self.carry_held().then(|| unsafe { GetForegroundWindow() });
+        let mut shots: Vec<(i32, Shot)> = Vec::new();
+        for window in vd::shown_windows(&desktops.current) {
+            let place = if window.desktop.is_empty() || carried == Some(window.hwnd) {
+                Place::Fixed
+            } else {
+                let Some(&(row, col)) = cells.get(window.desktop.as_str()) else { continue };
+                if sideways && self.follows(&window) { Place::Row(row) } else { Place::Cell(row, col) }
+            };
+            let far = match place {
+                Place::Fixed => 0,
+                Place::Row(row) => 2 * row.abs(),
+                Place::Cell(row, col) => 2 * row.abs() + col.abs(),
+            };
+            shots.push((far, Shot { hwnd: window.hwnd, rect: window.rect, place }));
+        }
+        // The nearest within the limit, in their order, bottom first.
+        let mut nearest: Vec<usize> = (0..shots.len()).collect();
+        nearest.sort_by_key(|&at| (shots[at].0, at));
+        let kept: HashSet<usize> = nearest.into_iter().take(glide::MOST_THUMBNAILS).collect();
+        let shots = shots.into_iter().enumerate().filter(|(at, _)| kept.contains(at)).map(|(_, (_, shot))| shot).rev().collect();
+        Some(Scene { hold, rows, cols, firm, shots })
+    }
+
+    /// Hold `hold` began to move: the picture follows it the ways it is set
+    /// to. A hold before it still settling goes where it was settling, now.
+    fn glide_begin(&mut self, hold: u32) {
+        let hand = input::followed();
+        if hand.hold != hold || hand.ways & (input::FOLLOW_X | input::FOLLOW_Y) == 0 || self.board.is_open() {
+            return;
+        }
+        if self.gliding.as_ref().is_some_and(|gliding| gliding.hold == hold) {
+            return;
+        }
+        if let Some(old) = self.gliding.take() {
+            self.glide_finish(old);
+        }
+        let Some(desktops) = self.sync() else { return };
+        let origin = self.heading(&desktops);
+        let Some(scene) = self.glide_scene(&desktops, &origin, hold, hand.ways) else { return };
+        self.glide.begin(scene);
+        self.gliding = Some(Gliding { hold, origin, landing: None, step: None, carry: false });
+    }
+
+    /// A glide still settling, or a step still under way, as a new one
+    /// begins: it goes where it was going, now.
+    fn glide_finish(&mut self, old: Gliding) {
+        if old.landing.is_some() {
+            return;
+        }
+        if let Some(to) = old.step.or_else(|| glide::decided(old.hold)) {
+            self.glide_go(&old.origin, to, old.carry);
+        }
+    }
+
+    /// A step `dir` (a hotkey) with the screen following the hand that way:
+    /// the screen recedes, slides there and comes forward, and Windows goes
+    /// there after (`glide_settled`). Steps upon a step under way go on from
+    /// it. False where the screen does not follow that way, or there is no
+    /// desktop that way to start from.
+    fn glide_step(&mut self, dir: Dir, carry: bool) -> bool {
+        let by = match dir {
+            Dir::Left => (-1, 0),
+            Dir::Right => (1, 0),
+            Dir::Up => (0, -1),
+            Dir::Down => (0, 1),
+        };
+        let mouse = self.config.mouse;
+        if !(if by.0 != 0 { mouse.follow_x } else { mouse.follow_y }) {
+            return false;
+        }
+        if let Some((hold, origin, at)) = self.gliding.as_ref().and_then(|g| Some((g.hold, g.origin.clone(), g.step.filter(|_| g.landing.is_none())?))) {
+            let to = (at.0 + by.0, at.1 + by.1);
+            // At the edge nothing more happens; the step under way goes on.
+            if let Some(id) = self.glide_cell(&origin, to) {
+                if let Some(gliding) = &mut self.gliding {
+                    gliding.step = Some(to);
+                    gliding.carry |= carry;
+                }
+                self.glide.retarget(hold, to);
+                let view = self.view(&id);
+                self.minimap.update(view);
+            }
+            return true;
+        }
+        let Some(desktops) = self.sync() else { return false };
+        let origin = self.heading(&desktops);
+        let (Some(from), Some(id)) = (self.grid.find(&origin), self.glide_cell(&origin, by)) else { return false };
+        if let Some(old) = self.gliding.take() {
+            self.glide_finish(old);
+        }
+        let hold = STEPS.fetch_add(1, Ordering::SeqCst) | 0x8000_0000;
+        let Some(scene) = self.glide_scene(&desktops, &origin, hold, input::FOLLOW_X | input::FOLLOW_Y) else { return false };
+        self.glide.step(scene, by);
+        self.gliding = Some(Gliding { hold, origin, landing: None, step: Some(by), carry });
+        let view = self.view(&id);
+        self.minimap.show(view, Some(from));
+        true
+    }
+
+    /// The app went to `to` in hold `hold` a way the hand is not followed:
+    /// the picture goes on from there.
+    fn glide_moved(&mut self, hold: u32, to: &str) {
+        let Some(ways) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|_| input::followed().ways) else { return };
+        let Some(desktops) = self.sync() else { return };
+        if let Some(scene) = self.glide_scene(&desktops, to, hold, ways) {
+            self.glide.rebase(scene);
+        }
+        if let Some(gliding) = &mut self.gliding {
+            gliding.origin = to.to_owned();
+        }
+    }
+
+    /// Hold `hold` was let go of and settles on `to`: the minimap goes there
+    /// along with the picture.
+    fn glide_target(&mut self, hold: u32, to: (i32, i32)) {
+        let Some(origin) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|gliding| gliding.origin.clone()) else { return };
+        if let Some(id) = self.glide_cell(&origin, to) {
+            let view = self.view(&id);
+            self.minimap.update(view);
+        }
+    }
+
+    /// Goes to the cell `to` from `origin`, as the end of a gesture does.
+    /// The cell when that is another one.
+    fn glide_go(&mut self, origin: &str, to: (i32, i32), carry: bool) -> Option<String> {
+        let id = self.glide_cell(origin, to)?;
+        let desktops = self.sync()?;
+        let heading = self.heading(&desktops);
+        let from = self.grid.find(&heading)?;
+        if id == heading {
+            return None;
+        }
+        debug_log!("app: the picture settled {to:?} from {}", &origin[..4.min(origin.len())]);
+        self.in_gesture = true;
+        self.go(&desktops, from, &id, carry || self.carry_held());
+        self.finish_gesture();
+        self.minimap.hide_after(LINGER_RELEASE_MS);
+        Some(id)
+    }
+
+    /// The picture of hold `hold` settled on `to`: Windows goes there, and
+    /// the picture goes once it is.
+    fn glide_settled(&mut self, hold: u32, to: (i32, i32)) {
+        let Some((origin, carry)) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.carry)) else { return };
+        match self.glide_go(&origin, to, carry) {
+            Some(id) => {
+                if let Some(gliding) = &mut self.gliding {
+                    gliding.landing = Some(id);
+                }
+            }
+            None => {
+                self.glide.arrived(hold);
+                self.gliding = None;
+            }
+        }
+    }
+
+    /// Windows is on `new`: the picture that settled there goes.
+    fn glide_arrived(&mut self, new: &str) {
+        if let Some(gliding) = self.gliding.take() {
+            if gliding.landing.as_deref() == Some(new) {
+                self.glide.arrived(gliding.hold);
+            } else {
+                self.gliding = Some(gliding);
+            }
+        }
+    }
+
     /// The current desktop changed, by us or by Windows' own shortcuts.
     fn desktop_changed(&mut self, new: &str) {
+        self.glide_arrived(new);
         self.usage_cell.suspend();
         debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
         #[cfg(feature = "debug-log")]
@@ -1111,6 +1350,9 @@ impl App {
 
     fn open_board(&mut self) {
         debug_log!("ui: open board sync");
+        if self.gliding.take().is_some() {
+            self.glide.cancel();
+        }
         let Some(desktops) = self.sync() else { return };
         self.forget_gone_windows();
         self.minimap.hide_after(0);
@@ -1722,6 +1964,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             if let Some((on, room)) = on.flatten() {
                 input::slide_shown(hold, stretch, on, Some(room));
             }
+            if message == WM_DRAG {
+                with_app(|app| app.glide_begin(hold));
+            }
             debug_log!("app: slide {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
         }
         WM_ROWS => {
@@ -1763,6 +2008,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             // Not to be lost: the minimap would stay up for good.
             if heard.is_none() {
                 SetTimer(hwnd, RELEASE_TIMER_ID, 50, None);
+            }
+        }
+        WM_GLIDE_TARGET => {
+            with_app(|app| app.glide_target(lparam.0 as u32, glide::target_of(wparam.0)));
+        }
+        WM_GLIDE_SETTLED => {
+            let (hold, to) = (lparam.0 as u32, glide::target_of(wparam.0));
+            // Not to be lost: the picture would wait for nothing.
+            if with_app(|app| app.glide_settled(hold, to)).is_none() {
+                let _ = PostMessageW(hwnd, message, wparam, lparam);
             }
         }
         WM_TIMER if wparam.0 == RELEASE_TIMER_ID => {

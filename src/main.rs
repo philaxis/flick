@@ -5,6 +5,8 @@
 mod debuglog;
 
 mod config;
+#[cfg(any(windows, test))]
+mod follow;
 mod grid;
 mod usage;
 #[cfg(any(windows, test))]
@@ -16,6 +18,8 @@ mod admin;
 mod app;
 #[cfg(windows)]
 mod board;
+#[cfg(windows)]
+mod glide;
 #[cfg(windows)]
 mod guide;
 #[cfg(any(windows, test))]

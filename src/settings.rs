@@ -726,8 +726,8 @@ impl Settings {
 
         let notice = match tab {
             Tab::Mouse => {
-                "Hold the trigger and move the mouse: sideways along a row of desktops, up and down from row to row. \
-                 Notches hold each desktop until the whole distance is moved."
+                "Hold the trigger and move the mouse: sideways along a row, up and down from row to row. \
+                 Following the hand, the screen slides along and the desktop changes on letting go."
             }
             Tab::Touchpad => {
                 p.text("Three-finger touchpad (T)", &fonts.label, &inner(TAB_ROWS.0 + 5.0), white(0.62));

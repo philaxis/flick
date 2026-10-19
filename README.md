@@ -22,7 +22,9 @@
 
 **Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop. By default the desktops go the other way from the fingers, as if pushing the screen like scrolling; the mouse follows the hand.
 
-**Mouse and touchpad each their own way.** Settings has a tab for each, *Mouse* and *Touchpad*. In each you set sideways (along a row) and up and down (to another row) apart: how far to move for one desktop (pixels for the mouse, millimetres for the touchpad) and how firmly each desktop holds until you have moved that far (*Notch*; Off follows the hand evenly). *Reverse direction* turns that hand around. The same settings are under `[mouse]` and `[touchpad]` in config.toml; a config.toml from an earlier version is read as the mouse settings.
+**Mouse and touchpad each their own way.** Settings has a tab for each, *Mouse* and *Touchpad*. In each you set sideways (along a row) and up and down (to another row) apart: how far to move for one desktop (pixels for the mouse, millimetres for the touchpad) and how firmly each desktop holds (*Notch*; Off follows the hand evenly). *Reverse direction* turns that hand around.
+
+**The screen follows the hand.** With *Follows the hand* on (the default, set for each way), the desktops slide along with the mouse or the fingers as on a Mac, the next ones coming into view, and the desktop changes once, when you let go: to the nearest one, or on to where a quick flick carries it. Windows pinned to every shelf stay put, and windows pinned to a shelf stay put sideways. Turned off, each desktop is gone to at once as the hand reaches it. The same settings are under `[mouse]` and `[touchpad]` in config.toml; a config.toml from an earlier version is read as the mouse settings.
 
 ## Get started
 

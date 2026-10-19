@@ -28,10 +28,10 @@ use windows::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::{
-                EnumWindows, FindWindowExW, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
+                EnumWindows, FindWindowExW, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
                 IsIconic, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
-                ShowWindow, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+                ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
                 SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SMTO_ABORTIFHUNG, WINDOWPLACEMENT, WM_CLOSE, WM_NULL,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
@@ -368,6 +368,42 @@ pub fn windows(current: &str) -> Vec<WindowInfo> {
             // On the desktop being shown nothing is hidden by the shell, so a
             // cloaked window there is a suspended store app, not a real window.
             if desktop == current && cloaked(hwnd) {
+                return None;
+            }
+            Some(describe(hwnd, desktop))
+        })
+        .collect()
+}
+
+/// What each desktop shows, topmost first, for a picture of it: the app
+/// windows and the windows they own (dialogs), not minimized, each with the
+/// desktop it is on (empty for one shown on all). On the desktop being shown
+/// a cloaked one is left out (`windows`).
+pub fn shown_windows(current: &str) -> Vec<WindowInfo> {
+    unsafe extern "system" fn each(hwnd: HWND, out: LPARAM) -> BOOL {
+        (*(out.0 as *mut Vec<HWND>)).push(hwnd);
+        TRUE
+    }
+    let mut all: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut all as *mut _ as isize));
+    }
+    all.into_iter()
+        .filter_map(|hwnd| unsafe {
+            if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+                return None;
+            }
+            let root = GetAncestor(hwnd, GA_ROOTOWNER);
+            let root = if root.0 == 0 { hwnd } else { root };
+            if !is_app_window(root) || (root == hwnd && is_shell_surface(hwnd)) {
+                return None;
+            }
+            let desktop = if pinned_everywhere(root) {
+                String::new()
+            } else {
+                vdapi::get_desktop_by_window(hwnd).or_else(|_| vdapi::get_desktop_by_window(root)).ok()?.id()
+            };
+            if (desktop.is_empty() || desktop == current) && cloaked(hwnd) {
                 return None;
             }
             Some(describe(hwnd, desktop))

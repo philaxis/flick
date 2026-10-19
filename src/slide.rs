@@ -58,6 +58,11 @@ impl Slide {
         notch::position(progress, self.notch as f32 / 100.0)
     }
 
+    /// How firm its notches are (`Config::mouse.notch_x` and the like).
+    pub fn notch(&self) -> u32 {
+        self.notch
+    }
+
     /// Unmapped counts, for selection, carrying travel and showing a drag.
     pub fn raw_rest(&self, step: i32) -> i32 {
         self.x - self.cell * step
@@ -177,6 +182,11 @@ impl Detent {
     pub fn display(&self, progress: f32) -> f32 {
         // Keep the old lean-and-snap range; only the approach within it bends.
         notch::position(progress, self.notch as f32 / FIRMEST as f32) * self.most()
+    }
+
+    /// How firm its notches are (`Detent::firm`).
+    pub fn notch(&self) -> u32 {
+        self.notch
     }
 
     pub fn set_room(&mut self, up: i32, down: i32) {

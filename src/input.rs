@@ -141,6 +141,18 @@ static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
 /// The board is open: a hold begun now goes from row to row as the hand
 /// goes, not by notches (`Plane::linear`), as it does with none set.
 static BOARD_OPEN: AtomicBool = AtomicBool::new(false);
+/// The ways the screen follows the hand in the hold going on (`FOLLOW_X`,
+/// `FOLLOW_Y`, and `FOLLOW_TOUCHPAD` when three fingers began it). Those
+/// ways come to no cell while held: the app is told nothing of them, and
+/// reads where the hand is instead (`followed`).
+static FOLLOWING: AtomicU32 = AtomicU32::new(0);
+pub const FOLLOW_X: u32 = 1;
+pub const FOLLOW_Y: u32 = 2;
+pub const FOLLOW_TOUCHPAD: u32 = 4;
+/// How far the hand went those ways in the hold, in thousandths of a cell
+/// (of a row up and down), kept once it is let go of.
+static FOLLOWED_X: AtomicI32 = AtomicI32::new(0);
+static FOLLOWED_Y: AtomicI32 = AtomicI32::new(0);
 
 /// The app says when the board opens and closes.
 pub fn set_board_open(open: bool) {
@@ -222,6 +234,39 @@ pub struct Hand {
     /// new hold or stretch, the app getting to a cell or a row): they may
     /// jump then, with the hand itself still.
     pub counted_from: u64,
+}
+
+/// Where the hand is in a hold followed by the screen (`FOLLOWING`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Followed {
+    pub hold: u32,
+    pub holding: bool,
+    /// `FOLLOW_X` and the like.
+    pub ways: u32,
+    /// Cells rightwards and rows downwards from where the hold began.
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Where the hand is, or was let go of, in the last hold.
+pub fn followed() -> Followed {
+    loop {
+        let before = WRITING.load(Ordering::SeqCst);
+        if before % 2 == 1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let followed = Followed {
+            hold: HOLD_ID.load(Ordering::SeqCst),
+            holding: HOLDING.load(Ordering::SeqCst),
+            ways: FOLLOWING.load(Ordering::SeqCst),
+            x: FOLLOWED_X.load(Ordering::SeqCst) as f64 / 1000.0,
+            y: FOLLOWED_Y.load(Ordering::SeqCst) as f64 / 1000.0,
+        };
+        if WRITING.load(Ordering::SeqCst) == before {
+            return followed;
+        }
+    }
 }
 
 /// A hold of the trigger is going on.
@@ -382,6 +427,10 @@ struct Settings {
     mouse_notch_y: u32,
     touchpad_notch_x: u32,
     touchpad_notch_y: u32,
+    /// The ways the screen follows the hand on each (`Config::mouse.follow_x`
+    /// and the like, as `FOLLOW_X | FOLLOW_Y`).
+    mouse_follow: u32,
+    touchpad_follow: u32,
 }
 
 impl Settings {
@@ -496,6 +545,9 @@ thread_local! {
     /// Where the hand is up and down in this hold, and along the row in this
     /// stretch of it.
     static PLANE: Cell<Plane> = const { Cell::new(Plane::new()) };
+    /// How far the hand went the ways the screen follows in this hold: in
+    /// counts, and on the touchpad, towards the next step (`touchpad_lean`).
+    static FOLLOWED: Cell<((i64, i64), (f64, f64))> = const { Cell::new(((0, 0), (0.0, 0.0))) };
     /// The hook thread's hidden window, which receives raw mouse input.
     static RAW_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Last position reported by an absolute pointer (remote desktop, pen).
@@ -543,6 +595,8 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         mouse_notch_y: config.mouse.notch_y,
         touchpad_notch_x: config.touchpad.notch_x,
         touchpad_notch_y: config.touchpad.notch_y,
+        mouse_follow: ways(config.mouse.follow_x, config.mouse.follow_y),
+        touchpad_follow: ways(config.touchpad.follow_x, config.touchpad.follow_y),
     });
     crate::touchpad::set_step_mm(config.touchpad.step_x, config.touchpad.step_y);
     match THREAD.load(Ordering::SeqCst) {
@@ -553,6 +607,10 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
             let _ = PostThreadMessageW(thread, WM_RELOAD, WPARAM(0), LPARAM(0));
         },
     }
+}
+
+fn ways(x: bool, y: bool) -> u32 {
+    (if x { FOLLOW_X } else { 0 }) | (if y { FOLLOW_Y } else { 0 })
 }
 
 /// The PC woke from sleep.
@@ -717,18 +775,26 @@ fn press(source: Source) {
             FRACTION.store(0, Ordering::SeqCst);
             ROW_ASKED.store(0, Ordering::SeqCst);
             ROW_FRACTION.store(0, Ordering::SeqCst);
+            FOLLOWED_X.store(0, Ordering::SeqCst);
+            FOLLOWED_Y.store(0, Ordering::SeqCst);
         });
+        FOLLOWED.set(((0, 0), (0.0, 0.0)));
         // Up and down by the notches of the hand that began the hold, the
-        // mouse's for a button or key; on the board after the hand.
-        let notch = SETTINGS.with(|slot| {
-            let s = slot.try_borrow().ok()?;
-            let s = s.as_ref()?;
-            Some(if source == Source::Touchpad {
-                (s.touchpad_notch_x, s.touchpad_notch_y.saturating_mul(crate::slide::notch::TOUCHPAD_VERTICAL_SCALE))
-            } else {
-                (s.mouse_notch_x, s.mouse_notch_y)
+        // mouse's for a button or key; on the board after the hand. The
+        // screen follows it the ways set for that hand, never on the board.
+        let (notch, follow) = SETTINGS
+            .with(|slot| {
+                let s = slot.try_borrow().ok()?;
+                let s = s.as_ref()?;
+                Some(if source == Source::Touchpad {
+                    ((s.touchpad_notch_x, s.touchpad_notch_y.saturating_mul(crate::slide::notch::TOUCHPAD_VERTICAL_SCALE)), s.touchpad_follow | FOLLOW_TOUCHPAD)
+                } else {
+                    ((s.mouse_notch_x, s.mouse_notch_y), s.mouse_follow)
+                })
             })
-        });
+            .unzip();
+        let follow = follow.filter(|ways| ways & (FOLLOW_X | FOLLOW_Y) != 0 && !BOARD_OPEN.load(Ordering::SeqCst));
+        FOLLOWING.store(follow.unwrap_or(0), Ordering::SeqCst);
         let (notch_x, notch_y) = notch.unwrap_or((crate::slide::notch::DEFAULT_X, crate::slide::FIRMEST));
         PLANE.set(Plane::configured(notch_x, notch_y, BOARD_OPEN.load(Ordering::SeqCst)));
         DRAGGING.set(false);
@@ -1098,6 +1164,9 @@ fn touchpad_event(event: crate::touchpad::Event) {
 /// Between touchpad steps the minimap leans as far as `Rails` gathered towards the next one,
 /// never past the end of a row or the first or last row.
 fn touchpad_lean(s: &Settings, (x, y): (f64, f64)) {
+    // The screen following the hand gives a little past the ends itself.
+    let (counts, _) = FOLLOWED.get();
+    FOLLOWED.set((counts, (x, y)));
     let plane = PLANE.get();
     let at_wall = |p: f64, cell: i32, (before, after): (i32, i32)| (p < 0.0 && cell <= -before) || (p > 0.0 && cell >= after);
     let x = match shown() {
@@ -1113,6 +1182,7 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64)) {
     writing(|| {
         FRACTION.store((along * 1000.0) as i32, Ordering::SeqCst);
         ROW_FRACTION.store((lean * 1000.0) as i32, Ordering::SeqCst);
+        store_followed(s);
     });
     if !DRAGGING.get() && (x.abs() * s.step_x as f64 >= DRAG_SHOWS as f64 || y.abs() * s.step_y as f64 >= DRAG_SHOWS as f64) {
         DRAGGING.set(true);
@@ -1153,10 +1223,18 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
 /// through every cell it passed. Coming to another row begins a new stretch
 /// along the row, from the cell the app lands on there, with what the hand
 /// went towards the next cell kept.
+///
+/// The ways the screen follows the hand (`FOLLOWING`) come to no cell: their
+/// travel is only kept, for the app to read (`followed`).
 fn advance(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
+    let following = FOLLOWING.load(Ordering::SeqCst);
+    let ((mut fx, mut fy), lean) = FOLLOWED.get();
+    let dx = if following & FOLLOW_X != 0 { fx += dx as i64; 0 } else { dx };
+    let dy = if following & FOLLOW_Y != 0 { fy += dy as i64; 0 } else { dy };
+    FOLLOWED.set(((fx, fy), lean));
     let (step, step_y) = (s.step_x, s.step_y);
     let mut plane = PLANE.get();
     if let Some((_, (up, down))) = rows_seen() {
@@ -1177,6 +1255,7 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
         ROW_FRACTION.store((rows.lean(step_y) * 1000.0) as i32, Ordering::SeqCst);
         ASKED.store(cols.cell(), Ordering::SeqCst);
         FRACTION.store(cols.rest(step) * 1000 / step, Ordering::SeqCst);
+        store_followed(s);
     });
     let stretch = STRETCH.load(Ordering::SeqCst);
     if moved.row {
@@ -1191,11 +1270,37 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
         debug_log!("slide: cell {} of stretch {stretch}", cols.cell());
         post(s, WM_SLIDE, slide_wparam(stretch, cols.cell()));
     }
-    if !DRAGGING.get() && (STEPPED.get() || cols.raw_rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS) {
+    let far = |counts: i64| counts.abs() >= DRAG_SHOWS as i64;
+    if !DRAGGING.get() && (STEPPED.get() || cols.raw_rest(step).abs() >= DRAG_SHOWS || rows.gathered(step_y).abs() >= DRAG_SHOWS || far(fx) || far(fy)) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(stretch, 0));
     }
     debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.raw_rest(step), rows.gathered(step_y));
+}
+
+/// Writes how far the hand went the ways the screen follows, and the
+/// minimap leaning as far those ways (cells not come to and the way to the
+/// next alike). Within `writing`.
+fn store_followed(s: &Settings) {
+    let following = FOLLOWING.load(Ordering::SeqCst);
+    let ((x, y), (lean_x, lean_y)) = FOLLOWED.get();
+    let cells = |counts: i64, step: i32, lean: f64| counts as f32 / step.max(1) as f32 + lean as f32;
+    // The minimap held back at each cell as the picture is (`follow::notched`).
+    let plane = PLANE.get();
+    if following & FOLLOW_X != 0 {
+        let x = cells(x, s.step_x, lean_x);
+        FOLLOWED_X.store((x * 1000.0) as i32, Ordering::SeqCst);
+        FRACTION.store((plane.cols.display(x) * 1000.0) as i32, Ordering::SeqCst);
+    }
+    if following & FOLLOW_Y != 0 {
+        let y = cells(y, s.step_y, lean_y);
+        FOLLOWED_Y.store((y * 1000.0) as i32, Ordering::SeqCst);
+        let notch = match plane.rows {
+            crate::slide::Rows::Notched(detent) => detent.notch(),
+            crate::slide::Rows::Linear(slide) => slide.notch(),
+        };
+        ROW_FRACTION.store((crate::slide::notch::position(y, notch as f32 / crate::slide::FIRMEST as f32) * 1000.0) as i32, Ordering::SeqCst);
+    }
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.
@@ -1453,7 +1558,7 @@ mod tests {
 
     #[test]
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
-        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true, mouse_notch_x: 40, mouse_notch_y: 100, touchpad_notch_x: 40, touchpad_notch_y: 100 };
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true, mouse_notch_x: 40, mouse_notch_y: 100, touchpad_notch_x: 40, touchpad_notch_y: 100, mouse_follow: 0, touchpad_follow: 0 };
         let info = MSLLHOOKSTRUCT::default();
         TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });
