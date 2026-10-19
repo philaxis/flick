@@ -2,7 +2,7 @@
 //! Shared thumbnails use dwmapi ordinal 147; keep the public path as fallback.
 use std::{cell::RefCell, collections::HashMap, ffi::c_void};
 use windows::{core::{w, ComInterface, Interface, PCSTR, HRESULT, Result, Error}, Foundation::Numerics::Matrix3x2, Win32::{
-    Foundation::{HWND, HMODULE, POINT, RECT, E_FAIL},
+    Foundation::{HWND, HMODULE, POINT, RECT, SIZE, E_FAIL},
     Graphics::{Direct3D::D3D_DRIVER_TYPE_HARDWARE, Direct3D11::*, DirectComposition::*, Direct2D::{*, Common::*}, Dwm::*, Dxgi::{*, Common::*}},
     System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
 }};
@@ -12,6 +12,7 @@ struct Thumbnail {
     visual: IDCompositionVisual2,
     opacity: IDCompositionEffectGroup,
     host: isize,
+    size: SIZE,
 }
 struct Scene {
     device: IDCompositionDesktopDevice,
@@ -91,12 +92,18 @@ unsafe fn register_inner(destination: HWND, source: HWND) -> Result<isize> {
         opacity.SetOpacity2(0.0)?;visual.SetEffect(&opacity)?;
         visual.SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR)?;
         scene.root.AddVisual(&visual,true,None)?;
-        scenes.thumbs.insert(id,Thumbnail {visual,opacity,host:destination.0});
+        scenes.thumbs.insert(id,Thumbnail {visual,opacity,host:destination.0,size});
         Ok(id)
     });
     match result {
         Ok(id)=>{DwmUnregisterThumbnail(legacy)?;Ok(id)}
         Err(e)=>{crate::app::log(&format!("composition thumbnail fallback: {e}"));Ok(legacy)}
+    }
+}
+
+pub unsafe fn source_size(id: isize) -> Result<SIZE> {
+    match SCENES.with(|s|s.borrow().thumbs.get(&id).map(|t|t.size)) {
+        Some(size)=>Ok(size),None=>DwmQueryThumbnailSourceSize(id)
     }
 }
 
@@ -138,7 +145,7 @@ pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4])
     let updated=SCENES.with(|scenes| -> Result<bool> {
         let scenes=scenes.borrow();
         let Some(thumb)=scenes.thumbs.get(&id) else {return Ok(false)};
-        let source=if props.dwFlags&DWM_TNP_RECTSOURCE!=0 {props.rcSource} else {let s=DwmQueryThumbnailSourceSize(id)?;RECT {left:0,top:0,right:s.cx,bottom:s.cy}};
+        let source=if props.dwFlags&DWM_TNP_RECTSOURCE!=0 {props.rcSource} else {let s=thumb.size;RECT {left:0,top:0,right:s.cx,bottom:s.cy}};
         let visible=props.fVisible.as_bool() && source.right>source.left && source.bottom>source.top && dest[2]>dest[0] && dest[3]>dest[1];
         thumb.opacity.SetOpacity2(if visible {props.opacity as f32/255.0} else {0.0})?;
         if visible {

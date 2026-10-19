@@ -46,7 +46,7 @@ use windows::{
                 DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             },
             Dwm::{
-                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmRegisterThumbnail,
                 DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
@@ -2078,7 +2078,7 @@ impl Board {
                 return *size;
             }
         }
-        let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().map(|s| {
+        let size = unsafe { crate::composition::source_size(thumb) }.ok().map(|s| {
             let mut outer = RECT::default();
             let mut visible = RECT::default();
             let queried = (s.cx.max(1) as f32, s.cy.max(1) as f32);

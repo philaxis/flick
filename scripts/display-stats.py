@@ -35,7 +35,7 @@ def report(folder):
     meta = json.loads((folder / 'display-meta.json').read_text())
     frequency, period = meta['frequency'], meta['refresh_ticks']
     print(f"Refresh: {frequency / period:.4f} Hz. Composed pixels, not a photodiode or physical panel scanout.")
-    print('|scenario|updates|capture losses|pixel repeats / pairs|no-update refreshes|step CV %|first response ms|input step CV %|marker error p95 px|max adjacent step px|post-dead-zone onset ms|input interval p95 ms|')
+    print('|scenario|updates|capture losses|pixel repeats / pairs|no-update refreshes|abs step CV %|first response ms|input abs step CV %|marker error p95 px|max adjacent step px|post-dead-zone onset ms|input interval p95 ms|')
     print('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     data = []
     for path in sorted(folder.glob('*-display.csv')):
@@ -49,6 +49,13 @@ def report(folder):
         eligible=next((int(r['qpc']) for r in inputs if abs(float(r['hand_cells']))>dead),end)
         intervals=[(b-a)*1000/frequency for a,b in zip(times,times[1:])]
         cadence_p95=sorted(intervals)[int(len(intervals)*.95)] if intervals else math.nan
+        # Sample actual quantized reports at every refresh, including unchanged desktop frames.
+        quantum=1200 if '-ptp-' in label else 1000
+        uniform=[]
+        for t in range(start,end,int(period)):
+            i=max(0,bisect.bisect_right(times,t)-1)
+            uniform.append(round(float(inputs[i]['hand_cells'])*quantum)/quantum)
+        input_cv=cv([abs(b-a) for a,b in zip(uniform,uniform[1:])])
         active = [r for r in frames if start <= int(r['qpc']) <= end]
         losses = sum(max(0, int(r['accumulated']) - 1) for r in active)
         repeats = gaps = 0
@@ -65,8 +72,7 @@ def report(folder):
             raw_steps.append(hand)
             # Prefer the largest fully visible patch common to both frames.
             candidates = [(min(int(a[c+'_n']), int(b[c+'_n'])), c) for c in COLORS
-                          if pos(a,c) is not None and pos(b,c) is not None
-]
+                          if pos(a,c) is not None and pos(b,c) is not None]
             if not candidates:
                 continue
             c = max(candidates)[1]
@@ -84,13 +90,19 @@ def report(folder):
             changed = next((r for r in active if pos(r,'magenta') is not None and abs(pos(r,'magenta')-base) >= 1), None)
             if changed:
                 first = (int(changed['qpc'])-start)*1000/frequency
+        settling=[r for r in frames if end<int(r['qpc'])<=end+frequency*0.8]
+        settle_steps=[]
+        for a,b in zip(settling,settling[1:]):
+            if int(b['accumulated'])>1 or abs((int(b['qpc'])-int(a['qpc']))/period-1)>0.25: continue
+            for c in COLORS:
+                if pos(a,c) is not None and pos(b,c) is not None: settle_steps.append(abs(pos(b,c)-pos(a,c)))
         p95 = sorted(marker_errors)[int(len(marker_errors)*.95)] if marker_errors else math.nan
         line = dict(scenario=label, updates=len(active), capture_losses=losses, repeat_pairs=repeats, pairs=len(changes), no_update_refreshes=gaps,
-                    step_cv=cv(changes), first_response_ms=first, input_step_cv=cv(raw_steps), marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95)
+                    step_cv=cv(list(map(abs,changes))), first_response_ms=first, input_step_cv=input_cv, marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95, settling_max_step_px=max(settle_steps,default=0))
         data.append(line)
         first_text = f'{first:.1f}' if first is not None else 'missing'
         onset=f'{line["eligible_response_ms"]:.1f}' if first is not None else 'missing'
-        print(f'|{label}|{len(active)}|{losses}|{repeats}/{len(changes)}|{gaps}|{cv(changes):.1f}|{first_text}|{cv(raw_steps):.1f}|{p95:.2f}|{line["max_step_px"]:.1f}|{onset}|{cadence_p95:.2f}|')
+        print(f'|{label}|{len(active)}|{losses}|{repeats}/{len(changes)}|{gaps}|{line["step_cv"]:.1f}|{first_text}|{input_cv:.1f}|{p95:.2f}|{line["max_step_px"]:.1f}|{onset}|{cadence_p95:.2f}|')
     (folder / 'display-summary.json').write_text(json.dumps(data, indent=2))
     print('CV includes intentional F-curve latching and reversal; it is not residual judder. First response is motion onset, not steady-state latency.')
     return data

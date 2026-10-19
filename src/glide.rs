@@ -257,7 +257,7 @@ impl Thumb {
         // source's, which can be a pixel off the frame's.
         let size = match source {
             Some(source) => (source.right - source.left, source.bottom - source.top),
-            None => match unsafe { DwmQueryThumbnailSourceSize(id) } {
+            None => match unsafe { crate::composition::source_size(id) } {
                 Ok(size) => (size.cx, size.cy),
                 Err(_) => {
                     unsafe {
