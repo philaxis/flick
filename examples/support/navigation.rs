@@ -35,6 +35,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 }
             }
         }
+        "pacing" => unsafe { super::drive_pacing::run(out, flick.unwrap()); },
         "run" | "motion" | "geometry" => unsafe {
             let geometry = mode == "geometry";
             let motion = mode != "run";

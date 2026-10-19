@@ -25,6 +25,10 @@ mod vdapi;
 mod drive_navigation;
 
 #[cfg(windows)]
+#[path = "support/pacing.rs"]
+mod drive_pacing;
+
+#[cfg(windows)]
 fn main() {
     use windows::{
         core::w,
