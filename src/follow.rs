@@ -1,7 +1,6 @@
 //! Variant F on the desktop grid; the same springs drive the board and minimap.
 use crate::transition_curve::{Latch, Spring};
 pub const GAP: f64 = 0.07;
-pub const GLOW: f64 = 0.55;
 pub const DIM: f64 = 0.55;
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
 pub fn scale(depth: f64) -> f64 { 1.0 - 0.5 * depth.clamp(0.0, 1.0) }

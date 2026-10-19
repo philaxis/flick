@@ -12,9 +12,9 @@
 //!
 //! Only the row the hand is on goes sideways (`Follow::offset`). The desktop
 //! in the middle stands out: the others are darkened by thumbnails of a
-//! black window over them and it has a thin edge of thumbnails of a white
-//! one (`follow::standing_out`). Above the picture the name of the row is
-//! shown while receded, in a small window of its own (`Banner`).
+//! black window over them (`follow::standing_out`). Above the picture the
+//! name of the row is shown while receded, in a small window of its own
+//! (`Banner`).
 //!
 //! With `FLICK_TRACE` set to a file, each frame is written to it as a line
 //! of CSV (`Trace`), kept in memory until the picture goes.
@@ -88,9 +88,6 @@ const WINDOW_CLASS: PCWSTR = w!("flick.glide");
 const WHITE_CLASS: PCWSTR = w!("flick.glide.white");
 /// Desktops in sight at once, at most: three each way with the screen receded.
 const WALLS: usize = 9;
-/// Desktops with an edge of light at once, at most: the four the middle of
-/// the screen is between.
-const LIT: usize = 4;
 /// The name of the row above the picture: its window's size and its place
 /// below the top of the screen, unscaled, and the size of its letters.
 const BANNER: (f32, f32) = (560.0, 30.0);
@@ -329,18 +326,16 @@ impl Drop for Screen {
 }
 
 /// What darkens the desktops not in the middle of a screen (thumbnails of
-/// a black window) and lights the edge of the one in the middle (of a white
-/// one, four to a desktop), above the desktops' windows and below the ones
-/// going along their row or shown on every desktop.
+/// a black window), above the desktops' windows and below the ones going
+/// along their row or shown on every desktop.
 #[derive(Default)]
 struct Veil {
     shades: Vec<Thumb>,
-    edges: Vec<Thumb>,
 }
 
-/// One opaque source bitmap: black on the left, white on the right.
-/// Keeping both swatches in one surface also avoids DWM dropping an entirely
-/// black, off-screen surface as empty.
+/// One opaque source bitmap: black on the left, white on the right. The
+/// white half keeps the off-screen surface from being entirely black, which
+/// DWM would drop as empty.
 struct Paints { hwnd: HWND }
 
 impl Paints {
@@ -610,7 +605,6 @@ impl Session {
         thumbs.extend(self.shots.into_iter().map(|(thumb, ..)| thumb));
         for veil in self.veils {
             thumbs.extend(veil.shades);
-            thumbs.extend(veil.edges);
         }
         (self.screens, thumbs)
     }
@@ -928,7 +922,6 @@ impl View {
                 let at = (screen.area.left, screen.area.top);
                 Veil {
                     shades: (0..WALLS).filter_map(|_| Thumb::new(screen, paints.hwnd, at, Some(RECT { left: 0, top: 0, right: 16, bottom: 16 }))).collect(),
-                    edges: (0..LIT * 4).filter_map(|_| Thumb::new(screen, paints.hwnd, at, Some(RECT { left: 16, top: 0, right: 32, bottom: 16 }))).collect(),
                 }
             })
             .collect()
@@ -1233,7 +1226,6 @@ fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
 /// up and down), and how it stands out (`follow::standing_out`).
 struct Desk {
     apart: (f64, f64),
-    emphasis: f64,
     lift: f64,
     dark: f64,
 }
@@ -1254,9 +1246,8 @@ fn in_sight(follow: &Follow, strip: &Strip, focus: &follow::Focus) -> Vec<Desk> 
         for col in near(along) {
             if exists(row, col) {
                 let apart = (col as f64 - along, row as f64 - strip.y);
-                let emphasis = focus.at(col, row);
-                let (lift, dark) = follow::standing_out(emphasis, strip.receded);
-                sight.push(Desk { apart, emphasis, lift, dark });
+                let (lift, dark) = follow::standing_out(focus.at(col, row), strip.receded);
+                sight.push(Desk { apart, lift, dark });
             }
         }
     }
@@ -1280,9 +1271,8 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
     for (index, screen) in session.screens.iter_mut().enumerate() {
         let size = (screen.area.right - screen.area.left, screen.area.bottom - screen.area.top);
         let whole = (size.0 as f64, size.1 as f64);
-        let edge = (2.0 * screen.scale as f64).round().max(1.0);
         let veil = session.veils.get_mut(index).unwrap_or(&mut empty);
-        let (mut walls, mut shades, mut edges) = (screen.walls.iter_mut(), veil.shades.iter_mut(), veil.edges.iter_mut());
+        let (mut walls, mut shades) = (screen.walls.iter_mut(), veil.shades.iter_mut());
         for desk in &sight {
             let at = follow::placed([0.0, 0.0, whole.0, whole.1], whole, scale, desk.apart, desk.lift);
             let inside = at[2] > 0.0 && at[3] > 0.0 && at[0] < whole.0 && at[1] < whole.1;
@@ -1297,18 +1287,8 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
                     moved += shade.draw(Some(at), size, opacity(desk.dark)) as u32;
                 }
             }
-            let glow = follow::GLOW * desk.emphasis * strip.receded;
-            if glow > 0.01 {
-                let [l, t, r, b] = at;
-                let lines = [[l - edge, t - edge, r + edge, t], [l - edge, b, r + edge, b + edge], [l - edge, t, l, b], [r, t, r + edge, b]];
-                for line in lines {
-                    if let Some(light) = edges.next() {
-                        moved += light.draw(Some(line), size, opacity(glow)) as u32;
-                    }
-                }
-            }
         }
-        for thumb in walls.chain(shades).chain(edges) {
+        for thumb in walls.chain(shades) {
             moved += thumb.draw(None, size, 0) as u32;
         }
     }
