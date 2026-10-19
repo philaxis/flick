@@ -2,16 +2,17 @@
 //! the settings window. All draw into a memory bitmap, which is then handed to
 //! their window.
 
-use std::{cell::{Cell, RefCell}, collections::HashMap, ffi::c_void};
+use std::{cell::{Cell, OnceCell, RefCell}, collections::HashMap, ffi::c_void};
 use windows::{
     core::{w, ComInterface, Interface, Result},
     Win32::{
         Foundation::RECT,
         Graphics::{
             Direct2D::{
-                Common::{D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F},
-                D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget,
-                ID2D1SolidColorBrush, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                Common::{D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U},
+                D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1LinearGradientBrush, ID2D1RenderTarget,
+                ID2D1SolidColorBrush, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_GRADIENT_STOP, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
                 D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
@@ -237,12 +238,14 @@ pub struct Painter<'a> {
     pub target: &'a ID2D1RenderTarget,
     brush: ID2D1SolidColorBrush,
     text_cache: Option<&'a TextCache>,
+    /// White fading to nothing, for the light falling on a surface from above.
+    sheen: OnceCell<Option<ID2D1LinearGradientBrush>>,
 }
 
 impl<'a> Painter<'a> {
     pub fn new(target: &'a ID2D1RenderTarget) -> Result<Painter<'a>> {
         let brush = unsafe { target.CreateSolidColorBrush(&white(1.0), None)? };
-        Ok(Painter { target, brush, text_cache: None })
+        Ok(Painter { target, brush, text_cache: None, sheen: OnceCell::new() })
     }
 
     pub fn cached(target: &'a ID2D1RenderTarget, text_cache: &'a TextCache) -> Result<Self> {
@@ -320,6 +323,139 @@ impl<'a> Painter<'a> {
             self.target.DrawBitmap(bitmap, Some(area), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
     }
+
+    /// Light from above on a rounded surface: `top` of white at its top
+    /// edge, nothing by its bottom.
+    pub fn sheen(&self, area: &Rect, radius: f32, top: f32) {
+        let brush = self.sheen.get_or_init(|| unsafe {
+            let stops = [
+                D2D1_GRADIENT_STOP { position: 0.0, color: white(1.0) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: white(0.0) },
+            ];
+            let stops = self.target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP).ok()?;
+            let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: D2D_POINT_2F { x: 0.0, y: 0.0 }, endPoint: D2D_POINT_2F { x: 0.0, y: 1.0 } };
+            self.target.CreateLinearGradientBrush(&line, None, &stops).ok()
+        });
+        let Some(brush) = brush else { return };
+        unsafe {
+            brush.SetStartPoint(D2D_POINT_2F { x: area.left, y: area.top });
+            brush.SetEndPoint(D2D_POINT_2F { x: area.left, y: area.bottom });
+            brush.SetOpacity(top);
+            self.target.FillRoundedRectangle(&rounded(area, radius), brush);
+        }
+    }
+
+    /// A line of `colour` in its middle, fading out towards both ends.
+    pub fn fading_line(&self, from: (f32, f32), to: (f32, f32), width: f32, colour: D2D1_COLOR_F) {
+        let clear = D2D1_COLOR_F { a: 0.0, ..colour };
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: clear },
+            D2D1_GRADIENT_STOP { position: 0.5, color: colour },
+            D2D1_GRADIENT_STOP { position: 1.0, color: clear },
+        ];
+        let point = |(x, y): (f32, f32)| D2D_POINT_2F { x, y };
+        unsafe {
+            let Ok(stops) = self.target.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else { return };
+            let line = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: point(from), endPoint: point(to) };
+            if let Ok(brush) = self.target.CreateLinearGradientBrush(&line, None, &stops) {
+                self.target.DrawLine(point(from), point(to), &brush, width, None);
+            }
+        }
+    }
+
+    /// A soft shadow or glow (`Glow`) cast by a rounded rectangle at
+    /// `area`: `corner` is how large each of its corners is drawn, which
+    /// sets how far it spreads and how round it is.
+    pub fn glow(&self, glow: &Glow, area: &Rect, corner: f32, opacity: f32) {
+        if opacity <= 0.0 || corner <= 0.0 {
+            return;
+        }
+        let spread = corner * Glow::INSET / Glow::CORNER;
+        let d = Rect { left: area.left - spread, top: area.top - spread, right: area.right + spread, bottom: area.bottom + spread };
+        // Not narrower than its two corners.
+        let k = corner.min((d.right - d.left) / 2.0).min((d.bottom - d.top) / 2.0);
+        let (c, n) = (Glow::CORNER, Glow::SIZE as f32);
+        let xs = [(d.left, d.left + k, 0.0, c), (d.left + k, d.right - k, c, n - c), (d.right - k, d.right, n - c, n)];
+        let ys = [(d.top, d.top + k, 0.0, c), (d.top + k, d.bottom - k, c, n - c), (d.bottom - k, d.bottom, n - c, n)];
+        for (top, bottom, sy0, sy1) in ys {
+            for (left, right, sx0, sx1) in xs {
+                if right - left < 0.01 || bottom - top < 0.01 {
+                    continue;
+                }
+                let dest = Rect { left, top, right, bottom };
+                let source = Rect { left: sx0, top: sy0, right: sx1, bottom: sy1 };
+                unsafe {
+                    self.target.DrawBitmap(&glow.0, Some(&dest), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&source));
+                }
+            }
+        }
+    }
+}
+
+/// A blurred rounded square of one colour, drawn stretched in nine parts
+/// (`Painter::glow`) under whatever casts it: made once for each target.
+pub struct Glow(ID2D1Bitmap);
+
+impl Glow {
+    /// Radius of the square's corners and of the blur, in its pixels.
+    const RADIUS: f32 = 14.0;
+    const BLUR: f32 = 10.0;
+    /// How far in from the bitmap's edge the square is.
+    const INSET: f32 = 3.0 * Self::BLUR;
+    /// The corner parts, out to the edge.
+    const CORNER: f32 = Self::INSET + Self::RADIUS;
+    const SIZE: usize = 2 * Self::CORNER as usize + 2;
+
+    pub fn new(target: &ID2D1RenderTarget, colour: D2D1_COLOR_F) -> Option<Glow> {
+        let n = Self::SIZE;
+        let mask = glow_mask(n, Self::INSET, Self::RADIUS, Self::BLUR);
+        let mut pixels = vec![0u8; n * n * 4];
+        for (pixel, a) in pixels.chunks_exact_mut(4).zip(mask) {
+            let a = a * colour.a;
+            pixel.copy_from_slice(&[(colour.b * a * 255.0) as u8, (colour.g * a * 255.0) as u8, (colour.r * a * 255.0) as u8, (a * 255.0) as u8]);
+        }
+        let properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let size = D2D_SIZE_U { width: n as u32, height: n as u32 };
+        unsafe { target.CreateBitmap(size, Some(pixels.as_ptr().cast()), (n * 4) as u32, &properties).ok().map(Glow) }
+    }
+}
+
+/// How much of each pixel of an `n` by `n` square is covered by a
+/// rounded square `inset` from its edges, blurred by `blur` (a Gaussian's
+/// deviation), row by row.
+fn glow_mask(n: usize, inset: f32, radius: f32, blur: f32) -> Vec<f32> {
+    let inside = |x: f32, y: f32| {
+        let (lo, hi) = (inset + radius, n as f32 - inset - radius);
+        let (dx, dy) = ((lo - x).max(x - hi).max(0.0), (lo - y).max(y - hi).max(0.0));
+        let edge = inset.max(0.0);
+        let within = x >= edge && x <= n as f32 - edge && y >= edge && y <= n as f32 - edge;
+        if within && dx.hypot(dy) <= radius { 1.0 } else { 0.0 }
+    };
+    let mut mask: Vec<f32> = (0..n * n).map(|i| inside((i % n) as f32 + 0.5, (i / n) as f32 + 0.5)).collect();
+    let reach = (3.0 * blur).ceil() as isize;
+    let kernel: Vec<f32> = (-reach..=reach).map(|i| (-(i * i) as f32 / (2.0 * blur * blur)).exp()).collect();
+    let total: f32 = kernel.iter().sum();
+    for horizontal in [true, false] {
+        let from = mask.clone();
+        for y in 0..n {
+            for x in 0..n {
+                let mut sum = 0.0;
+                for (k, weight) in kernel.iter().enumerate() {
+                    let o = k as isize - reach;
+                    let (sx, sy) = if horizontal { (x as isize + o, y as isize) } else { (x as isize, y as isize + o) };
+                    if sx >= 0 && sy >= 0 && (sx as usize) < n && (sy as usize) < n {
+                        sum += weight * from[sy as usize * n + sx as usize];
+                    }
+                }
+                mask[y * n + x] = sum / total;
+            }
+        }
+    }
+    mask
 }
 
 #[cfg(test)]

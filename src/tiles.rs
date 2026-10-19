@@ -118,83 +118,109 @@ fn place(sizes: &[(f32, f32)], rows: usize, space: &Space) -> Option<Vec<Placed>
 /// A part of an area: left, top, width and height, from the area's corner.
 pub type Part = (f32, f32, f32, f32);
 
-/// Where the windows go when some are pinned: those pinned to every desktop
-/// at the left, those pinned to their row right of them or under them, and
-/// the others in what is left at the right. A kind with no windows has no
-/// part. Each part includes room for its heading.
+/// The places of the pinned windows, at the left of the preview area and
+/// of one size whatever is in them: those pinned to every desktop at the
+/// top, those pinned to their row under them, and the other windows in
+/// what is left at the right.
 #[derive(Debug, PartialEq)]
-pub struct PinParts {
-    pub all: Option<Part>,
-    pub row: Option<Part>,
+pub struct PinColumn {
+    pub all: Part,
+    pub row: Part,
     pub rest: Part,
 }
 
-/// The share of the width the pinned windows take: about this much more
-/// for each, and never less or more than these.
-const PINNED_EACH: f32 = 0.07;
-const PINNED_SHARE: (f32, f32) = (0.18, 0.45);
+/// The share of the width the pinned places take.
+const COLUMN_SHARE: f32 = 0.19;
 /// Width per height of a window as it usually is, for telling how large
-/// tiles come out before the windows are known.
+/// previews come out before the windows are known.
 const USUAL_ASPECT: f32 = 1.6;
 
-/// Splits an area of size `area` for `all` windows pinned to every desktop
-/// and `row` pinned to their row, where the row with the most has
-/// `row_most`. The part of those pinned everywhere is laid out as if this
-/// row had `row_most`, so that it is the same in every row and its windows
-/// never move whichever cell is looked at; this row's take as much of the
-/// room kept for them as they need, and with none of them, the others take
-/// it. Otherwise how wide the pinned part is depends on how many of them
-/// there are and on nothing else. The two kinds share it side by side or
-/// one over the other, whichever gives their tiles more room. No part is
-/// made narrower than `least`, the narrowest a tile can be with its buttons.
-pub fn pin_parts(all: usize, row: usize, row_most: usize, area: (f32, f32), gap: f32, head: f32, least: f32) -> PinParts {
-    let kept = pin_parts_for(all, row.max(row_most), area, gap, head, least);
-    match kept.all {
-        Some(a) if row == 0 => {
-            let right = a.0 + a.2 + gap;
-            PinParts { all: kept.all, row: None, rest: (right, 0.0, area.0 - right, area.1) }
-        }
-        Some(_) => kept,
-        None => pin_parts_for(all, row, area, gap, head, least),
+/// Splits an area of size `area` into the pinned places and the rest,
+/// the column of places being between `width.0` and `width.1` wide (and
+/// never more than half).
+pub fn pin_column(area: (f32, f32), gap: f32, width: (f32, f32)) -> PinColumn {
+    let (w, h) = area;
+    let column = (w * COLUMN_SHARE).clamp(width.0, width.1.max(width.0)).min((w - gap) / 2.0).max(0.0);
+    let upper = ((h - gap) / 2.0).max(0.0);
+    PinColumn {
+        all: (0.0, 0.0, column, upper),
+        row: (0.0, upper + gap, column, (h - upper - gap).max(0.0)),
+        rest: (column + gap, 0.0, (w - column - gap).max(0.0), h),
     }
 }
 
-/// `pin_parts` for a row with the most windows pinned to it.
-fn pin_parts_for(all: usize, row: usize, area: (f32, f32), gap: f32, head: f32, least: f32) -> PinParts {
+/// How a place of fixed size is filled with its windows.
+pub struct SlotRules {
+    pub gap: f32,
+    /// Under each preview, for its app's icon and its buttons.
+    pub foot: f32,
+    /// The least a preview may be (without its foot); smaller, the
+    /// windows are shown by their apps' icons.
+    pub least: (f32, f32),
+    /// The least and the most an icon may be.
+    pub icon: (f32, f32),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct SlotFill {
+    /// Previews (with their feet), or icons.
+    pub previews: bool,
+    /// One for each window shown, in order; with `more`, one more after
+    /// them, standing for those that did not fit.
+    pub cells: Vec<Part>,
+    pub more: usize,
+}
+
+/// Fills a place of size `area` with `n` windows: as previews in a grid,
+/// as large as they come; too small, as icons, down to the least icon; and
+/// with still more, the last cell standing for the rest.
+pub fn fill_slot(n: usize, area: (f32, f32), rules: &SlotRules) -> SlotFill {
     let (w, h) = area;
-    let pinned = all + row;
-    if pinned == 0 {
-        return PinParts { all: None, row: None, rest: (0.0, 0.0, w, h) };
+    if n == 0 {
+        return SlotFill { previews: false, cells: Vec::new(), more: 0 };
     }
-    let share = (0.1 + PINNED_EACH * pinned as f32).clamp(PINNED_SHARE.0, PINNED_SHARE.1);
-    let width = ((w - gap) * share).max(least).min((w - gap) * PINNED_SHARE.1.max(0.5));
-    let rest = (width + gap, 0.0, w - width - gap, h);
-    let whole = (0.0, 0.0, width, h);
-    if all == 0 || row == 0 {
-        let (all_part, row_part) = if row == 0 { (Some(whole), None) } else { (None, Some(whole)) };
-        return PinParts { all: all_part, row: row_part, rest };
-    }
-    // How wide each tile of `n` windows comes out in a part, at best.
-    let tile = |n: usize, (_, _, pw, ph): Part| {
-        (1..=n)
-            .map(|rows| {
-                let columns = n.div_ceil(rows) as f32;
-                let across = (pw - gap * (columns - 1.0)) / columns;
-                let down = (ph - head - gap * (rows as f32 - 1.0)) / rows as f32;
-                across.min(down * USUAL_ASPECT)
-            })
-            .fold(0.0, f32::max)
+    // Cells of a grid `columns` across, the last line centred.
+    let grid = |columns: usize, cell: (f32, f32), count: usize, gap: f32| -> Vec<Part> {
+        let rows = count.div_ceil(columns);
+        let block = (cell.0 * columns.min(count) as f32 + gap * (columns.min(count) as f32 - 1.0), cell.1 * rows as f32 + gap * (rows as f32 - 1.0));
+        let (x0, y0) = ((w - block.0) / 2.0, (h - block.1) / 2.0);
+        (0..count).map(|i| {
+            let (row, col) = (i / columns, i % columns);
+            let in_row = if row + 1 == rows { count - row * columns } else { columns };
+            let x = x0 + (block.0 - (cell.0 * in_row as f32 + gap * (in_row as f32 - 1.0))) / 2.0;
+            (x + col as f32 * (cell.0 + gap), y0 + row as f32 * (cell.1 + gap), cell.0, cell.1)
+        }).collect()
     };
-    let first = all as f32 / pinned as f32;
-    let over = ((0.0, 0.0, width, (h - gap) * first), (0.0, (h - gap) * first + gap, width, (h - gap) * (1.0 - first)));
-    if width - gap < 2.0 * least {
-        return PinParts { all: Some(over.0), row: Some(over.1), rest };
+    let cell = |columns: usize, gap: f32| {
+        let rows = n.div_ceil(columns) as f32;
+        ((w - gap * (columns as f32 - 1.0)) / columns as f32, (h - gap * (rows - 1.0)) / rows)
+    };
+    let preview = |(cw, ch): (f32, f32)| {
+        let tall = (ch - rules.foot).max(0.0);
+        let pw = cw.min(tall * USUAL_ASPECT);
+        (pw, pw / USUAL_ASPECT)
+    };
+    let best = (1..=n).max_by(|a, b| preview(cell(*a, rules.gap)).0.total_cmp(&preview(cell(*b, rules.gap)).0)).unwrap_or(1);
+    let (pw, ph) = preview(cell(best, rules.gap));
+    if pw >= rules.least.0 && ph >= rules.least.1 {
+        let (cw, _) = cell(best, rules.gap);
+        return SlotFill { previews: true, cells: grid(best, (cw.min(pw), ph + rules.foot), n, rules.gap), more: 0 };
     }
-    let left = ((width - gap) * first).clamp(least, width - gap - least);
-    let side = ((0.0, 0.0, left, h), (left + gap, 0.0, width - gap - left, h));
-    let smaller = |(a, r): (Part, Part)| tile(all, a).min(tile(row, r));
-    let (a, r) = if smaller(side) >= smaller(over) { side } else { over };
-    PinParts { all: Some(a), row: Some(r), rest }
+    let gap = rules.gap * 0.5;
+    let square = |columns: usize| { let (cw, ch) = cell(columns, gap); cw.min(ch) };
+    let columns = (1..=n).max_by(|a, b| square(*a).total_cmp(&square(*b))).unwrap_or(1);
+    let size = square(columns).min(rules.icon.1);
+    if size >= rules.icon.0 {
+        return SlotFill { previews: false, cells: grid(columns, (size, size), n, gap), more: 0 };
+    }
+    let size = rules.icon.0.min(w).min(h).max(0.0);
+    let fit = |room: f32| (((room + gap) / (size + gap)).floor() as usize).max(1);
+    let (columns, rows) = (fit(w), fit(h));
+    let room = columns * rows;
+    if n <= room {
+        return SlotFill { previews: false, cells: grid(columns, (size, size), n, gap), more: 0 };
+    }
+    SlotFill { previews: false, cells: grid(columns, (size, size), room, gap), more: n - (room - 1) }
 }
 
 #[cfg(test)]
@@ -235,52 +261,28 @@ mod tests {
             }
         }
     }
-    /// Pinned windows are kept at the left, those pinned everywhere first,
-    /// with no part on another, and the others keep at least half the width.
+    /// A place of fixed size shows its windows as previews while they come
+    /// out large enough, then as icons, then the icons that fit with the
+    /// last cell standing for the rest; always within the place.
     #[test]
-    fn pinned_windows_go_left_of_the_others() {
-        let (area, gap) = ((2400.0, 900.0), 30.0);
-        let apart = |a: Part, b: Part| a.0 + a.2 <= b.0 + 0.5 || b.0 + b.2 <= a.0 + 0.5 || a.1 + a.3 <= b.1 + 0.5 || b.1 + b.3 <= a.1 + 0.5;
-        for (all, row, rest) in [(1, 0, 6), (4, 3, 2)] {
-            let parts = pin_parts(all, row, row, area, gap, 36.0, 0.0);
-            let a = parts.all.expect("a part for those pinned everywhere");
-            assert_eq!((a.0, a.1), (0.0, 0.0), "{all} {row} {rest}: {parts:?}");
-            assert!(parts.rest.2 >= area.0 / 2.0 && parts.rest.0 > a.0, "{parts:?}");
-            assert!(apart(a, parts.rest), "{parts:?}");
-            if let Some(r) = parts.row {
-                assert!(apart(a, r) && apart(r, parts.rest) && (r.0 > a.0 || r.1 > a.1), "{parts:?}");
-            }
+    fn a_pinned_place_is_filled_by_previews_then_icons_then_a_count() {
+        let rules = SlotRules { gap: 12.0, foot: 26.0, least: (110.0, 60.0), icon: (24.0, 56.0) };
+        let area = (330.0, 260.0);
+        let inside = |fill: &SlotFill| fill.cells.iter().all(|c| c.0 >= -0.01 && c.1 >= -0.01 && c.0 + c.2 <= area.0 + 0.01 && c.1 + c.3 <= area.1 + 0.01);
+        let one = fill_slot(1, area, &rules);
+        assert!(one.previews && one.cells.len() == 1 && one.cells[0].2 > 300.0, "{one:?}");
+        let four = fill_slot(4, area, &rules);
+        assert!(four.previews && four.cells.len() == 4 && inside(&four), "{four:?}");
+        let many = fill_slot(12, area, &rules);
+        assert!(!many.previews && many.cells.len() == 12 && many.more == 0 && inside(&many), "{many:?}");
+        assert!(many.cells.iter().all(|c| c.2 >= 24.0 && c.2 <= 56.0 && c.2 == c.3));
+        let crowd = fill_slot(400, area, &rules);
+        assert!(!crowd.previews && crowd.more > 0 && inside(&crowd), "{crowd:?}");
+        assert_eq!(crowd.cells.len() - 1 + crowd.more, 400);
+        assert!(crowd.cells.iter().all(|c| c.2 == 24.0));
+        for (a, b) in [&four, &many, &crowd].iter().flat_map(|f| f.cells.iter().enumerate().flat_map(move |(i, a)| f.cells[i + 1..].iter().map(move |b| (a, b)))) {
+            assert!(a.0 + a.2 <= b.0 + 0.01 || b.0 + b.2 <= a.0 + 0.01 || a.1 + a.3 <= b.1 + 0.01 || b.1 + b.3 <= a.1 + 0.01, "{a:?} on {b:?}");
         }
-        // Fewer pinned windows, a narrower part.
-        assert!(pin_parts(1, 0, 0, area, gap, 36.0, 0.0).rest.2 > pin_parts(4, 3, 3, area, gap, 36.0, 0.0).rest.2);
-        // On a small screen no part is made narrower than a tile with its buttons.
-        let parts = pin_parts(1, 2, 2, (1000.0, 600.0), 20.0, 24.0, 244.0);
-        assert!(parts.all.unwrap().2 >= 244.0 && parts.row.unwrap().2 >= 244.0, "{parts:?}");
-    }
-
-    /// Whichever row is looked at, however many windows are pinned to it,
-    /// the part of those pinned everywhere is the same; this row's part is
-    /// within the room kept for the row with the most, and the others start
-    /// right after what is taken.
-    #[test]
-    fn the_part_pinned_everywhere_is_the_same_in_every_row() {
-        for (area, gap, least) in [((2400.0, 900.0), 30.0, 0.0), ((1000.0, 600.0), 20.0, 244.0), ((1840.0, 640.0), 20.0, 180.0)] {
-            for all in 1..4 {
-                for most in 0..5 {
-                    let widest = pin_parts(all, most, most, area, gap, 36.0, least);
-                    for row in 0..=most {
-                        let parts = pin_parts(all, row, most, area, gap, 36.0, least);
-                        assert_eq!(parts.all, widest.all, "{all} {row} of {most} in {area:?}");
-                        assert_eq!(parts.row.is_some(), row > 0);
-                        if row > 0 {
-                            assert_eq!(parts.row, widest.row);
-                            assert_eq!(parts.rest, widest.rest);
-                        }
-                        let taken = [parts.all, parts.row].into_iter().flatten().map(|p| p.0 + p.2).fold(0.0, f32::max);
-                        assert!(parts.rest.0 >= taken + gap - 0.01 && parts.rest.0 + parts.rest.2 <= area.0 + 0.01, "{parts:?}");
-                    }
-                }
-            }
-        }
+        assert!(fill_slot(0, area, &rules).cells.is_empty());
     }
 }
