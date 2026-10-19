@@ -439,7 +439,8 @@ mod tests {
         let actual: Vec<String> = ["a0", "a1", "b1", "new"].iter().map(|s| s.to_string()).collect();
         assert!(g.sync(&actual, "b1"));
         assert_eq!(g.rows[1].cells, ["b1", "new"]);
-        assert_eq!(go(&mut g, "b1", Dir::Up).as_deref(), Some("a0"));
+        // The cell it was left on gone, the shelf stays turned about there.
+        assert_eq!(go(&mut g, "b1", Dir::Up).as_deref(), Some("a1"));
     }
 
     /// Board moves save each shelf's anchor even while Windows stays on
