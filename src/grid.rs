@@ -46,6 +46,18 @@ impl Row {
     pub fn anchor(&self) -> usize {
         self.last.as_ref().and_then(|id| self.cells.iter().position(|c| c == id)).unwrap_or(0)
     }
+
+    /// Keeps only the cells `keep` holds to. Where the one the row was left
+    /// on goes, the row stays turned about there: on the kept cell before
+    /// it, or else the one after.
+    fn retain(&mut self, keep: impl Fn(&CellId) -> bool) {
+        if let Some(at) = self.last.as_ref().and_then(|id| self.cells.iter().position(|c| c == id)) {
+            if !keep(&self.cells[at]) {
+                self.last = self.cells[..at].iter().rev().chain(&self.cells[at + 1..]).find(|c| keep(c)).cloned();
+            }
+        }
+        self.cells.retain(|c| keep(c));
+    }
 }
 
 /// What a row is called: its name, or its number while the user has not
@@ -150,6 +162,31 @@ impl Grid {
         Some((Pos { row, col: self.rows[row].anchor() }, (origin, last - origin)))
     }
 
+    /// The cell `col` cells along and `row` rows down from `from` (up and
+    /// to the left when negative), as a picture of a hold counts them:
+    /// along `from`'s row from `from`, along another from the cell a move
+    /// there lands on (`Row::anchor`).
+    pub fn counted(&self, from: Pos, (col, row): (i32, i32)) -> Option<Pos> {
+        let at = usize::try_from(from.row as i32 + row).ok()?;
+        let line = self.rows.get(at)?;
+        let reference = if row == 0 { from.col } else { line.anchor() };
+        let col = usize::try_from(reference as i32 + col).ok().filter(|&col| col < line.cells.len())?;
+        Some(Pos { row: at, col })
+    }
+
+    /// The rows a hold from `from` turned stay turned, as a cube's do: each
+    /// is left on the cell `turns` has for it, counted as `counted` does.
+    /// True when one changed.
+    pub fn keep_turns(&mut self, from: Pos, turns: &[(i32, i32)]) -> bool {
+        let cells: Vec<CellId> =
+            turns.iter().filter(|turn| turn.0 != 0).filter_map(|&turn| self.id_at(self.counted(from, turn)?).cloned()).collect();
+        let before: Vec<usize> = self.rows.iter().map(Row::anchor).collect();
+        for id in &cells {
+            self.visit(id);
+        }
+        self.rows.iter().map(Row::anchor).ne(before)
+    }
+
     pub fn visit(&mut self, id: &str) {
         if let Some(pos) = self.find(id) {
             self.rows[pos.row].last = Some(id.to_owned());
@@ -163,7 +200,11 @@ impl Grid {
         if row >= self.rows.len() {
             return;
         }
-        self.rows[from.row].cells.remove(from.col);
+        if from.row == row {
+            self.rows[row].cells.remove(from.col);
+        } else {
+            self.rows[from.row].retain(|c| c != id);
+        }
         let cells = &mut self.rows[row].cells;
         cells.insert(index.min(cells.len()), id.to_owned());
         self.rows.retain(|r| !r.cells.is_empty());
@@ -204,7 +245,7 @@ impl Grid {
     /// Moves a cell into a new row inserted before row `at`.
     pub fn move_cell_to_new_row(&mut self, id: &str, at: usize) {
         let Some(from) = self.find(id) else { return };
-        self.rows[from.row].cells.remove(from.col);
+        self.rows[from.row].retain(|c| c != id);
         let at = at.min(self.rows.len());
         self.rows.insert(at, Row::with_cell(id.to_owned()));
         self.rows.retain(|r| !r.cells.is_empty());
@@ -240,7 +281,7 @@ impl Grid {
 
     pub fn remove(&mut self, id: &str) {
         for r in &mut self.rows {
-            r.cells.retain(|c| c != id);
+            r.retain(|c| c != id);
         }
         self.rows.retain(|r| !r.cells.is_empty());
         self.emphasised.retain(|c| c != id);
@@ -267,7 +308,7 @@ impl Grid {
     pub fn sync(&mut self, actual: &[CellId], current: &str) -> bool {
         let before = self.clone();
         for r in &mut self.rows {
-            r.cells.retain(|c| actual.contains(c));
+            r.retain(|c| actual.contains(c));
         }
         self.rows.retain(|r| !r.cells.is_empty());
         self.emphasised.retain(|c| actual.contains(c));
@@ -340,6 +381,21 @@ mod tests {
         assert!(!g.name_unnamed());
     }
 
+    #[test]
+    fn a_shelf_turned_in_a_hold_stays_turned_once_left() {
+        // From shelf 3 up to shelf 2, two cells along it, back down to shelf 3.
+        let mut g = grid(&[&["a"], &["b0", "b1", "b2", "b3"], &["c0", "c1"]]);
+        g.visit("c1");
+        let from = g.find("c1").unwrap();
+        let mut hand = crate::follow::Follow::new((-2, 0), vec![(0, 0), (0, 3), (-1, 0)]);
+        assert_eq!(hand.finish_path(&[(0.0, -1.0, 1), (2.0, -1.0, 0), (2.0, 0.0, 1)]), (0, 0));
+        assert!(g.keep_turns(from, &hand.turns()));
+        // Shelf 2 is shown and gone to at the cell it was turned to; shelf 3 is where it was.
+        assert_eq!(g.counted(from, (0, -1)), Some(Pos { row: 1, col: 2 }));
+        assert_eq!(g.across(2, -1).unwrap().0, Pos { row: 1, col: 2 });
+        assert_eq!(g.rows[2].anchor(), 1);
+    }
+
     fn grid(rows: &[&[&str]]) -> Grid {
         Grid {
             rows: rows
@@ -383,7 +439,8 @@ mod tests {
         let actual: Vec<String> = ["a0", "a1", "b1", "new"].iter().map(|s| s.to_string()).collect();
         assert!(g.sync(&actual, "b1"));
         assert_eq!(g.rows[1].cells, ["b1", "new"]);
-        assert_eq!(go(&mut g, "b1", Dir::Up).as_deref(), Some("a0"));
+        // The cell it was left on gone, the shelf stays turned about there.
+        assert_eq!(go(&mut g, "b1", Dir::Up).as_deref(), Some("a1"));
     }
 
     /// Board moves save each shelf's anchor even while Windows stays on

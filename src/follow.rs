@@ -185,6 +185,8 @@ impl Follow {
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
     pub fn selected(&self) -> (i32, i32) { (self.columns[(self.row - self.rows.0) as usize].cell, self.row) }
     pub fn start_picture(&mut self) { self.depth = Spring::default(); }
+    /// The cell each row was left turned to, as `selected` counts them.
+    pub fn turns(&self) -> Vec<(i32, i32)> { self.columns.iter().zip(self.rows.0..).map(|(column, row)| (column.cell, row)).collect() }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
     pub fn reframe(&mut self, rows: (i32, i32), cols: Vec<(i32, i32)>, hand: (f64, f64), row_changed: bool) {
         if row_changed {

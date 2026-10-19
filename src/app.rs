@@ -218,6 +218,23 @@ struct Gliding {
     /// the active window goes along.
     step: Option<(i32, i32)>,
     carry: bool,
+    /// For steps: the cell each row stepped off was left on, counted as
+    /// `step` is (a hold's are in `fallback`).
+    turns: Vec<(i32, i32)>,
+}
+
+impl Gliding {
+    /// The cell each row was left turned to so far, as the picture counts
+    /// them (`App::glide_cell`): a shelf stays turned where it was left.
+    fn turns(&mut self) -> Vec<(i32, i32)> {
+        match (&mut self.fallback, input::follow_hold(self.hold)) {
+            (Some(fallback), Some(saved)) => {
+                fallback.track_path(0.0, &saved.path);
+                fallback.turns()
+            }
+            _ => self.turns.clone(),
+        }
+    }
 }
 
 /// Steps are numbered apart from holds (`Gliding::hold`).
@@ -1048,9 +1065,7 @@ impl App {
     /// hold counts them: along a row from the cell a move there lands on.
     fn glide_cell(&self, origin: &str, (col, row): (i32, i32)) -> Option<String> {
         let from = self.grid.find(origin)?;
-        let line = self.grid.rows.get(usize::try_from(from.row as i32 + row).ok()?)?;
-        let reference = if row == 0 { from.col } else { line.anchor() };
-        line.cells.get(usize::try_from(reference as i32 + col).ok()?).cloned()
+        self.grid.id_at(self.grid.counted(from, (col, row))?).cloned()
     }
 
     /// What hold `hold` shows going `ways` (`input::FOLLOW_X` and the like)
@@ -1129,19 +1144,20 @@ impl App {
         let Some(scene) = self.glide_scene(&desktops, &origin, hold, hand.ways) else { return };
         let fallback = follow::Follow::new(scene.rows, scene.cols.clone());
         self.glide.begin(scene);
-        self.gliding = Some(Gliding { hold, fallback: Some(fallback), origin, landing: None, step: None, carry: false });
+        self.gliding = Some(Gliding { hold, fallback: Some(fallback), origin, landing: None, step: None, carry: false, turns: Vec::new() });
     }
 
     /// A glide still settling, or a step still under way, as a new one
     /// begins: it goes where it was going, now.
     fn glide_finish(&mut self, mut old: Gliding) {
         let saved = input::follow_hold(old.hold);
+        let turns = old.turns();
         input::forget_hold(old.hold);
         if old.landing.is_some() {
             return;
         }
         if let Some(to) = old.step.or_else(|| glide::decided(old.hold)).or_else(|| Some(old.fallback.as_mut()?.finish_path(&saved?.path))) {
-            self.glide_go(&old.origin, to, old.carry);
+            self.glide_go(&old.origin, to, &turns, old.carry);
         }
     }
 
@@ -1161,11 +1177,24 @@ impl App {
         if !(if by.0 != 0 { mouse.follow_x } else { mouse.follow_y }) {
             return false;
         }
-        if let Some((hold, origin, at)) = self.gliding.as_ref().and_then(|g| Some((g.hold, g.origin.clone(), g.step.filter(|_| g.landing.is_none())?))) {
-            let to = (at.0 + by.0, at.1 + by.1);
+        if let Some((hold, origin, at, turns)) =
+            self.gliding.as_ref().and_then(|g| Some((g.hold, g.origin.clone(), g.step.filter(|_| g.landing.is_none())?, g.turns.clone())))
+        {
+            // Up and down, to the cell the row was left on in this step, or
+            // the one a move there lands on.
+            let to = if by.1 == 0 {
+                (at.0 + by.0, at.1)
+            } else {
+                let row = at.1 + by.1;
+                (turns.iter().find(|turn| turn.1 == row).map_or(0, |turn| turn.0), row)
+            };
             // At the edge nothing more happens; the step under way goes on.
             if let Some(id) = self.glide_cell(&origin, to) {
                 if let Some(gliding) = &mut self.gliding {
+                    if by.1 != 0 {
+                        gliding.turns.retain(|turn| turn.1 != at.1);
+                        gliding.turns.push(at);
+                    }
                     gliding.step = Some(to);
                     gliding.carry |= carry;
                 }
@@ -1184,7 +1213,7 @@ impl App {
         let hold = STEPS.fetch_add(1, Ordering::SeqCst) | 0x8000_0000;
         let Some(scene) = self.glide_scene(&desktops, &origin, hold, input::FOLLOW_X | input::FOLLOW_Y) else { return false };
         self.glide.step(scene, by);
-        self.gliding = Some(Gliding { hold, fallback: None, origin, landing: None, step: Some(by), carry });
+        self.gliding = Some(Gliding { hold, fallback: None, origin, landing: None, step: Some(by), carry, turns: Vec::new() });
         let view = self.view(&id);
         self.minimap.show(view, Some(from));
         true
@@ -1193,7 +1222,15 @@ impl App {
     /// The app went to `to` in hold `hold` a way the hand is not followed:
     /// the picture goes on from there.
     fn glide_moved(&mut self, hold: u32, to: &str) {
-        let Some(ways) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|_| input::followed().ways) else { return };
+        let Some((ways, origin, turns)) =
+            self.gliding.as_mut().filter(|gliding| gliding.hold == hold).map(|g| (input::followed().ways, g.origin.clone(), g.turns()))
+        else {
+            return;
+        };
+        // The rows turned in the picture so far stay so, the one gone to
+        // where it was gone to.
+        self.glide_remember(&origin, &turns);
+        self.grid.visit(to);
         let Some(desktops) = self.sync() else { return };
         if let Some(scene) = self.glide_scene(&desktops, to, hold, ways) {
             if let Some(gliding) = &mut self.gliding {
@@ -1214,16 +1251,28 @@ impl App {
     /// Hold `hold` was let go of and settles on `to`: the minimap goes there
     /// along with the picture.
     fn glide_target(&mut self, hold: u32, to: (i32, i32)) {
-        let Some(origin) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|gliding| gliding.origin.clone()) else { return };
+        let Some((origin, turns)) = self.gliding.as_mut().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.turns())) else { return };
+        self.glide_remember(&origin, &turns);
         if let Some(id) = self.glide_cell(&origin, to) {
             let view = self.view(&id);
             self.minimap.update(view);
         }
     }
 
-    /// Goes to the cell `to` from `origin`, as the end of a gesture does.
-    /// The cell when that is another one.
-    fn glide_go(&mut self, origin: &str, to: (i32, i32), carry: bool) -> Option<String> {
+    /// The rows a hold turned stay turned (`Row::last`), whichever it goes
+    /// to: each at the cell it was left on, `turns` counted from `origin`
+    /// as `glide_cell` counts them, and saved at once.
+    fn glide_remember(&mut self, origin: &str, turns: &[(i32, i32)]) {
+        if self.grid.find(origin).is_some_and(|from| self.grid.keep_turns(from, turns)) {
+            self.save();
+        }
+    }
+
+    /// Goes to the cell `to` from `origin`, as the end of a gesture does,
+    /// the rows turned on the way (`turns`) staying so. The cell when that
+    /// is another one.
+    fn glide_go(&mut self, origin: &str, to: (i32, i32), turns: &[(i32, i32)], carry: bool) -> Option<String> {
+        self.glide_remember(origin, turns);
         let id = self.glide_cell(origin, to)?;
         let desktops = self.sync()?;
         let heading = self.heading(&desktops);
@@ -1242,9 +1291,12 @@ impl App {
     /// The picture of hold `hold` settled on `to`: Windows goes there, and
     /// the picture goes once it is.
     fn glide_settled(&mut self, hold: u32, to: (i32, i32)) {
+        let Some((origin, carry, turns)) = self.gliding.as_mut().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.carry, g.turns())) else {
+            input::forget_hold(hold);
+            return;
+        };
         input::forget_hold(hold);
-        let Some((origin, carry)) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.carry)) else { return };
-        match self.glide_go(&origin, to, carry) {
+        match self.glide_go(&origin, to, &turns, carry) {
             Some(id) => {
                 if let Some(gliding) = &mut self.gliding {
                     gliding.landing = Some(id);
@@ -1501,7 +1553,13 @@ impl App {
             }
 
             Action::MoveWindow { window, cell, monitor } => self.move_window(window, cell, monitor),
-            Action::MoveCell { id, row, index } => self.grid.move_cell(&id, row, index),
+            Action::MoveCell { id, row, index } => {
+                self.grid.move_cell(&id, row, index);
+                // The selection, carried to another shelf, turns that shelf to it.
+                if id == self.board.selected() {
+                    self.grid.visit(&id);
+                }
+            }
             Action::MoveCellToNewRow { id, at } => self.grid.move_cell_to_new_row(&id, at),
             Action::MoveRow { from, at } => self.grid.move_row(from, at),
             Action::ToggleEmphasis(id) => self.grid.toggle_emphasis(&id),
