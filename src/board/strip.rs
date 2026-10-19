@@ -272,10 +272,15 @@ impl Strip {
         self.across.retarget(hand.1 - old.1, now, curve::SNAP);
         if !holding && self.holding { self.along_mut(row).committed(); self.across.committed(); }
         (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
+        self.advance_depth(now);
+    }
+
+    /// Depth still settles on idle frames; translation targets only change on real input.
+    pub fn advance_depth(&mut self, now: f32) {
         let rows_moving = self.across.at(now).abs() > 0.01;
         let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01);
-        self.recede.moving(now, moving || holding && (hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
-        self.row_recede.moving(now, rows_moving || holding && hand.1.abs() > 0.01);
+        self.recede.moving(now, moving || self.holding && (self.hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
+        self.row_recede.moving(now, rows_moving || self.holding && self.hand.1.abs() > 0.01);
     }
 
     /// How far the cells of `row` are drawn from where they are laid out,
@@ -325,6 +330,17 @@ mod tests {
 
     /// Beside the selection: left, right, and where moving up or down
     /// would land, lined up under it; none past the ends.
+    #[test]
+    fn a_release_settles_without_more_input_reports() {
+        let mut strip=Strip::default();
+        strip.follow((0.0,0.0),0,0,true,0.0);
+        strip.follow((0.15,0.0),0,0,true,0.1);
+        strip.advance_depth(0.2);
+        strip.follow((0.0,0.0),0,0,false,0.21);
+        for frame in 14..120 {strip.advance_depth(frame as f32/60.0);}
+        assert!(strip.depth(2.0)<0.001);
+        assert!(!strip.active(2.0));
+    }
     #[test]
     fn neighbours_are_either_side_and_the_landing_cells_of_the_rows_around() {
         let g = grid(&[(3, 2), (4, 1), (1, 0)]);

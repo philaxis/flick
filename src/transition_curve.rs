@@ -130,16 +130,18 @@ impl Recede {
     pub fn depth(&self, t: f32) -> f32 { self.sample(t).p.clamp(0.0, 1.0) as f32 }
     pub fn settled(&self, t: f32) -> bool { t >= self.fall && self.sample(t).settled(0.0) }
     pub fn kick(&mut self, now: f32, velocity: f64) {
+        let now=now.max(self.start);
         self.state = self.sample(now); self.start = now; self.state.v += velocity;
     }
     pub fn moving(&mut self, now: f32, moving: bool) {
+        let now=now.max(self.start);
         self.state.advance(if moving { 1.0 } else { 0.0 }, (now - self.start).max(0.0) as f64, if moving { 22.0 } else { 14.0 }, 1.0);
         self.start = now;
         self.fall = if moving { f32::INFINITY } else { now };
     }
-    pub fn step(&mut self, now: f32, end: f32) { self.kick(now, 6.0); self.fall = end; }
+    pub fn step(&mut self, now: f32, end: f32) { self.kick(now, 6.0); self.fall = end.max(self.start); }
     pub fn hold(&mut self, now: f32) { self.kick(now, 0.0); self.fall = f32::INFINITY; }
-    pub fn release(&mut self, now: f32, end: f32) { self.kick(now, 0.0); self.fall = end.max(now); }
+    pub fn release(&mut self, now: f32, end: f32) { self.kick(now, 0.0); self.fall = end.max(self.start); }
 }
 
 #[cfg(test)]

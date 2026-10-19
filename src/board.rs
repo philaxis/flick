@@ -1482,6 +1482,7 @@ impl Board {
             self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
         }
         self.strip_input = Some((hand, holding));
+        self.strip.advance_depth(t);
         let mut frame = self.strip.clone();
         if holding && !changed_origin {
             if let Some(((x,y),at)) = crate::follow::resample(&self.strip_samples,t as f64) {
