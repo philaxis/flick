@@ -81,7 +81,7 @@ def report(folder):
             if abs((t1-t0)/period-1)<0.25: adjacent_changes.append(dx)
             repeats += abs(dx) < 0.01
             gaps += max(0, round((t1-t0)/period)-1)
-            if int(b['marker_n']) and pos(b,'magenta') is not None:
+            if pos(b,'marker') is not None and pos(b,'magenta') is not None:
                 marker_errors.append(abs(pos(b,'magenta')-pos(b,'marker')))
         first = None
         initial = next((r for r in reversed(frames) if int(r['qpc']) <= start and pos(r,'magenta') is not None), None)

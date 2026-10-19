@@ -91,7 +91,8 @@ unsafe fn register_inner(destination: HWND, source: HWND) -> Result<isize> {
         let opacity=scene.device.CreateEffectGroup()?;
         opacity.SetOpacity2(0.0)?;visual.SetEffect(&opacity)?;
         visual.SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR)?;
-        scene.root.AddVisual(&visual,true,None)?;
+        // With a null sibling, FALSE inserts above all children (TRUE inserts below them).
+        scene.root.AddVisual(&visual,false,None)?;
         scenes.thumbs.insert(id,Thumbnail {visual,opacity,host:destination.0,size});
         Ok(id)
     });
