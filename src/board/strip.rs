@@ -242,6 +242,7 @@ impl Strip {
     /// go, it settles on the committed cell without predicting a fling.
     pub fn follow(&mut self, hand: (f32, f32), row: usize, counted_from: u64, holding: bool, now: f32) {
         let hand = if holding { hand } else { (0.0, 0.0) };
+        if holding && hand != (0.0, 0.0) && self.recede.settled(now) { self.recede.hold(now); }
         if holding && hand.1.abs() > 0.02 {
             self.row_recede.hold(now);
         }
@@ -434,6 +435,16 @@ mod tests {
             assert_eq!(strip.depth(t), 0.0);
             assert_eq!(strip.row_depth(t), 0.0);
         }
+    }
+
+    #[test]
+    fn the_first_pull_after_idle_starts_receding_from_the_front() {
+        let mut strip = Strip::default();
+        strip.follow((0.0, 0.0), 0, 1, true, 1.0);
+        strip.follow((0.1, 0.0), 0, 1, true, 2.0);
+        assert_eq!(strip.depth(2.0), 0.0);
+        strip.follow((0.1, 0.0), 0, 1, true, 2.016);
+        assert!(strip.depth(2.016) > 0.0 && strip.depth(2.016) < 0.1);
     }
 
     #[test]

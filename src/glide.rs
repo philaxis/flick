@@ -47,7 +47,7 @@ use windows::{
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Gdi::{
-                FillRect, GetDC, ReleaseDC, GdiFlush, GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
+                GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
             },
         },
         System::{
@@ -350,7 +350,7 @@ impl Paints {
         let make = |class: PCWSTR, white: bool| unsafe {
             let (x, y) = (GetSystemMetrics(SM_XVIRTUALSCREEN) - 200, GetSystemMetrics(SM_YVIRTUALSCREEN) - 200);
             let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
                 class,
                 w!("Flick"),
                 WS_POPUP,
@@ -366,13 +366,19 @@ impl Paints {
             if hwnd.0 == 0 {
                 return None;
             }
+            // A layered bitmap has pixels even when its window is off-screen;
+            // GDI's visible clipping region there is empty.
+            let seeded = (|| {
+                let mut dib = Dib::new((16, 16)).ok()?;
+                for pixel in dib.pixels_mut().chunks_exact_mut(4) {
+                    pixel.copy_from_slice(if white { &[255, 255, 255, 255] } else { &[0, 0, 0, 255] });
+                }
+                let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
+                UpdateLayeredWindow(hwnd, None, Some(&POINT { x, y }), Some(&SIZE { cx: 16, cy: 16 }),
+                    dib.dc, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA).ok()
+            })();
+            if seeded.is_none() { let _ = DestroyWindow(hwnd); return None; }
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            // Off-screen source windows may never receive WM_PAINT; seed the
-            // redirected surface before DWM stretches it into shades and edges.
-            let dc = GetDC(hwnd);
-            FillRect(dc, &RECT { left: 0, top: 0, right: 16, bottom: 16 }, HBRUSH(GetStockObject(if white { WHITE_BRUSH } else { BLACK_BRUSH }).0));
-            ReleaseDC(hwnd, dc);
-            let _ = GdiFlush();
             let _ = crate::vdapi::pin_window(hwnd);
             Some(hwnd)
         };

@@ -71,7 +71,7 @@ use windows::{
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, PostMessageW, WM_APP, DrawIconEx, GetClassLongPtrW, GetWindowRect, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, SetLayeredWindowAttributes, ShowWindow, LWA_ALPHA, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
-                GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOREDRAW, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
+                GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOREDRAW, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
                 WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
                 GW_OWNER, HTTRANSPARENT, WM_NCHITTEST, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
@@ -1164,6 +1164,7 @@ impl Board {
 
     /// Covers every monitor and shows `model`.
     pub fn open(&mut self, model: Model, grid: Grid) {
+        let cold = self.window_target.is_none();
         let monitors = vd::monitors();
         // Home is the primary monitor rather than the one under the cursor,
         // so the board looks the same wherever the cursor is.
@@ -1201,12 +1202,24 @@ impl Board {
         self.window_failed = false;
         crate::input::set_board_open(true);
         unsafe {
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_SHOWWINDOW);
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_NOACTIVATE);
             SetTimer(self.hwnd, ON_TOP_TIMER_ID, ON_TOP_MS, None);
         }
         self.set_model(model, grid);
+        if cold {
+            // Compile transformed/clipped drawing paths before the first gesture.
+            let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
+            self.strip.follow((0.1, 0.0), row, 0, true, 0.0);
+            self.strip.follow((0.1, 0.0), row, 0, true, 0.1);
+            self.strip_at = 0.1;
+            self.strip_on = true;
+            self.lay_out_strip(None);
+            self.paint();
+            self.settle_strip(Instant::now());
+        }
         // Warm drawing resources and the clock before the first held movement.
         self.paint();
+        unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE); }
         self.start_motion();
     }
 

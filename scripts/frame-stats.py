@@ -24,6 +24,10 @@ def report(folder):
     for mode in ['board', 'follow']:
         with (folder / f'{mode}.csv').open() as source:
             rows = list(csv.DictReader(source))
+        if mode == 'board':
+            # Opening warms one stationary frame before the measured hold.
+            first = next(i for i, r in enumerate(rows) if float(r['hand_along']) != 0 or float(r['hand_across']) != 0)
+            rows = rows[first:]
         start = float(rows[0]['qpc_ms'])
         # Same window for both builds: exclude 0.5s startup and the screenshot/tail.
         active = [r for r in rows if 500 <= float(r['qpc_ms']) - start <= 5500]
