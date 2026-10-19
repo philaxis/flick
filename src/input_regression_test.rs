@@ -104,7 +104,9 @@ fn settings() -> Settings {
         step_y: 400,
         mouse_reverse: false,
         touchpad_reverse: true,
+        mouse_notch_x: 40,
         mouse_notch_y: 100,
+        touchpad_notch_x: 40,
         touchpad_notch_y: 100,
     }
 }
