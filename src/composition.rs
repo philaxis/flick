@@ -4,7 +4,7 @@ use std::{cell::RefCell, collections::HashMap, ffi::c_void};
 use windows::{core::{w, ComInterface, Interface, PCSTR, HRESULT, Result, Error}, Foundation::Numerics::Matrix3x2, Win32::{
     Foundation::{HWND, HMODULE, POINT, RECT, SIZE, E_FAIL},
     Graphics::{Direct3D::D3D_DRIVER_TYPE_HARDWARE, Direct3D11::*, DirectComposition::*, Direct2D::{*, Common::*}, Dwm::*, Dxgi::{*, Common::*}},
-    System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+    System::LibraryLoader::{GetModuleHandleW, GetProcAddress}, UI::WindowsAndMessaging::GetWindowRect,
 }};
 
 type SharedThumbnail = unsafe extern "system" fn(HWND, HWND, u32, *const DWM_THUMBNAIL_PROPERTIES, *mut c_void, *mut *mut c_void, *mut isize) -> HRESULT;
@@ -21,7 +21,9 @@ struct Scene {
     surface: Option<(IDCompositionSurface, (i32,i32))>,
 }
 #[derive(Default)]
-struct Scenes { hosts: HashMap<isize,Scene>, thumbs: HashMap<isize,Thumbnail> }
+struct Scenes { hosts: HashMap<isize,Scene>, thumbs: HashMap<isize,Thumbnail>,
+    /// Each source's thumbnail size, kept while its window keeps the size it had (`GetWindowRect`).
+    sizes: HashMap<isize,(SIZE,SIZE)> }
 thread_local! { static SCENES: RefCell<Scenes> = RefCell::default(); }
 
 static BLUR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -92,8 +94,21 @@ impl Scene {
 
 unsafe fn register_inner(destination: HWND, source: HWND, composed: bool) -> Result<isize> {
     if !composed {return DwmRegisterThumbnail(destination,source);}
-    let legacy=DwmRegisterThumbnail(destination,source)?;
-    let size=match DwmQueryThumbnailSourceSize(legacy) {Ok(size)=>size,Err(e)=>{let _=DwmUnregisterThumbnail(legacy);return Err(e)}};
+    // Each public handle costs DWM round trips before the first frame; ask only for a resized window.
+    let mut frame=RECT::default();
+    let window=GetWindowRect(source,&mut frame).ok().map(|_| SIZE {cx:frame.right-frame.left,cy:frame.bottom-frame.top});
+    let known=SCENES.with(|s|s.borrow().sizes.get(&source.0).copied()).filter(|(w,_)| Some(*w)==window).map(|(_,size)| size);
+    let size=match known {
+        Some(size)=>size,
+        None=>{
+            let legacy=DwmRegisterThumbnail(destination,source)?;
+            let size=DwmQueryThumbnailSourceSize(legacy);
+            let _=DwmUnregisterThumbnail(legacy);
+            let size=size?;
+            if let Some(window)=window {SCENES.with(|s|s.borrow_mut().sizes.insert(source.0,(window,size)));}
+            size
+        }
+    };
     let result=SCENES.with(|scenes| -> Result<isize> {
         let mut scenes=scenes.borrow_mut();
         if !scenes.hosts.contains_key(&destination.0) {scenes.hosts.insert(destination.0,Scene::new(destination)?);}
@@ -116,8 +131,8 @@ unsafe fn register_inner(destination: HWND, source: HWND, composed: bool) -> Res
         Ok(id)
     });
     match result {
-        Ok(id)=>{DwmUnregisterThumbnail(legacy)?;Ok(id)}
-        Err(e)=>{crate::app::log(&format!("composition thumbnail fallback: {e}"));Ok(legacy)}
+        Ok(id)=>Ok(id),
+        Err(e)=>{crate::app::log(&format!("composition thumbnail fallback: {e}"));DwmRegisterThumbnail(destination,source)}
     }
 }
 
@@ -184,7 +199,9 @@ pub fn commit(hwnd: HWND) -> Result<()> {
     SCENES.with(|scenes| {let scenes=scenes.borrow();match scenes.hosts.get(&hwnd.0) {Some(scene)=>unsafe {scene.device.Commit()},None=>Ok(())}})
 }
 pub fn forget(hwnd: HWND) {
-    SCENES.with(|scenes| {let mut scenes=scenes.borrow_mut();scenes.thumbs.retain(|_,t|t.host!=hwnd.0);scenes.hosts.remove(&hwnd.0);});
+    SCENES.with(|scenes| {let mut scenes=scenes.borrow_mut();scenes.thumbs.retain(|_,t|t.host!=hwnd.0);scenes.hosts.remove(&hwnd.0);
+        // Closed windows' handles can be reused; forget sizes with the host.
+        if scenes.hosts.is_empty() {scenes.sizes.clear();}});
 }
 
 /// Begin/EndDraw pairs ensure D2D pixels and thumbnail transforms share a commit.

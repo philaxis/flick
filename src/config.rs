@@ -40,7 +40,7 @@ minimap = false
 # How window pictures move. "auto": the normal view places them at fractional pixels in one
 # DirectComposition commit on Windows 11 22H2..25H2 builds, falling back to the public thumbnails;
 # the board keeps the public path. "off": public thumbnails everywhere. "all": the board too
-# (still experimental). Takes effect when Flick starts.
+# (experimental: its redrawn surface can miss refreshes). Takes effect when Flick starts.
 compositor = "auto"
 
 # Lets Windows compress or page out the memory of apps in a shelf not visited for this long (minutes).
