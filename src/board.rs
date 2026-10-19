@@ -206,21 +206,26 @@ const FOOTER: f32 = 44.0;
 const ON_TOP_TIMER_ID: usize = 2;
 const ON_TOP_MS: u32 = 250;
 const POPUP_TIMER_ID: usize = 3;
-const POPUP_GLIDE_MS: u64 = 120;
 const POPUP_GRACE_MS: u64 = 200;
 const POPUP_FADE_IN_MS: u64 = 80;
 const POPUP_FADE_OUT_MS: u64 = 120;
 /// While what moved eases into place, how often it is drawn again.
 const MOTION_TIMER_ID: usize = 4;
+/// Requested board animation interval; WM_TIMER also runs when vblank stops.
 const MOTION_MS: u32 = 15;
-/// How fast a jump in the map or the tiles is eased away, as the minimap's
-/// grid eases its own (`overlay::SETTLE_TAU`).
-const SETTLE_TAU: f32 = 0.045;
-/// A frame that comes later than this eases only this far, so that a slow
-/// machine still shows the way between rather than the end of it.
-const MOTION_LONGEST_STEP: f32 = 1.0 / 30.0;
+/// Natural period in seconds of the critically damped board, tile and popup
+/// springs: a jump from rest covers 98% of its distance in about 0.3 seconds.
+const MOTION_RESPONSE: f32 = 0.32;
+/// Angular frequency (rad/s); damping is exactly critical, with no bounce.
+const MOTION_OMEGA: f32 = std::f32::consts::TAU / MOTION_RESPONSE;
+/// Stalls consume at most 64 ms of animation, preserving intermediate frames
+/// on slow machines. Normal frames use their full elapsed time.
+/// shortcut: stalls stretch duration; revisit if the board gains frame pacing.
+const MOTION_LONGEST_STEP: f32 = 0.064;
 /// Under this much left to go, in pixels, a part is in place.
 const SETTLED: f32 = 0.5;
+/// A near-target spring must also be this slow (px/s) before its tail is cut.
+const SETTLED_SPEED: f32 = SETTLED * MOTION_OMEGA;
 /// How far the tiles of a cell just gone to come in from, unscaled.
 const ARRIVE: f32 = 40.0;
 /// How far past the first and last cell the hand can pull a row, in cells,
@@ -389,8 +394,8 @@ impl PopupLayout {
 
 /// Geometry and opacity have separate clocks so crossing a gap never restarts a glide.
 struct PopupAnimation {
-    from: (Rect, Rect),
-    target: (Rect, Rect),
+    target: [Rect; 2],
+    rest: [[Spring; 4]; 2],
     moved: Instant,
     fade_from: f32,
     faded: Instant,
@@ -399,17 +404,27 @@ struct PopupAnimation {
 
 impl PopupAnimation {
     fn new(frame: Rect, cell: Rect, now: Instant) -> Self {
-        Self { from: (frame, cell), target: (frame, cell), moved: now, fade_from: 0.0, faded: now, leave_at: None }
+        Self { target: [frame, cell], rest: [[Spring::default(); 4]; 2], moved: now, fade_from: 0.0, faded: now, leave_at: None }
+    }
+
+    fn springs(&self, now: Instant) -> [[Spring; 4]; 2] {
+        let step = now.saturating_duration_since(self.moved).as_secs_f32();
+        self.rest.map(|edges| edges.map(|spring| {
+            let spring = spring.sample(step);
+            if spring.settled() { Spring::default() } else { spring }
+        }))
     }
 
     fn sample(&self, now: Instant) -> (Rect, Rect, f32) {
         let progress = |since: Instant, ms| (now.saturating_duration_since(since).as_secs_f32() * 1000.0 / ms as f32).min(1.0);
         let ease = |t: f32| 1.0 - (1.0 - t).powi(3);
-        let t = ease(progress(self.moved, POPUP_GLIDE_MS));
-        let blend = |a: Rect, b: Rect| if t == 1.0 { b } else { Rect {
-            left: a.left + (b.left - a.left) * t, top: a.top + (b.top - a.top) * t,
-            right: a.right + (b.right - a.right) * t, bottom: a.bottom + (b.bottom - a.bottom) * t,
-        } };
+        let springs = self.springs(now);
+        let [frame, cell] = std::array::from_fn(|i| {
+            let target = self.target[i];
+            let [left, top, right, bottom] = springs[i].map(|spring| spring.offset);
+            Rect { left: target.left + left, top: target.top + top,
+                right: target.right + right, bottom: target.bottom + bottom }
+        });
         let fade_in = |at: Instant| {
             let t = (at.saturating_duration_since(self.faded).as_secs_f32() * 1000.0 / POPUP_FADE_IN_MS as f32).min(1.0);
             self.fade_from + (1.0 - self.fade_from) * ease(t)
@@ -418,7 +433,7 @@ impl PopupAnimation {
             Some(at) if now >= at => fade_in(at) * (1.0 - ease(progress(at, POPUP_FADE_OUT_MS))),
             _ => fade_in(now),
         };
-        (blend(self.from.0, self.target.0), blend(self.from.1, self.target.1), alpha)
+        (frame, cell, alpha)
     }
 
     fn show(&mut self, now: Instant) {
@@ -430,9 +445,15 @@ impl PopupAnimation {
     }
 
     fn glide_to(&mut self, frame: Rect, cell: Rect, now: Instant) {
-        let (from, from_cell, _) = self.sample(now);
-        self.from = (from, from_cell);
-        self.target = (frame, cell);
+        self.rest = self.springs(now);
+        for ((springs, was), to) in self.rest.iter_mut().zip(self.target).zip([frame, cell]) {
+            for ((spring, a), b) in springs.iter_mut()
+                .zip([was.left, was.top, was.right, was.bottom])
+                .zip([to.left, to.top, to.right, to.bottom]) {
+                spring.offset += a - b;
+            }
+        }
+        self.target = [frame, cell];
         self.moved = now;
         self.show(now);
     }
@@ -445,7 +466,7 @@ impl PopupAnimation {
     fn next_tick(&self, now: Instant, shown: (Rect, Rect, f32)) -> Option<u32> {
         let (frame, cell, alpha) = self.sample(now);
         let goal = if self.leave_at.is_some_and(|at| now >= at) { 0.0 } else { 1.0 };
-        if (frame, cell, alpha) != shown || frame != self.target.0 || cell != self.target.1 || alpha != goal
+        if (frame, cell, alpha) != shown || frame != self.target[0] || cell != self.target[1] || alpha != goal
             || self.leave_at.is_some() && alpha == 0.0 {
             Some(16)
         } else {
@@ -470,13 +491,34 @@ enum Part {
     Tile(isize),
 }
 
-/// The board moving the way the minimap does (`overlay::Camera`): every
-/// part is drawn where it is laid out plus what is left of its last jump,
-/// eased away, plus where the held trigger pulls it between two cells.
+/// One axis of a critically damped spring, relative to its target, in px and px/s.
+#[derive(Clone, Copy, Default, Debug)]
+struct Spring {
+    offset: f32,
+    velocity: f32,
+}
+
+impl Spring {
+    /// Exact solution of x'' + 2ωx' + ω²x = 0, independent of frame subdivision.
+    fn sample(self, seconds: f32) -> Self {
+        let carry = self.velocity + MOTION_OMEGA * self.offset;
+        let decay = (-MOTION_OMEGA * seconds).exp();
+        Self {
+            offset: (self.offset + carry * seconds) * decay,
+            velocity: (self.velocity - MOTION_OMEGA * carry * seconds) * decay,
+        }
+    }
+
+    fn settled(self) -> bool {
+        self.offset.abs() < SETTLED && self.velocity.abs() < SETTLED_SPEED
+    }
+}
+
+/// Each part is drawn at its layout plus the spring's remaining displacement
+/// and the held trigger's direct pull between cells.
 #[derive(Default)]
 struct Motion {
-    /// What is left to ease away of each part's jumps, in pixels.
-    rest: HashMap<Part, (f32, f32)>,
+    rest: HashMap<Part, [Spring; 2]>,
     /// How far the hand pulled each part in the last frame, in pixels.
     hand: HashMap<Part, (f32, f32)>,
     /// What the hand was counted from then (`input::Hand::counted_from`).
@@ -492,7 +534,7 @@ impl Motion {
     /// Where a part is drawn, relative to where it is laid out.
     fn offset(&self, part: &Part) -> (f32, f32) {
         let (rest, hand) = (self.rest.get(part).copied().unwrap_or_default(), self.hand.get(part).copied().unwrap_or_default());
-        (rest.0 + hand.0, rest.1 + hand.1)
+        (rest[0].offset + hand.0, rest[1].offset + hand.1)
     }
 
     fn is_moving(&self) -> bool {
@@ -504,19 +546,28 @@ impl Motion {
     /// layout comes in from `arrive` when it is a tile; anything else
     /// that came or went has nothing to ease from.
     fn moved(&mut self, before: &HashMap<Part, (f32, f32)>, after: &HashMap<Part, (f32, f32)>, arrive: (f32, f32), now: Instant) {
-        if !self.is_moving() {
-            self.last = Some(now);
-        }
+        self.elapse(now);
         let rest = after.iter().filter_map(|(part, at)| {
-            let left = self.rest.get(part).copied().unwrap_or_default();
+            let mut left = self.rest.get(part).copied().unwrap_or_default();
             let jump = match before.get(part) {
-                Some(was) => (left.0 + was.0 - at.0, left.1 + was.1 - at.1),
+                Some(was) => (was.0 - at.0, was.1 - at.1),
                 None if matches!(part, Part::Tile(_)) => arrive,
                 None => (0.0, 0.0),
             };
-            (jump.0.abs() >= SETTLED || jump.1.abs() >= SETTLED).then(|| (part.clone(), jump))
+            left[0].offset += jump.0;
+            left[1].offset += jump.1;
+            (!left.iter().all(|spring| spring.settled())).then(|| (part.clone(), left))
         });
         self.rest = rest.collect();
+    }
+
+    fn elapse(&mut self, now: Instant) {
+        let step = self.last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32()).min(MOTION_LONGEST_STEP);
+        self.last = Some(now);
+        self.rest.retain(|_, rest| {
+            *rest = rest.map(|spring| spring.sample(step));
+            !rest.iter().all(|spring| spring.settled())
+        });
     }
 
     /// One frame at `now`, with the hand pulling the parts by `hand`. When
@@ -524,21 +575,17 @@ impl Motion {
     /// its jump is eased away like any other, so nothing jumps. Returns
     /// whether anything is still moving.
     fn advance(&mut self, hand: HashMap<Part, (f32, f32)>, counted_from: u64, now: Instant) -> bool {
-        let step = self.last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32()).min(MOTION_LONGEST_STEP);
-        self.last = Some(now);
-        if self.counted_from != Some(counted_from) {
+        self.elapse(now);
+        if self.counted_from.is_some_and(|from| from != counted_from) {
             let parts: std::collections::HashSet<Part> = self.hand.keys().chain(hand.keys()).cloned().collect();
             for part in parts {
                 let (was, is) = (self.hand.get(&part).copied().unwrap_or_default(), hand.get(&part).copied().unwrap_or_default());
                 let rest = self.rest.entry(part).or_default();
-                *rest = (rest.0 + was.0 - is.0, rest.1 + was.1 - is.1);
+                rest[0].offset += was.0 - is.0;
+                rest[1].offset += was.1 - is.1;
             }
         }
-        let keep = (-step / SETTLE_TAU).exp();
-        self.rest.retain(|_, rest| {
-            *rest = (rest.0 * keep, rest.1 * keep);
-            rest.0.abs() >= SETTLED || rest.1.abs() >= SETTLED
-        });
+        self.rest.retain(|_, rest| !rest.iter().all(|spring| spring.settled()));
         (self.hand, self.counted_from) = (hand, Some(counted_from));
         self.is_moving()
     }
@@ -546,6 +593,7 @@ impl Motion {
     fn stop(&mut self) {
         self.rest.clear();
         self.hand.clear();
+        self.counted_from = None;
         self.last = None;
     }
 }
@@ -1088,7 +1136,7 @@ impl Board {
             self.motion.slowest = self.motion.slowest.max(took);
             debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}",
                 self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len(),
-                self.motion.rest.values().map(|r| r.0.abs().max(r.1.abs())).fold(0.0, f32::max), hand.along, hand.across,
+                self.motion.rest.values().flatten().map(|spring| spring.offset.abs()).fold(0.0, f32::max), hand.along, hand.across,
                 self.motion.hand.values().next());
         }
         if !moving && !crate::input::holding() {
@@ -1552,6 +1600,8 @@ impl Board {
             right: (r.right - offset.0).round() as i32,
             bottom: (r.bottom - offset.1).round() as i32,
         };
+        #[cfg(feature = "debug-log")]
+        let mut placed = Vec::new();
         for &(hwnd, thumb) in thumbs {
             let mut props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
@@ -1602,7 +1652,10 @@ impl Board {
                 props.opacity = (props.opacity as f32 * opacity).round() as u8;
                 let _ = DwmUpdateThumbnailProperties(thumb, &props);
             }
+            #[cfg(feature = "debug-log")]
+            placed.push(format!("{hwnd:x}={},{},{},{}", props.rcDestination.left, props.rcDestination.top, props.rcDestination.right, props.rcDestination.bottom));
         }
+        debug_log!("board: thumbnails {}", placed.join(" "));
     }
 
     /// Thumbnails stack in registration order; re-register the one that will
@@ -2499,7 +2552,7 @@ impl Board {
             self.motion.moved(&before, &self.marks(), arrive, now);
             let mut at = now;
             while at < now + Duration::from_millis(ms) {
-                at += Duration::from_millis(MOTION_MS as u64);
+                at = (at + Duration::from_millis(MOTION_MS as u64)).min(now + Duration::from_millis(ms));
                 self.motion.advance(HashMap::new(), 0, at);
             }
             debug_log!("board: rendered {ms} ms into a move, {:?}", self.motion.rest);
@@ -2967,15 +3020,41 @@ mod tests {
         let cell = |x| rect(x, 800.0, 70.0, 50.0);
         let mut animation = PopupAnimation::new(a, cell(10.0), now);
         animation.glide_to(b, cell(200.0), now);
-        let halfway = now + Duration::from_millis(60);
+        let halfway = now + Duration::from_millis(120);
         let before = animation.sample(halfway);
         assert!(before.0.left > 105.0 && before.0.left < b.left);
         assert!(before.0.bottom > a.bottom && before.0.bottom < b.bottom);
         animation.glide_to(c, cell(-100.0), halfway);
         assert_eq!(animation.sample(halfway), before);
-        let end = halfway + Duration::from_millis(POPUP_GLIDE_MS);
+        let end = halfway + Duration::from_secs(1);
         assert_eq!(animation.sample(end), (c, cell(-100.0), 1.0));
         assert_eq!(animation.next_tick(end, animation.sample(end)), None);
+    }
+
+    #[test]
+    fn popup_retargeting_preserves_spring_velocity_and_matches_tile_arrival() {
+        let now = Instant::now();
+        let a = rect(10.0, 20.0, 500.0, 100.0);
+        let b = rect(a.left + ARRIVE, a.top, 500.0, 100.0);
+        let mut animation = PopupAnimation::new(a, a, now);
+        animation.glide_to(b, b, now);
+        let mut motion = Motion::default();
+        let tile = Part::Tile(1);
+        motion.moved(&HashMap::new(), &HashMap::from([(tile.clone(), (0.0, 0.0))]), (ARRIVE, 0.0), now);
+        for ms in [40, 80, 120, 160, 200, 240, 280, 320, 400] {
+            let at = now + Duration::from_millis(ms);
+            motion.advance(HashMap::new(), 0, at);
+            let popup_left = b.left - animation.sample(at).0.left;
+            assert!((motion.offset(&tile).0 - popup_left).abs() < 0.001);
+        }
+        let at = now + Duration::from_millis(120);
+        let before = animation.springs(at);
+        let shown = animation.sample(at);
+        animation.glide_to(a, a, at);
+        assert_eq!(animation.sample(at), shown);
+        for (was, is) in before.into_iter().flatten().zip(animation.rest.into_iter().flatten()) {
+            assert_eq!(was.velocity, is.velocity);
+        }
     }
 
     #[test]
@@ -2986,7 +3065,7 @@ mod tests {
         let mut animation = PopupAnimation::new(a, a, now);
         let shown = animation.sample(now);
         animation.glide_to(b, b, now);
-        let late = now + Duration::from_millis(200);
+        let late = now + Duration::from_secs(1);
         assert_eq!(animation.sample(late), (b, b, 1.0));
         assert_eq!(animation.next_tick(late, shown), Some(16));
         let shown = animation.sample(late);
@@ -3278,23 +3357,71 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_is_eased_away_like_the_minimaps() {
+    fn spring_is_critical_and_arrives_without_overshoot() {
+        for offset in [-200.0, 200.0] {
+            let spring = Spring { offset, velocity: 0.0 };
+            let mut previous = offset.abs();
+            for ms in 0..1000 {
+                let t = ms as f32 / 1000.0;
+                let at = spring.sample(t);
+                let expected = offset * (1.0 + MOTION_OMEGA * t) * (-MOTION_OMEGA * t).exp();
+                assert!((at.offset - expected).abs() < 0.0001);
+                assert!(at.offset * offset >= 0.0 && at.offset.abs() <= previous + 0.0001);
+                previous = at.offset.abs();
+            }
+            let arrived = 1.0 - spring.sample(0.3).offset / offset;
+            assert!((0.975..0.985).contains(&arrived), "{arrived}");
+        }
+    }
+
+    #[test]
+    fn spring_integration_is_independent_of_frame_subdivision() {
+        for velocity in [-800.0, 0.0, 400.0] {
+            let start = Spring { offset: 200.0, velocity };
+            for frames in [1, 5, 20, 40] {
+                let mut divided = start;
+                for _ in 0..frames {
+                    divided = divided.sample(0.016);
+                }
+                let single = start.sample(0.016 * frames as f32);
+                assert!((single.offset - divided.offset).abs() < 0.0001);
+                assert!((single.velocity - divided.velocity).abs() < 0.001);
+            }
+        }
+        assert!(!Spring { offset: 0.0, velocity: 100.0 }.settled());
+    }
+
+    #[test]
+    fn repeated_jumps_keep_the_current_position_and_velocity_on_both_axes() {
+        let now = Instant::now();
+        for (part, jump) in [(Part::Row(0, "a".into()), (100.0, 0.0)), (Part::Selection(0), (0.0, 100.0))] {
+            let before = HashMap::from([(part.clone(), jump)]);
+            let after = HashMap::from([(part.clone(), (0.0, 0.0))]);
+            let mut motion = Motion::default();
+            motion.moved(&before, &after, (0.0, 0.0), now);
+            let at = now + Duration::from_millis(48);
+            motion.advance(HashMap::new(), 0, at);
+            let was = motion.rest[&part];
+            assert!(was.iter().any(|spring| spring.velocity != 0.0));
+            motion.moved(&before, &after, (0.0, 0.0), at);
+            let is = motion.rest[&part];
+            assert_eq!(is.map(|spring| spring.velocity), was.map(|spring| spring.velocity));
+            assert_eq!(motion.offset(&part), (was[0].offset + jump.0, was[1].offset + jump.1));
+        }
+    }
+
+    #[test]
+    fn slow_frames_keep_intermediate_motion_then_cut_the_settled_tail() {
         let now = Instant::now();
         let row = Part::Row(0, "a".into());
         let mut motion = Motion::default();
         motion.moved(&HashMap::from([(row.clone(), (100.0, 0.0))]), &HashMap::from([(row.clone(), (0.0, 0.0))]), (0.0, 0.0), now);
-        // Drawn where it was, then a frame later most of the way back.
-        assert_eq!(motion.offset(&row), (100.0, 0.0));
-        assert!(motion.advance(HashMap::new(), 0, now + Duration::from_millis(16)));
-        let left = motion.offset(&row).0;
-        assert!((left - 100.0 * (-0.016 / SETTLE_TAU).exp()).abs() < 0.5, "{left}");
-        // A frame very late eases no further than one of a slow machine would.
         motion.advance(HashMap::new(), 0, now + Duration::from_millis(500));
-        assert!((motion.offset(&row).0 - left * (-MOTION_LONGEST_STEP / SETTLE_TAU).exp()).abs() < 0.5);
-        let mut at = now + Duration::from_millis(500);
-        for _ in 0..40 {
-            at += Duration::from_millis(16);
-            motion.advance(HashMap::new(), 0, at);
+        let expected = Spring { offset: 100.0, velocity: 0.0 }.sample(MOTION_LONGEST_STEP).offset;
+        assert!((motion.offset(&row).0 - expected).abs() < 0.0001);
+        assert!(motion.offset(&row).0 > 50.0);
+        for frame in 1..=40 {
+            motion.advance(HashMap::new(), 0, now + Duration::from_millis(500 + frame * 16));
         }
         assert!(!motion.is_moving());
         assert_eq!(motion.offset(&row), (0.0, 0.0));
@@ -3350,6 +3477,37 @@ mod tests {
             motion.advance(HashMap::new(), 3, at);
         }
         assert_eq!(drawn(&motion, -pitch), -pitch);
+    }
+
+    #[test]
+    fn hand_confirmation_is_continuous_in_either_order_on_both_axes() {
+        let now = Instant::now();
+        for (part, axis, sign) in [(Part::Row(0, "a".into()), 0, -1.0), (Part::Selection(0), 1, 1.0)] {
+            let point = |distance| if axis == 0 { (distance, 0.0) } else { (0.0, distance) };
+            let component = |motion: &Motion| if axis == 0 { motion.offset(&part).0 } else { motion.offset(&part).1 };
+            for hand_first in [false, true] {
+                let mut motion = Motion::default();
+                motion.advance(HashMap::from([(part.clone(), point(sign * 40.0))]), 1, now);
+                assert_eq!(component(&motion), sign * 40.0, "the first hand sample follows directly");
+                let at = now + Duration::from_millis(16);
+                motion.advance(HashMap::from([(part.clone(), point(sign * 90.0))]), 1, at);
+                assert_eq!(component(&motion), sign * 90.0, "the hand follows directly");
+                let confirm = at + Duration::from_millis(16);
+                let moved = |motion: &mut Motion| motion.moved(
+                    &HashMap::from([(part.clone(), point(0.0))]),
+                    &HashMap::from([(part.clone(), point(sign * 100.0))]), (0.0, 0.0), confirm);
+                let counted = |motion: &mut Motion| { motion.advance(
+                    HashMap::from([(part.clone(), point(-sign * 10.0))]), 2, confirm); };
+                if hand_first { counted(&mut motion); moved(&mut motion); }
+                else { moved(&mut motion); counted(&mut motion); }
+                assert!((sign * 100.0 + component(&motion) - sign * 90.0).abs() < 0.001);
+                let release = confirm + Duration::from_millis(16);
+                motion.advance(HashMap::new(), 3, release);
+                assert!((sign * 100.0 + component(&motion) - sign * 90.0).abs() < 0.001);
+                motion.advance(HashMap::new(), 3, release + Duration::from_millis(16));
+                assert!(component(&motion).abs() < 10.0);
+            }
+        }
     }
 
     #[test]

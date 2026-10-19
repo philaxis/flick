@@ -40,6 +40,10 @@ mod slide;
 mod stack;
 #[cfg(any(windows, test))]
 mod tiles;
+// The board and a full-screen overlay are to share it; nothing uses it yet.
+#[cfg(any(windows, test))]
+#[allow(dead_code)]
+mod transition_curve;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
