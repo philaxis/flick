@@ -338,68 +338,40 @@ struct Veil {
     edges: Vec<Thumb>,
 }
 
-/// The windows the veils are thumbnails of: plain black and white, out of
-/// sight past the screens, for as long as the picture is up.
-struct Paints {
-    black: HWND,
-    white: HWND,
-}
+/// One opaque source bitmap: black on the left, white on the right.
+/// Keeping both swatches in one surface also avoids DWM dropping an entirely
+/// black, off-screen surface as empty.
+struct Paints { hwnd: HWND }
 
 impl Paints {
     fn new() -> Option<Paints> {
-        let make = |class: PCWSTR, white: bool| unsafe {
-            let (x, y) = (GetSystemMetrics(SM_XVIRTUALSCREEN) - 200, GetSystemMetrics(SM_YVIRTUALSCREEN) - 200);
+        unsafe {
+            let origin = POINT { x: GetSystemMetrics(SM_XVIRTUALSCREEN) - 200, y: GetSystemMetrics(SM_YVIRTUALSCREEN) - 200 };
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
-                class,
-                w!("Flick"),
-                WS_POPUP,
-                x,
-                y,
-                16,
-                16,
-                None,
-                None,
-                GetModuleHandleW(None).ok()?,
-                None,
+                WHITE_CLASS, w!("Flick"), WS_POPUP, origin.x, origin.y, 32, 16,
+                None, None, GetModuleHandleW(None).ok()?, None,
             );
-            if hwnd.0 == 0 {
-                return None;
-            }
-            // A layered bitmap has pixels even when its window is off-screen;
-            // GDI's visible clipping region there is empty.
+            if hwnd.0 == 0 { return None; }
             let seeded = (|| {
-                let mut dib = Dib::new((16, 16)).ok()?;
-                for pixel in dib.pixels_mut().chunks_exact_mut(4) {
-                    pixel.copy_from_slice(if white { &[255, 255, 255, 255] } else { &[0, 0, 0, 255] });
+                let mut dib = Dib::new((32, 16)).ok()?;
+                for (i, pixel) in dib.pixels_mut().chunks_exact_mut(4).enumerate() {
+                    pixel.copy_from_slice(if i % 32 < 16 { &[0, 0, 0, 255] } else { &[255, 255, 255, 255] });
                 }
                 let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
-                UpdateLayeredWindow(hwnd, None, Some(&POINT { x, y }), Some(&SIZE { cx: 16, cy: 16 }),
+                UpdateLayeredWindow(hwnd, None, Some(&origin), Some(&SIZE { cx: 32, cy: 16 }),
                     dib.dc, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA).ok()
             })();
             if seeded.is_none() { let _ = DestroyWindow(hwnd); return None; }
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = crate::vdapi::pin_window(hwnd);
-            Some(hwnd)
-        };
-        let black = make(WINDOW_CLASS, false)?;
-        let Some(white) = make(WHITE_CLASS, true) else {
-            unsafe {
-                let _ = DestroyWindow(black);
-            }
-            return None;
-        };
-        Some(Paints { black, white })
+            Some(Paints { hwnd })
+        }
     }
 }
 
 impl Drop for Paints {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyWindow(self.black);
-            let _ = DestroyWindow(self.white);
-        }
-    }
+    fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.hwnd); } }
 }
 
 /// The name of the row above the picture on one screen: a layered window
@@ -955,8 +927,8 @@ impl View {
             .map(|screen| {
                 let at = (screen.area.left, screen.area.top);
                 Veil {
-                    shades: (0..WALLS).filter_map(|_| Thumb::new(screen, paints.black, at, None)).collect(),
-                    edges: (0..LIT * 4).filter_map(|_| Thumb::new(screen, paints.white, at, None)).collect(),
+                    shades: (0..WALLS).filter_map(|_| Thumb::new(screen, paints.hwnd, at, Some(RECT { left: 0, top: 0, right: 16, bottom: 16 }))).collect(),
+                    edges: (0..LIT * 4).filter_map(|_| Thumb::new(screen, paints.hwnd, at, Some(RECT { left: 16, top: 0, right: 32, bottom: 16 }))).collect(),
                 }
             })
             .collect()

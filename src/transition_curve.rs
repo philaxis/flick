@@ -61,13 +61,11 @@ impl Latch {
     }
     pub fn rebase(&mut self, raw: f64) { self.last = raw; self.hand = 0.0; self.held = true; self.hold_origin = 0.0; }
     pub fn target(&self, room: (i32, i32)) -> f64 {
-        let pull = if (self.cell == room.0 && self.hand < 0.0) || (self.cell == room.1 && self.hand > 0.0) {
-            self.hand.signum() * EDGE * self.hand.abs() / (self.hand.abs() + EDGE)
-        } else {
-            let hand = self.hand - self.hold_origin;
-            let hand = if self.held { hand.signum() * (hand.abs() - HOLD).max(0.0) / (1.0 - HOLD) } else { hand };
-            PULL * (hand / PULL).tanh()
-        };
+        let hand = self.hand - self.hold_origin;
+        let hand = if self.held { hand.signum() * (hand.abs() - HOLD).max(0.0) / (1.0 - HOLD) } else { hand };
+        let pull = if (self.cell == room.0 && hand < 0.0) || (self.cell == room.1 && hand > 0.0) {
+            hand.signum() * EDGE * hand.abs() / (hand.abs() + EDGE)
+        } else { PULL * (hand / PULL).tanh() };
         self.cell as f64 + pull
     }
 }
@@ -168,6 +166,19 @@ mod tests {
             assert_eq!(l.track(direction * 1.999, (-4, 4)), 0);
             assert_eq!(l.track(direction * 2.0, (-4, 4)), direction as i32);
         }
+    }
+    #[test]
+    fn a_commit_at_the_last_cell_also_holds_before_its_existing_edge_curve() {
+        let mut l = Latch::default();
+        l.track(1.0, (0, 1));
+        l.track(1.2, (0, 1));
+        assert!((l.target((0, 1)) - 1.0).abs() < 1e-9);
+        l.track(1.5, (0, 1));
+        assert!(l.target((0, 1)) > 1.0 && l.target((0, 1)) < 1.15);
+        assert_eq!(l.track(0.5, (0, 1)), -1);
+        let mut edge = Latch::default();
+        edge.track(-0.1, (0, 1));
+        assert!((edge.target((0, 1)) + EDGE * 0.1 / (0.1 + EDGE)).abs() < 1e-9);
     }
     #[test]
     fn a_coalesced_commit_holds_from_the_sample_without_adding_to_distance() {
