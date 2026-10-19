@@ -100,16 +100,28 @@ pub enum Dir {
 pub const STEP_MM: f64 = 10.0;
 /// Travel from where the hold began before its way is judged: well under a step, so none is lost.
 pub const JUDGE_MM: f64 = 3.0;
-/// The larger way over the smaller that judges a start straight (about 34° off the axis at most);
-/// anything flatter is meant slantwise and both ways count.
-pub const RAIL_RATIO: f64 = 1.5;
-/// Width of the channel: sideways drift within it while going straight is a crooked finger path.
+// Moving along a row is easy and changing row is deliberate: an unclear start goes across, and
+// leaving a rail for up and down takes longer and straighter travel than leaving it for across.
+/// A start at most this steep (degrees from across, about 1.1 across for 1 up or down) goes across.
+pub const X_RAIL_MAX_DEG: f64 = 42.0;
+/// A start this much more up and down than across (about 63° steep) goes up and down.
+pub const Y_RAIL_RATIO: f64 = 2.0;
+/// Starts between `X_RAIL_MAX_DEG` and this are meant slantwise and both ways count; steeper
+/// ones short of `Y_RAIL_RATIO` go across.
+pub const SLANT_MAX_DEG: f64 = 55.0;
+/// Width of the channel round a rail across: up and down drift within it is a crooked finger path.
 /// It is forgotten after every channel of straight travel, so slow drift never adds up.
-pub const CHANNEL_MM: f64 = 6.0;
-/// Out of the channel, the recent movement must be within this of the other axis to switch to it.
-pub const SWITCH_DEG: f64 = 30.0;
-/// Going slantwise, the recent movement held within this of one axis...
-pub const RELOCK_DEG: f64 = 15.0;
+pub const X_CHANNEL_MM: f64 = 9.0;
+/// The same round a rail up and down: narrower, so turning across from it comes sooner.
+pub const Y_CHANNEL_MM: f64 = 4.0;
+/// Out of the channel, the recent movement must be within this of up and down to switch to it...
+pub const Y_SWITCH_DEG: f64 = 20.0;
+/// ...and within this of across to switch to that.
+pub const X_SWITCH_DEG: f64 = 35.0;
+/// Going slantwise, the recent movement held within this of across...
+pub const X_RELOCK_DEG: f64 = 20.0;
+/// ...or of up and down...
+pub const Y_RELOCK_DEG: f64 = 12.0;
 /// ...for this long locks onto that axis again.
 pub const RELOCK_MS: u32 = 150;
 /// Recent movement fades by this per ms (libinput's 0.97^ms: about a 100 ms window).
@@ -181,12 +193,13 @@ impl Rails {
                 if x.hypot(y) < JUDGE_MM {
                     return steps;
                 }
-                self.mode = if x >= y * RAIL_RATIO {
-                    Mode::Rail(0)
-                } else if y >= x * RAIL_RATIO {
+                let steep = y.atan2(x).to_degrees();
+                self.mode = if y >= x * Y_RAIL_RATIO {
                     Mode::Rail(1)
-                } else {
+                } else if steep > X_RAIL_MAX_DEG && steep < SLANT_MAX_DEG {
                     Mode::Free
+                } else {
+                    Mode::Rail(0)
                 };
                 if let Mode::Rail(axis) = self.mode {
                     self.off = self.gathered[1 - axis];
@@ -200,7 +213,8 @@ impl Rails {
             Mode::Rail(axis) => {
                 let side = 1 - axis;
                 self.off += d[side];
-                if self.off.abs() > CHANNEL_MM && self.within(side, SWITCH_DEG) {
+                let (channel, switch) = if axis == 0 { (X_CHANNEL_MM, Y_SWITCH_DEG) } else { (Y_CHANNEL_MM, X_SWITCH_DEG) };
+                if self.off.abs() > channel && self.within(side, switch) {
                     // An L: the new way gathers from nothing, so the turn itself is no step.
                     self.mode = Mode::Rail(side);
                     self.gathered = [0.0; 2];
@@ -208,7 +222,7 @@ impl Rails {
                     return steps;
                 }
                 self.along += d[axis].abs();
-                if self.along >= CHANNEL_MM {
+                if self.along >= channel {
                     (self.off, self.along) = (0.0, 0.0);
                 }
                 self.step(axis, d[axis], &mut steps);
@@ -217,7 +231,7 @@ impl Rails {
                 for axis in 0..2 {
                     self.step(axis, d[axis], &mut steps);
                 }
-                let near = (0..2).find(|&axis| self.within(axis, RELOCK_DEG));
+                let near = (0..2).find(|&axis| self.within(axis, [X_RELOCK_DEG, Y_RELOCK_DEG][axis]));
                 match (near, self.near) {
                     (Some(axis), Some((was, since))) if axis == was => {
                         if ms.wrapping_sub(since) >= RELOCK_MS {
@@ -439,10 +453,10 @@ mod tests {
         let mut ms = 0;
         let steps = drive(&mut rails, &mut ms, line((0.0, 0.0), (35.0, -35.0), 0.5));
         assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Up), steps.len()), (3, 3, 6));
-        // Shallower than the rail ratio still counts both ways.
-        let mut shallow = Rails::default();
-        let steps = drive(&mut shallow, &mut 0, line((0.0, 0.0), (40.0, 30.0), 0.5));
-        assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Down)), (4, 3));
+        // Near 45° only: 50° steep still counts both ways.
+        let mut steep = Rails::default();
+        let steps = drive(&mut steep, &mut 0, line((0.0, 0.0), (30.0, 35.8), 0.5));
+        assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Down)), (3, 3));
         // Then straight on rightwards for longer than RELOCK_MS: a rail again, wavering is ignored.
         let more = drive(&mut rails, &mut ms, line((35.0, -35.0), (55.0, -35.0), 0.5));
         assert_eq!(more, vec![Dir::Right; 2]);
@@ -450,18 +464,43 @@ mod tests {
         assert_eq!(drive(&mut rails, &mut ms, wobble), vec![Dir::Right; 3]);
     }
     #[test]
+    fn an_unclear_start_goes_along_the_row_and_only_a_clear_one_changes_row() {
+        // (angle from across, rights, downs): a 40° slant is across alone; so is 58°, short of
+        // the up-and-down ratio; 65° is up and down alone; 45° and 50° count both ways.
+        for (deg, rights, downs) in [(0.0, 5, 0), (30.0, 4, 0), (40.0, 3, 0), (45.0, 3, 3), (50.0, 3, 3), (58.0, 2, 0), (65.0, 0, 4), (90.0, 0, 5)] {
+            let rad = f64::to_radians(deg);
+            let to = (50.0 * rad.cos(), 50.0 * rad.sin());
+            let mut rails = Rails::default();
+            let steps = drive(&mut rails, &mut 0, line((0.0, 0.0), to, 0.5));
+            assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Down), steps.len()), (rights, downs, rights + downs), "{deg}°");
+        }
+        // A 40° slant across wavering up and down besides still changes no row.
+        let mut rails = Rails::default();
+        let path = (0..=140).map(|i| {
+            let x = i as f64 * 0.5;
+            (x, x * 0.84 + 3.0 * ((x / 25.0 * std::f64::consts::TAU).cos() - 1.0))
+        });
+        let steps = drive(&mut rails, &mut 0, path);
+        assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Down)), (7, 0));
+    }
+    #[test]
     fn an_l_switches_axis_without_counting_the_turn() {
         let mut rails = Rails::default();
         let mut ms = 0;
         let down = drive(&mut rails, &mut ms, line((0.0, 0.0), (0.0, 34.0), 0.5));
         assert_eq!(down, vec![Dir::Down; 3]);
-        // Out of the channel the remaining 4 mm down is dropped and across gathers from nothing.
-        let across = drive(&mut rails, &mut ms, line((0.0, 34.0), (-27.0, 34.0), 0.5));
+        // Out of the narrow channel the remaining 4 mm down is dropped and across gathers from nothing.
+        let across = drive(&mut rails, &mut ms, line((0.0, 34.0), (-25.0, 34.0), 0.5));
         assert_eq!(across, vec![Dir::Left; 2]);
         assert_eq!(rails.progress().1, 0.0);
-        // And back to up and down the same way.
-        let up = drive(&mut rails, &mut ms, line((-27.0, 34.0), (-27.0, 7.0), 0.5));
-        assert_eq!(up, vec![Dir::Up; 2]);
+        // Back to up and down the same way, only out of the wider channel round across.
+        let up = drive(&mut rails, &mut ms, line((-25.0, 34.0), (-25.0, 14.0), 0.5));
+        assert_eq!(up, vec![Dir::Up]);
+        let mut late = Rails::default();
+        drive(&mut late, &mut 0, line((0.0, 0.0), (30.0, 0.0), 0.5));
+        assert!(drive(&mut late, &mut 100, line((30.0, 0.0), (30.0, 9.0), 0.5)).is_empty());
+        // Still across: further along the row steps there.
+        assert_eq!(drive(&mut late, &mut 200, line((30.0, 9.0), (40.0, 9.0), 0.5)), vec![Dir::Right]);
     }
     #[test]
     fn a_hand_resting_on_the_edge_of_a_step_does_not_take_it_back() {
