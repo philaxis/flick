@@ -1347,15 +1347,24 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
 
 unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     #[cfg(feature = "motion-probe")]
-    if message == WM_APP + 61 && wparam.0 <= 3 {
-        thread_local! { static REPLAY: RefCell<crate::touchpad::Gesture> = RefCell::default(); }
+    if (message == WM_APP + 61 && wparam.0 <= 3) || (message == WM_APP + 62 && wparam.0 & 255 <= 3) {
+        thread_local! {
+            static REPLAY: RefCell<crate::touchpad::Gesture> = RefCell::default();
+            static REPLAY_CLOCK: RefCell<crate::touchpad::ScanClock> = RefCell::default();
+        }
         // Test coordinates are signed thousandths of a centimetre; no cross-process pointers.
         let x = lparam.0 as u32 as i32 as f64 / 1000.0;
         let y = (lparam.0 as u64 >> 32) as u32 as i32 as f64 / 1000.0;
-        let contacts: Vec<_> = (0..wparam.0).map(|id| crate::touchpad::Contact {
+        let contacts: Vec<_> = (0..(wparam.0 & 255)).map(|id| crate::touchpad::Contact {
             id: id as u32, confident: true, x: x + id as f64 * 0.4, y,
         }).collect();
-        let event = REPLAY.with(|g| g.borrow_mut().update(&contacts, GetMessageTime() as u32));
+        let mut event = REPLAY.with(|g| g.borrow_mut().update(&contacts, GetMessageTime() as u32));
+        if message == WM_APP + 62 {
+            let scan=((wparam.0 >> 8) & 65535) as u32;
+            event.scan_time=Some(scan);
+            event.sampled_at=Some(REPLAY_CLOCK.with(|c| c.borrow_mut().stamp(scan,Instant::now())));
+            if contacts.is_empty() {REPLAY_CLOCK.with(|c| *c.borrow_mut()=Default::default());}
+        }
         touchpad_event(event);
         return LRESULT(0);
     }

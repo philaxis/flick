@@ -46,6 +46,7 @@ try {
 } finally {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process drive -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $drive -and ($_.MainWindowTitle -in @('F wide', 'F tall') -or $_.MainWindowTitle -like 'F motion *') } | Stop-Process -Force
+    & $drive xbutton up
     Start-Sleep 1
     & $drive navigation unstage $out
     foreach ($f in 'config.toml', 'state.json') {

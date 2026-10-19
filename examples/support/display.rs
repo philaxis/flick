@@ -119,7 +119,7 @@ fn hand(scenario: &str, t: f64) -> f64 {
     }
 }
 
-unsafe fn input(kind: &str, scenario: &str, out: &Path, duration: f64, frequency: i64) {
+unsafe fn input(kind: &str, scenario: &str, out: &Path, duration: f64, frequency: i64, device_clock: bool) {
     let pad = FindWindowExW(HWND_MESSAGE, None, w!("flick.input"), None);
     assert!(kind != "ptp" || pad.0 != 0);
     let mouse = |flags, dx| {
@@ -128,7 +128,9 @@ unsafe fn input(kind: &str, scenario: &str, out: &Path, duration: f64, frequency
     };
     let touch = |x: f64, count| {
         let x = (x * 1200.0).round() as i32;
-        PostMessageW(pad, WM_APP+61, WPARAM(count), LPARAM(x as u32 as isize)).unwrap();
+        let scan=((qpc() as i128*10000/frequency as i128) & 65535) as usize;
+        let (message,data)=if device_clock {(WM_APP+62,count | scan<<8)} else {(WM_APP+61,count)};
+        PostMessageW(pad, message, WPARAM(data), LPARAM(x as u32 as isize)).unwrap();
     };
     if kind == "mouse" { mouse(MOUSEEVENTF_XDOWN,0); } else { touch(0.0,3); }
     std::thread::sleep(Duration::from_millis(80));
@@ -200,7 +202,8 @@ pub unsafe fn run(out: &Path, flick: &str) {
         // Drain setup before injecting; AccumulatedFrames remains visible in the CSV.
         let _=capture.frame(false).unwrap();
         let (k,s,path)=(kind.to_owned(),scenario.to_owned(),out.join(format!("{label}-input.csv")));
-        let worker=std::thread::spawn(move||input(&k,&s,&path,6.0,frequency));
+        let device_clock=!Path::new(flick).file_name().unwrap().to_string_lossy().eq_ignore_ascii_case("baseline.exe");
+        let worker=std::thread::spawn(move||input(&k,&s,&path,6.0,frequency,device_clock));
         let start=Instant::now();
         let mut csv=String::from("qpc,accumulated,capture_ms,magenta_l,magenta_t,magenta_r,magenta_b,magenta_n,cyan_l,cyan_t,cyan_r,cyan_b,cyan_n,yellow_l,yellow_t,yellow_r,yellow_b,yellow_n,marker_l,marker_t,marker_r,marker_b,marker_n,magenta_x,cyan_x,yellow_x,marker_x\n");
         let(mut frames,mut missed)=(0,0);

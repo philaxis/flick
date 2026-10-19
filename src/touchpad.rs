@@ -107,7 +107,7 @@ impl ScanClock {
         let mapped = self.last.and_then(|(before, at)| {
             if scan > u16::MAX as u32 {return None;}
             let ticks = (scan as u16).wrapping_sub(before) as u64;
-            if ticks > 500 {return None;}
+            if ticks == 0 || ticks > 500 {return None;}
             let candidate = at + Duration::from_micros(ticks * 100);
             (candidate <= received + Duration::from_millis(2)
                 && received.saturating_duration_since(candidate) <= Duration::from_millis(50)).then_some(candidate.min(received))
@@ -532,6 +532,7 @@ mod tests {
         let idle=start+Duration::from_secs(1);
         assert_eq!(clock.stamp(0,idle),idle);
         assert_eq!(clock.stamp(400,idle+Duration::from_millis(8)),idle+Duration::from_millis(8));
+        assert_eq!(clock.stamp(400,idle+Duration::from_millis(16)),idle+Duration::from_millis(16));
     }
 
 }
