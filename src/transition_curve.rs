@@ -107,6 +107,7 @@ impl Glide {
         self.start = now;
     }
     pub fn committed(&mut self) { self.commit = true; }
+    pub fn following(&mut self) { self.commit = false; }
     pub fn release(&mut self, distance: f32, velocity: f32, now: f32) {
         self.retarget(distance, now, SNAP);
         self.state.v += velocity as f64;

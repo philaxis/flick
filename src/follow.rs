@@ -202,12 +202,14 @@ impl Follow {
         let mut moving = !self.released;
         for i in 0..self.along.len() {
             let target = if !self.released && self.axis == 0 && i == current { self.columns[i].target(self.cols[i]) } else { self.columns[i].cell as f64 };
+            if !self.released && (target-self.columns[i].cell as f64).abs()>1e-9 { self.committing[i]=false; }
             if self.released || self.committing[i] { self.along[i].commit(target,dt,false); }
             else { self.along[i].position(target,dt,false); }
             if self.along[i].settled(self.columns[i].cell as f64) { self.committing[i]=false; }
             moving |= (self.along[i].p - self.columns[i].cell as f64).abs() > 0.01;
         }
         let target = if !self.released && self.axis == 1 { self.rows_hand.target(self.rows) } else { self.row as f64 };
+        if !self.released && (target-self.row as f64).abs()>1e-9 { self.row_committing=false; }
         if self.released || self.row_committing { self.vertical.commit(target,dt,true); }
         else { self.vertical.position(target,dt,true); }
         if self.vertical.settled(self.row as f64) { self.row_committing=false; }

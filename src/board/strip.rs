@@ -270,6 +270,8 @@ impl Strip {
         }
         self.across.vertical = true;
         self.across.retarget(hand.1 - old.1, now, curve::SNAP);
+        if holding && hand.0 != 0.0 { self.along_mut(row).following(); }
+        if holding && hand.1 != 0.0 { self.across.following(); }
         if !holding && self.holding { self.along_mut(row).committed(); self.across.committed(); }
         (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
         self.advance_depth(now);
