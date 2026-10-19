@@ -9,7 +9,7 @@
 //!   drive shot <path> | pixel <x> <y> | wins [all] | cursor | info | idle
 //!   drive post <class> <message> <wparam> <lparam> | client <class>
 //!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND> | mem
-//!   drive rmdesk <desktop id prefix>
+//!   drive desk | mkdesk | rmdesk <desktop id prefix>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -402,6 +402,11 @@ fn main() {
                 vdapi::select(false);
                 println!("foreground on current desktop: {:?} title: {}", vdapi::is_window_on_current_desktop(fg), String::from_utf16_lossy(&title[..n]).chars().take(30).collect::<String>());
                 println!("board {:?} rect {:?} visible {:?} cloaked {} style {:x} ex {:x} fg {:?}", board, r, IsWindowVisible(board), cloaked, GetWindowLongW(board, GWL_STYLE), GetWindowLongW(board, GWL_EXSTYLE), GetForegroundWindow());
+            }
+            Some("desk") => {
+                // desk: prints the current desktop's id.
+                vdapi::select(false);
+                println!("desk {:?}", vdapi::get_current_desktop().map(|d| d.id()));
             }
             Some("mkdesk") => {
                 // mkdesk: creates a desktop for a test and prints its id.
