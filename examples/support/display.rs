@@ -82,9 +82,9 @@ fn scan_line(line: &[u8], y: u32, boxes: &mut [(i32,i32,i32,i32,u32);4], mass: &
             let classify = |x: u32| {
                 let p = &line[x as usize * 4..][..3];
                 let (b,g,r) = (p[0] as u32,p[1] as u32,p[2] as u32);
-                if r > 40 && b > 40 && g * 3 < r.min(b) { Some((0,r.min(b)-g)) }
-                else if b > 40 && g > 40 && r * 3 < b.min(g) { Some((1,b.min(g)-r)) }
-                else if r > 40 && g > 40 && b * 3 < r.min(g) { Some((2,r.min(g)-b)) }
+                if r > 40 && b > 40 && g * 3 < r.min(b) && r.abs_diff(b)*10 <= r.max(b) { Some((0,r.min(b)-g)) }
+                else if b > 40 && g > 40 && r * 3 < b.min(g) && b.abs_diff(g)*10 <= b.max(g) { Some((1,b.min(g)-r)) }
+                else if r > 40 && g > 40 && b * 3 < r.min(g) && r.abs_diff(g)*10 <= r.max(g) { Some((2,r.min(g)-b)) }
                 else if y < 40 && g > 180 && r < 40 && b < 40 { Some((3,g-r.max(b))) } else { None }
             };
             let mut x=0;
@@ -235,6 +235,9 @@ mod tests {
         scan_line(&row,200,&mut boxes,&mut mass,&mut moment);
         assert_eq!((boxes[0].0,boxes[0].2,boxes[0].4),(100,299,200));
         assert_eq!(moment[0] as f64/mass[0] as f64,199.5);
+        let sky=[255,140,0,255].repeat(400);
+        let mut boxes=[(i32::MAX,i32::MAX,-1,-1,0);4];
+        scan_line(&sky,200,&mut boxes,&mut mass,&mut moment);assert_eq!(boxes[1].4,0);
     }
     #[test] fn trajectory_is_continuous_and_has_a_real_pause() {
         for t in [1.2,1.6,2.4,3.8,4.2,5.3] { assert!((hand("mixed",t-1e-5)-hand("mixed",t+1e-5)).abs()<1e-6); }

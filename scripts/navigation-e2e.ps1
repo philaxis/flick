@@ -22,7 +22,7 @@ try {
     if ($LASTEXITCODE) { throw 'stage failed' }
     if ($Mode -in @('matrix','final-matrix')) {
         $probeExit = 0
-        $variants = if ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('timed','blur','composition','gentle','slow') }
+        $variants = if ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
         foreach ($variant in $variants) {
             Write-Output "VARIANT=$variant"
             Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR -ErrorAction SilentlyContinue
