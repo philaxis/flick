@@ -1439,6 +1439,7 @@ impl App {
             sticky: self.config.vertical_sticky,
             autostart: self.autostart,
             touchpad: self.config.three_finger_touchpad,
+            mouse_reverse: self.config.mouse_reverse,
             touchpad_reverse: self.config.touchpad_reverse,
             touchpad_status: crate::touchpad::status(),
         }
@@ -2421,6 +2422,7 @@ pub fn render_settings(path: &str) {
         sticky: config.vertical_sticky,
         autostart: true,
         touchpad: false,
+        mouse_reverse: config.mouse_reverse,
         touchpad_reverse: config.touchpad_reverse,
         touchpad_status: crate::touchpad::Status::Absent,
     };

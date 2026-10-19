@@ -102,7 +102,8 @@ fn settings() -> Settings {
         triggers: vec![Trigger::XButton2],
         step_x: 260,
         step_y: 400,
-        touchpad_reverse: false,
+        mouse_reverse: false,
+        touchpad_reverse: true,
     }
 }
 

@@ -79,12 +79,6 @@ impl Gesture {
     }
 }
 
-/// Which way the desktops go for a hand moving by `delta`: against it when
-/// reversed, like content scrolled on a touchpad, or with it, like the mouse.
-pub fn directed(delta: (f64, f64), reverse: bool) -> (f64, f64) {
-    if reverse { (-delta.0, -delta.1) } else { delta }
-}
-
 /// HID unit exponent is a signed four-bit integer; linear SI is cm, English is inches.
 pub fn cm_per_unit(
     logical: (i32, i32),
@@ -214,12 +208,6 @@ mod tests {
                 y: 0.0,
             })
             .collect()
-    }
-    #[test]
-    fn reverse_turns_both_ways_around() {
-        assert_eq!(directed((1.5, -0.5), true), (-1.5, 0.5));
-        assert_eq!(directed((1.5, -0.5), false), (1.5, -0.5));
-        assert_eq!(directed((0.0, 0.0), true), (0.0, 0.0));
     }
     #[test]
     fn tap_and_small_travel() {

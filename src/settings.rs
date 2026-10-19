@@ -44,7 +44,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units.
 /// Below the last row, the link to the file and a margin.
-const SIZE: (f32, f32) = (400.0, ROWS.0 + (10.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
+const SIZE: (f32, f32) = (400.0, ROWS.0 + (11.0 - BELOW_UP_AND_DOWN) * ROWS.1 + 52.0);
 /// Whether up and down has settings of its own (a flick or a distance, and
 /// how much). Not now: rows go by distance, a distance of their own. The
 /// switch is kept hidden, and its key in config.toml read and left alone,
@@ -72,7 +72,8 @@ pub struct View {
     pub sticky: bool,
     pub autostart: bool,
     pub touchpad: bool,
-    /// See `Config::touchpad_reverse`.
+    /// See `Config::mouse_reverse`, `touchpad_reverse`.
+    pub mouse_reverse: bool,
     pub touchpad_reverse: bool,
     pub touchpad_status: crate::touchpad::Status,
 }
@@ -102,6 +103,7 @@ enum Hit {
     /// One half of the vertical mode switch: flick (true) or distance.
     Mode(bool),
     StepY,
+    MouseReverse,
     Autostart,
     Touchpad,
     TouchpadReverse,
@@ -115,6 +117,7 @@ struct Layout {
     step_x: Rect,
     mode: [Rect; 2],
     step_y: Rect,
+    mouse_reverse: Rect,
     autostart: Rect,
     touchpad: Rect,
     touchpad_reverse: Rect,
@@ -137,11 +140,12 @@ impl Layout {
             step_x: slider(1.0),
             mode: [Rect { right: mode.left + half, ..mode }, Rect { left: mode.left + half, ..mode }],
             step_y: slider(if UP_AND_DOWN_OF_ITS_OWN { 3.0 } else { 2.0 }),
-            autostart: right(4.0 - up, 44.0, 24.0),
-            touchpad: right(5.0 - up, 44.0, 24.0),
-            touchpad_reverse: right(6.0 - up, 44.0, 24.0),
-            touchpad_settings: rect(EDGES.0 * s, (row(9.0 - up) + 4.0) * s, 240.0 * s, 30.0 * s),
-            file: rect(EDGES.0 * s, (row(10.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
+            mouse_reverse: right(4.0 - up, 44.0, 24.0),
+            autostart: right(5.0 - up, 44.0, 24.0),
+            touchpad: right(6.0 - up, 44.0, 24.0),
+            touchpad_reverse: right(7.0 - up, 44.0, 24.0),
+            touchpad_settings: rect(EDGES.0 * s, (row(10.0 - up) + 4.0) * s, 240.0 * s, 30.0 * s),
+            file: rect(EDGES.0 * s, (row(11.0 - up) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
 
@@ -153,6 +157,7 @@ impl Layout {
             (&self.mode[0], Hit::Mode(true)),
             (&self.mode[1], Hit::Mode(false)),
             (&self.step_y, Hit::StepY),
+            (&self.mouse_reverse, Hit::MouseReverse),
             (&self.autostart, Hit::Autostart),
             (&self.touchpad, Hit::Touchpad),
             (&self.touchpad_reverse, Hit::TouchpadReverse),
@@ -344,6 +349,8 @@ impl Settings {
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => Action::Close,
             WM_KEYDOWN if wparam.0 == 0x54 && !self.view.capturing =>
                 Action::Set("three_finger_touchpad", (!self.view.touchpad).to_string()),
+            WM_KEYDOWN if wparam.0 == 0x4D && !self.view.capturing =>
+                Action::Set("mouse_reverse", (!self.view.mouse_reverse).to_string()),
             WM_KEYDOWN if wparam.0 == 0x52 && !self.view.capturing =>
                 Action::Set("touchpad_reverse", (!self.view.touchpad_reverse).to_string()),
             WM_KEYDOWN if wparam.0 == 0x57 && self.view.touchpad_status == crate::touchpad::Status::Conflict =>
@@ -446,6 +453,7 @@ impl Settings {
         match hit {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Mode(sticky) if sticky != self.view.sticky => Action::Set("vertical_sticky", sticky.to_string()),
+            Hit::MouseReverse => Action::Set("mouse_reverse", (!self.view.mouse_reverse).to_string()),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
             Hit::Touchpad => Action::Set("three_finger_touchpad", (!self.view.touchpad).to_string()),
             Hit::TouchpadReverse => Action::Set("touchpad_reverse", (!self.view.touchpad_reverse).to_string()),
@@ -546,12 +554,15 @@ impl Settings {
         }
         let up = BELOW_UP_AND_DOWN;
 
-        label(4.0 - up, "Start with Windows");
+        label(4.0 - up, "Reverse mouse direction (M)");
+        self.draw_switch(&p, &layout.mouse_reverse, view.mouse_reverse, Hit::MouseReverse);
+
+        label(5.0 - up, "Start with Windows");
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
 
-        label(5.0 - up, "Three-finger touchpad (T)");
+        label(6.0 - up, "Three-finger touchpad (T)");
         self.draw_switch(&p, &layout.touchpad, view.touchpad, Hit::Touchpad);
-        label(6.0 - up, "Reverse direction (R)");
+        label(7.0 - up, "Reverse touchpad direction (R)");
         self.draw_switch(&p, &layout.touchpad_reverse, view.touchpad_reverse, Hit::TouchpadReverse);
         let notice = match view.touchpad_status {
             crate::touchpad::Status::Absent => "No precision touchpad detected",
@@ -560,7 +571,7 @@ impl Settings {
             crate::touchpad::Status::Conflict => crate::touchpad::NOTICE,
             crate::touchpad::Status::Unavailable => "Touchpad reports could not be read on this device.",
         };
-        let area = Rect { bottom: row(9.0 - up).top, ..row(7.0 - up) };
+        let area = Rect { bottom: row(10.0 - up).top, ..row(8.0 - up) };
         p.text(notice, &fonts.notice, &area, white(0.62));
         if view.touchpad_status == crate::touchpad::Status::Conflict {
             self.draw_button(&p, fonts, &layout.touchpad_settings, "Open Windows touchpad settings (W)", Hit::TouchpadSettings);
