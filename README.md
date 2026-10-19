@@ -20,7 +20,7 @@
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
 
-**Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop.
+**Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop. By default the desktops go the other way from the fingers, as if pushing the screen like scrolling; “Reverse touchpad direction” in Settings turns this off, and “Reverse mouse direction” does the same for the mouse (off by default).
 
 ## Get started
 

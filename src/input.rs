@@ -366,6 +366,10 @@ struct Settings {
     /// the next: farther, so that rows are not changed by the way.
     step_x: i32,
     step_y: i32,
+    /// The desktops go against the hand on the mouse and on three fingers
+    /// (`Config::mouse_reverse`, `touchpad_reverse`).
+    mouse_reverse: bool,
+    touchpad_reverse: bool,
 }
 
 impl Settings {
@@ -521,6 +525,8 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         triggers,
         step_x: config.step_x.max(20),
         step_y: config.step_y.max(20),
+        mouse_reverse: config.mouse_reverse,
+        touchpad_reverse: config.touchpad_reverse,
     });
     match THREAD.load(Ordering::SeqCst) {
         0 => {
@@ -1041,6 +1047,7 @@ fn touchpad_event(event: crate::touchpad::Event) {
         if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
             // The pad judged which way each step goes (`touchpad::Rails`); a whole step each is
             // exactly one cell or row of the plane, so no mouse rounding comes into it.
+            // `touchpad_reverse` turns the steps and the lean between them around alike.
             for step in &event.steps {
                 use crate::touchpad::Dir;
                 let (dx, dy) = match step {
@@ -1049,9 +1056,10 @@ fn touchpad_event(event: crate::touchpad::Event) {
                     Dir::Up => (0, -s.step_y),
                     Dir::Down => (0, s.step_y),
                 };
-                travel(s, dx, dy);
+                let (dx, dy) = directed((dx, dy), s.touchpad_reverse);
+                advance(s, dx, dy);
             }
-            touchpad_lean(s, event.progress);
+            touchpad_lean(s, directed(event.progress, s.touchpad_reverse));
             if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
         }
         false
@@ -1092,7 +1100,19 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-/// Adds mouse travel and emits steps.
+/// Which way the desktops go for a hand moving by `delta`: against it when
+/// reversed, as if pushing the screen, or with it.
+fn directed<T: std::ops::Neg<Output = T>>(delta: (T, T), reverse: bool) -> (T, T) {
+    if reverse { (-delta.0, -delta.1) } else { delta }
+}
+
+/// Mouse travel, the other way round with `mouse_reverse`.
+fn travel(s: &Settings, dx: i32, dy: i32) {
+    let (dx, dy) = directed((dx, dy), s.mouse_reverse);
+    advance(s, dx, dy);
+}
+
+/// Adds travel and emits steps.
 ///
 /// Each way on its own (`Plane`): one cell per `step_x` of travel as far as
 /// the hand goes, and one row each time up and down travel gathers `step_y`
@@ -1106,7 +1126,7 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
 /// through every cell it passed. Coming to another row begins a new stretch
 /// along the row, from the cell the app lands on there, with what the hand
 /// went towards the next cell kept.
-fn travel(s: &Settings, dx: i32, dy: i32) {
+fn advance(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
@@ -1397,8 +1417,16 @@ mod tests {
     }
 
     #[test]
+    fn reverse_turns_both_ways_around() {
+        assert_eq!(directed((3, -2), true), (-3, 2));
+        assert_eq!(directed((3, -2), false), (3, -2));
+        assert_eq!(directed((1.5, -0.5), true), (-1.5, 0.5));
+        assert_eq!(directed((1.5, -0.5), false), (1.5, -0.5));
+    }
+
+    #[test]
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
-        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400 };
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, mouse_reverse: false, touchpad_reverse: true };
         let info = MSLLHOOKSTRUCT::default();
         TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });

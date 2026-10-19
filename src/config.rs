@@ -24,6 +24,10 @@ trigger = "xbutton2"
 
 # Three-finger precision touchpad trigger (Windows three-finger swipes and taps must be Nothing).
 three_finger_touchpad = false
+# Which way the desktops go for each device. With true they go the other way from the hand, as if pushing the screen like scrolling content on a touchpad; with false they follow it.
+# Keyboard shortcuts are not affected.
+mouse_reverse = false
+touchpad_reverse = true
 
 # How far to move (pixels) to go one cell sideways (step_x) and one shelf up or down (step_y). The longer vertical distance keeps you from changing shelf by accident.
 step_x = 260
@@ -51,6 +55,8 @@ sleep_after_minutes = 0
 pub struct Config {
     pub trigger: String,
     pub three_finger_touchpad: bool,
+    pub mouse_reverse: bool,
+    pub touchpad_reverse: bool,
     pub step_x: i32,
     pub step_y: i32,
     pub vertical_sticky: bool,
@@ -66,6 +72,8 @@ impl Default for Config {
         Config {
             trigger: "xbutton2".into(),
             three_finger_touchpad: false,
+            mouse_reverse: false,
+            touchpad_reverse: true,
             step_x: 260,
             step_y: 400,
             vertical_sticky: true,
@@ -169,6 +177,20 @@ mod tests {
         assert!(!toml::from_str::<Config>("trigger = \"f13\"").unwrap().three_finger_touchpad);
         let enabled = with_value("# keep me\n", "three_finger_touchpad", "true");
         assert!(toml::from_str::<Config>(&enabled).unwrap().three_finger_touchpad);
+    }
+
+    /// Configs written before the settings existed keep the mouse as it was
+    /// and reverse the touchpad; each can be changed on its own.
+    #[test]
+    fn mouse_follows_the_hand_and_touchpad_is_reversed_by_default() {
+        let reverse = |c: Config| (c.mouse_reverse, c.touchpad_reverse);
+        assert_eq!(reverse(Config::default()), (false, true));
+        assert_eq!(reverse(toml::from_str(DEFAULT_CONFIG).unwrap()), (false, true));
+        assert_eq!(reverse(toml::from_str("three_finger_touchpad = true").unwrap()), (false, true));
+        let mouse = with_value(DEFAULT_CONFIG, "mouse_reverse", "true");
+        assert_eq!(reverse(toml::from_str(&mouse).unwrap()), (true, true));
+        let touchpad = with_value(DEFAULT_CONFIG, "touchpad_reverse", "false");
+        assert_eq!(reverse(toml::from_str(&touchpad).unwrap()), (false, false));
     }
 
     /// Older state files have no usage field. New credits survive the same
