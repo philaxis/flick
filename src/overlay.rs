@@ -58,9 +58,10 @@ const PAD: f32 = 10.0;
 /// Room under the grid for the shelf name.
 const TITLE_H: f32 = 20.0;
 /// Settling and fade time scales, in seconds.
+const SETTLE_TAU: f32 = 0.045;
 const FADE_TAU: f32 = 0.025;
 /// How far past the end of its row the highlight is pushed, in cells.
-const EDGE_GIVE: f32 = 0.15;
+const EDGE_GIVE: f32 = 0.16;
 /// Cells shown either side of the highlight at most, sideways and up and
 /// down; the ones beyond fade out at the edge of the minimap.
 const REACH: usize = 3;
@@ -108,13 +109,12 @@ struct Spring {
 
 impl Spring {
     fn advance(&mut self, dt: f32) {
-        self.advance_axis(dt, false);
-    }
-    fn advance_axis(&mut self, dt: f32, vertical: bool) {
-        let mut state = crate::transition_curve::Spring { p: self.offset as f64, v: self.velocity as f64 };
-        state.position(0.0, dt as f64, vertical);
-        self.offset = state.p as f32;
-        self.velocity = state.v as f32;
+        // Keep the same total lag as the former exponential correction.
+        let omega = 2.0 / SETTLE_TAU;
+        let carry = self.velocity + omega * self.offset;
+        let keep = (-omega * dt).exp();
+        self.offset = (self.offset + carry * dt) * keep;
+        self.velocity = (self.velocity - omega * carry * dt) * keep;
     }
 }
 
@@ -260,7 +260,7 @@ impl Camera {
             for rest in &mut self.rest_x {
                 rest.advance(step);
             }
-            self.rest_y.advance_axis(step, true);
+            self.rest_y.advance(step);
         }
         (self.goal_x, self.goal_y, self.counted_from) = (goal_x, goal_y, Some(counted_from));
     }
@@ -647,12 +647,13 @@ impl Overlay {
         let hiding = self.hide_at.is_some_and(|at| now >= at);
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
+        // F is already integrated by the desktop renderer; sample its exact frame, without a second spring.
         if let Some(drawn) = crate::glide::drawn() {
             self.view.title.clone_from(&drawn.title);
             self.camera.follow(&self.view, &drawn);
         } else {
             self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
-
+            if crate::input::holding() { if let Some(axis) = crate::input::axis() { self.camera.lock_axis(axis); } }
         }
         #[cfg(feature = "debug-log")]
         if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.offset.abs() > 0.001 {
@@ -1110,15 +1111,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_spring_uses_variant_f_and_keeps_its_velocity() {
-        let mut spring = Spring { offset: 1.0, velocity: 0.0 };
-        spring.advance(0.3);
-        assert!(spring.offset < 0.0 && spring.offset > -0.09);
-        let v = spring.velocity;
-        spring.offset += 1.0; spring.advance(0.0);
-        assert!((spring.velocity - v).abs() < 1e-5);
-        spring.advance(2.0);
-        assert!(spring.offset.abs() < 0.001);
+    fn a_spring_settles_without_overshoot_and_keeps_its_velocity() {
+        for hz in [30.0, 60.0, 144.0] {
+            for offset in [-2.0, -0.88, 0.88, 2.0] {
+                let mut spring = Spring { offset, velocity: 0.0 };
+                let mut last = offset.abs();
+                for _ in 0..hz as usize {
+                    spring.advance(1.0 / hz);
+                    assert!(spring.offset * offset >= 0.0, "the correction overshot");
+                    assert!(spring.offset.abs() <= last, "the correction went backwards");
+                    last = spring.offset.abs();
+                }
+                assert!(last < 0.0001);
+            }
+        }
+        let mut spring = Spring { offset: 0.88, velocity: -0.2 };
+        let velocity = spring.velocity;
+        spring.offset += 1.0;
+        spring.advance(0.0);
+        assert_eq!(spring.velocity, velocity, "a new target changed speed instantly");
+        spring.advance(0.0000001);
+        let omega = 2.0 / SETTLE_TAU;
+        let acceleration = (spring.velocity - velocity) / 0.0000001;
+        assert!((acceleration - (-2.0 * omega * velocity - omega * omega * 1.88)).abs() < 1.0,
+            "the spring is not critically damped");
     }
 
     #[test]

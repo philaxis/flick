@@ -1,4 +1,5 @@
 # Run after building Flick; stage, run and restore within this same bridge job.
+param([string]$Mode = 'run')
 $ErrorActionPreference = 'Stop'
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $flick = Join-Path $target 'release\Flick.exe'
@@ -19,7 +20,7 @@ $logStart = if (Test-Path "$cfg\log.txt") { (Get-Content "$cfg\log.txt").Count }
 try {
     & $drive navigation stage $out
     if ($LASTEXITCODE) { throw 'stage failed' }
-    & $drive navigation run $out $flick
+    & $drive navigation $Mode $out $flick
     $probeExit = $LASTEXITCODE
     if ($probeExit) { Write-Warning 'Probe failed; collecting its trace before reporting the result' }
 } finally {

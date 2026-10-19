@@ -49,10 +49,10 @@ use windows::{
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
-            Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_OUTPUT_DESC},
+            Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
-                BitBlt, CreateRoundRectRgn, DeleteObject, GdiFlush, GetDC, InvalidateRect, MonitorFromPoint, ReleaseDC, SetWindowRgn,
-                ValidateRect, MONITOR_DEFAULTTOPRIMARY, SRCCOPY,
+                BitBlt, CreateRoundRectRgn, DeleteObject, GdiFlush, GetDC, InvalidateRect, ReleaseDC, SetWindowRgn,
+                ValidateRect, SRCCOPY,
             },
         },
         System::LibraryLoader::GetModuleHandleW,
@@ -277,6 +277,7 @@ impl FrameClock {
     fn start(&mut self, hwnd: HWND) {
         let shared = &self.shared;
         shared.hwnd.store(hwnd.0, Ordering::SeqCst);
+        shared.fresh.store(true, Ordering::SeqCst);
         shared.running.store(true, Ordering::SeqCst);
         match &self.thread {
             Some(thread) => thread.unpark(),
@@ -307,52 +308,25 @@ impl FrameClock {
 }
 
 fn clock_loop(shared: &ClockShared) {
-    let mut output: Option<IDXGIOutput> = None;
+    let Ok(mut pacer) = crate::overlay::FramePacer::new() else { return };
+    let mut frame = Instant::now();
     loop {
-        while !shared.running.load(Ordering::SeqCst) {
-            std::thread::park();
-        }
+        while !shared.running.load(Ordering::SeqCst) { std::thread::park(); }
         if shared.fresh.swap(false, Ordering::SeqCst) {
-            output = None;
+            if let Some(m) = crate::vd::monitors().into_iter().find(|m| m.primary) { pacer.place(m.work); }
+            frame = Instant::now();
         }
-        if output.is_none() {
-            output = primary_output();
-        }
-        let waited = output.as_ref().is_some_and(|output| unsafe { output.WaitForVBlank() }.is_ok());
-        if !waited {
-            // The motion timer draws meanwhile; try again a little later.
-            output = None;
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
+        // Some drivers return from WaitForVBlank immediately; share the validated
+        // refresh clock instead of flooding the UI queue with unpaced frames.
+        let (_, vblank) = pacer.wait(frame).unwrap_or_default();
+        frame = Instant::now();
         if shared.running.load(Ordering::SeqCst) && !shared.posted.swap(true, Ordering::SeqCst) {
             let hwnd = HWND(shared.hwnd.load(Ordering::SeqCst));
-            if unsafe { PostMessageW(hwnd, WM_BOARD_FRAME, WPARAM(0), LPARAM(0)) }.is_err() {
+            if unsafe { PostMessageW(hwnd, WM_BOARD_FRAME, WPARAM(vblank as usize), LPARAM(0)) }.is_err() {
                 shared.posted.store(false, Ordering::SeqCst);
             }
         }
     }
-}
-
-/// The DXGI output showing the primary monitor.
-fn primary_output() -> Option<IDXGIOutput> {
-    unsafe {
-        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let mut a = 0;
-        while let Ok(adapter) = factory.EnumAdapters(a) {
-            let mut o = 0;
-            while let Ok(output) = adapter.EnumOutputs(o) {
-                let mut desc = DXGI_OUTPUT_DESC::default();
-                if output.GetDesc(&mut desc).is_ok() && desc.AttachedToDesktop.as_bool() && desc.Monitor == monitor {
-                    return Some(output);
-                }
-                o += 1;
-            }
-            a += 1;
-        }
-    }
-    None
 }
 
 /// One drawn frame of the board's motion, as `FLICK_TRACE` has it.
@@ -368,6 +342,7 @@ struct TraceFrame {
     depth: f32,
     draw: Duration,
     dwm: Duration,
+    submit: Duration,
     thumbs: usize,
 }
 
@@ -409,13 +384,13 @@ impl Trace {
         let mut out = String::new();
         let new = std::fs::metadata(&self.path).map_or(true, |m| m.len() == 0);
         if new {
-            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails\n");
+            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms\n");
         }
         for f in self.frames.drain(..) {
-            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{}\n",
+            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3}\n",
                 ms(f.at), f.interval.map_or(String::new(), |i| format!("{:.3}", ms(i))),
                 if f.by_vblank { "vblank" } else { "timer" }, f.hand.0, f.hand.1, f.drawn.0, f.drawn.1, f.drawn.2,
-                f.depth, ms(f.draw), ms(f.dwm), f.thumbs));
+                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit)));
         }
         let written = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
             .and_then(|mut file| file.write_all(out.as_bytes()));
@@ -1468,6 +1443,7 @@ impl Board {
                     depth: self.strip.depth(t),
                     draw: took - dwm,
                     dwm,
+                    submit: took - prepared,
                     thumbs: self.thumbs.len() + self.strip_thumbs.len(),
                 };
                 if let Some(trace) = &mut self.trace {
@@ -2269,7 +2245,7 @@ impl Board {
                 if self.motion_timer {
                     let now = Instant::now();
                     self.vblank_frame = Some(now);
-                    self.tick_motion(now, true);
+                    self.tick_motion(now, wparam.0 != 0);
                 }
                 Action::None
             }

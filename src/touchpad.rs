@@ -105,7 +105,7 @@ pub enum Dir {
 }
 
 /// Movement needed to commit a cell in either direction, in millimetres.
-pub const STEP_MM: f64 = 4.0;
+pub const STEP_MM: f64 = 12.0;
 /// Pad travel for one step sideways and up and down as set (`Config::touchpad`), in hundredths of
 /// a mm; none set is `STEP_MM`.
 static STEP_SET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];

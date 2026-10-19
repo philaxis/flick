@@ -35,7 +35,8 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 }
             }
         }
-        "run" => unsafe {
+        "run" | "motion" => unsafe {
+            let motion = mode == "motion";
             let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();
             let ids: Vec<_> = ids.lines().collect();
             let all = vdapi::get_desktops().unwrap();
@@ -55,7 +56,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             let mut report = String::new();
             let mut failures = 0;
             for (follow, minimap) in [(true, false), (true, true), (false, true)] {
-                let config = format!("config_version = 2\ntrigger = \"xbutton2, f8\"\nminimap = {minimap}\nhotkeys = false\n[mouse]\nstep_x = 260\nstep_y = 400\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
+                let config = format!("config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = {minimap}\nhotkeys = false\n[mouse]\nstep_x = 300\nstep_y = 300\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
                 std::fs::write(cfg.join("config.toml"), config).unwrap();
                 goto(0);
                 let mut child = Command::new(flick.unwrap()).arg("--portable").env("FLICK_GLIDE_STATS", "1").env("FLICK_TRACE", out.join(format!("trace-{follow}-{minimap}.csv")))
@@ -64,14 +65,21 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 let app = FindWindowW(w!("flick.main"), None);
                 assert!(app.0 != 0, "Flick did not start");
                 for (label, start, moves, target) in [
-                    ("mouse-right", 0, vec![(300, 12)], 1),
-                    ("mouse-up-then-right", 4, vec![(8, -440), (500, 5)], 3),
-                    ("mouse-right-then-up", 4, vec![(300, 10), (5, -1000)], 3),
+                    ("mouse-right", 0, vec![(340, 8)], 1),
+                    ("mouse-up-then-right", 4, vec![(4, -340), (340, 4)], 3),
+                    ("mouse-right-then-up", 4, vec![(340, 4), (4, -340)], 3),
+                    ("mouse-down-then-right", 2, vec![(4, 340), (340, 4)], 5),
+                    ("edge-then-inward", 1, vec![(900, 0), (-340, 0)], 0),
                 ] {
                     goto(start);
                     mouse(MOUSEEVENTF_XDOWN, 0, 0);
                     wait(80);
-                    for (dx, dy) in moves { stroke(dx, dy, 450); wait(250); }
+                    for (dx, dy) in moves { stroke(dx, dy, if motion { 240 } else { 450 }); if !motion { wait(250); } }
+                    if follow {
+                        let still = vdapi::get_current_desktop().unwrap().id() == ids[start];
+                        failures += usize::from(!still);
+                        report += &format!("follow={follow} minimap={minimap} {label} Windows-stays-until-release: {still}\n");
+                    }
                     let _ = Command::new(&me).args(["shot", out.join(format!("{follow}-{minimap}-{label}.raw")).to_str().unwrap()]).status();
                     mouse(MOUSEEVENTF_XUP, 0, 0);
                     wait(1800);
@@ -84,7 +92,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 for up in [false, true] {
                     let input = super::key_vk(0x77, up);
                     SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-                    if !up { wait(80); stroke(300, 8, 450); wait(250); }
+                    if !up { wait(80); stroke(340, 8, 450); wait(250); }
                 }
                 wait(1800);
                 let got = vdapi::get_current_desktop().unwrap().id();
@@ -93,7 +101,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 // The second press arrives before the first picture can settle.
                 if follow {
                     goto(4);
-                    for (dx, dy) in [(4, -440), (300, 4)] {
+                    for (dx, dy) in [(4, -340), (340, 4)] {
                         mouse(MOUSEEVENTF_XDOWN, 0, 0);
                         stroke(dx, dy, 50);
                         wait(200); // Remove fling velocity without giving the released hold time to settle.
@@ -105,6 +113,46 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     report += &format!("follow={follow} minimap={minimap} rapid-up-then-right: {} actual={got}\n", got == ids[3]);
                     failures += usize::from(got != ids[3]);
                 }
+                if motion {
+                    goto(0);
+                    if follow {
+                        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(180, 0, 100); mouse(MOUSEEVENTF_XUP, 0, 0); wait(1800);
+                        let ok = vdapi::get_current_desktop().unwrap().id() == ids[0];
+                        failures += usize::from(!ok);
+                        report += &format!("follow={follow} minimap={minimap} subthreshold-no-fling: {ok}\n");
+                    }
+                    // Colored, differently proportioned native windows expose source-frame fitting errors.
+                    let mut windows = Vec::new();
+                    for (title, rgb, width, height, dest) in [("F wide", [255, 255, 0], 800, 300, 0), ("F tall", [0, 255, 255], 300, 700, 1)] {
+                        let args = ["hold".to_owned(), rgb[0].to_string(), rgb[1].to_string(), rgb[2].to_string(), title.into(), "200".into(), "120".into(), width.to_string(), height.to_string(), "90".into()];
+                        windows.push(Command::new(&me).args(args).spawn().unwrap());
+                        wait(400);
+                        let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title));
+                        vdapi::move_window_to_desktop(*all.iter().find(|d| d.id() == ids[dest]).unwrap(), hwnd).unwrap();
+                    }
+                    goto(0);
+                    let _ = PostMessageW(app, WM_APP + 2, WPARAM(0), LPARAM(0)); wait(900);
+                    let board = FindWindowW(w!("flick.board"), None);
+                    let opened = IsWindowVisible(board).as_bool();
+                    failures += usize::from(!opened);
+                    report += &format!("follow={follow} minimap={minimap} board-open: {opened}\n");
+                    for (label, vk) in [("right", 0x27), ("left", 0x25), ("down", 0x28), ("up", 0x26)] {
+                        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(vk), LPARAM(0)); wait(150);
+                        let _ = Command::new(&me).args(["shot", out.join(format!("board-{follow}-{minimap}-{label}.raw")).to_str().unwrap()]).status();
+                        wait(1050);
+                    }
+                    let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)); wait(800);
+                    goto(2);
+                    let _ = PostMessageW(app, WM_APP + 2, WPARAM(0), LPARAM(0)); wait(700);
+                    mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
+                    stroke(4, 340, 240); stroke(340, 4, 240);
+                    mouse(MOUSEEVENTF_XUP, 0, 0); wait(1500);
+                    let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)); wait(1200);
+                    let got = vdapi::get_current_desktop().unwrap().id();
+                    let ok = got == ids[5]; failures += usize::from(!ok);
+                    report += &format!("follow={follow} minimap={minimap} board-down-then-right: {ok} actual={got}\n");
+                    for window in &mut windows { let _ = window.kill(); let _ = window.wait(); }
+                } else {
                 // Fifty physical button taps interleaved with holds, 100 ms apart.
                 let measuring = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let running = measuring.clone();
@@ -157,6 +205,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 let selected = got == ids[1] && !IsWindowVisible(board).as_bool();
                 failures += usize::from(!focused || !selected);
                 report += &format!("follow={follow} minimap={minimap} board keyboard: focused={focused} Esc-goes-to-selection={selected} actual={got}\n");
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 wait(500);
@@ -167,6 +216,6 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             print!("{report}");
             assert_eq!(failures, 0, "navigation probe failed; see report.txt");
         },
-        _ => panic!("navigation stage|run|unstage <out> [flick]"),
+        _ => panic!("navigation stage|run|motion|unstage <out> [flick]"),
     }
 }
