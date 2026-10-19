@@ -576,7 +576,7 @@ impl Motion {
     /// whether anything is still moving.
     fn advance(&mut self, hand: HashMap<Part, (f32, f32)>, counted_from: u64, now: Instant) -> bool {
         self.elapse(now);
-        if self.counted_from != Some(counted_from) {
+        if self.counted_from.is_some_and(|from| from != counted_from) {
             let parts: std::collections::HashSet<Part> = self.hand.keys().chain(hand.keys()).cloned().collect();
             for part in parts {
                 let (was, is) = (self.hand.get(&part).copied().unwrap_or_default(), hand.get(&part).copied().unwrap_or_default());
@@ -3482,7 +3482,8 @@ mod tests {
             let component = |motion: &Motion| if axis == 0 { motion.offset(&part).0 } else { motion.offset(&part).1 };
             for hand_first in [false, true] {
                 let mut motion = Motion::default();
-                motion.advance(HashMap::new(), 1, now);
+                motion.advance(HashMap::from([(part.clone(), point(sign * 40.0))]), 1, now);
+                assert_eq!(component(&motion), sign * 40.0, "the first hand sample follows directly");
                 let at = now + Duration::from_millis(16);
                 motion.advance(HashMap::from([(part.clone(), point(sign * 90.0))]), 1, at);
                 assert_eq!(component(&motion), sign * 90.0, "the hand follows directly");
