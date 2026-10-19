@@ -86,6 +86,7 @@ fn main() {
                 let mut bits = std::ptr::null_mut();
                 let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
                 SelectObject(dc, bitmap);
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
                 let _ = BitBlt(dc, 0, 0, w, h, screen, x, y, SRCCOPY);
                 let pixels = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
                 let mut out = Vec::with_capacity(pixels.len() + 8);

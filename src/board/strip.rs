@@ -155,7 +155,7 @@ pub fn clip(dest: &Rect, within: &Rect, source: (f32, f32)) -> Option<(Rect, Rec
     Some((shown, Rect { left: x(shown.left), top: y(shown.top), right: x(shown.right), bottom: y(shown.bottom) }))
 }
 
-/// How bright a picture is when the strip is `depth` back.
+/// Brightness follows distance from the displayed camera, including during a commit.
 pub fn shade(distance: f32) -> f32 { 1.0 - DIM * distance.clamp(0.0, 1.0) }
 
 /// The size of a picture `depth` back.
@@ -361,16 +361,13 @@ mod tests {
         assert!(clip(&rect(120.0, 0.0, 50.0, 50.0), &within, (10.0, 10.0)).is_none());
     }
 
-    /// The neighbours darken as the strip goes back; the middle never.
     #[test]
-    fn neighbours_darken_with_depth_only() {
+    fn neighbours_darken_with_distance() {
         assert!(near(shade(0.0), 1.0));
         assert!(near(shade(1.0), 1.0 - DIM));
-        assert!(near(shade(0.0), 1.0));
+        assert!(near(shade(0.5), 1.0 - DIM * 0.5));
         assert!(near(scale(1.0), RECEDE) && near(scale(0.0), 1.0));
     }
-
-
 
     #[test]
     fn both_axes_use_f_and_carry_speed_through_retargets() {
@@ -403,6 +400,7 @@ mod tests {
         let before = strip.offset(0, 0.2).0;
         strip.follow((0.0, 0.0), 0, 3, false, 0.2);
         assert!((strip.offset(0, 0.2).0 - before).abs() < 1e-5);
+        for i in 21..=200 { strip.follow((0.0, 0.0), 0, 3, false, i as f32 / 100.0); }
         assert!(strip.offset(0, 2.0).0.abs() < 0.001 && !strip.active(2.0));
     }
 }

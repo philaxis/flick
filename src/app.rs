@@ -1188,6 +1188,14 @@ impl App {
         let Some(ways) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|_| input::followed().ways) else { return };
         let Some(desktops) = self.sync() else { return };
         if let Some(scene) = self.glide_scene(&desktops, to, hold, ways) {
+            if let Some(gliding) = &mut self.gliding {
+                if let Some(fallback) = &mut gliding.fallback {
+                    if let Some(saved) = input::follow_hold(hold) {
+                        fallback.finish_path(&saved.path);
+                        fallback.reframe(scene.rows, scene.cols.clone(), (saved.hand.x, saved.hand.y), self.grid.find(&gliding.origin).is_some_and(|from| from.row != scene.origin.row));
+                    }
+                }
+            }
             self.glide.rebase(scene);
         }
         if let Some(gliding) = &mut self.gliding {

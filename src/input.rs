@@ -1197,8 +1197,17 @@ fn touchpad_event(event: crate::touchpad::Event) {
                         by
                     });
                     let steps = directed((steps[0], steps[1]), s.touchpad_reverse);
-                    advance(s, if s.touchpad_follow & FOLLOW_X != 0 { raw[0] - old[0] } else { steps.0 },
-                        if s.touchpad_follow & FOLLOW_Y != 0 { raw[1] - old[1] } else { steps.1 });
+                    let following = FOLLOWING.load(Ordering::SeqCst);
+                    let (mut whole, mut lean) = FOLLOWED.get();
+                    let pad_cells = directed((counts[0] as i64, counts[1] as i64), s.touchpad_reverse);
+                    let pad_lean = directed(event.lean, s.touchpad_reverse);
+                    // Normal-view pad precision must not depend on the mouse's Distance.
+                    if following & FOLLOW_X != 0 { whole.0 = pad_cells.0 * s.step_x as i64; lean.0 = pad_lean.0; }
+                    if following & FOLLOW_Y != 0 { whole.1 = pad_cells.1 * s.step_y as i64; lean.1 = pad_lean.1; }
+                    FOLLOWED.set((whole, lean));
+                    let dx = if following & FOLLOW_X != 0 { 0 } else if s.touchpad_follow & FOLLOW_X != 0 { raw[0] - old[0] } else { steps.0 };
+                    let dy = if following & FOLLOW_Y != 0 { 0 } else if s.touchpad_follow & FOLLOW_Y != 0 { raw[1] - old[1] } else { steps.1 };
+                    advance(s, dx, dy);
                 } else if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
                 return false;
             }

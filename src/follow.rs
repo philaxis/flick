@@ -139,20 +139,33 @@ impl Label {
 pub struct Follow {
     pub rows: (i32, i32), pub cols: Vec<(i32, i32)>, pub row: i32,
     along: Vec<Spring>, columns: Vec<Latch>, vertical: Spring, rows_hand: Latch,
-    depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool,
+    depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool, path_cursor: usize,
 }
 impl Follow {
     pub fn new(rows: (i32, i32), cols: Vec<(i32, i32)>) -> Self {
         let n = (rows.1 - rows.0 + 1).max(1) as usize;
         Self { rows, cols, row: 0, along: vec![Spring::default(); n], columns: vec![Latch::default(); n],
             vertical: Spring::default(), rows_hand: Latch::default(), depth: Spring::default(),
-            last: None, axis: 0, hand: (0.0, 0.0), released: false }
+            last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0 }
     }
     pub fn cols_of(&self, row: i32) -> (i32, i32) {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
     }
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
+    pub fn reframe(&mut self, rows: (i32, i32), cols: Vec<(i32, i32)>, hand: (f64, f64), row_changed: bool) {
+        if row_changed {
+            let depth = self.depth;
+            let (last, path_cursor) = (self.last, self.path_cursor);
+            *self = Self::new(rows, cols);
+            self.depth = depth; self.last = last; self.hand = hand; self.path_cursor = path_cursor;
+            for column in &mut self.columns { column.rebase(hand.0); }
+            self.rows_hand.rebase(hand.1);
+        } else {
+            self.cols = cols;
+            for (column, &(left, right)) in self.columns.iter_mut().zip(&self.cols) { column.cell = column.cell.clamp(left, right); }
+        }
+    }
     pub fn velocity(&self) -> ((f64, f64), f64) {
         ((self.along[(self.row - self.rows.0) as usize].v, self.vertical.v), self.depth.v)
     }
@@ -196,8 +209,13 @@ impl Follow {
         self.depth.v += 5.0 * commits.abs() as f64;
         (self.offset(self.row), self.vertical.p)
     }
+    pub fn track_path(&mut self, now: f64, path: &[(f64, f64, usize)]) {
+        for &(x, y, axis) in path.iter().skip(self.path_cursor) { self.track_locked(now, (x, y), axis); }
+        // The last straight leg keeps growing until the next turn.
+        self.path_cursor = path.len().saturating_sub(1);
+    }
     pub fn finish_path(&mut self, path: &[(f64, f64, usize)]) -> (i32, i32) {
-        for &(x, y, axis) in path { self.track_locked(0.0, (x, y), axis); }
+        self.track_path(0.0, path);
         self.let_go(0.0, self.hand)
     }
     pub fn let_go(&mut self, now: f64, at: (f64, f64)) -> (i32, i32) {
@@ -230,6 +248,13 @@ mod tests {
         for i in 3..250 { f.settle(i as f64 * 0.01); }
         assert!((f.offset(1) - 1.0).abs() < 1e-6 && f.offset(0).abs() < 1e-6);
         assert!(f.settle(3.0).1);
+    }
+    #[test]
+    fn an_immediate_row_change_rebases_the_followed_column() {
+        let mut f = Follow::new((0, 0), vec![(0, 3)]);
+        f.track_locked(0.0, (1.4, 0.0), 0);
+        f.reframe((0, 0), vec![(-1, 0)], (1.4, 0.0), true);
+        assert_eq!(f.finish_path(&[(0.4, 0.0, 0)]), (-1, 0));
     }
     #[test]
     fn a_key_step_uses_the_same_position_and_depth_springs() {

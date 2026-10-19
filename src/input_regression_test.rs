@@ -305,6 +305,22 @@ fn letting_go_of_the_touchpad_keeps_where_the_hand_was() {
     assert!((after.x - before.x).abs() < 1e-3 && (after.y - before.y).abs() < 1e-3, "{before:?} then {after:?}");
 }
 
+#[test]
+fn touchpad_follow_keeps_sub_count_precision_and_the_other_axis_immediate() {
+    let posted = |message| api::CALLS.with(|c| c.borrow().messages.iter().filter(|m| m.0 == message).count());
+    let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    reset();
+    let s = Settings { step_x: 20, touchpad_follow: FOLLOW_X, ..settings() };
+    SETTINGS.with(|slot| *slot.borrow_mut() = Some(s));
+    touchpad_event(crate::touchpad::Event { began: true, ..Default::default() });
+    touchpad_event(crate::touchpad::Event { lean: (0.123, 0.8), axis: Some(0), ..Default::default() });
+    assert!((followed().x + 0.123).abs() < 0.0011);
+    assert_eq!(posted(WM_ROWS), 0);
+    touchpad_event(crate::touchpad::Event { steps: vec![crate::touchpad::Dir::Down], axis: Some(1), ..Default::default() });
+    assert_eq!(posted(WM_ROWS), 1);
+    reset();
+}
+
 fn packet(kind: u32, len: usize) -> Vec<u8> {
     let mut packet = vec![0; len];
     packet[..4].copy_from_slice(&kind.to_le_bytes());

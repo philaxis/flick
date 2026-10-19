@@ -605,7 +605,6 @@ struct Session {
     began: Instant,
     /// Where the hand was last seen.
     hand: (f64, f64),
-    path_cursor: usize,
     /// As drawn.
     shown: Option<Strip>,
     /// The farthest up or down the strip went (`ROW_WINDOWS_JOIN`).
@@ -800,13 +799,12 @@ impl View {
                     return;
                 }
                 let (hand, visible, began, farthest_y, trace) = (old.hand, old.visible, old.began, old.farthest_y, old.trace.take());
-                let follow = old.follow.clone();
-                let path_cursor = old.path_cursor;
+                let mut follow = old.follow.clone();
+                follow.reframe(scene.rows, scene.cols.clone(), hand, scene.origin.row != old.origin.row);
                 let (screens, leftover) = old.retire(self.trace.as_deref());
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
                     new.follow = follow;
-                    new.path_cursor = path_cursor;
                     (new.hand, new.visible, new.began, new.farthest_y) = (hand, visible, began, farthest_y);
                     new.trace = trace.or(new.trace.take());
                 }
@@ -910,7 +908,6 @@ impl View {
             hide_after: None,
             began: Instant::now(),
             hand: (0.0, 0.0),
-            path_cursor: 0,
             shown: None,
             farthest_y: 0.0,
             names: scene.names,
@@ -1022,11 +1019,7 @@ impl View {
                     session.hand = (hand.x, hand.y);
                 }
                 if let Some(saved) = &saved {
-                    for &(x, y, axis) in saved.path.iter().skip(session.path_cursor) {
-                        session.follow.track_locked(now, (x, y), axis);
-                    }
-                    // The last straight leg keeps growing until the next turn.
-                    session.path_cursor = saved.path.len().saturating_sub(1);
+                    session.follow.track_path(now, &saved.path);
                 }
                 if hand.hold == session.hold && hand.holding {
                     let at = session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis));

@@ -156,6 +156,9 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                         mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(-110, 0, 250); wait(900);
                         let _ = Command::new(&me).args(["shot", out.join("board-held-tall.raw").to_str().unwrap()]).status();
                         mouse(MOUSEEVENTF_XUP, 0, 0); wait(1500);
+                        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x25), LPARAM(0)); wait(150);
+                        let _ = Command::new(&me).args(["shot", out.join("board-moving-left.raw").to_str().unwrap()]).status();
+                        wait(1500);
                     }
                     let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)); wait(1500);
                     goto(2);
