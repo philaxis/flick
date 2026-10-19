@@ -798,6 +798,7 @@ impl App {
     fn slide(&mut self, key: (u32, u8), to: Option<i32>, carry: bool) -> Option<(i32, (usize, usize))> {
         let began = self.sliding.take().filter(|(of, _)| *of == key).map(|(_, origin)| origin);
         let (origin, on, room) = if self.board.is_open() {
+            self.board.follow_hand();
             let origin = began.unwrap_or_else(|| self.board.selected());
             let (on, room) = match to {
                 Some(to) => {
@@ -846,6 +847,7 @@ impl App {
     fn rows(&mut self, hold: u32, to: i32, carry: bool) -> Option<(i32, (usize, usize))> {
         let began = self.rowing.take().filter(|(of, _)| *of == hold).map(|(_, row)| row);
         let (on, room) = if self.board.is_open() {
+            self.board.follow_hand();
             let origin = began.or_else(|| self.grid.find(&self.board.selected()).map(|pos| pos.row))?;
             debug_log!("app: the selection goes to row {to:+}, the board being open");
             let across = self.grid.across(origin, to)?;
@@ -2285,6 +2287,8 @@ pub fn time_minimap(path: &str) {
 /// same made-up windows when sizes were supplied. `FLICK_USAGE=1` adds
 /// scores 0,1,4,16 and a sample grid; it also adds varied usage to minimap renders.
 /// `FLICK_HOVER_FROM=row,col` and `FLICK_HOVER_MS=60` sample a glide to `FLICK_HOVER`.
+/// `FLICK_STEP_FROM=row,col` and `FLICK_STEP_MS=30` show the board that long
+/// after the selection moved from that cell to the current one.
 pub fn render_board(path: &str, sizes: Option<&str>) {
     // Reading the desktops needs a backend, and only a known Windows gets one.
     if vdapi::select(false).is_none() {
@@ -2380,8 +2384,18 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
         let ms = std::env::var("FLICK_HOVER_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(60).min(10_000);
         Some((pos, ms))
     });
+    let step = std::env::var("FLICK_STEP_FROM").ok().and_then(|value| {
+        let (row, col) = value.split_once(',')?;
+        let pos = Pos { row: row.trim().parse().ok()?, col: col.trim().parse().ok()? };
+        let ms = std::env::var("FLICK_STEP_MS").ok().and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(30).min(10_000);
+        Some((pos, ms))
+    });
+    // The current cell is where the move went, its row lined up on it.
+    if step.is_some() {
+        app.grid.visit(&desktops.current);
+    }
     let size = (2560, 1440);
-    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5, hover, glide) {
+    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5, hover, glide, step) {
         write_raw(path, size, &pixels);
     }
 }

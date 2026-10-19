@@ -224,6 +224,11 @@ pub struct Hand {
     pub counted_from: u64,
 }
 
+/// A hold of the trigger is going on.
+pub fn holding() -> bool {
+    HOLDING.load(Ordering::SeqCst)
+}
+
 /// Where the hand is now; nothing while no hold is going on.
 pub fn hand() -> Hand {
     loop {

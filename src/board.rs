@@ -210,6 +210,22 @@ const POPUP_GLIDE_MS: u64 = 120;
 const POPUP_GRACE_MS: u64 = 200;
 const POPUP_FADE_IN_MS: u64 = 80;
 const POPUP_FADE_OUT_MS: u64 = 120;
+/// While what moved eases into place, how often it is drawn again.
+const MOTION_TIMER_ID: usize = 4;
+const MOTION_MS: u32 = 15;
+/// How fast a jump in the map or the tiles is eased away, as the minimap's
+/// grid eases its own (`overlay::SETTLE_TAU`).
+const SETTLE_TAU: f32 = 0.045;
+/// A frame that comes later than this eases only this far, so that a slow
+/// machine still shows the way between rather than the end of it.
+const MOTION_LONGEST_STEP: f32 = 1.0 / 30.0;
+/// Under this much left to go, in pixels, a part is in place.
+const SETTLED: f32 = 0.5;
+/// How far the tiles of a cell just gone to come in from, unscaled.
+const ARRIVE: f32 = 40.0;
+/// How far past the first and last cell the hand can pull a row, in cells,
+/// as in the minimap (`overlay::EDGE_GIVE`).
+const EDGE_GIVE: f32 = 0.16;
 /// The longest name a shelf can be given, in characters.
 const NAME_LENGTH: usize = 24;
 /// Sent after the cursor leaves a window that called `TrackMouseEvent`.
@@ -438,6 +454,110 @@ impl PopupAnimation {
     }
 }
 
+/// What moves as one when the selection does.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum Part {
+    /// A row's cells and its + buttons on a monitor's map, known by the
+    /// row's first cell.
+    Row(usize, CellId),
+    /// The row names and the apps pinned to the rows, on a monitor's map.
+    Names(usize),
+    /// The column vertical moves travel along, with the + buttons on it.
+    Spine(usize),
+    /// The frame of the selected cell, on a monitor's map.
+    Selection(usize),
+    /// A tile, by its window.
+    Tile(isize),
+}
+
+/// The board moving the way the minimap does (`overlay::Camera`): every
+/// part is drawn where it is laid out plus what is left of its last jump,
+/// eased away, plus where the held trigger pulls it between two cells.
+#[derive(Default)]
+struct Motion {
+    /// What is left to ease away of each part's jumps, in pixels.
+    rest: HashMap<Part, (f32, f32)>,
+    /// How far the hand pulled each part in the last frame, in pixels.
+    hand: HashMap<Part, (f32, f32)>,
+    /// What the hand was counted from then (`input::Hand::counted_from`).
+    counted_from: Option<u64>,
+    last: Option<Instant>,
+    /// Frames drawn and the time spent drawing them, since it last stood still.
+    frames: u32,
+    drawing: Duration,
+    slowest: Duration,
+}
+
+impl Motion {
+    /// Where a part is drawn, relative to where it is laid out.
+    fn offset(&self, part: &Part) -> (f32, f32) {
+        let (rest, hand) = (self.rest.get(part).copied().unwrap_or_default(), self.hand.get(part).copied().unwrap_or_default());
+        (rest.0 + hand.0, rest.1 + hand.1)
+    }
+
+    fn is_moving(&self) -> bool {
+        !self.rest.is_empty() || !self.hand.is_empty()
+    }
+
+    /// The parts were laid out at `before` and are now at `after`: each is
+    /// still drawn where it was and eases from there. A part new to the
+    /// layout comes in from `arrive` when it is a tile; anything else
+    /// that came or went has nothing to ease from.
+    fn moved(&mut self, before: &HashMap<Part, (f32, f32)>, after: &HashMap<Part, (f32, f32)>, arrive: (f32, f32), now: Instant) {
+        if !self.is_moving() {
+            self.last = Some(now);
+        }
+        let rest = after.iter().filter_map(|(part, at)| {
+            let left = self.rest.get(part).copied().unwrap_or_default();
+            let jump = match before.get(part) {
+                Some(was) => (left.0 + was.0 - at.0, left.1 + was.1 - at.1),
+                None if matches!(part, Part::Tile(_)) => arrive,
+                None => (0.0, 0.0),
+            };
+            (jump.0.abs() >= SETTLED || jump.1.abs() >= SETTLED).then(|| (part.clone(), jump))
+        });
+        self.rest = rest.collect();
+    }
+
+    /// One frame at `now`, with the hand pulling the parts by `hand`. When
+    /// what the hand is counted from changed (it came to a cell, or let go),
+    /// its jump is eased away like any other, so nothing jumps. Returns
+    /// whether anything is still moving.
+    fn advance(&mut self, hand: HashMap<Part, (f32, f32)>, counted_from: u64, now: Instant) -> bool {
+        let step = self.last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32()).min(MOTION_LONGEST_STEP);
+        self.last = Some(now);
+        if self.counted_from != Some(counted_from) {
+            let parts: std::collections::HashSet<Part> = self.hand.keys().chain(hand.keys()).cloned().collect();
+            for part in parts {
+                let (was, is) = (self.hand.get(&part).copied().unwrap_or_default(), hand.get(&part).copied().unwrap_or_default());
+                let rest = self.rest.entry(part).or_default();
+                *rest = (rest.0 + was.0 - is.0, rest.1 + was.1 - is.1);
+            }
+        }
+        let keep = (-step / SETTLE_TAU).exp();
+        self.rest.retain(|_, rest| {
+            *rest = (rest.0 * keep, rest.1 * keep);
+            rest.0.abs() >= SETTLED || rest.1.abs() >= SETTLED
+        });
+        (self.hand, self.counted_from) = (hand, Some(counted_from));
+        self.is_moving()
+    }
+
+    fn stop(&mut self) {
+        self.rest.clear();
+        self.hand.clear();
+        self.last = None;
+    }
+}
+
+/// How far the hand pulls the selected row sideways and the selection up or
+/// down, in cells and rows, kept within a little of the first and last as
+/// in the minimap.
+fn hand_pull(at: (usize, usize), last: (usize, usize), hand: (f32, f32)) -> (f32, f32) {
+    let pull = |at: usize, last: usize, by: f32| (at as f32 + by).clamp(-EDGE_GIVE, last as f32 + EDGE_GIVE) - at as f32;
+    (pull(at.0, last.0, hand.0), pull(at.1, last.1, hand.1))
+}
+
 /// The map of all rows and cells, in the coordinates of the monitor it is on.
 #[derive(Default)]
 struct MapLayout {
@@ -448,6 +568,9 @@ struct MapLayout {
     /// The "add a row" buttons below and above the rows.
     add_row: Rect,
     add_row_top: Rect,
+    /// From one cell to the next, and from one row to the next.
+    pitch: f32,
+    row_pitch: f32,
 }
 
 /// The map as laid out for one monitor.
@@ -520,6 +643,10 @@ pub struct Board {
     popup_animation: Option<PopupAnimation>,
     popup_alpha: f32,
     popup_timer: Option<Instant>,
+    /// The map and the tiles easing into place after the selection moved,
+    /// and following the held trigger; drawn by `MOTION_TIMER_ID` meanwhile.
+    motion: Motion,
+    motion_timer: bool,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
@@ -576,10 +703,12 @@ pub struct Board {
 
 /// The parts of `area` the tiles go into: all in one, or when some windows
 /// are pinned, those in parts of their own at the left, where they stay
-/// whichever cell is looked at (`tiles::pin_parts`). Each part has a
-/// heading, or none.
+/// whichever cell is looked at (`tiles::pin_parts`), room being kept for
+/// `row_most` windows pinned to the row, the most any row has here. Each
+/// part has a heading, or none.
 fn split_area<'a>(
     here: &[(&'a WindowModel, bool)],
+    row_most: usize,
     area: &Rect,
     s: f32,
 ) -> Vec<(Rect, Option<&'static str>, Vec<(&'a WindowModel, bool)>)> {
@@ -591,7 +720,7 @@ fn split_area<'a>(
         return vec![(*area, None, here.to_vec())];
     }
     let (head, gap) = (24.0 * s, 20.0 * s);
-    let parts = tiles::pin_parts(all.len(), row.len(), size(area), gap, head, tile_least(s));
+    let parts = tiles::pin_parts(all.len(), row.len(), row_most, size(area), gap, head, tile_least(s));
     let place = |(x, y, w, h): tiles::Part| Rect { top: area.top + y + head, ..rect(area.left + x, area.top + y, w, h) };
     let mut out = Vec::new();
     for (part, name, group) in [(parts.all, "All rows", all), (parts.row, "This row", row)] {
@@ -660,6 +789,8 @@ impl Board {
                 popup_animation: None,
                 popup_alpha: 0.0,
                 popup_timer: None,
+                motion: Motion::default(),
+                motion_timer: false,
                 factory: paint::d2d_factory()?,
                 canvas: None,
                 fonts: None,
@@ -753,6 +884,7 @@ impl Board {
         self.hover = Hit::Nothing;
         self.press = None;
         self.hide_popup();
+        self.motion.stop();
         self.refused = None;
         self.stop_editing();
         self.open = true;
@@ -776,6 +908,8 @@ impl Board {
         }
         self.press = None;
         self.hide_popup();
+        // What changed is not a move: it is shown as it is.
+        self.motion.stop();
         self.relayout();
         self.hover_under_cursor();
         self.register_thumbnails();
@@ -816,6 +950,7 @@ impl Board {
         // board is opened again.
         self.canvas = None;
         self.press = None;
+        self.stop_motion();
         unsafe {
             let _ = ReleaseCapture();
             let _ = KillTimer(self.hwnd, ON_TOP_TIMER_ID);
@@ -826,16 +961,148 @@ impl Board {
         }
     }
 
-    /// Shows a selection whose row anchors the app has already saved.
+    /// Shows a selection whose row anchors the app has already saved. What
+    /// moved is drawn where it was and eases into place, as in the minimap:
+    /// the selection stays on the spine and its row slides under it, or the
+    /// selection goes along the spine to the next row. Tiles of windows
+    /// shown before and after (on every desktop, or in the row while the
+    /// row stays) stay; those of the cell gone to come in from its side.
     pub fn select(&mut self, id: CellId, grid: Grid) {
+        let now = Instant::now();
+        let before = self.marks();
+        let arrive = self.arrival(&grid, &id);
         self.grid = grid;
         self.selected = id;
         self.hide_popup();
         self.relayout();
+        self.motion.moved(&before, &self.marks(), arrive, now);
         self.hover_under_cursor();
         self.register_thumbnails();
-        self.update_popup(Instant::now());
+        if self.motion.is_moving() {
+            // The preview comes up over the cell under the cursor once it is in place.
+            self.start_motion();
+        } else {
+            self.update_popup(now);
+        }
         self.invalidate();
+    }
+
+    /// Where the tiles of `to` come in from: the side of the move.
+    fn arrival(&self, grid: &Grid, to: &str) -> (f32, f32) {
+        let distance = ARRIVE * self.scale;
+        let sign = |a: usize, b: usize| b.cmp(&a) as i32 as f32;
+        match (self.grid.find(&self.selected), grid.find(to)) {
+            (Some(from), Some(to)) if from.row != to.row => (0.0, sign(from.row, to.row) * distance),
+            (Some(from), Some(to)) => (sign(from.col, to.col) * distance, 0.0),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// The held trigger began a hold over the open board: its rows follow
+    /// the hand from now on, as the minimap's do.
+    pub fn follow_hand(&mut self) {
+        if self.open {
+            self.start_motion();
+        }
+    }
+
+    fn start_motion(&mut self) {
+        if !self.motion_timer {
+            unsafe {
+                SetTimer(self.hwnd, MOTION_TIMER_ID, MOTION_MS, None);
+            }
+            self.motion_timer = true;
+        }
+    }
+
+    fn stop_motion(&mut self) {
+        self.motion.stop();
+        if self.motion_timer {
+            unsafe {
+                let _ = KillTimer(self.hwnd, MOTION_TIMER_ID);
+            }
+            self.motion_timer = false;
+        }
+    }
+
+    /// Where each part that moves is laid out: its top left corner.
+    fn marks(&self) -> HashMap<Part, (f32, f32)> {
+        let corner = |r: &Rect| (r.left, r.top);
+        let mut marks = HashMap::new();
+        for map in &self.maps {
+            let m = map.monitor;
+            marks.insert(Part::Spine(m), corner(&map.layout.spine));
+            if let Some(row) = map.layout.rows.first() {
+                marks.insert(Part::Names(m), corner(&row.header));
+            }
+            for row in &map.layout.rows {
+                if let Some(first) = row.cells.first() {
+                    marks.insert(Part::Row(m, first.id.clone()), corner(&first.body));
+                }
+                if let Some(cell) = row.cells.iter().find(|cell| cell.id == self.selected) {
+                    marks.insert(Part::Selection(m), corner(&cell.body));
+                }
+            }
+        }
+        for tile in &self.tiles {
+            marks.insert(Part::Tile(tile.hwnd.0), corner(&tile.frame));
+        }
+        marks
+    }
+
+    /// How far the hand pulls the selected row and the selection, in pixels.
+    fn hand_parts(&self, hand: (f32, f32)) -> HashMap<Part, (f32, f32)> {
+        let mut parts = HashMap::new();
+        let Some(at) = self.grid.find(&self.selected).filter(|_| hand != (0.0, 0.0)) else { return parts };
+        for map in &self.maps {
+            let Some(row) = map.layout.rows.get(at.row) else { continue };
+            let Some(first) = row.cells.first() else { continue };
+            let last = (row.cells.len() - 1, map.layout.rows.len() - 1);
+            let (x, y) = hand_pull((at.col, at.row), last, hand);
+            if x != 0.0 {
+                parts.insert(Part::Row(map.monitor, first.id.clone()), (-x * map.layout.pitch, 0.0));
+            }
+            if y != 0.0 {
+                parts.insert(Part::Selection(map.monitor), (0.0, y * map.layout.row_pitch));
+            }
+        }
+        parts
+    }
+
+    /// One frame of the motion: follows the hand, eases what jumped, and
+    /// draws. Stops once all is in place and no hold goes on.
+    fn tick_motion(&mut self, now: Instant) {
+        let hand = crate::input::hand();
+        let was_moving = self.motion.is_moving();
+        let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now);
+        if was_moving || moving {
+            let started = Instant::now();
+            self.update_thumbnails();
+            self.paint();
+            unsafe {
+                ValidateRect(self.hwnd, None);
+            }
+            let took = started.elapsed();
+            self.motion.frames += 1;
+            self.motion.drawing += took;
+            self.motion.slowest = self.motion.slowest.max(took);
+            debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}",
+                self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len(),
+                self.motion.rest.values().map(|r| r.0.abs().max(r.1.abs())).fold(0.0, f32::max), hand.along, hand.across,
+                self.motion.hand.values().next());
+        }
+        if !moving && !crate::input::holding() {
+            debug_log!("board: motion settled after {} frames, drawing {:.2} ms a frame on average and {:.2} at most",
+                self.motion.frames, self.motion.drawing.as_secs_f32() * 1000.0 / self.motion.frames.max(1) as f32,
+                self.motion.slowest.as_secs_f32() * 1000.0);
+            (self.motion.frames, self.motion.drawing, self.motion.slowest) = (0, Duration::ZERO, Duration::ZERO);
+            self.stop_motion();
+            if was_moving {
+                self.hover_under_cursor();
+                self.update_popup(now);
+                self.invalidate();
+            }
+        }
     }
 
     /// Puts the board back above a window that came up over it while it is
@@ -955,7 +1222,11 @@ impl Board {
                 bottom: monitor.top + layout.top - 26.0 * s,
             };
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
-            for (part, name, group) in split_area(&here, &area, s) {
+            // The part of the windows on every desktop is the same in every row.
+            let row_most = self.model.rows.iter()
+                .map(|row| row.cells.iter().flat_map(|cell| &cell.windows).filter(|w| w.follows && self.monitor_of(w) == m).count())
+                .max().unwrap_or(0);
+            for (part, name, group) in split_area(&here, row_most, &area, s) {
                 if let Some(name) = name {
                     sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, part, name));
                 }
@@ -1264,14 +1535,17 @@ impl Board {
     /// Puts every thumbnail where its tile is, or under the cursor while its
     /// window is being dragged.
     fn update_thumbnails(&self) {
-        self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window(), 1.0);
+        let shift = |hwnd| self.motion.offset(&Part::Tile(hwnd));
+        self.place_thumbnails(&self.thumbs, &self.tiles, &self.tile_windows(), (0.0, 0.0), self.dragged_window(), 1.0, &shift);
         if let Some(popup) = &self.popup {
             self.place_thumbnails(&self.popup_thumbs, &popup.tiles, &self.model.popup_windows(&popup.id),
-                (popup.frame.left.round(), popup.frame.top.round()), None, self.popup_alpha);
+                (popup.frame.left.round(), popup.frame.top.round()), None, self.popup_alpha, &|_| (0.0, 0.0));
         }
     }
 
-    fn place_thumbnails(&self, thumbs: &[(isize, isize)], tiles: &[TileLayout], windows: &[(&WindowModel, bool)], offset: (f32, f32), dragged: Option<isize>, opacity: f32) {
+    /// `shift` says how far each tile is drawn from where it is laid out.
+    #[allow(clippy::too_many_arguments)]
+    fn place_thumbnails(&self, thumbs: &[(isize, isize)], tiles: &[TileLayout], windows: &[(&WindowModel, bool)], offset: (f32, f32), dragged: Option<isize>, opacity: f32, shift: &dyn Fn(isize) -> (f32, f32)) {
         let to_rect = |r: &Rect| RECT {
             left: (r.left - offset.0).round() as i32,
             top: (r.top - offset.1).round() as i32,
@@ -1312,7 +1586,8 @@ impl Board {
                     // for its buttons the picture sits in the middle.
                     let (tw, th) = size(&tile.thumb);
                     let (w, h) = fitted(tw, th);
-                    let (cx, cy) = centre(&tile.thumb);
+                    let ((cx, cy), (dx, dy)) = (centre(&tile.thumb), shift(hwnd));
+                    let (cx, cy) = (cx + dx, cy + dy);
                     props.rcDestination = to_rect(&rect(cx - w / 2.0, cy - h / 2.0, w, h));
                     // A minimized window shows what it last looked like, faded.
                     // (Without a kept picture the source is only a sliver.)
@@ -1404,6 +1679,10 @@ impl Board {
                 unsafe { let _ = KillTimer(self.hwnd, POPUP_TIMER_ID); }
                 self.popup_timer = None;
                 self.tick_popup(Instant::now());
+                Action::None
+            }
+            WM_TIMER if wparam.0 == MOTION_TIMER_ID => {
+                self.tick_motion(Instant::now());
                 Action::None
             }
             WM_TIMER if wparam.0 == ON_TOP_TIMER_ID => {
@@ -1884,7 +2163,9 @@ impl Board {
         }
         for tile in &self.tiles {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
-                self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere));
+                self.shifted(p, (0.0, 0.0), self.motion.offset(&Part::Tile(tile.hwnd.0)), || {
+                    self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere));
+                });
             }
         }
     }
@@ -1964,6 +2245,21 @@ impl Board {
         p.stroke(&grow(&tile.frame, 1.0 * s), 10.0 * s, width, colour);
     }
 
+    /// Draws with everything moved by `by`, the target's translation being
+    /// `base` before and after.
+    fn shifted(&self, p: &Painter, base: (f32, f32), by: (f32, f32), draw: impl FnOnce()) {
+        if by == (0.0, 0.0) {
+            return draw();
+        }
+        unsafe {
+            p.target.SetTransform(&Matrix3x2::translation(base.0 + by.0, base.1 + by.1));
+        }
+        draw();
+        unsafe {
+            p.target.SetTransform(&Matrix3x2::translation(base.0, base.1));
+        }
+    }
+
     /// The map of all rows and cells: plain squares holding each cell's apps
     /// (icon and count), with the controls appearing on hover.
     fn draw_map(&self, p: &Painter, fonts: &Fonts, map: &Map) {
@@ -1973,23 +2269,46 @@ impl Board {
         // The cell a dragged window would be dropped on.
         let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
 
+        // Each part where the motion has it (`Motion`), the selection's frame
+        // apart from its cell: under the cells, and its outline over them.
+        let base = (map.area.left, map.area.top);
+        let at = |part: Part| self.motion.offset(&part);
+        let (spine, names, selection) = (at(Part::Spine(map.monitor)), at(Part::Names(map.monitor)), at(Part::Selection(map.monitor)));
+        let selected = layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected);
+
         // The column vertical moves travel along.
-        p.fill(&layout.spine, 10.0 * s, white(0.035));
+        self.shifted(p, base, spine, || p.fill(&layout.spine, 10.0 * s, white(0.035)));
+        if let Some(cell) = selected {
+            self.shifted(p, base, selection, || self.draw_selection(p, cell, false));
+        }
         for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
             let in_selected_row = selected_row == Some(r);
-            self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
-            self.draw_badges(p, fonts, &row.pins, 1.0);
-            if row.pins_more > 0 {
-                p.text(&format!("+{}", row.pins_more), &fonts.small, &row.pins_more_label, white(0.50));
-            }
-            for cell in &row.cells {
-                self.draw_cell(p, fonts, cell, in_selected_row, drop_cell == Some(cell.id.as_str()));
-            }
-            self.draw_plus(p, &row.plus, Hit::Plus(r));
-            self.draw_plus(p, &row.plus_left, Hit::PlusLeft(r));
+            self.shifted(p, base, names, || {
+                self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
+                self.draw_badges(p, fonts, &row.pins, 1.0);
+                if row.pins_more > 0 {
+                    p.text(&format!("+{}", row.pins_more), &fonts.small, &row.pins_more_label, white(0.50));
+                }
+            });
+            let shift = row.cells.first().map_or((0.0, 0.0), |first| at(Part::Row(map.monitor, first.id.clone())));
+            // How far the selected cell is drawn from its frame, in cells:
+            // away from it, it is filled as the others are.
+            let apart = (shift.0 - selection.0).hypot(shift.1 - selection.1) / layout.pitch.max(1.0);
+            self.shifted(p, base, shift, || {
+                for cell in &row.cells {
+                    self.draw_cell(p, fonts, cell, in_selected_row, drop_cell == Some(cell.id.as_str()), apart.min(1.0));
+                }
+                self.draw_plus(p, &row.plus, Hit::Plus(r));
+                self.draw_plus(p, &row.plus_left, Hit::PlusLeft(r));
+            });
         }
-        self.draw_plus(p, &layout.add_row, Hit::AddRow);
-        self.draw_plus(p, &layout.add_row_top, Hit::AddRowTop);
+        self.shifted(p, base, spine, || {
+            self.draw_plus(p, &layout.add_row, Hit::AddRow);
+            self.draw_plus(p, &layout.add_row_top, Hit::AddRowTop);
+        });
+        if let Some(cell) = selected {
+            self.shifted(p, base, selection, || self.draw_selection(p, cell, true));
+        }
 
         // What is being dragged is drawn only on the monitor the cursor is on.
         if contains(&map.area, self.cursor.0, self.cursor.1) {
@@ -2017,29 +2336,45 @@ impl Board {
         p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 }));
     }
 
-    fn draw_cell(&self, p: &Painter, fonts: &Fonts, cell: &CellLayout, in_selected_row: bool, drop_target: bool) {
+    /// The frame of the selected cell: its glow and fill under the cells,
+    /// or its outline over them. It is drawn apart from the cell, so that
+    /// it can stay while the row slides under it.
+    fn draw_selection(&self, p: &Painter, cell: &CellLayout, outline: bool) {
+        let s = self.scale;
+        let radius = 8.0 * s;
+        let dim = if self.dragged_cell() == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
+        if outline {
+            p.stroke(&cell.body, radius, 2.0 * s, accent(dim));
+            return;
+        }
+        for (by, a) in [(5.0, 0.08), (3.0, 0.14)] {
+            p.fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
+        }
+        p.fill(&cell.body, radius, accent(0.35 * dim));
+    }
+
+    /// A cell of the map. The selected one is filled by its frame
+    /// (`draw_selection`), and as the others are only where it is drawn
+    /// `apart` from that frame, in cells (up to one).
+    fn draw_cell(&self, p: &Painter, fonts: &Fonts, cell: &CellLayout, in_selected_row: bool, drop_target: bool, apart: f32) {
         let s = self.scale;
         let radius = 8.0 * s;
         let dim = if self.dragged_cell() == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
         let is_selected = cell.id == self.selected;
         let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) if *id == cell.id);
-        if is_selected {
-            for (by, a) in [(5.0, 0.08), (3.0, 0.14)] {
-                p.fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
-            }
-        }
-        let fill = if is_selected {
-            accent(0.35 * dim)
-        } else if cell.emphasised {
+        let fill = if cell.emphasised {
             warm(0.40 * dim)
         } else {
             white((if in_selected_row { 0.08 + 0.32 * cell.usage } else { 0.04 + 0.28 * cell.usage }) * dim)
         };
-        p.fill(&cell.body, radius, fill);
+        let fill = if is_selected { D2D1_COLOR_F { a: fill.a * apart, ..fill } } else { fill };
+        if fill.a > 0.0 {
+            p.fill(&cell.body, radius, fill);
+        }
         if drop_target {
             p.stroke(&cell.body, radius, 2.5 * s, accent(1.0));
         } else if is_selected {
-            p.stroke(&cell.body, radius, 2.0 * s, accent(dim));
+            // Its outline is its frame's.
         } else if cell.emphasised {
             p.stroke(&cell.body, radius, 1.5 * s, warm(0.95 * dim));
         } else if hovering {
@@ -2140,7 +2475,11 @@ impl Board {
 
     /// Draws the board (without live thumbnails) into a bitmap and returns the
     /// BGRA pixels, for reviewing the layout without showing a window.
-    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>, glide: Option<(grid::Pos, u64)>) -> Option<Vec<u8>> {
+    /// With `step` the selection has just come from that cell to the current
+    /// one, as by an arrow key, and the picture is that many milliseconds
+    /// into the motion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>, glide: Option<(grid::Pos, u64)>, step: Option<(grid::Pos, u64)>) -> Option<Vec<u8>> {
         self.size = size;
         self.scale = scale;
         self.home = rect(0.0, 0.0, size.0 as f32, size.1 as f32);
@@ -2148,8 +2487,25 @@ impl Board {
         self.selected = model.current.clone();
         self.model = model;
         self.grid = grid;
-        self.relayout();
         let now = Instant::now();
+        if let Some((from, ms)) = step.filter(|(from, _)| self.grid.id_at(*from).is_some()) {
+            let (current, grid) = (self.selected.clone(), self.grid.clone());
+            self.selected = self.grid.id_at(from)?.clone();
+            self.grid.visit(&self.selected);
+            self.relayout();
+            let (before, arrive) = (self.marks(), self.arrival(&grid, &current));
+            (self.selected, self.grid) = (current, grid);
+            self.relayout();
+            self.motion.moved(&before, &self.marks(), arrive, now);
+            let mut at = now;
+            while at < now + Duration::from_millis(ms) {
+                at += Duration::from_millis(MOTION_MS as u64);
+                self.motion.advance(HashMap::new(), 0, at);
+            }
+            debug_log!("board: rendered {ms} ms into a move, {:?}", self.motion.rest);
+        } else {
+            self.relayout();
+        }
         let point_at = |board: &mut Self, pos: Option<grid::Pos>| {
             board.hover = Hit::Nothing;
             if let Some(cell) = pos.and_then(|pos| board.maps[0].layout.rows.get(pos.row)?.cells.get(pos.col)) {
@@ -2503,6 +2859,11 @@ fn layout_pins(row: &RowModel, header: &Rect, left: f32, room: f32, icon: f32, s
 /// Lays out the map at the bottom of a monitor: rows top to bottom, each
 /// shifted sideways so that its landing cell (`anchors[row]`) sits on a common
 /// column, the spine. `size` is the space above the footer; `s` the scale.
+///
+/// Where the names and the spine are does not depend on the anchors while
+/// there is room: room is kept for any row to be shifted as far as it can
+/// go, so that moving about only slides rows under a still spine. Only rows
+/// too long for that are packed by their anchors, and the names then move.
 fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> MapLayout {
     let (w, h) = size;
     let (margin, header_w, gap) = (60.0 * s, 170.0 * s, 10.0 * s);
@@ -2511,14 +2872,20 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
 
     let anchor = |r: usize| anchors.get(r).copied().unwrap_or(0);
     let rows = model.rows.len().max(1) as f32;
-    let lead = (0..model.rows.len()).map(anchor).max().unwrap_or(0);
-    let tail = model.rows.iter().enumerate().map(|(r, row)| row.cells.len().saturating_sub(anchor(r))).max().unwrap_or(1).max(1);
-    let columns = (lead + tail) as f32;
-
-    // Squares of a fixed look, shrunk only when the grid would not fit.
-    let fit_w = (w - 2.0 * margin - header_w) / (columns + 1.2) - gap;
+    let fit_w = |columns: usize| (w - 2.0 * margin - header_w) / (columns as f32 + 1.2) - gap;
     let fit_h = (h * MAX_SHARE) / (rows + 1.2) - gap;
-    let cell_h = (62.0 * s).min(fit_h).min(fit_w * 0.62).max(22.0 * s);
+    // Squares of a fixed look, shrunk only when the grid would not fit.
+    let natural = (62.0 * s).min(fit_h);
+    let longest = model.rows.iter().map(|row| row.cells.len()).max().unwrap_or(1).max(1);
+    let (lead, tail) = if fit_w(2 * longest - 1) * 0.62 >= natural {
+        (longest - 1, longest)
+    } else {
+        let lead = (0..model.rows.len()).map(anchor).max().unwrap_or(0);
+        let tail = model.rows.iter().enumerate().map(|(r, row)| row.cells.len().saturating_sub(anchor(r))).max().unwrap_or(1).max(1);
+        (lead, tail)
+    };
+    let columns = (lead + tail) as f32;
+    let cell_h = natural.min(fit_w(lead + tail) * 0.62).max(22.0 * s);
     let cell_w = cell_h / 0.62;
     let pitch = cell_w + gap;
     let row_pitch = cell_h + gap;
@@ -2583,6 +2950,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     }
     layout.spine = rect(spine_x - gap / 2.0, rows_top - gap / 2.0, pitch, (y - rows_top).max(0.0));
     layout.add_row = rect(spine_x + (cell_w - plus) / 2.0, y - gap / 2.0 + 2.0 * s, plus, plus);
+    (layout.pitch, layout.row_pitch) = (pitch, row_pitch);
     layout
 }
 
@@ -2867,5 +3235,148 @@ mod tests {
                 assert!(cells.iter().all(|c| !overlaps(c, plus)), "a + on a cell with anchors {anchors:?}");
             }
         }
+    }
+
+    /// With rows of a few cells, the names and the spine stay where they
+    /// are wherever the rows are lined up: moving about only slides rows.
+    #[test]
+    fn names_and_spine_stay_while_rows_slide() {
+        let rows = vec![row(&["a", "b", "c"]), row(&["d", "e", "f", "g"]), row(&["h"])];
+        let model = Model { rows, pinned: Vec::new(), current: "a".into() };
+        for (size, s) in [((1920.0, 1080.0 - FOOTER), 1.0), ((1280.0, 720.0 - FOOTER), 1.0), ((2560.0, 1440.0 - FOOTER * 1.5), 1.5)] {
+            let layouts: Vec<MapLayout> = [[0, 0, 0], [2, 0, 0], [1, 3, 0], [0, 3, 0]].iter().map(|anchors| layout_map(&model, anchors, size, s)).collect();
+            let first = &layouts[0];
+            for layout in &layouts[1..] {
+                assert_eq!(layout.spine, first.spine, "the spine moved at {size:?}");
+                for (row, was) in layout.rows.iter().zip(&first.rows) {
+                    assert_eq!((row.header, row.name), (was.header, was.name), "a name moved at {size:?}");
+                }
+                assert_eq!(layout.pitch, first.pitch);
+            }
+            // Going one cell right slides the row one cell left under the spine.
+            let (before, after) = (&layouts[0], layout_map(&model, &[1, 0, 0], size, s));
+            assert_eq!(after.rows[0].cells[0].body.left, before.rows[0].cells[0].body.left - before.pitch);
+            assert_eq!(after.rows[0].cells[1].body.left, before.rows[0].cells[0].body.left);
+            assert!(after.rows[0].cells[1].body.left >= after.spine.left);
+        }
+    }
+
+    /// Rows too long to keep room for every shift are packed by their
+    /// anchors instead: the names may move then, and the map still fits.
+    #[test]
+    fn long_rows_are_packed_and_still_fit() {
+        let ids: Vec<String> = (0..14).map(|i| format!("c{i}")).collect();
+        let long: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let model = Model { rows: vec![row(&long), row(&["x"])], pinned: Vec::new(), current: "c0".into() };
+        let size = (1280.0, 720.0 - FOOTER);
+        for anchors in [[0, 0], [7, 0], [13, 0]] {
+            let layout = layout_map(&model, &anchors, size, 1.0);
+            let right = layout.rows.iter().map(|row| row.plus.right).fold(0.0, f32::max);
+            let left = layout.rows.iter().map(|row| row.header.left.min(row.plus_left.left)).fold(f32::MAX, f32::min);
+            assert!(left >= 0.0 && right <= size.0, "off the screen with anchors {anchors:?}: {left}..{right}");
+        }
+    }
+
+    #[test]
+    fn a_jump_is_eased_away_like_the_minimaps() {
+        let now = Instant::now();
+        let row = Part::Row(0, "a".into());
+        let mut motion = Motion::default();
+        motion.moved(&HashMap::from([(row.clone(), (100.0, 0.0))]), &HashMap::from([(row.clone(), (0.0, 0.0))]), (0.0, 0.0), now);
+        // Drawn where it was, then a frame later most of the way back.
+        assert_eq!(motion.offset(&row), (100.0, 0.0));
+        assert!(motion.advance(HashMap::new(), 0, now + Duration::from_millis(16)));
+        let left = motion.offset(&row).0;
+        assert!((left - 100.0 * (-0.016 / SETTLE_TAU).exp()).abs() < 0.5, "{left}");
+        // A frame very late eases no further than one of a slow machine would.
+        motion.advance(HashMap::new(), 0, now + Duration::from_millis(500));
+        assert!((motion.offset(&row).0 - left * (-MOTION_LONGEST_STEP / SETTLE_TAU).exp()).abs() < 0.5);
+        let mut at = now + Duration::from_millis(500);
+        for _ in 0..40 {
+            at += Duration::from_millis(16);
+            motion.advance(HashMap::new(), 0, at);
+        }
+        assert!(!motion.is_moving());
+        assert_eq!(motion.offset(&row), (0.0, 0.0));
+    }
+
+    /// Tiles shown before and after stay; those new to the board come in
+    /// from the side moved to; a part that jumps again mid-way goes on from
+    /// where it is drawn.
+    #[test]
+    fn kept_tiles_stay_and_new_ones_come_in_from_the_side() {
+        let now = Instant::now();
+        let (kept, new, moved) = (Part::Tile(1), Part::Tile(2), Part::Tile(3));
+        let before = HashMap::from([(kept.clone(), (10.0, 10.0)), (moved.clone(), (100.0, 0.0))]);
+        let after = HashMap::from([(kept.clone(), (10.0, 10.0)), (new.clone(), (50.0, 50.0)), (moved.clone(), (60.0, 0.0))]);
+        let mut motion = Motion::default();
+        motion.moved(&before, &after, (40.0, 0.0), now);
+        assert_eq!(motion.offset(&kept), (0.0, 0.0));
+        assert_eq!(motion.offset(&new), (40.0, 0.0));
+        assert_eq!(motion.offset(&moved), (40.0, 0.0));
+        let again = HashMap::from([(moved.clone(), (0.0, 0.0))]);
+        motion.moved(&after, &again, (0.0, 40.0), now);
+        assert_eq!(motion.offset(&moved), (100.0, 0.0));
+        assert_eq!(motion.offset(&new), (0.0, 0.0), "gone from the board");
+    }
+
+    /// The row follows the hand between cells, and when the app gets to the
+    /// next cell (the layout slides by a cell and the hand is counted from
+    /// there) nothing jumps, in whichever order the two are heard of.
+    #[test]
+    fn coming_to_a_cell_while_held_does_not_jump() {
+        let now = Instant::now();
+        let row = Part::Row(0, "a".into());
+        let pitch = 100.0;
+        let drawn = |motion: &Motion, layout: f32| layout + motion.offset(&row).0;
+        let mut motion = Motion::default();
+        // A hold begins: the hand starts from where the row is.
+        motion.advance(HashMap::new(), 1, now);
+        motion.advance(HashMap::from([(row.clone(), (-0.9 * pitch, 0.0))]), 1, now);
+        assert_eq!(drawn(&motion, 0.0), -0.9 * pitch);
+        // The hand is past the cell; the app has not got there yet.
+        motion.advance(HashMap::from([(row.clone(), (-1.02 * pitch, 0.0))]), 1, now);
+        let was = drawn(&motion, 0.0);
+        motion.moved(&HashMap::from([(row.clone(), (0.0, 0.0))]), &HashMap::from([(row.clone(), (-pitch, 0.0))]), (0.0, 0.0), now);
+        assert!((drawn(&motion, -pitch) - was).abs() < 0.01);
+        motion.advance(HashMap::from([(row.clone(), (-0.02 * pitch, 0.0))]), 2, now);
+        assert!((drawn(&motion, -pitch) - was).abs() < 0.01);
+        // Letting go: the row eases back onto the spine.
+        motion.advance(HashMap::new(), 3, now);
+        assert!((drawn(&motion, -pitch) - was).abs() < 0.01);
+        let mut at = now;
+        for _ in 0..40 {
+            at += Duration::from_millis(16);
+            motion.advance(HashMap::new(), 3, at);
+        }
+        assert_eq!(drawn(&motion, -pitch), -pitch);
+    }
+
+    #[test]
+    fn the_hand_pulls_a_little_past_the_ends_only() {
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4;
+        assert!(near(hand_pull((0, 0), (3, 2), (-1.0, 0.0)), (-EDGE_GIVE, 0.0)));
+        assert!(near(hand_pull((1, 1), (3, 2), (0.5, -0.25)), (0.5, -0.25)));
+        assert!(near(hand_pull((3, 2), (3, 2), (2.0, 2.0)), (EDGE_GIVE, EDGE_GIVE)));
+    }
+
+    /// Going to a row with more or fewer windows pinned to it, or none, the
+    /// windows on every desktop keep their part, and so their tiles.
+    #[test]
+    fn windows_on_every_desktop_stay_whichever_row() {
+        let everywhere = window(1, false);
+        let (followers, own) = ([window(2, true), window(3, true)], window(4, false));
+        let area = rect(40.0, 64.0, 1840.0, 640.0);
+        let parts = |row: &[WindowModel]| {
+            let here: Vec<(&WindowModel, bool)> = [(&everywhere, true), (&own, false)].into_iter().chain(row.iter().map(|w| (w, false))).collect();
+            let parts = split_area(&here, 2, &area, 1.0);
+            let all = parts.iter().find(|(_, name, _)| *name == Some("All rows")).map(|(part, _, _)| *part).unwrap();
+            let tiles = layout_tiles(&[(&everywhere, true)], &all, 1.0, &HashMap::new());
+            (all, tiles[0].frame, parts.iter().any(|(_, name, _)| *name == Some("This row")))
+        };
+        let (none, one, two) = (parts(&[]), parts(&followers[..1]), parts(&followers));
+        assert_eq!((none.0, none.1), (two.0, two.1));
+        assert_eq!((one.0, one.1), (two.0, two.1));
+        assert_eq!((none.2, one.2, two.2), (false, true, true));
     }
 }

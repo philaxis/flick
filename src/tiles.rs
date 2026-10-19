@@ -138,12 +138,29 @@ const PINNED_SHARE: (f32, f32) = (0.18, 0.45);
 const USUAL_ASPECT: f32 = 1.6;
 
 /// Splits an area of size `area` for `all` windows pinned to every desktop
-/// and `row` pinned to their row. How wide the pinned part is depends on how
-/// many of them there are and on nothing else, so it stays where it is
-/// whichever cell is looked at. The two kinds share it side by side or one
-/// over the other, whichever gives their tiles more room. No part is made
-/// narrower than `least`, the narrowest a tile can be with its buttons.
-pub fn pin_parts(all: usize, row: usize, area: (f32, f32), gap: f32, head: f32, least: f32) -> PinParts {
+/// and `row` pinned to their row, where the row with the most has
+/// `row_most`. The part of those pinned everywhere is laid out as if this
+/// row had `row_most`, so that it is the same in every row and its windows
+/// never move whichever cell is looked at; this row's take as much of the
+/// room kept for them as they need, and with none of them, the others take
+/// it. Otherwise how wide the pinned part is depends on how many of them
+/// there are and on nothing else. The two kinds share it side by side or
+/// one over the other, whichever gives their tiles more room. No part is
+/// made narrower than `least`, the narrowest a tile can be with its buttons.
+pub fn pin_parts(all: usize, row: usize, row_most: usize, area: (f32, f32), gap: f32, head: f32, least: f32) -> PinParts {
+    let kept = pin_parts_for(all, row.max(row_most), area, gap, head, least);
+    match kept.all {
+        Some(a) if row == 0 => {
+            let right = a.0 + a.2 + gap;
+            PinParts { all: kept.all, row: None, rest: (right, 0.0, area.0 - right, area.1) }
+        }
+        Some(_) => kept,
+        None => pin_parts_for(all, row, area, gap, head, least),
+    }
+}
+
+/// `pin_parts` for a row with the most windows pinned to it.
+fn pin_parts_for(all: usize, row: usize, area: (f32, f32), gap: f32, head: f32, least: f32) -> PinParts {
     let (w, h) = area;
     let pinned = all + row;
     if pinned == 0 {
@@ -225,7 +242,7 @@ mod tests {
         let (area, gap) = ((2400.0, 900.0), 30.0);
         let apart = |a: Part, b: Part| a.0 + a.2 <= b.0 + 0.5 || b.0 + b.2 <= a.0 + 0.5 || a.1 + a.3 <= b.1 + 0.5 || b.1 + b.3 <= a.1 + 0.5;
         for (all, row, rest) in [(1, 0, 6), (4, 3, 2)] {
-            let parts = pin_parts(all, row, area, gap, 36.0, 0.0);
+            let parts = pin_parts(all, row, row, area, gap, 36.0, 0.0);
             let a = parts.all.expect("a part for those pinned everywhere");
             assert_eq!((a.0, a.1), (0.0, 0.0), "{all} {row} {rest}: {parts:?}");
             assert!(parts.rest.2 >= area.0 / 2.0 && parts.rest.0 > a.0, "{parts:?}");
@@ -235,9 +252,35 @@ mod tests {
             }
         }
         // Fewer pinned windows, a narrower part.
-        assert!(pin_parts(1, 0, area, gap, 36.0, 0.0).rest.2 > pin_parts(4, 3, area, gap, 36.0, 0.0).rest.2);
+        assert!(pin_parts(1, 0, 0, area, gap, 36.0, 0.0).rest.2 > pin_parts(4, 3, 3, area, gap, 36.0, 0.0).rest.2);
         // On a small screen no part is made narrower than a tile with its buttons.
-        let parts = pin_parts(1, 2, (1000.0, 600.0), 20.0, 24.0, 244.0);
+        let parts = pin_parts(1, 2, 2, (1000.0, 600.0), 20.0, 24.0, 244.0);
         assert!(parts.all.unwrap().2 >= 244.0 && parts.row.unwrap().2 >= 244.0, "{parts:?}");
+    }
+
+    /// Whichever row is looked at, however many windows are pinned to it,
+    /// the part of those pinned everywhere is the same; this row's part is
+    /// within the room kept for the row with the most, and the others start
+    /// right after what is taken.
+    #[test]
+    fn the_part_pinned_everywhere_is_the_same_in_every_row() {
+        for (area, gap, least) in [((2400.0, 900.0), 30.0, 0.0), ((1000.0, 600.0), 20.0, 244.0), ((1840.0, 640.0), 20.0, 180.0)] {
+            for all in 1..4 {
+                for most in 0..5 {
+                    let widest = pin_parts(all, most, most, area, gap, 36.0, least);
+                    for row in 0..=most {
+                        let parts = pin_parts(all, row, most, area, gap, 36.0, least);
+                        assert_eq!(parts.all, widest.all, "{all} {row} of {most} in {area:?}");
+                        assert_eq!(parts.row.is_some(), row > 0);
+                        if row > 0 {
+                            assert_eq!(parts.row, widest.row);
+                            assert_eq!(parts.rest, widest.rest);
+                        }
+                        let taken = [parts.all, parts.row].into_iter().flatten().map(|p| p.0 + p.2).fold(0.0, f32::max);
+                        assert!(parts.rest.0 >= taken + gap - 0.01 && parts.rest.0 + parts.rest.2 <= area.0 + 0.01, "{parts:?}");
+                    }
+                }
+            }
+        }
     }
 }
