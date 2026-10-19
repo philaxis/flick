@@ -2899,6 +2899,12 @@ impl Board {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
                 if let Some(at) = place(Carried::of(window, *everywhere), &tile.frame) {
                     self.placed(p, at, || self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere)));
+                    #[cfg(feature = "motion-probe")]
+                    if window.title == "F motion 0" {
+                        let dest = at.rect(&tile.thumb);
+                        let x = (dest.left + dest.right) * 0.5;
+                        p.fill_square(&rect(x - 2.0, 20.0, 4.0, 12.0), rgba(0.0, 1.0, 0.0, 1.0));
+                    }
                 }
             }
         }

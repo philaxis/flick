@@ -29,6 +29,10 @@ mod drive_navigation;
 mod drive_pacing;
 
 #[cfg(windows)]
+#[path = "support/display.rs"]
+mod drive_display;
+
+#[cfg(windows)]
 fn main() {
     use windows::{
         core::w,

@@ -25,7 +25,7 @@ try {
     if ($probeExit) { Write-Warning 'Probe failed; collecting its trace before reporting the result' }
 } finally {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process drive -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $drive -and $_.MainWindowTitle -in @('F wide', 'F tall') } | Stop-Process -Force
+    Get-Process drive -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $drive -and ($_.MainWindowTitle -in @('F wide', 'F tall') -or $_.MainWindowTitle -like 'F motion *') } | Stop-Process -Force
     Start-Sleep 1
     & $drive navigation unstage $out
     foreach ($f in 'config.toml', 'state.json') {

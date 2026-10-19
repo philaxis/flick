@@ -1274,6 +1274,19 @@ fn touchpad_lean(s: &Settings, (x, y): (f64, f64), lean: (f64, f64)) {
 }
 
 unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    #[cfg(feature = "motion-probe")]
+    if message == WM_APP + 61 && wparam.0 <= 3 {
+        thread_local! { static REPLAY: RefCell<crate::touchpad::Gesture> = RefCell::default(); }
+        // Test coordinates are signed thousandths of a centimetre; no cross-process pointers.
+        let x = lparam.0 as u32 as i32 as f64 / 1000.0;
+        let y = (lparam.0 as u64 >> 32) as u32 as i32 as f64 / 1000.0;
+        let contacts: Vec<_> = (0..wparam.0).map(|id| crate::touchpad::Contact {
+            id: id as u32, confident: true, x: x + id as f64 * 0.4, y,
+        }).collect();
+        let event = REPLAY.with(|g| g.borrow_mut().update(&contacts, GetMessageTime() as u32));
+        touchpad_event(event);
+        return LRESULT(0);
+    }
     if message == WM_INPUT {
         on_raw_input(HRAWINPUT(lparam.0));
     }

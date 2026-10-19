@@ -17,6 +17,8 @@ path = "src/main.rs"
 # Keeps a record of what the input hooks saw and did (src/debuglog.rs), for
 # finding out why a gesture was not taken. Not for the released exe.
 debug-log = []
+# Contact replay and visual markers, absent from ordinary builds.
+motion-probe = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
