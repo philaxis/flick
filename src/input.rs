@@ -470,7 +470,6 @@ fn reload_touchpad() {
 thread_local! {
     static TOUCHPAD: RefCell<crate::touchpad::Reader> = RefCell::new(crate::touchpad::Reader::default());
     static TOUCHPAD_ON: Cell<bool> = const { Cell::new(false) };
-    static TOUCHPAD_REST: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     static TOUCHPAD_BUTTONS: Cell<u32> = const { Cell::new(0) };
     static SETTINGS: RefCell<Option<Settings>> = const { RefCell::new(None) };
     /// Which triggers are down right now.
@@ -1038,18 +1037,52 @@ fn touchpad_event(event: crate::touchpad::Event) {
     with_settings(|s| {
         if event.began {
             press(Source::Touchpad);
-            TOUCHPAD_REST.set((0.0, 0.0));
         }
         if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
-            let rest = TOUCHPAD_REST.get();
-            let (x, y) = (rest.0 + event.delta.0 * s.step_x as f64, rest.1 + event.delta.1 * s.step_y as f64);
-            let (dx, dy) = (x as i32, y as i32);
-            TOUCHPAD_REST.set((x - dx as f64, y - dy as f64));
-            if dx != 0 || dy != 0 { travel(s, dx, dy); }
+            // The pad judged which way each step goes (`touchpad::Rails`); a whole step each is
+            // exactly one cell or row of the plane, so no mouse rounding comes into it.
+            for step in &event.steps {
+                use crate::touchpad::Dir;
+                let (dx, dy) = match step {
+                    Dir::Left => (-s.step_x, 0),
+                    Dir::Right => (s.step_x, 0),
+                    Dir::Up => (0, -s.step_y),
+                    Dir::Down => (0, s.step_y),
+                };
+                travel(s, dx, dy);
+            }
+            touchpad_lean(s, event.progress);
             if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
         }
         false
     });
+}
+
+/// Between touchpad steps the minimap leans as far as `Rails` gathered towards the next one,
+/// never past the end of a row or the first or last row.
+fn touchpad_lean(s: &Settings, (x, y): (f64, f64)) {
+    let plane = PLANE.get();
+    let at_wall = |p: f64, cell: i32, (before, after): (i32, i32)| (p < 0.0 && cell <= -before) || (p > 0.0 && cell >= after);
+    let x = match shown() {
+        Some((_, Some(room))) if at_wall(x, plane.cols.cell(), room) => 0.0,
+        _ => x,
+    };
+    let y = match rows_seen() {
+        Some((_, room)) if at_wall(y, plane.rows.cell(), room) => 0.0,
+        _ => y,
+    };
+    let lean = match plane.rows {
+        crate::slide::Rows::Notched(_) => y * crate::slide::LEAN as f64,
+        crate::slide::Rows::Linear(_) => y,
+    };
+    writing(|| {
+        FRACTION.store((x * 1000.0) as i32, Ordering::SeqCst);
+        ROW_FRACTION.store((lean * 1000.0) as i32, Ordering::SeqCst);
+    });
+    if !DRAGGING.get() && (x.abs() * s.step_x as f64 >= DRAG_SHOWS as f64 || y.abs() * s.step_y as f64 >= DRAG_SHOWS as f64) {
+        DRAGGING.set(true);
+        post(s, WM_DRAG, slide_wparam(STRETCH.load(Ordering::SeqCst), 0));
+    }
 }
 
 unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

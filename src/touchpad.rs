@@ -13,6 +13,10 @@ pub struct Event {
     pub began: bool,
     pub delta: (f64, f64),
     pub ended: Option<bool>, // whether the release is a tap
+    /// Cells and rows the hold travelled, in order (`Rails`).
+    pub steps: Vec<Dir>,
+    /// How far towards the next step each way, in steps (`Rails::progress`).
+    pub progress: (f64, f64),
 }
 
 #[derive(Default)]
@@ -22,6 +26,7 @@ pub struct Gesture {
     held: bool,
     blocked: bool,
     path: f64,
+    rails: Rails,
 }
 
 impl Gesture {
@@ -70,12 +75,186 @@ impl Gesture {
             && contacts.iter().all(|c| c.confident)
         {
             self.held = true;
+            self.rails = Rails::default();
             event.began = true;
         } else if self.held {
             event.delta = delta;
+            event.steps = self.rails.travel((delta.0 * 10.0, delta.1 * 10.0), ms);
+            event.progress = self.rails.progress();
         }
         self.previous = contacts.to_vec();
         event
+    }
+}
+
+/// One cell or row of a touchpad hold. Screen directions: down is +y on the pad.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Pad travel for one step either way, in mm (the 1 cm a step always was).
+pub const STEP_MM: f64 = 10.0;
+/// Travel from where the hold began before its way is judged: well under a step, so none is lost.
+pub const JUDGE_MM: f64 = 3.0;
+/// The larger way over the smaller that judges a start straight (about 34° off the axis at most);
+/// anything flatter is meant slantwise and both ways count.
+pub const RAIL_RATIO: f64 = 1.5;
+/// Width of the channel: sideways drift within it while going straight is a crooked finger path.
+/// It is forgotten after every channel of straight travel, so slow drift never adds up.
+pub const CHANNEL_MM: f64 = 6.0;
+/// Out of the channel, the recent movement must be within this of the other axis to switch to it.
+pub const SWITCH_DEG: f64 = 30.0;
+/// Going slantwise, the recent movement held within this of one axis...
+pub const RELOCK_DEG: f64 = 15.0;
+/// ...for this long locks onto that axis again.
+pub const RELOCK_MS: u32 = 150;
+/// Recent movement fades by this per ms (libinput's 0.97^ms: about a 100 ms window).
+pub const DECAY_PER_MS: f64 = 0.97;
+/// A gap longer than this between reports forgets the recent movement.
+pub const RECENT_TIMEOUT_MS: u32 = 100;
+/// Recent movement shorter than this has no direction to speak of.
+pub const RECENT_MIN_MM: f64 = 0.5;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Mode {
+    /// Not yet `JUDGE_MM` from where the hold began.
+    #[default]
+    Judging,
+    /// Locked to one axis: 0 sideways, 1 up and down.
+    Rail(usize),
+    /// Both ways count on their own.
+    Free,
+}
+
+/// Turns a touchpad hold's travel (pad mm, no acceleration) into steps, keeping a hand that means
+/// to go straight on one axis however crooked its fingers go. After Chromium's snap scroll
+/// channel and libinput's fading direction vector for scroll axis locking.
+///
+/// Each axis gathers travel and steps once it reaches a whole `STEP_MM`, keeping what goes past.
+/// Turning back has to gather a whole step from nothing again, so a hand resting on the edge of a
+/// step does not take it to and fro.
+#[derive(Debug, Default)]
+pub struct Rails {
+    mode: Mode,
+    /// Travel gathered towards the next step on each axis (x, y).
+    gathered: [f64; 2],
+    /// While on a rail: sideways travel since the channel last forgot it, and straight travel since.
+    off: f64,
+    along: f64,
+    /// Recent movement, fading (`DECAY_PER_MS`).
+    recent: [f64; 2],
+    last_ms: Option<u32>,
+    /// Going slantwise: the axis recent movement keeps close to, and since when.
+    near: Option<(usize, u32)>,
+}
+
+impl Rails {
+    /// How far towards the next step each way, in steps; nothing on the axis a rail ignores.
+    pub fn progress(&self) -> (f64, f64) {
+        let [x, y] = self.gathered.map(|g| g / STEP_MM);
+        match self.mode {
+            Mode::Judging => (0.0, 0.0),
+            Mode::Rail(0) => (x, 0.0),
+            Mode::Rail(_) => (0.0, y),
+            Mode::Free => (x, y),
+        }
+    }
+
+    /// The hand moved `delta` mm (down positive) at `ms`; the steps that came of it.
+    pub fn travel(&mut self, delta: (f64, f64), ms: u32) -> Vec<Dir> {
+        let d = [delta.0, delta.1];
+        let fade = match self.last_ms.map(|last| ms.wrapping_sub(last)) {
+            Some(dt) if dt <= RECENT_TIMEOUT_MS => DECAY_PER_MS.powi(dt as i32),
+            _ => 0.0,
+        };
+        self.last_ms = Some(ms);
+        self.recent = [self.recent[0] * fade + d[0], self.recent[1] * fade + d[1]];
+        let mut steps = Vec::new();
+        match self.mode {
+            Mode::Judging => {
+                self.gathered = [self.gathered[0] + d[0], self.gathered[1] + d[1]];
+                let [x, y] = self.gathered.map(f64::abs);
+                if x.hypot(y) < JUDGE_MM {
+                    return steps;
+                }
+                self.mode = if x >= y * RAIL_RATIO {
+                    Mode::Rail(0)
+                } else if y >= x * RAIL_RATIO {
+                    Mode::Rail(1)
+                } else {
+                    Mode::Free
+                };
+                if let Mode::Rail(axis) = self.mode {
+                    self.off = self.gathered[1 - axis];
+                    self.gathered[1 - axis] = 0.0;
+                    self.along = self.gathered[axis].abs();
+                }
+                for axis in 0..2 {
+                    self.step(axis, 0.0, &mut steps);
+                }
+            }
+            Mode::Rail(axis) => {
+                let side = 1 - axis;
+                self.off += d[side];
+                if self.off.abs() > CHANNEL_MM && self.within(side, SWITCH_DEG) {
+                    // An L: the new way gathers from nothing, so the turn itself is no step.
+                    self.mode = Mode::Rail(side);
+                    self.gathered = [0.0; 2];
+                    (self.off, self.along) = (0.0, 0.0);
+                    return steps;
+                }
+                self.along += d[axis].abs();
+                if self.along >= CHANNEL_MM {
+                    (self.off, self.along) = (0.0, 0.0);
+                }
+                self.step(axis, d[axis], &mut steps);
+            }
+            Mode::Free => {
+                for axis in 0..2 {
+                    self.step(axis, d[axis], &mut steps);
+                }
+                let near = (0..2).find(|&axis| self.within(axis, RELOCK_DEG));
+                match (near, self.near) {
+                    (Some(axis), Some((was, since))) if axis == was => {
+                        if ms.wrapping_sub(since) >= RELOCK_MS {
+                            self.mode = Mode::Rail(axis);
+                            self.gathered[1 - axis] = 0.0;
+                            (self.off, self.along) = (0.0, 0.0);
+                            self.near = None;
+                        }
+                    }
+                    (Some(axis), _) => self.near = Some((axis, ms)),
+                    (None, _) => self.near = None,
+                }
+            }
+        }
+        steps
+    }
+
+    /// Recent movement is within `degrees` of `axis`, either way along it.
+    fn within(&self, axis: usize, degrees: f64) -> bool {
+        let (a, b) = (self.recent[axis].abs(), self.recent[1 - axis].abs());
+        a.hypot(b) >= RECENT_MIN_MM && b <= a * degrees.to_radians().tan()
+    }
+
+    fn step(&mut self, axis: usize, d: f64, steps: &mut Vec<Dir>) {
+        // What a step leaves over lies its own way, so turning back passes nothing before a whole step.
+        let g = &mut self.gathered[axis];
+        *g += d;
+        while g.abs() >= STEP_MM {
+            let way = g.signum();
+            *g -= way * STEP_MM;
+            steps.push(match (axis, way > 0.0) {
+                (0, false) => Dir::Left,
+                (0, true) => Dir::Right,
+                (_, false) => Dir::Up,
+                (_, true) => Dir::Down,
+            });
+        }
     }
 }
 
@@ -208,6 +387,112 @@ mod tests {
                 y: 0.0,
             })
             .collect()
+    }
+
+    /// Feeds the hand through `points` (mm), one report every 8 ms from `ms`.
+    fn drive(rails: &mut Rails, ms: &mut u32, points: impl IntoIterator<Item = (f64, f64)>) -> Vec<Dir> {
+        let mut last: Option<(f64, f64)> = None;
+        let mut steps = Vec::new();
+        for p in points {
+            if let Some(l) = last {
+                *ms += 8;
+                steps.extend(rails.travel((p.0 - l.0, p.1 - l.1), *ms));
+            }
+            last = Some(p);
+        }
+        steps
+    }
+    fn line(from: (f64, f64), to: (f64, f64), mm_per_report: f64) -> Vec<(f64, f64)> {
+        let n = ((to.0 - from.0).hypot(to.1 - from.1) / mm_per_report).ceil().max(1.0) as usize;
+        (0..=n)
+            .map(|i| {
+                let t = i as f64 / n as f64;
+                (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
+            })
+            .collect()
+    }
+    fn count(steps: &[Dir], dir: Dir) -> usize {
+        steps.iter().filter(|s| **s == dir).count()
+    }
+    #[test]
+    fn straight_down_with_a_crooked_finger_path_takes_no_cell_sideways() {
+        // Wavering 4 mm either way, at several paces and wavelengths, drifting off sideways too.
+        for (wave, drift, pace) in [(40.0, 0.0, 0.5), (24.0, 0.0, 0.3), (40.0, 12.0, 0.8), (60.0, -15.0, 0.4)] {
+            let mut rails = Rails::default();
+            let mut ms = 0;
+            let path = (0..=(61.0 / pace) as usize).map(|i| {
+                let y = i as f64 * pace;
+                (4.0 * ((std::f64::consts::TAU * y / wave).cos() - 1.0) + drift * y / 60.0, y)
+            });
+            let steps = drive(&mut rails, &mut ms, path);
+            assert_eq!(steps, vec![Dir::Down; 6], "wave {wave} drift {drift} pace {pace}");
+            assert_eq!(rails.progress().0, 0.0, "a rail does not lean sideways");
+        }
+        // Up and across alike: the axes are the same.
+        let mut rails = Rails::default();
+        let path = (0..=122).map(|i| (-(i as f64) * 0.5, 4.0 * ((i as f64 * 0.5 / 40.0 * std::f64::consts::TAU).cos() - 1.0)));
+        assert_eq!(drive(&mut rails, &mut 0, path), vec![Dir::Left; 6]);
+    }
+    #[test]
+    fn slantwise_goes_both_ways_and_steady_straight_travel_locks_again() {
+        let mut rails = Rails::default();
+        let mut ms = 0;
+        let steps = drive(&mut rails, &mut ms, line((0.0, 0.0), (35.0, -35.0), 0.5));
+        assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Up), steps.len()), (3, 3, 6));
+        // Shallower than the rail ratio still counts both ways.
+        let mut shallow = Rails::default();
+        let steps = drive(&mut shallow, &mut 0, line((0.0, 0.0), (40.0, 30.0), 0.5));
+        assert_eq!((count(&steps, Dir::Right), count(&steps, Dir::Down)), (4, 3));
+        // Then straight on rightwards for longer than RELOCK_MS: a rail again, wavering is ignored.
+        let more = drive(&mut rails, &mut ms, line((35.0, -35.0), (55.0, -35.0), 0.5));
+        assert_eq!(more, vec![Dir::Right; 2]);
+        let wobble = (0..=60).map(|i| (55.0 + i as f64 * 0.5, -35.0 + 4.0 * (i as f64 * 0.5 / 30.0 * std::f64::consts::TAU).sin()));
+        assert_eq!(drive(&mut rails, &mut ms, wobble), vec![Dir::Right; 3]);
+    }
+    #[test]
+    fn an_l_switches_axis_without_counting_the_turn() {
+        let mut rails = Rails::default();
+        let mut ms = 0;
+        let down = drive(&mut rails, &mut ms, line((0.0, 0.0), (0.0, 34.0), 0.5));
+        assert_eq!(down, vec![Dir::Down; 3]);
+        // Out of the channel the remaining 4 mm down is dropped and across gathers from nothing.
+        let across = drive(&mut rails, &mut ms, line((0.0, 34.0), (-27.0, 34.0), 0.5));
+        assert_eq!(across, vec![Dir::Left; 2]);
+        assert_eq!(rails.progress().1, 0.0);
+        // And back to up and down the same way.
+        let up = drive(&mut rails, &mut ms, line((-27.0, 34.0), (-27.0, 7.0), 0.5));
+        assert_eq!(up, vec![Dir::Up; 2]);
+    }
+    #[test]
+    fn a_hand_resting_on_the_edge_of_a_step_does_not_take_it_back() {
+        let mut rails = Rails::default();
+        let mut ms = 0;
+        let mut path = line((0.0, 0.0), (0.0, 10.0), 0.5);
+        for _ in 0..20 {
+            path.extend([(0.3, 8.5), (-0.2, 11.0), (0.0, 9.0), (0.1, 10.5)]);
+        }
+        assert_eq!(drive(&mut rails, &mut ms, path), vec![Dir::Down]);
+        // Back the other way: a whole step from where the step was, not from what it left over.
+        assert!(drive(&mut rails, &mut ms, line((0.1, 10.5), (0.0, 0.6), 0.5)).is_empty());
+        assert_eq!(drive(&mut rails, &mut ms, line((0.0, 0.6), (0.0, -0.1), 0.5)), vec![Dir::Up]);
+    }
+    #[test]
+    fn short_travel_is_judged_before_it_counts_and_one_cm_is_one_step() {
+        let mut rails = Rails::default();
+        assert!(rails.travel((1.0, 2.0), 0).is_empty());
+        assert_eq!(rails.progress(), (0.0, 0.0));
+        assert!(rails.travel((0.0, 7.0), 8).is_empty());
+        assert_eq!(rails.progress(), (0.0, 0.9));
+        assert_eq!(rails.travel((0.0, 1.0), 16), vec![Dir::Down]);
+        // One report going more than a step at once takes every step it went.
+        let mut fling = Rails::default();
+        assert_eq!(fling.travel((25.0, 1.0), 0), vec![Dir::Right; 2]);
+        // The gesture hands its hold's travel over in mm.
+        let mut g = Gesture::default();
+        g.update(&hand(3, 0.0), 0);
+        assert_eq!(g.update(&hand(3, 1.0), 8).steps, vec![Dir::Right]);
+        let progress = g.update(&hand(3, 1.05), 16).progress;
+        assert!((progress.0 - 0.05).abs() < 1e-9 && progress.1 == 0.0, "{progress:?}");
     }
     #[test]
     fn tap_and_small_travel() {
