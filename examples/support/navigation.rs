@@ -96,6 +96,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     for (dx, dy) in [(4, -440), (300, 4)] {
                         mouse(MOUSEEVENTF_XDOWN, 0, 0);
                         stroke(dx, dy, 50);
+                        wait(200); // Remove fling velocity without giving the released hold time to settle.
                         mouse(MOUSEEVENTF_XUP, 0, 0);
                         wait(5);
                     }

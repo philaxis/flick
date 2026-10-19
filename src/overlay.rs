@@ -25,7 +25,8 @@ use windows::{
         Graphics::{
             Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
             DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER},
-            Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_OUTPUT_DESC},
+            Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_OUTPUT_DESC, DXGI_FRAME_STATISTICS},
+            Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO},
             Gdi::{
                 EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromPoint, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION,
                 DEVMODEW, ENUM_CURRENT_SETTINGS, HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
@@ -33,6 +34,7 @@ use windows::{
         },
         System::{
             LibraryLoader::GetModuleHandleW,
+            Performance::QueryPerformanceFrequency,
             Threading::{
                 CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimerEx, WaitForMultipleObjects,
                 WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
@@ -150,7 +152,6 @@ struct Camera {
     pace_y: f32,
     /// What the goal was last worked out from, but for the hand's place.
     counted_from: Option<(u64, u64)>,
-    followed: Option<(u32, Pos)>,
 }
 
 impl Camera {
@@ -176,10 +177,11 @@ impl Camera {
         }
     }
 
-    fn follow_goals(view: &View, origin: Pos, drawn: &crate::glide::Drawn) -> (Vec<f32>, f32) {
+    fn follow_goals(view: &View, drawn: &crate::glide::Drawn) -> (Vec<f32>, f32) {
+        let origin = drawn.origin;
         let xs = (0..view.rows.len()).map(|row| {
             let relative = row as i32 - origin.row as i32;
-            let base = if row == origin.row { origin.col } else { view.anchor(row) };
+            let base = if row == origin.row { origin.col } else { drawn.anchors.get(row).copied().unwrap_or(0) };
             let along = usize::try_from(relative - drawn.rows.0).ok().and_then(|i| drawn.along.get(i)).copied().unwrap_or(0.0);
             -(base as f32 + along as f32)
         }).collect();
@@ -187,11 +189,7 @@ impl Camera {
     }
 
     fn follow(&mut self, view: &View, drawn: &crate::glide::Drawn) {
-        if self.followed.map(|f| f.0) != Some(drawn.hold) {
-            self.followed = view.cur.map(|origin| (drawn.hold, origin));
-        }
-        let Some((_, origin)) = self.followed else { return };
-        let (xs, y) = Self::follow_goals(view, origin, drawn);
+        let (xs, y) = Self::follow_goals(view, drawn);
         self.rest_x = vec![Spring::default(); xs.len()];
         self.put_x = vec![0.0; xs.len()];
         self.pace_x = vec![0.0; xs.len()];
@@ -315,6 +313,7 @@ fn create_window() -> Result<HWND> {
 struct VBlank {
     requests: mpsc::SyncSender<HMONITOR>,
     done: mpsc::Receiver<bool>,
+    period_ns: Arc<std::sync::atomic::AtomicU64>,
     ready: Arc<OwnedHandle>,
     pending: bool,
     enabled: bool,
@@ -327,15 +326,36 @@ impl VBlank {
         let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).ok()?.0 as _) };
         let ready = Arc::new(ready);
         let signal = ready.clone();
+        let period_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let measured = period_ns.clone();
         std::thread::Builder::new().name("minimap vblank".into()).spawn(move || {
             let mut monitor = HMONITOR(0);
             let mut output = None;
+            let mut previous: Option<DXGI_FRAME_STATISTICS> = None;
+            let mut frequency = 0;
+            unsafe { let _ = QueryPerformanceFrequency(&mut frequency); }
             while let Ok(wanted) = inbox.recv() {
                 if wanted != monitor {
                     output = output_for_monitor(wanted);
                     monitor = wanted;
+                    previous = None;
+                    measured.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
                 let ok = output.as_ref().is_some_and(|output| unsafe { output.WaitForVBlank() }.is_ok());
+                if let Some(output) = &output {
+                    let mut stats = DXGI_FRAME_STATISTICS::default();
+                    if unsafe { output.GetFrameStatistics(&mut stats) }.is_ok() {
+                        if let Some(last) = previous {
+                            let frames = stats.SyncRefreshCount.wrapping_sub(last.SyncRefreshCount);
+                            let ticks = stats.SyncQPCTime - last.SyncQPCTime;
+                            if frames > 0 && ticks > 0 && frequency > 0 {
+                                let seconds = ticks as f64 / frequency as f64 / frames as f64;
+                                if (0.001..=0.1).contains(&seconds) { measured.store((seconds * 1e9) as u64, std::sync::atomic::Ordering::Relaxed); }
+                            }
+                        }
+                        previous = Some(stats);
+                    }
+                }
                 if !ok {
                     monitor = HMONITOR(0);
                     output = None;
@@ -345,7 +365,7 @@ impl VBlank {
                 }
             }
         }).ok()?;
-        Some(Self { requests, done, ready, pending: false, enabled: true })
+        Some(Self { requests, done, period_ns, ready, pending: false, enabled: true })
     }
 
     fn reset(&mut self) {
@@ -432,6 +452,15 @@ impl FramePacer {
                 && EnumDisplaySettingsW(PCWSTR(info.szDevice.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode).as_bool()
                 && mode.dmDisplayFrequency > 1 { mode.dmDisplayFrequency } else { 60 };
             self.period = Duration::from_secs_f64(1.0 / hz as f64);
+            // DWM exposes the primary output's clock; never apply it to a secondary output.
+            if info.monitorInfo.dwFlags & 1 != 0 {
+                let mut timing = DWM_TIMING_INFO { cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
+                let mut frequency = 0;
+                if DwmGetCompositionTimingInfo(HWND(0), &mut timing).is_ok() && QueryPerformanceFrequency(&mut frequency).is_ok() && frequency > 0 {
+                    let seconds = timing.qpcRefreshPeriod as f64 / frequency as f64;
+                    if (0.001..=0.1).contains(&seconds) { self.period = Duration::from_secs_f64(seconds); }
+                }
+            }
         }
         if self.vblank.is_none() {
             self.vblank = VBlank::spawn();
@@ -441,8 +470,8 @@ impl FramePacer {
         }
     }
 
-    /// Give DXGI at most two refresh intervals, including drawing time.
-    /// On failure or an early vblank, the timer finishes this frame.
+    /// Output statistics supply the actual period. Broken drivers that return
+    /// immediately from WaitForVBlank fall back to the measured display period.
     pub(crate) fn wait(&mut self, frame: Instant) -> Result<(Duration, bool)> {
         let deadline = frame + self.period * 2;
         if Instant::now() >= deadline {
@@ -452,9 +481,12 @@ impl FramePacer {
         if self.vblank.as_ref().is_some_and(|v| v.enabled && !v.pending) {
             self.arm(deadline)?;
             vblank_ok = self.vblank.as_mut().unwrap().wait(self.monitor, self.timer, deadline);
+            let measured = self.vblank.as_ref().unwrap().period_ns.load(std::sync::atomic::Ordering::Relaxed);
+            if measured != 0 { self.period = Duration::from_nanos(measured); }
             if vblank_ok && frame.elapsed() >= self.period.mul_f64(0.9) {
                 return Ok((Duration::ZERO, true));
             }
+            vblank_ok = false;
         }
         let before = Instant::now();
         let remaining = (frame + self.period).saturating_duration_since(before);
@@ -615,7 +647,7 @@ impl Overlay {
         let hiding = self.hide_at.is_some_and(|at| now >= at);
         let goal = if hiding { 0.0 } else { 1.0 };
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
-        if let Some(drawn) = crate::glide::drawn().filter(|d| d.hold == crate::input::followed().hold) {
+        if let Some(drawn) = crate::glide::drawn() {
             self.camera.follow(&self.view, &drawn);
         } else {
             self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
@@ -1179,8 +1211,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn an_early_vblank_uses_the_timer_but_a_normal_vblank_does_not() {
-        for elapsed in [Duration::ZERO, Duration::from_millis(19)] {
+    fn an_immediate_driver_reply_uses_the_timer_but_a_real_vblank_does_not() {
+        for (elapsed, measured) in [(Duration::ZERO, 0), (Duration::from_millis(19), 0), (Duration::from_millis(9), 8_333_333)] {
             let mut pacer = FramePacer::new().unwrap();
             pacer.period = Duration::from_millis(20);
             let (requests, _inbox) = mpsc::sync_channel(1);
@@ -1188,15 +1220,14 @@ mod tests {
             let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).unwrap().0 as _) };
             reply.send(true).unwrap();
             unsafe { SetEvent(HANDLE(ready.as_raw_handle() as isize)).unwrap(); }
-            pacer.vblank = Some(VBlank { requests, done, ready: Arc::new(ready), pending: false, enabled: true });
+            pacer.vblank = Some(VBlank { requests, done, period_ns: Arc::new(std::sync::atomic::AtomicU64::new(measured)), ready: Arc::new(ready), pending: false, enabled: true });
             let frame = Instant::now() - elapsed;
             let (timer, ok) = pacer.wait(frame).unwrap();
-            assert!(ok);
-            assert_eq!(!timer.is_zero(), elapsed.is_zero(), "only an early vblank needs a timer top-up");
-            if elapsed.is_zero() {
-                assert!(frame.elapsed() >= pacer.period, "an early vblank let the next frame start too soon");
-            }
+            assert_eq!(ok, !elapsed.is_zero());
+            assert_eq!(!timer.is_zero(), elapsed.is_zero());
+            if elapsed.is_zero() { assert!(frame.elapsed() >= pacer.period); }
             assert!(pacer.vblank.as_ref().unwrap().enabled);
+            if measured != 0 { assert_eq!(pacer.period, Duration::from_nanos(measured)); }
         }
     }
 
@@ -1208,7 +1239,7 @@ mod tests {
         let (requests, inbox) = mpsc::sync_channel(1);
         let (reply, done) = mpsc::sync_channel(1);
         let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).unwrap().0 as _) };
-        pacer.vblank = Some(VBlank { requests, done, ready: Arc::new(ready), pending: false, enabled: true });
+        pacer.vblank = Some(VBlank { requests, done, period_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)), ready: Arc::new(ready), pending: false, enabled: true });
 
         let before = Instant::now();
         assert!(!pacer.wait(before).unwrap().1);
@@ -1237,7 +1268,7 @@ mod tests {
         let ready = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None).unwrap().0 as _) };
         reply.send(false).unwrap();
         unsafe { SetEvent(HANDLE(ready.as_raw_handle() as isize)).unwrap(); }
-        pacer.vblank = Some(VBlank { requests, done, ready: Arc::new(ready), pending: false, enabled: true });
+        pacer.vblank = Some(VBlank { requests, done, period_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)), ready: Arc::new(ready), pending: false, enabled: true });
         let before = Instant::now();
         let (fallback, ok) = pacer.wait(before).unwrap();
         assert!(!ok && fallback > Duration::ZERO);
@@ -1380,10 +1411,12 @@ mod tests {
     #[test]
     fn a_followed_move_from_the_third_row_slides_the_second_row() {
         let view = View { rows: vec![vec![CellView::default(); 3]; 3], cur: Some(Pos { row: 2, col: 0 }), ..Default::default() };
-        let drawn = crate::glide::Drawn { hold: 1, rows: (-2, 0), along: vec![0.0, 0.4, 0.0], y: -1.0 };
-        let (xs, y) = Camera::follow_goals(&view, view.cur.unwrap(), &drawn);
+        let drawn = crate::glide::Drawn { origin: view.cur.unwrap(), anchors: vec![0; 3], rows: (-2, 0), along: vec![0.0, 0.4, 0.0], y: -1.0 };
+        let (xs, y) = Camera::follow_goals(&view, &drawn);
         assert!(xs[0].abs() < 1e-6 && (xs[1] + 0.4).abs() < 1e-6 && xs[2].abs() < 1e-6);
         assert!((y + 1.0).abs() < 1e-6);
+        let moved = View { cur: Some(Pos { row: 1, col: 1 }), anchors: vec![0, 1, 0], ..view };
+        assert_eq!(Camera::follow_goals(&moved, &drawn), (xs, y), "arrival must not rebase a frame still on screen");
     }
 
 }

@@ -14,12 +14,14 @@ $was = Get-Process Flick -ErrorAction SilentlyContinue | Select-Object -First 1 
 Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
 foreach ($f in 'config.toml', 'state.json') { if (Test-Path "$cfg\$f") { Copy-Item "$cfg\$f" $backup } }
+$probeExit = 1
 $logStart = if (Test-Path "$cfg\log.txt") { (Get-Content "$cfg\log.txt").Count } else { 0 }
 try {
     & $drive navigation stage $out
     if ($LASTEXITCODE) { throw 'stage failed' }
     & $drive navigation run $out $flick
-    if ($LASTEXITCODE) { throw 'probe failed' }
+    $probeExit = $LASTEXITCODE
+    if ($probeExit) { Write-Warning 'Probe failed; collecting its trace before reporting the result' }
 } finally {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep 1
@@ -32,3 +34,7 @@ try {
     if ($was) { Start-Process $was }
 }
 Get-Content "$out\report.txt"
+
+# Transport succeeds even on an assertion failure so its evidence is retrievable.
+Set-Content (Join-Path $out 'probe-exit.txt') $probeExit
+Write-Output "PROBE_EXIT=$probeExit"

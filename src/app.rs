@@ -90,7 +90,7 @@ const RECLAIM_TIMER_ID: usize = 7;
 /// One-shot timer that sorts the windows kept on top once more, after Windows
 /// has finished raising the one just clicked.
 const RESTACK_TIMER_ID: usize = 8;
-/// One-shot timer for a switch Windows never told of (`FLIGHT_MS`).
+/// Recovery timer, kept until the current desktop can be read.
 const FLIGHT_TIMER_ID: usize = 9;
 /// A switch asked of Windows is taken as made after this long even when
 /// Windows has not told of it, so a cell waiting behind it is not kept waiting.
@@ -1121,7 +1121,7 @@ impl App {
                 crate::grid::row_title(&self.grid.rows[at].name, at)
             })
             .collect();
-        Some(Scene { hold, rows, cols, firm, shots, names })
+        Some(Scene { hold, origin: from, anchors: self.grid.rows.iter().map(|r| r.anchor()).collect(), rows, cols, firm, shots, names })
     }
 
     /// Hold `hold` began to move: the picture follows it the ways it is set
@@ -1362,7 +1362,8 @@ impl App {
 
     fn open_board(&mut self) {
         debug_log!("ui: open board sync");
-        if self.gliding.take().is_some() {
+        if let Some(old) = self.gliding.take() {
+            self.glide_finish(old);
             self.glide.cancel();
         }
         let Some(desktops) = self.sync() else { return };

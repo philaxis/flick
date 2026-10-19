@@ -125,6 +125,8 @@ pub struct Shot {
 /// windows, bottom first.
 pub struct Scene {
     pub hold: u32,
+    pub origin: crate::grid::Pos,
+    pub anchors: Vec<usize>,
     /// The rows up and down from the first, and for each the cells along
     /// it (`Follow::new`).
     pub rows: (i32, i32),
@@ -588,6 +590,8 @@ fn qpc_ms() -> f64 {
 
 struct Session {
     hold: u32,
+    origin: crate::grid::Pos,
+    anchors: Vec<usize>,
     follow: Follow,
     screens: Vec<Screen>,
     /// The windows' thumbnails, bottom first, and where each is drawn.
@@ -621,7 +625,8 @@ struct Session {
 
 impl Session {
     /// What its thumbnails are, its screens kept for the next.
-    fn retire(self) -> (Vec<Screen>, Vec<Thumb>) {
+    fn retire(self, path: Option<&std::path::Path>) -> (Vec<Screen>, Vec<Thumb>) {
+        if let (Some(path), Some(trace)) = (path, &self.trace) { write_trace(path, &trace.lines); }
         let mut thumbs: Vec<Thumb> = self.leftover;
         thumbs.extend(self.shots.into_iter().map(|(thumb, ..)| thumb));
         for veil in self.veils {
@@ -677,7 +682,7 @@ fn run(app: HWND, inbox: mpsc::Receiver<Request>) {
         return crate::app::log("the sliding picture has no frame clock");
     };
     let trace = std::env::var_os("FLICK_TRACE").filter(|path| !path.is_empty()).map(std::path::PathBuf::from);
-    let mut view = View { app, session: None, pacer, period: Duration::from_secs_f64(1.0 / 60.0), frame: Instant::now(), paints: None, ink: None, trace };
+    let mut view = View { app, session: None, pacer, period: Duration::from_secs_f64(1.0 / 60.0), frame: Instant::now(), paints: None, ink: Ink::new(), trace };
     loop {
         unsafe {
             let mut message = MSG::default();
@@ -736,7 +741,8 @@ fn new_window(area: RECT) -> Option<HWND> {
 /// The minimap uses the exact displayed rows rather than the hold's origin row.
 #[derive(Clone)]
 pub struct Drawn {
-    pub hold: u32,
+    pub origin: crate::grid::Pos,
+    pub anchors: Vec<usize>,
     pub rows: (i32, i32),
     pub along: Vec<f64>,
     pub y: f64,
@@ -772,7 +778,7 @@ impl View {
                 // Monitors as they were are kept, so the picture stays up
                 // from one hold to the next, going on from where it was.
                 let (_, receded) = self.carried();
-                let (screens, leftover) = self.session.take().map(Session::retire).unwrap_or_default();
+                let (screens, leftover) = self.session.take().map(|s| s.retire(self.trace.as_deref())).unwrap_or_default();
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
                     new.receded_from = receded;
@@ -780,7 +786,7 @@ impl View {
             }
             Request::Step(scene, to) => {
                 let (carry, receded) = self.carried();
-                let (screens, leftover) = self.session.take().map(Session::retire).unwrap_or_default();
+                let (screens, leftover) = self.session.take().map(|s| s.retire(self.trace.as_deref())).unwrap_or_default();
                 let step = Step { from: carry, receded, ..Step::new(0.0, to) };
                 self.begin(scene, screens, leftover, Phase::Stepping(step));
             }
@@ -799,7 +805,7 @@ impl View {
                 }
                 let (hand, visible, began, farthest_y, trace) = (old.hand, old.visible, old.began, old.farthest_y, old.trace.take());
                 let histories = (std::mem::take(&mut old.follow.x.history), std::mem::take(&mut old.follow.y.history));
-                let (screens, leftover) = old.retire();
+                let (screens, leftover) = old.retire(self.trace.as_deref());
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
                     (new.follow.x.history, new.follow.y.history) = histories;
@@ -890,6 +896,8 @@ impl View {
         let trace = self.trace.as_ref().map(|_| Trace { lines: Vec::with_capacity(512), last: None });
         self.session = Some(Session {
             hold: scene.hold,
+            origin: scene.origin,
+            anchors: scene.anchors,
             follow,
             screens,
             shots,
@@ -983,11 +991,8 @@ impl View {
         if std::env::var_os("FLICK_GLIDE_STATS").is_some() {
             crate::app::log(&line);
         }
-        if let (Some(path), Some(trace)) = (&self.trace, &session.trace) {
-            write_trace(path, &trace.lines);
-        }
         // Thumbnails before their windows.
-        let (screens, thumbs) = session.retire();
+        let (screens, thumbs) = session.retire(self.trace.as_deref());
         drop(thumbs);
         drop(screens);
         self.paints = None;
@@ -1096,7 +1101,7 @@ impl View {
             moves = draw(session, &strip);
             session.stats.updates += moves;
             session.shown = Some(strip.clone());
-            *DRAWN.lock().unwrap() = Some(Drawn { hold: session.hold, rows: session.follow.rows, along: strip.along.clone(), y: strip.y });
+            *DRAWN.lock().unwrap() = Some(Drawn { origin: session.origin, anchors: session.anchors.clone(), rows: session.follow.rows, along: strip.along.clone(), y: strip.y });
         }
         if self.ink.is_none() {
             self.ink = Ink::new();
@@ -1121,6 +1126,11 @@ impl View {
                     let _ = SetWindowPos(minimap, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
                 }
             }
+        }
+        if session.stats.frames == 0 {
+            // Thumbnail/font setup is not animation time: the next visible frame starts from zero.
+            session.began = Instant::now();
+            self.frame = session.began;
         }
         session.stats.frames += 1;
         session.stats.cpu.push(thread_cpu() - cpu);
@@ -1159,12 +1169,13 @@ impl View {
         }
     }
 
-    /// Waits for the next refresh: DWM's, or, when it does not wait (an
-    /// idle display), the rest of a refresh's time.
+    /// Waits for this output's DXGI refresh, with a bounded timer fallback.
     fn pace(&mut self) -> Paced {
         let before = Instant::now();
         let (fallback, vblank) = self.pacer.wait(self.frame).unwrap_or_default();
-        self.frame = Instant::now();
+        self.period = self.pacer.period;
+        let now = Instant::now();
+        self.frame = if vblank { now } else { (self.frame + self.period).max(now - self.period) };
         Paced { flushed: vblank, flush: before.elapsed().as_secs_f64() * 1000.0, timer: (!fallback.is_zero()).then_some(fallback.as_secs_f64() * 1000.0) }
     }
 
