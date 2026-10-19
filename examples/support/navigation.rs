@@ -54,11 +54,11 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             let me = std::env::current_exe().unwrap();
             let mut report = String::new();
             let mut failures = 0;
-            for follow in [true, false] {
-                let config = format!("config_version = 2\ntrigger = \"xbutton2, f8\"\nminimap = true\nhotkeys = false\n[mouse]\nstep_x = 260\nstep_y = 400\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
+            for (follow, minimap) in [(true, false), (true, true), (false, true)] {
+                let config = format!("config_version = 2\ntrigger = \"xbutton2, f8\"\nminimap = {minimap}\nhotkeys = false\n[mouse]\nstep_x = 260\nstep_y = 400\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
                 std::fs::write(cfg.join("config.toml"), config).unwrap();
                 goto(0);
-                let mut child = Command::new(flick.unwrap()).arg("--portable").env("FLICK_GLIDE_STATS", "1").env("FLICK_TRACE", out.join(format!("trace-{follow}.csv")))
+                let mut child = Command::new(flick.unwrap()).arg("--portable").env("FLICK_GLIDE_STATS", "1").env("FLICK_TRACE", out.join(format!("trace-{follow}-{minimap}.csv")))
                     .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
                 wait(3000);
                 let app = FindWindowW(w!("flick.main"), None);
@@ -72,13 +72,13 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     mouse(MOUSEEVENTF_XDOWN, 0, 0);
                     wait(80);
                     for (dx, dy) in moves { stroke(dx, dy, 450); wait(250); }
-                    let _ = Command::new(&me).args(["shot", out.join(format!("{follow}-{label}.raw")).to_str().unwrap()]).status();
+                    let _ = Command::new(&me).args(["shot", out.join(format!("{follow}-{minimap}-{label}.raw")).to_str().unwrap()]).status();
                     mouse(MOUSEEVENTF_XUP, 0, 0);
                     wait(1800);
                     let got = vdapi::get_current_desktop().unwrap().id();
                     let ok = got == ids[target];
                     failures += usize::from(!ok);
-                    report += &format!("follow={follow} {label}: {ok} start={} expected={} actual={got}\n", ids[start], ids[target]);
+                    report += &format!("follow={follow} minimap={minimap} {label}: {ok} start={} expected={} actual={got}\n", ids[start], ids[target]);
                 }
                 goto(0);
                 for up in [false, true] {
@@ -88,7 +88,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 }
                 wait(1800);
                 let got = vdapi::get_current_desktop().unwrap().id();
-                report += &format!("follow={follow} keyboard-trigger: {} actual={got}\n", got == ids[1]);
+                report += &format!("follow={follow} minimap={minimap} keyboard-trigger: {} actual={got}\n", got == ids[1]);
                 failures += usize::from(got != ids[1]);
                 // Fifty physical button taps interleaved with holds, 100 ms apart.
                 let mut latencies = Vec::new();
@@ -101,13 +101,13 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     let before = Instant::now();
                     let answered = SendMessageTimeoutW(app, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 2500, None).0 != 0;
                     latencies.push(before.elapsed().as_millis());
-                    if !answered { report += &format!("follow={follow} UI timeout at tap {i}\n"); }
+                    if !answered { report += &format!("follow={follow} minimap={minimap} UI timeout at tap {i}\n"); }
                 }
                 let board = FindWindowW(w!("flick.board"), None);
                 let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0));
                 wait(2000);
                 latencies.sort();
-                report += &format!("follow={follow} 50 taps: UI p95={}ms max={}ms alive={}\n", latencies[47], latencies[49], child.try_wait().unwrap().is_none());
+                report += &format!("follow={follow} minimap={minimap} 50 taps: UI p95={}ms max={}ms alive={}\n", latencies[47], latencies[49], child.try_wait().unwrap().is_none());
                 let _ = child.kill();
                 let _ = child.wait();
                 wait(500);
