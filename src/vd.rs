@@ -20,19 +20,18 @@ use windows::{
             },
             ProcessStatus::{K32EmptyWorkingSet, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
             Threading::{
-                AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
                 PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
             },
         },
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
-            Input::KeyboardAndMouse::SetFocus,
             WindowsAndMessaging::{
                 EnumWindows, FindWindowExW, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-                IsIconic, IsWindowVisible, PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
+                IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
                 ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOMOVE,
-                SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SMTO_ABORTIFHUNG, WINDOWPLACEMENT, WM_CLOSE, WM_NULL,
+                SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WM_CLOSE,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
@@ -114,39 +113,12 @@ pub fn app_windows() -> Vec<HWND> {
     out
 }
 
-/// `SetForegroundWindow` is refused for background processes unless we share
-/// input state with the thread that currently owns the foreground.
+/// Request activation without joining another application's input queue.
 pub fn force_foreground(hwnd: HWND) {
     unsafe {
-        // Done again, Windows may take it for a window of the desktop left
-        // being given the keyboard, and go back there.
-        if GetForegroundWindow() == hwnd {
-            return;
-        }
-        #[cfg(feature = "debug-log")]
-        {
-            let fg = GetForegroundWindow();
-            debug_log!(
-                "vd: foreground before {:x} on {:?}",
-                fg.0,
-                vdapi::get_desktop_by_window(fg).map(|d| d.id()[..4].to_owned()).ok()
-            );
-        }
-        let me = GetCurrentThreadId();
-        let foreground = GetForegroundWindow();
-        let other = GetWindowThreadProcessId(foreground, None);
-        // Sharing input with a thread that is not answering (a window still
-        // being opened, or hung) makes the focus change wait on it: the app
-        // would stand still, every trigger with it, until that thread answers.
-        let answering = SendMessageTimeoutW(foreground, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 100, None).0 != 0;
-        let attach = other != 0 && other != me && answering;
-        if attach {
-            let _ = AttachThreadInput(me, other, true);
-        }
-        let _ = SetForegroundWindow(hwnd);
-        if attach {
-            let _ = SetFocus(hwnd);
-            let _ = AttachThreadInput(me, other, false);
+        if GetForegroundWindow() != hwnd {
+            // AttachThreadInput makes even SetFocus wait indefinitely on the other UI thread.
+            let _ = SetForegroundWindow(hwnd);
         }
     }
 }

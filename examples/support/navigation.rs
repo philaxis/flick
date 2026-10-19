@@ -105,6 +105,24 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     report += &format!("follow={follow} minimap={minimap} rapid-up-then-right: {} actual={got}\n", got == ids[3]);
                     failures += usize::from(got != ids[3]);
                 }
+                // Real keyboard input must reach the board without joining foreign input queues.
+                goto(0);
+                mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(30); mouse(MOUSEEVENTF_XUP, 0, 0);
+                wait(700);
+                let board = FindWindowW(w!("flick.board"), None);
+                let focused = GetForegroundWindow() == board && IsWindowVisible(board).as_bool();
+                for vk in [0x27, 0x1b] {
+                    for up in [false, true] {
+                        SendInput(&[super::key_vk(vk, up)], std::mem::size_of::<INPUT>() as i32);
+                        wait(20);
+                    }
+                    wait(400);
+                }
+                wait(1500);
+                let got = vdapi::get_current_desktop().unwrap().id();
+                let selected = got == ids[1] && !IsWindowVisible(board).as_bool();
+                failures += usize::from(!focused || !selected);
+                report += &format!("follow={follow} minimap={minimap} board keyboard: focused={focused} Esc-goes-to-selection={selected} actual={got}\n");
                 // Fifty physical button taps interleaved with holds, 100 ms apart.
                 let measuring = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let running = measuring.clone();
