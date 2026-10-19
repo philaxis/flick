@@ -988,6 +988,8 @@ fn release(s: &Settings, source: Source) {
 }
 
 fn finish_release(s: &Settings, source: Source, tap: Option<bool>) {
+    #[cfg(feature = "motion-probe")]
+    probe_flush();
     let ended = HELD.with(|held| held.borrow_mut().release(source));
     debug_log!("up {source:?}{}", if ended { ": hold ends" } else { "" });
     if ended {
@@ -1173,6 +1175,8 @@ fn raw_mouse_input(raw: &RAWINPUT) {
 }
 
 fn touchpad_event(event: crate::touchpad::Event) {
+    #[cfg(feature = "motion-probe")]
+    let probe_delta = event.delta;
     if CAPTURING.load(Ordering::SeqCst) { return; }
     with_settings(|s| {
         if event.began {
@@ -1240,6 +1244,8 @@ fn touchpad_event(event: crate::touchpad::Event) {
         }
         false
     });
+    #[cfg(feature = "motion-probe")]
+    probe_input("ptp", probe_delta.0, probe_delta.1);
 }
 
 /// Between touchpad steps the minimap leans as far as `Rails` gathered towards the next one,
@@ -1311,6 +1317,8 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     let by: [i32; 2] = std::array::from_fn(|i| (lock.at[i] * step[i]).round() as i32 - (before[i] * step[i]).round() as i32);
     MOUSE_AXIS.set(lock);
     advance(s, by[0], by[1]);
+    #[cfg(feature = "motion-probe")]
+    probe_input("mouse", dx as f64, dy as f64);
 }
 
 /// Adds travel and emits steps.
@@ -1696,4 +1704,24 @@ mod tests {
         // administrator gets it.
         assert!(hidden_by(8, 0, admin));
     }
+}
+
+
+#[cfg(feature = "motion-probe")]
+thread_local! { static PROBE_INPUT: RefCell<Vec<(i64, &'static str, f64, f64)>> = const {RefCell::new(Vec::new())}; }
+#[cfg(feature = "motion-probe")]
+fn probe_input(kind: &'static str, x: f64, y: f64) {
+    let mut at = 0;
+    unsafe { let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut at); }
+    PROBE_INPUT.with(|v| v.borrow_mut().push((at,kind,x,y)));
+}
+#[cfg(feature = "motion-probe")]
+fn probe_flush() {
+    use std::fmt::Write;
+    let Some(path) = std::env::var_os("FLICK_INPUT_TRACE") else {return};
+    PROBE_INPUT.with(|v| {
+        let mut csv = String::from("qpc,kind,dx,dy\n");
+        for (at,kind,x,y) in v.borrow_mut().drain(..) {let _ = writeln!(csv,"{at},{kind},{x:.6},{y:.6}");}
+        let _ = std::fs::write(path,csv);
+    });
 }

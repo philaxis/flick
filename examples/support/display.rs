@@ -16,6 +16,7 @@ struct Capture {
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
+    sample: std::cell::RefCell<Option<Vec<u8>>>,
 }
 impl Capture {
     unsafe fn new() -> Result<Self> {
@@ -39,11 +40,11 @@ impl Capture {
                 let texture = D3D11_TEXTURE2D_DESC { Width: width, Height: height, MipLevels: 1, ArraySize: 1, Format: DXGI_FORMAT_B8G8R8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Usage: D3D11_USAGE_STAGING, CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32, ..Default::default() };
                 let mut staging = None; device.CreateTexture2D(&texture, None, Some(&mut staging))?;
                 println!("duplication {width}x{height}, mode {} / {} Hz", desc.ModeDesc.RefreshRate.Numerator, desc.ModeDesc.RefreshRate.Denominator);
-                return Ok(Self { duplication, context: context.unwrap(), staging: staging.unwrap(), width, height });
+                return Ok(Self { duplication, context: context.unwrap(), staging: staging.unwrap(), width, height, sample: std::cell::RefCell::new(None) });
             }
         }
     }
-    unsafe fn frame(&self) -> Result<Option<(DXGI_OUTDUPL_FRAME_INFO, [(i32,i32,i32,i32,u32); 4], f64)>> {
+    unsafe fn frame(&self, save: bool) -> Result<Option<(DXGI_OUTDUPL_FRAME_INFO, [(i32,i32,i32,i32,u32); 4], [f64;4], f64)>> {
         let start = Instant::now();
         let (mut info, mut resource) = (DXGI_OUTDUPL_FRAME_INFO::default(), None);
         match self.duplication.AcquireNextFrame(50, &mut info, &mut resource) {
@@ -58,6 +59,7 @@ impl Capture {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
         let mut boxes = [(i32::MAX, i32::MAX, -1, -1, 0); 4];
+        let (mut mass,mut moment)=([0u64;4],[0u64;4]);
         for y in 0..self.height {
             let line = std::slice::from_raw_parts((mapped.pData as *const u8).add((y * mapped.RowPitch) as usize), self.width as usize * 4);
             for x in 0..self.width {
@@ -68,11 +70,19 @@ impl Capture {
                     else if b > 40 && g > 40 && r * 3 < b.min(g) { Some(1) }
                     else if r > 40 && g > 40 && b * 3 < r.min(g) { Some(2) }
                     else if y < 40 && g > 180 && r < 40 && b < 40 { Some(3) } else { None };
-                if let Some(c) = c { let v = &mut boxes[c]; v.0=v.0.min(x as i32); v.1=v.1.min(y as i32); v.2=v.2.max(x as i32); v.3=v.3.max(y as i32); v.4+=1; }
+                if let Some(c) = c { let weight = match c {0=>r.min(b)-g,1=>b.min(g)-r,2=>r.min(g)-b,_=>g-r.max(b)} as u64;
+                    mass[c]+=weight;moment[c]+=weight*x as u64;let v = &mut boxes[c]; v.0=v.0.min(x as i32); v.1=v.1.min(y as i32); v.2=v.2.max(x as i32); v.3=v.3.max(y as i32); v.4+=1; }
             }
         }
+        if save && self.sample.borrow().is_none() {
+            let mut raw=Vec::with_capacity((self.width*self.height*4+8) as usize);
+            raw.extend_from_slice(&self.width.to_le_bytes());raw.extend_from_slice(&self.height.to_le_bytes());
+            for y in 0..self.height {raw.extend_from_slice(std::slice::from_raw_parts((mapped.pData as *const u8).add((y*mapped.RowPitch) as usize),self.width as usize*4));}
+            *self.sample.borrow_mut()=Some(raw);
+        }
         self.context.Unmap(&self.staging, 0);
-        Ok(Some((info, boxes, start.elapsed().as_secs_f64()*1000.0)))
+        let centers=std::array::from_fn(|i| if mass[i]>0 {moment[i] as f64/mass[i] as f64} else {f64::NAN});
+        Ok(Some((info, boxes, centers, start.elapsed().as_secs_f64()*1000.0)))
     }
 }
 
@@ -150,31 +160,33 @@ pub unsafe fn run(out: &Path, flick: &str) {
     let mut timing=windows::Win32::Graphics::Dwm::DWM_TIMING_INFO {cbSize:std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_TIMING_INFO>() as u32,..Default::default()};
     windows::Win32::Graphics::Dwm::DwmGetCompositionTimingInfo(HWND(0),&mut timing).unwrap();
     let refresh_ticks = timing.qpcRefreshPeriod;
-    std::fs::write(out.join("display-meta.json"),serde_json::json!({"frequency":frequency,"refresh_ticks":refresh_ticks,"baseline":"0078a16 + motion probe","capture":"desktop duplication, not panel scanout"}).to_string()).unwrap();
+    std::fs::write(out.join("display-meta.json"),serde_json::json!({"frequency":frequency,"refresh_ticks":refresh_ticks,"composition":std::env::var_os("FLICK_COMPOSITION").is_some(),"capture":"desktop duplication, not panel scanout"}).to_string()).unwrap();
     for mode in ["follow","board"] { for kind in ["mouse","ptp"] { for scenario in ["slow","normal","fast","mixed"] {
         super::vdapi::switch_desktop(home).unwrap(); wait(500);
         let label=format!("{mode}-{kind}-{scenario}");
-        let mut child=Command::new(flick).arg("--portable").env("FLICK_TRACE",out.join(format!("{label}-app.csv")))
+        let mut child=Command::new(flick).arg("--portable").env("FLICK_INPUT_TRACE",out.join(format!("{label}-received.csv"))).env("FLICK_TRACE",out.join(format!("{label}-app.csv")))
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         wait(1200);
         let app=FindWindowW(w!("flick.main"),None); assert!(app.0!=0);
         if mode=="board" {PostMessageW(app,WM_APP+2,WPARAM(0),LPARAM(0)).unwrap();wait(700);assert!(IsWindowVisible(FindWindowW(w!("flick.board"),None)).as_bool());}
         let capture=Capture::new().unwrap();
         // Drain setup before injecting; AccumulatedFrames remains visible in the CSV.
-        let _=capture.frame().unwrap();
+        let _=capture.frame(false).unwrap();
         let (k,s,path)=(kind.to_owned(),scenario.to_owned(),out.join(format!("{label}-input.csv")));
         let worker=std::thread::spawn(move||input(&k,&s,&path,6.0,frequency));
         let start=Instant::now();
-        let mut csv=String::from("qpc,accumulated,capture_ms,magenta_l,magenta_t,magenta_r,magenta_b,magenta_n,cyan_l,cyan_t,cyan_r,cyan_b,cyan_n,yellow_l,yellow_t,yellow_r,yellow_b,yellow_n,marker_l,marker_t,marker_r,marker_b,marker_n\n");
+        let mut csv=String::from("qpc,accumulated,capture_ms,magenta_l,magenta_t,magenta_r,magenta_b,magenta_n,cyan_l,cyan_t,cyan_r,cyan_b,cyan_n,yellow_l,yellow_t,yellow_r,yellow_b,yellow_n,marker_l,marker_t,marker_r,marker_b,marker_n,magenta_x,cyan_x,yellow_x,marker_x\n");
         let(mut frames,mut missed)=(0,0);
         while start.elapsed()<Duration::from_millis(7200) {
-            if let Some((info,boxes,ms))=capture.frame().unwrap() {
+            if let Some((info,boxes,centers,ms))=capture.frame(start.elapsed()>Duration::from_millis(1000)).unwrap() {
                 frames+=1;missed+=info.AccumulatedFrames.saturating_sub(1);
                 write!(csv,"{},{},{ms:.3}",info.LastPresentTime,info.AccumulatedFrames).unwrap();
-                for b in boxes {write!(csv,",{},{},{},{},{}",b.0,b.1,b.2,b.3,b.4).unwrap();}csv.push('\n');
+                for b in boxes {write!(csv,",{},{},{},{},{}",b.0,b.1,b.2,b.3,b.4).unwrap();}
+                for x in centers {write!(csv,",{x:.6}").unwrap();}csv.push('\n');
             }
         }
         worker.join().unwrap();
+        if let Some(raw)=capture.sample.into_inner() {std::fs::write(out.join(format!("{label}.raw")),raw).unwrap();}
         std::fs::write(out.join(format!("{label}-display.csv")),csv).unwrap();
         if mode=="board" {PostMessageW(FindWindowW(w!("flick.board"),None),WM_KEYDOWN,WPARAM(0x1b),LPARAM(0)).unwrap();wait(300);}
         let _=child.kill();let _=child.wait();
