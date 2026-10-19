@@ -1261,24 +1261,23 @@ impl App {
 
     /// The rows a hold turned stay turned (`Row::last`), whichever it goes
     /// to: each at the cell it was left on, `turns` counted from `origin`
-    /// as `glide_cell` counts them. True when one changed.
-    fn glide_remember(&mut self, origin: &str, turns: &[(i32, i32)]) -> bool {
-        self.grid.find(origin).is_some_and(|from| self.grid.keep_turns(from, turns))
+    /// as `glide_cell` counts them, and saved at once.
+    fn glide_remember(&mut self, origin: &str, turns: &[(i32, i32)]) {
+        if self.grid.find(origin).is_some_and(|from| self.grid.keep_turns(from, turns)) {
+            self.save();
+        }
     }
 
     /// Goes to the cell `to` from `origin`, as the end of a gesture does,
     /// the rows turned on the way (`turns`) staying so. The cell when that
     /// is another one.
     fn glide_go(&mut self, origin: &str, to: (i32, i32), turns: &[(i32, i32)], carry: bool) -> Option<String> {
-        let turned = self.glide_remember(origin, turns);
+        self.glide_remember(origin, turns);
         let id = self.glide_cell(origin, to)?;
         let desktops = self.sync()?;
         let heading = self.heading(&desktops);
         let from = self.grid.find(&heading)?;
         if id == heading {
-            if turned {
-                self.save();
-            }
             return None;
         }
         debug_log!("app: the picture settled {to:?} from {}", &origin[..4.min(origin.len())]);
