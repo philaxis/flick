@@ -110,11 +110,6 @@ impl Dib {
         unsafe { std::slice::from_raw_parts_mut(self.bits as *mut u8, self.len()) }
     }
 
-    /// The pixels as Direct2D takes them, with the length of one row in bytes.
-    pub fn raw(&self) -> (*const c_void, u32) {
-        (self.bits, (self.size.0 * 4) as u32)
-    }
-
     pub fn bounds(&self) -> RECT {
         RECT { left: 0, top: 0, right: self.size.0, bottom: self.size.1 }
     }

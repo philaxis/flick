@@ -6,6 +6,7 @@
 //! The board owns layout, hit-testing, drawing and the DWM thumbnails. It does
 //! not touch desktops itself; input is turned into an `Action` for the app.
 
+mod sheet;
 mod strip;
 
 use crate::{
@@ -896,6 +897,10 @@ pub struct Board {
     /// (source window, thumbnail handle) of every tile, in stacking order.
     thumbs: Vec<(isize, isize)>,
     icons: HashMap<isize, Option<ID2D1Bitmap>>,
+    /// The icons again, for thumbnails over the previews (`sheet`).
+    sheet: Option<sheet::IconSheet>,
+    /// The thumbnail of a preview's icon by the preview's own thumbnail.
+    badges: HashMap<isize, isize>,
     hover: Hit,
     press: Option<Press>,
     cursor: (f32, f32),
@@ -1034,6 +1039,8 @@ impl Board {
                 scale: 1.0,
                 thumbs: Vec::new(),
                 icons: HashMap::new(),
+                sheet: sheet::IconSheet::new().map_err(|e| crate::app::log(&format!("board icon sheet failed: {e}"))).ok(),
+                badges: HashMap::new(),
                 hover: Hit::Nothing,
                 press: None,
                 cursor: (0.0, 0.0),
@@ -1204,6 +1211,9 @@ impl Board {
         self.settle_strip(Instant::now());
         self.clear_thumbnails();
         self.icons.clear();
+        if let Some(sheet) = &mut self.sheet {
+            sheet.clear();
+        }
         // Keep the D2D target for repeated trigger presses; ensure_canvas handles resizing.
         self.press = None;
         self.stop_motion();
@@ -1927,6 +1937,7 @@ impl Board {
     }
 
     fn clear_thumbnails(&mut self) {
+        unregister_badges(&mut self.badges);
         unregister_strip_thumbnails(&mut self.strip_thumbs);
         unregister_thumbnails(&mut self.thumbs);
         self.source_sizes.borrow_mut().clear();
@@ -1936,11 +1947,13 @@ impl Board {
     /// Registers a live thumbnail for every tile and, while the strip
     /// moves, for as many of the tiles of the cells beside as
     /// `strip::MAX_THUMBS` allows. Thumbnails stack in the order they are
-    /// registered: those beside go under the selected cell's, and the
-    /// windows on every desktop, which never move, over everything.
+    /// registered: those beside go under the selected cell's, the windows
+    /// on every desktop, which never move, over them, and the apps' icons
+    /// over all the previews.
     fn register_thumbnails(&mut self) {
         let mut old = std::mem::take(&mut self.thumbs);
         let mut old_strip = std::mem::take(&mut self.strip_thumbs);
+        let mut old_badges = std::mem::take(&mut self.badges);
         self.thumbnail_state.borrow_mut().clear();
         if self.strip_on {
             let wanted: Vec<Vec<HWND>> = self.strip_cells.iter().map(|cell| {
@@ -1966,8 +1979,17 @@ impl Board {
                 self.thumbs.push((hwnd.0, thumb));
             }
         }
+        if let Some(sheet) = &self.sheet {
+            let previews = self.thumbs.iter().copied().chain(self.strip_thumbs.iter().map(|(_, hwnd, thumb)| (*hwnd, *thumb)));
+            for (_, thumb) in previews.filter(|(hwnd, _)| sheet.slot(*hwnd).is_some()) {
+                if let Ok(badge) = unsafe { crate::composition::register(self.hwnd, sheet.hwnd, crate::composition::board_enabled()) } {
+                    self.badges.insert(thumb, badge);
+                }
+            }
+        }
         self.update_thumbnails();
         // Keep the old pictures until their replacements are visible.
+        unregister_badges(&mut old_badges);
         unregister_strip_thumbnails(&mut old_strip);
         unregister_thumbnails(&mut old);
     }
@@ -2064,7 +2086,9 @@ impl Board {
             let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd).filter(|tile| !tile.icon_only);
             let minimized = windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized);
             let place = placing(hwnd);
-            let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), self.dragged_window() == Some(hwnd), 1.0, place);
+            let dragged = self.dragged_window() == Some(hwnd);
+            let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), dragged, 1.0, place);
+            self.put_badge(thumb, tile, minimized, _shown.is_some() && !dragged, place);
             if self.trace.is_some() && geometry.is_none() {
                 if let (Some((dest, source)), Some(tile), Some((place, _, _))) = (_shown, tile, place) {
                     geometry = Some((hwnd, dest, source, place.rect(&tile.thumb)));
@@ -2085,7 +2109,9 @@ impl Board {
                 let carried = Carried::of(w, *everywhere);
                 self.tile_place(cell.pos, carried, &tile.frame).map(|(place, clip)| (place, clip, self.tile_shade(cell.pos, carried)))
             });
-            self.put_thumbnail(*thumb, tile, window.is_some_and(|(w, _)| w.minimized), (0.0, 0.0), false, 1.0, placing);
+            let minimized = window.is_some_and(|(w, _)| w.minimized);
+            let shown = self.put_thumbnail(*thumb, tile, minimized, (0.0, 0.0), false, 1.0, placing);
+            self.put_badge(*thumb, tile, minimized, shown.is_some(), placing);
         }
         debug_log!("board: thumbnails {}", placed.join(" "));
         geometry
@@ -2177,12 +2203,69 @@ impl Board {
         props.fVisible.as_bool().then_some((props.rcDestination, props.rcSource))
     }
 
+    /// Puts the app's icon over the preview `thumb` of `tile`'s window: on
+    /// its lower left corner, or large in its middle when the preview tells
+    /// little (minimized, or of a window with nothing to show yet). Hidden
+    /// with the preview, unless it is hidden for being minimized.
+    fn put_badge(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, shown: bool, placing: Option<(Place, Option<Rect>, f32)>) {
+        let Some(&badge) = self.badges.get(&thumb) else { return };
+        let mut props = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
+            opacity: 255,
+            fVisible: false.into(),
+            ..Default::default()
+        };
+        let mut precise = [0.0; 4];
+        let slot = tile.and_then(|tile| self.sheet.as_ref()?.slot(tile.hwnd.0));
+        if let (Some(tile), Some((x, y, side)), Some((place, clip, bright))) = (tile, slot, placing) {
+            let source = self.source_rect(thumb, tile.hwnd);
+            let plain = minimized || source.is_none_or(|source| source.frame.right - source.frame.left < 40.0 || source.frame.bottom - source.frame.top < 40.0);
+            if shown || plain {
+                let r = match source {
+                    _ if plain => middle_icon(&tile.thumb, self.scale),
+                    Some(source) => corner_icon(&shown_frame(&tile.thumb, &source), self.scale),
+                    None => tile.icon,
+                };
+                let dest = place.rect(&r);
+                let cut = match clip {
+                    Some(clip) => strip::clip(&dest, &clip, (side, side)),
+                    None => Some((dest, rect(0.0, 0.0, side, side))),
+                };
+                if let Some((dest, from)) = cut {
+                    precise = [dest.left, dest.top, dest.right, dest.bottom];
+                    props.rcDestination = RECT { left: dest.left.round() as i32, top: dest.top.round() as i32, right: dest.right.round() as i32, bottom: dest.bottom.round() as i32 };
+                    props.rcSource = RECT {
+                        left: (x + from.left).round() as i32,
+                        top: (y + from.top).round() as i32,
+                        right: (x + from.right).round() as i32,
+                        bottom: (y + from.bottom).round() as i32,
+                    };
+                    props.opacity = (255.0 * bright).round() as u8;
+                    props.fVisible = true.into();
+                }
+            }
+        }
+        let visible = props.fVisible.as_bool();
+        let state = if visible { (props.rcDestination, props.rcSource, props.opacity, true, props.dwFlags) }
+            else { (RECT::default(), RECT::default(), 0, false, 0) };
+        unsafe {
+            if (crate::composition::needs_update(badge) || self.thumbnail_state.borrow().get(&badge) != Some(&state)) && crate::composition::update(badge, &props, precise).is_ok() {
+                self.thumbnail_state.borrow_mut().insert(badge, state);
+                self.thumbnail_updates.set(self.thumbnail_updates.get() + 1);
+            }
+        }
+    }
+
     /// Thumbnails stack in registration order; re-register the one that will
     /// follow the cursor to lift it above the rest.
     fn raise_thumbnail(&mut self, hwnd: isize) {
         if let Some(i) = self.thumbs.iter().position(|&(h, _)| h == hwnd) {
             let (_, old) = self.thumbs.remove(i);
             unsafe {
+                // Its icon stays under it; a dragged window shows none.
+                if let Some(badge) = self.badges.remove(&old) {
+                    let _ = crate::composition::unregister(badge);
+                }
                 let _ = crate::composition::unregister(old);
                 if let Ok(thumb) = crate::composition::register(self.hwnd, HWND(hwnd), crate::composition::board_enabled()) {
                     self.thumbs.push((hwnd, thumb));
@@ -2688,12 +2771,24 @@ impl Board {
     }
 
     fn load_icons(&mut self, target: &ID2D1RenderTarget) {
-        // Large enough for the middle of a preview with nothing live in it.
-        let size = (48.0 * self.scale).round() as i32;
+        // Large enough for the middle of a preview that tells little.
+        let size = (64.0 * self.scale).round() as i32;
         let in_cells = self.model.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.windows);
         for window in in_cells.chain(&self.model.pinned) {
             // Cache absent icons too: asking another process every frame stalls motion.
-            self.icons.entry(window.hwnd.0).or_insert_with(|| icon_bitmap(target, window.hwnd, size));
+            if self.icons.contains_key(&window.hwnd.0) {
+                continue;
+            }
+            let pixels = icon_pixels(window.hwnd, size);
+            if let (Some(sheet), Some(pixels)) = (&mut self.sheet, &pixels) {
+                sheet.add(window.hwnd.0, size, pixels);
+            }
+            self.icons.insert(window.hwnd.0, pixels.and_then(|pixels| icon_bitmap(target, &pixels, size)));
+        }
+        if let Some(sheet) = &mut self.sheet {
+            if let Err(e) = sheet.update() {
+                crate::app::log(&format!("board icon sheet: {e}"));
+            }
         }
     }
 
@@ -2891,12 +2986,13 @@ impl Board {
         for tile in tiles {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
                 if let Some(at) = place(Carried::of(window, *everywhere), &tile.frame) {
-                    let live = !tile.icon_only && if middle {
-                        self.thumbs.iter().any(|&(hwnd, _)| hwnd == tile.hwnd.0)
+                    let preview = if tile.icon_only { None } else if middle {
+                        self.thumbs.iter().find(|&&(hwnd, _)| hwnd == tile.hwnd.0).map(|&(_, thumb)| thumb)
                     } else {
-                        self.strip_thumbs.iter().any(|(cell, hwnd, _)| cell == id && *hwnd == tile.hwnd.0)
+                        self.strip_thumbs.iter().find(|(cell, hwnd, _)| cell == id && *hwnd == tile.hwnd.0).map(|&(_, _, thumb)| thumb)
                     };
-                    self.placed(p, at, || self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere), live));
+                    let badged = preview.is_some_and(|thumb| self.badges.contains_key(&thumb));
+                    self.placed(p, at, || self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere), preview.is_some(), badged));
                     #[cfg(feature = "motion-probe")]
                     if window.title == "F motion 0" {
                         let dest = at.rect(&tile.thumb);
@@ -2956,11 +3052,13 @@ impl Board {
     }
 
     /// One window: what is under its live preview (its shadow, the glow of
-    /// its pin, a face for when there is nothing live to show and its app's
-    /// icon then), its app's icon under the corner, and under the cursor its
-    /// buttons and, after a while, its title. Kept above the others, it
-    /// stands higher.
-    fn draw_tile(&self, p: &Painter, fonts: &Fonts, tile: &TileLayout, window: &WindowModel, pin: Pin, live: bool) {
+    /// its pin, a face for when there is nothing live to show), its app's
+    /// icon unless one is put over the preview (`put_badge`): large in the
+    /// middle of a preview that tells little, on its lower left corner
+    /// otherwise, and under the cursor its buttons and, after a while, its
+    /// title. Kept above the others, it stands higher.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tile(&self, p: &Painter, fonts: &Fonts, tile: &TileLayout, window: &WindowModel, pin: Pin, live: bool, badged: bool) {
         let s = self.scale;
         let hot = self.hover == self.tile_hit(tile.hwnd);
         // The cursor is on the tile or on one of its buttons.
@@ -2990,14 +3088,13 @@ impl Board {
             }
             return;
         }
-        // With nothing live to show, its app's icon in the middle says what it is.
-        if !live || window.minimized {
-            if let Some(bitmap) = icon {
-                p.bitmap(bitmap, &centred((bw.min(bh) * 0.42).min(64.0 * s)), 0.85 * dim);
+        if let Some(bitmap) = icon.filter(|_| !badged) {
+            // With nothing live to show, its app's icon in the middle says what it is.
+            if !live || window.minimized {
+                p.bitmap(bitmap, &middle_icon(&body, s), 0.85 * dim);
+            } else {
+                p.bitmap(bitmap, &tile.icon, dim);
             }
-        }
-        if let Some(bitmap) = icon {
-            p.bitmap(bitmap, &tile.icon, if pointed { 1.0 } else { 0.80 } * dim);
         }
         let resting = self.resting.is_some_and(|(hwnd, at)| hwnd == tile.hwnd.0 && at.elapsed().as_millis() + 30 >= TITLE_MS as u128);
         if pointed && resting && !dragged {
@@ -3403,6 +3500,12 @@ fn unregister_strip_thumbnails(thumbs: &mut Vec<(CellId, isize, isize)>) {
     }
 }
 
+fn unregister_badges(badges: &mut HashMap<isize, isize>) {
+    for (_, badge) in badges.drain() {
+        unsafe { let _ = crate::composition::unregister(badge); }
+    }
+}
+
 fn unregister_thumbnails(thumbs: &mut Vec<(isize, isize)>) {
     for (_, thumb) in thumbs.drain(..) {
         unsafe { let _ = crate::composition::unregister(thumb); }
@@ -3472,12 +3575,14 @@ pub fn icon_key(hwnd: HWND) -> u64 {
     })
 }
 
-/// The window's icon as a Direct2D bitmap of `size` pixels.
-pub fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<ID2D1Bitmap> {
+/// The window's icon, `size` pixels square, premultiplied.
+fn icon_pixels(hwnd: HWND, size: i32) -> Option<Vec<u8>> {
     let icon = window_icon(hwnd)?;
     unsafe {
         let mut dib = Dib::new((size, size)).ok()?;
         DrawIconEx(dib.dc, 0, 0, icon, size, size, 0, None, DI_NORMAL).ok()?;
+        // Finish GDI drawing before reading the bitmap's memory.
+        let _ = GdiFlush();
         // Icons without an alpha channel leave alpha at zero; make what they drew opaque.
         let pixels = dib.pixels_mut();
         if pixels.chunks_exact(4).all(|p| p[3] == 0) {
@@ -3485,7 +3590,14 @@ pub fn icon_bitmap(target: &ID2D1RenderTarget, hwnd: HWND, size: i32) -> Option<
                 p[3] = 255;
             }
         }
-        let (bits, pitch) = dib.raw();
+        Some(pixels.to_vec())
+    }
+}
+
+/// An icon's `pixels` as a Direct2D bitmap of `size` pixels.
+fn icon_bitmap(target: &ID2D1RenderTarget, pixels: &[u8], size: i32) -> Option<ID2D1Bitmap> {
+    unsafe {
+        let (bits, pitch) = (pixels.as_ptr() as *const std::ffi::c_void, size as u32 * 4);
         let properties = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0,
@@ -3533,24 +3645,53 @@ fn tile_least(s: f32) -> f32 {
     120.0 * s
 }
 
-/// A window's tile with its preview at `x, y`, `w` by `h`, the line under
-/// it holding its app's icon at the left, its title (after resting on it a
-/// while) and, at the right, its buttons. One kept above the others stands
-/// a little higher.
+/// An app's icon on the lower left corner of the preview `picture`, a
+/// little over its edges, as Mission Control has it.
+fn corner_icon(picture: &Rect, s: f32) -> Rect {
+    let side = 32.0 * s;
+    rect(picture.left - 6.0 * s, picture.bottom - side + 10.0 * s, side, side)
+}
+
+/// An app's icon large in the middle of `picture`, for a preview that
+/// tells little.
+fn middle_icon(picture: &Rect, s: f32) -> Rect {
+    let (w, h) = size(picture);
+    let side = (w.min(h) * 0.42).min(64.0 * s);
+    let (cx, cy) = centre(picture);
+    rect(cx - side / 2.0, cy - side / 2.0, side, side)
+}
+
+/// Where in a tile's `slot` the window of `source` shows, without the
+/// borders round it that DWM gives too (`strip::fit_source`).
+fn shown_frame(slot: &Rect, source: &ThumbnailSource) -> Rect {
+    let full = strip::fit_source(slot, &source.frame, source.full);
+    let k = (full.right - full.left) / source.full.0.max(1.0);
+    Rect {
+        left: full.left + source.frame.left * k,
+        top: full.top + source.frame.top * k,
+        right: full.left + source.frame.right * k,
+        bottom: full.top + source.frame.bottom * k,
+    }
+}
+
+/// A window's tile with its preview at `x, y`, `w` by `h`, its app's icon
+/// on the preview's lower left corner, the line under it holding its title
+/// (after resting on it a while) and, at the right, its buttons. One kept
+/// above the others stands a little higher.
 fn tile_at(window: &WindowModel, x: f32, y: f32, w: f32, h: f32, s: f32) -> TileLayout {
     let y = if window.topmost { y - 4.0 * s } else { y };
     let foot = FOOT * s;
-    let (icon, button) = (22.0 * s, 24.0 * s);
+    let (line, button) = (22.0 * s, 24.0 * s);
     let bottom = y + h;
     let by = bottom + (foot - button) / 2.0;
     let close = rect(x + w - button, by, button, button);
     let pin = rect(close.left - 4.0 * s - button, by, button, button);
     let top = rect(pin.left - 4.0 * s - button, by, button, button);
-    let icon = rect(x + 2.0 * s, bottom + (foot - icon) / 2.0, icon, icon);
+    let icon = corner_icon(&rect(x, y, w, h), s);
     TileLayout {
         hwnd: window.hwnd,
         frame: rect(x, y, w, h + foot),
-        title: rect(icon.right + 8.0 * s, icon.top, (x + w - icon.right - 8.0 * s).max(0.0), size(&icon).1),
+        title: rect(icon.right + 6.0 * s, bottom + (foot - line) / 2.0, (x + w - icon.right - 6.0 * s).max(0.0), line),
         icon,
         thumb: rect(x, y, w, h),
         top,
