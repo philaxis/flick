@@ -2,6 +2,7 @@
 pub const COMMIT: f64 = 1.0;
 pub const EDGE: f64 = 0.15;
 pub const PULL: f64 = 0.2;
+pub const HOLD: f64 = 0.25;
 pub const SLIDE_START: f32 = 0.0;
 pub const SLIDE_END: f32 = 0.65;
 pub const SNAP: f32 = SLIDE_END;
@@ -30,7 +31,7 @@ impl Spring {
     }
     pub fn settled(&self, target: f64) -> bool { (self.p - target).abs() < 0.0005 && self.v.abs() < 0.005 }
     pub fn position(&mut self, target: f64, dt: f64, vertical: bool) {
-        let (w, z) = if vertical { (15.0, 0.65) } else { (17.0, 0.62) };
+        let (w, z) = if vertical { (32.0, 0.78) } else { (35.0, 0.78) };
         self.advance(target, dt, w, z);
         if self.settled(target) { self.p = target; self.v = 0.0; }
     }
@@ -38,14 +39,14 @@ impl Spring {
 
 /// Distances are normalized by the configured Distance: one full unit commits.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Latch { pub cell: i32, pub hand: f64, last: f64 }
+pub struct Latch { pub cell: i32, pub hand: f64, last: f64, held: bool, hold_origin: f64 }
 impl Latch {
     pub fn track(&mut self, raw: f64, room: (i32, i32)) -> i32 {
         let delta = raw - self.last;
         self.last = raw;
         // Turning inward at an edge starts there, without paying back overscroll.
         if (self.cell == room.0 && self.hand < 0.0 && delta > 0.0)
-            || (self.cell == room.1 && self.hand > 0.0 && delta < 0.0) { self.hand = 0.0; }
+            || (self.cell == room.1 && self.hand > 0.0 && delta < 0.0) { self.hand = 0.0; self.hold_origin = 0.0; }
         self.hand += delta;
         let before = self.cell;
         while self.hand.abs() >= COMMIT - 1e-9 {
@@ -55,13 +56,18 @@ impl Latch {
             self.cell = next;
             self.hand -= dir as f64;
         }
+        if self.cell != before { self.held = true; self.hold_origin = self.hand; }
         self.cell - before
     }
-    pub fn rebase(&mut self, raw: f64) { self.last = raw; self.hand = 0.0; }
+    pub fn rebase(&mut self, raw: f64) { self.last = raw; self.hand = 0.0; self.held = true; self.hold_origin = 0.0; }
     pub fn target(&self, room: (i32, i32)) -> f64 {
         let pull = if (self.cell == room.0 && self.hand < 0.0) || (self.cell == room.1 && self.hand > 0.0) {
             self.hand.signum() * EDGE * self.hand.abs() / (self.hand.abs() + EDGE)
-        } else { PULL * (self.hand / PULL).tanh() };
+        } else {
+            let hand = self.hand - self.hold_origin;
+            let hand = if self.held { hand.signum() * (hand.abs() - HOLD).max(0.0) / (1.0 - HOLD) } else { hand };
+            PULL * (hand / PULL).tanh()
+        };
         self.cell as f64 + pull
     }
 }
@@ -144,8 +150,47 @@ mod tests {
             one.position(1.0, 0.3, vertical);
             for _ in 0..30 { many.position(1.0, 0.01, vertical); }
             assert!((one.p - many.p).abs() < 1e-9 && (one.v - many.v).abs() < 1e-9);
-            assert!(one.p > 1.0 && one.p < 1.09);
+            assert!((one.p - 1.0).abs() < 0.003);
             let v = one.v; one.position(2.0, 0.0, vertical); assert!((one.v - v).abs() < 1e-9);
+        }
+    }
+    #[test]
+    fn committed_hold_is_flat_continuous_and_keeps_distance() {
+        for direction in [-1.0, 1.0] {
+            let mut l = Latch::default();
+            l.track(direction, (-4, 4));
+            for by in [0.01, 0.1, 0.249999, 0.25, -0.1, -0.25] {
+                l.track(direction + by, (-4, 4));
+                assert!((l.target((-4, 4)) - direction).abs() < 1e-9);
+            }
+            l.track(direction + 0.250001, (-4, 4));
+            assert!((l.target((-4, 4)) - direction).abs() < 0.000002);
+            assert_eq!(l.track(direction * 1.999, (-4, 4)), 0);
+            assert_eq!(l.track(direction * 2.0, (-4, 4)), direction as i32);
+        }
+    }
+    #[test]
+    fn a_coalesced_commit_holds_from_the_sample_without_adding_to_distance() {
+        let mut l = Latch::default();
+        assert_eq!(l.track(1.4, (-4, 4)), 1);
+        for raw in [1.4, 1.5, 1.2, 1.65] {
+            l.track(raw, (-4, 4));
+            assert!((l.target((-4, 4)) - 1.0).abs() < 1e-9);
+        }
+        assert_eq!(l.track(2.0, (-4, 4)), 1);
+        assert!((l.target((-4, 4)) - 2.0).abs() < 1e-9);
+    }
+    #[test]
+    fn commit_overshoot_stays_below_three_percent_and_settles_in_two_hundred_ms() {
+        for vertical in [false, true] {
+            let mut spring = Spring::default();
+            let mut peak = 0.0_f64;
+            for frame in 1..=1000 {
+                spring.position(1.0, 0.001, vertical);
+                peak = peak.max(spring.p);
+                if frame >= 200 { assert!((spring.p - 1.0).abs() <= 0.03); }
+            }
+            assert!(peak > 1.0 && peak <= 1.03, "{peak}");
         }
     }
     #[test]

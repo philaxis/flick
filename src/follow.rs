@@ -2,10 +2,9 @@
 use crate::transition_curve::{Latch, Spring};
 pub const GAP: f64 = 0.07;
 pub const GLOW: f64 = 0.55;
-pub const LIFT: f64 = 0.0;
 pub const DIM: f64 = 0.55;
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
-pub fn scale(depth: f64) -> f64 { 1.0 - 0.3 * depth.clamp(0.0, 1.0) }
+pub fn scale(depth: f64) -> f64 { 1.0 - 0.5 * depth.clamp(0.0, 1.0) }
 /// Where `rect` (left, top, right, bottom on a screen `size` across and
 /// down) of a desktop `apart` desktops from where the strip is (sideways,
 /// up and down) is drawn, the screen at `scale`: the strip's desktops side
@@ -25,12 +24,31 @@ pub fn placed(rect: [f64; 4], size: (f64, f64), scale: f64, apart: (f64, f64), l
     [cx + (rect[0] - w / 2.0) * size, cy + (rect[1] - h / 2.0) * size, cx + (rect[2] - w / 2.0) * size, cy + (rect[3] - h / 2.0) * size]
 }
 
-/// How much a desktop `apart` (sideways, up and down) from the middle of
-/// the screen is the one in the middle: 1 there, 0 a desktop or more away,
-/// shared out between those on either side as the strip goes from one to
-/// the next, so that standing out goes over from one to the next smoothly.
-pub fn emphasis(apart: (f64, f64)) -> f64 {
-    1.0 - apart.0.hypot(apart.1).min(1.0)
+/// Selection weights follow their own springs, independent of the hand's lean.
+#[derive(Clone, Debug)]
+pub struct Focus { cells: Vec<((i32, i32), Spring)>, last: f64 }
+impl Default for Focus {
+    fn default() -> Self { Self { cells: vec![((0, 0), Spring { p: 1.0, v: 0.0 })], last: 0.0 } }
+}
+impl Focus {
+    pub fn advance(&mut self, selected: (i32, i32), now: f64) -> bool {
+        let dt = (now - self.last).max(0.0);
+        self.last = now;
+        if !self.cells.iter().any(|(cell, _)| *cell == selected) { self.cells.push((selected, Spring::default())); }
+        let mut changed = false;
+        self.cells.retain_mut(|(cell, spring)| {
+            let target = if *cell == selected { 1.0 } else { 0.0 };
+            let before = spring.p;
+            spring.advance(target, dt, 35.0, 1.0);
+            if spring.settled(target) { spring.p = target; spring.v = 0.0; }
+            changed |= before != spring.p;
+            *cell == selected || !spring.settled(0.0)
+        });
+        changed
+    }
+    pub fn at(&self, col: i32, row: i32) -> f64 {
+        self.cells.iter().find(|(cell, _)| *cell == (col, row)).map_or(0.0, |(_, s)| s.p.clamp(0.0, 1.0))
+    }
 }
 
 /// What a desktop with `emphasis` looks like, the screen receded
@@ -38,7 +56,7 @@ pub fn emphasis(apart: (f64, f64)) -> f64 {
 /// `DIM` at most). Whole, everything is as it is.
 pub fn standing_out(emphasis: f64, receded: f64) -> (f64, f64) {
     let (emphasis, receded) = (emphasis.clamp(0.0, 1.0), receded.clamp(0.0, 1.0));
-    (1.0 + LIFT * emphasis * receded, DIM * (1.0 - emphasis))
+    ((1.0 - (0.65 - 0.15 * emphasis) * receded) / scale(receded), DIM * (1.0 - emphasis))
 }
 
 /// Where a row stands sideways in a single step (`Step`), the strip at
@@ -152,6 +170,7 @@ impl Follow {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
     }
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
+    pub fn selected(&self) -> (i32, i32) { (self.columns[(self.row - self.rows.0) as usize].cell, self.row) }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
     pub fn reframe(&mut self, rows: (i32, i32), cols: Vec<(i32, i32)>, hand: (f64, f64), row_changed: bool) {
         if row_changed {
@@ -238,6 +257,24 @@ pub fn remember(path: &mut Vec<(f64, f64, usize)>, point: (f64, f64, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_size_changes_by_spring_and_cells_do_not_overlap() {
+        let mut focus = Focus::default();
+        assert!(!focus.advance((1, 0), 0.0));
+        assert_eq!(focus.at(0, 0), 1.0);
+        for frame in 1..=120 {
+            focus.advance((1, 0), frame as f64 / 120.0);
+            let mut previous = None;
+            for col in -1..=2 {
+                let (lift, _) = standing_out(focus.at(col, 0), 1.0);
+                let r = placed([0.0, 0.0, 1000.0, 800.0], (1000.0, 800.0), scale(1.0), (col as f64, 0.0), lift);
+                if let Some(right) = previous { assert!(r[0] > right); }
+                previous = Some(r[2]);
+            }
+        }
+        assert!((scale(1.0) * standing_out(focus.at(1, 0), 1.0).0 - 0.5).abs() < 1e-9);
+        assert!((scale(1.0) * standing_out(focus.at(0, 0), 1.0).0 - 0.35).abs() < 1e-9);
+    }
     #[test]
     fn down_then_right_commits_without_waiting_and_releases_without_fling() {
         let mut f = Follow::new((0, 2), vec![(0, 3); 3]);

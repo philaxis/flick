@@ -24,6 +24,7 @@ use windows::{
         Foundation::{CloseHandle, COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_FAILED, WAIT_OBJECT_0, WPARAM},
         Graphics::{
             Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+            DirectComposition::DCompositionWaitForCompositorClock,
             DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER},
             Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, DXGI_OUTPUT_DESC, DXGI_FRAME_STATISTICS},
             Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO},
@@ -431,13 +432,14 @@ pub(crate) struct FramePacer {
     timer: HANDLE,
     vblank: Option<VBlank>,
     monitor: HMONITOR,
+    compositor: bool,
     pub(crate) period: Duration,
 }
 
 impl FramePacer {
     pub(crate) fn new() -> Result<Self> {
         let timer = unsafe { CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)? };
-        Ok(Self { timer, vblank: None, monitor: HMONITOR(0), period: Duration::from_secs_f64(1.0 / 60.0) })
+        Ok(Self { timer, vblank: None, monitor: HMONITOR(0), compositor: false, period: Duration::from_secs_f64(1.0 / 60.0) })
     }
 
     /// Pace to the primary overlay's monitor; all its other windows show
@@ -453,7 +455,8 @@ impl FramePacer {
                 && mode.dmDisplayFrequency > 1 { mode.dmDisplayFrequency } else { 60 };
             self.period = Duration::from_secs_f64(1.0 / hz as f64);
             // DWM exposes the primary output's clock; never apply it to a secondary output.
-            if info.monitorInfo.dwFlags & 1 != 0 {
+            self.compositor = info.monitorInfo.dwFlags & 1 != 0;
+            if self.compositor {
                 let mut timing = DWM_TIMING_INFO { cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
                 let mut frequency = 0;
                 if DwmGetCompositionTimingInfo(HWND(0), &mut timing).is_ok() && QueryPerformanceFrequency(&mut frequency).is_ok() && frequency > 0 {
@@ -462,7 +465,7 @@ impl FramePacer {
                 }
             }
         }
-        if self.vblank.is_none() {
+        if !self.compositor && self.vblank.is_none() {
             self.vblank = VBlank::spawn();
         }
         if let Some(vblank) = &mut self.vblank {
@@ -477,8 +480,16 @@ impl FramePacer {
         if Instant::now() >= deadline {
             return Ok((Duration::ZERO, false));
         }
+        // Windows 11's compositor clock is bounded and signals once per refresh,
+        // including when DXGI's output wait returns immediately on hybrid GPUs.
+        if self.compositor {
+            let timeout = (self.period * 2).as_millis().max(1) as u32;
+            if unsafe { DCompositionWaitForCompositorClock(None, timeout) } == 0 {
+                return Ok((Duration::ZERO, true));
+            }
+        }
         let mut vblank_ok = false;
-        if self.vblank.as_ref().is_some_and(|v| v.enabled && !v.pending) {
+        if !self.compositor && self.vblank.as_ref().is_some_and(|v| v.enabled && !v.pending) {
             self.arm(deadline)?;
             vblank_ok = self.vblank.as_mut().unwrap().wait(self.monitor, self.timer, deadline);
             let measured = self.vblank.as_ref().unwrap().period_ns.load(std::sync::atomic::Ordering::Relaxed);

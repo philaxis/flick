@@ -609,6 +609,7 @@ struct Session {
     shown: Option<Strip>,
     /// The farthest up or down the strip went (`ROW_WINDOWS_JOIN`).
     farthest_y: f64,
+    focus: follow::Focus,
     names: Vec<String>,
     label: Label,
     last_frame: Option<Instant>,
@@ -910,6 +911,7 @@ impl View {
             hand: (0.0, 0.0),
             shown: None,
             farthest_y: 0.0,
+            focus: follow::Focus::default(),
             names: scene.names,
             label: Label::new(0),
             last_frame: None,
@@ -1087,11 +1089,17 @@ impl View {
             Phase::Settling(to, _) | Phase::Arriving(to, _) => to.1,
             Phase::Stepping(step) => step.to.1,
         };
+        let selected = match session.phase {
+            Phase::Following => session.follow.selected(),
+            Phase::Settling(to, _) | Phase::Arriving(to, _) => to,
+            Phase::Stepping(step) => step.to,
+        };
+        let focus_changed = session.focus.advance(selected, now);
         session.label.show(now, row);
         session.farthest_y = session.farthest_y.max(strip.y.abs());
         let mut moves = 0;
         let drawing = Instant::now();
-        if session.shown.as_ref() != Some(&strip) {
+        if focus_changed || session.shown.as_ref() != Some(&strip) {
             moves = draw(session, &strip);
             session.stats.updates += moves;
             session.shown = Some(strip.clone());
@@ -1248,7 +1256,7 @@ struct Desk {
 
 /// The desktops of `follow` that may be in sight with the strip at
 /// `strip`: the nearest two each way of each row's own place and one more.
-fn in_sight(follow: &Follow, strip: &Strip) -> Vec<Desk> {
+fn in_sight(follow: &Follow, strip: &Strip, focus: &follow::Focus) -> Vec<Desk> {
     let exists = |row: i32, col: i32| {
         (follow.rows.0..=follow.rows.1).contains(&row) && {
             let cols = follow.cols_of(row);
@@ -1262,7 +1270,7 @@ fn in_sight(follow: &Follow, strip: &Strip) -> Vec<Desk> {
         for col in near(along) {
             if exists(row, col) {
                 let apart = (col as f64 - along, row as f64 - strip.y);
-                let emphasis = follow::emphasis(apart);
+                let emphasis = focus.at(col, row);
                 let (lift, dark) = follow::standing_out(emphasis, strip.receded);
                 sight.push(Desk { apart, emphasis, lift, dark });
             }
@@ -1279,7 +1287,7 @@ fn opacity(share: f64) -> u8 {
 fn draw(session: &mut Session, strip: &Strip) -> u32 {
     let mut moved = 0;
     let scale = follow::scale(strip.receded);
-    let sight = in_sight(&session.follow, strip);
+    let sight = in_sight(&session.follow, strip, &session.focus);
     let rows = session.follow.rows;
     // Windows going along their row stay where they are until the strip
     // has gone up or down a little, then go with it.
@@ -1328,7 +1336,7 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
         let (at, shown) = match *place {
             Place::Cell(row, col) => {
                 let apart = (col as f64 - strip.along(rows, row), row as f64 - strip.y);
-                let (lift, _) = follow::standing_out(follow::emphasis(apart), strip.receded);
+                let (lift, _) = follow::standing_out(session.focus.at(col, row), strip.receded);
                 (follow::placed(edges, whole, scale, apart, lift), 1.0)
             }
             Place::Row(row) => {

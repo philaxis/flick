@@ -242,9 +242,6 @@ impl Strip {
     /// go, it settles on the committed cell without predicting a fling.
     pub fn follow(&mut self, hand: (f32, f32), row: usize, counted_from: u64, holding: bool, now: f32) {
         let hand = if holding { hand } else { (0.0, 0.0) };
-        if holding && !self.holding {
-            self.recede.hold(now);
-        }
         if holding && hand.1.abs() > 0.02 {
             self.row_recede.hold(now);
         }
@@ -262,7 +259,8 @@ impl Strip {
         self.across.retarget(hand.1 - old.1, now, curve::SNAP);
         (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
         let rows_moving = self.across.at(now).abs() > 0.01;
-        self.recede.moving(now, holding || rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01));
+        let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01);
+        self.recede.moving(now, moving || holding && (hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
         self.row_recede.moving(now, rows_moving || holding && hand.1.abs() > 0.01);
     }
 
@@ -401,13 +399,13 @@ mod tests {
             strip.moved(&marks(0.0), &marks(1.0), 0.0);
             let get = |s: &Strip, t| { let p = s.offset(0, t); if axis == 0 { p.0 } else { p.1 } };
             assert!((get(&strip, 0.0) - 1.0).abs() < 1e-6);
-            assert!(get(&strip, 0.3) < 0.0, "arrival ticks past the target");
+            assert!(get(&strip, 0.18) < 0.0 && get(&strip, 0.18) > -0.03, "arrival ticks at most three percent past the target");
             let before = get(&strip, 0.1);
             let velocity = (get(&strip, 0.10001) - before) / 0.00001;
             strip.moved(&marks(1.0), &marks(2.0), 0.1);
             assert!((get(&strip, 0.1) - 1.0 - before).abs() < 1e-5);
             assert!(((get(&strip, 0.10001) - get(&strip, 0.1)) / 0.00001 - velocity).abs() < 0.05);
-            assert!(strip.depth(0.3) > 0.95);
+            assert!(strip.depth(0.1) > 0.5);
             assert!(get(&strip, 2.0).abs() < 0.001 && strip.depth(2.0) < 0.001 && !strip.active(2.0));
         }
     }
@@ -423,6 +421,18 @@ mod tests {
             desktop.advance(now as f64);
             assert!((1.0 - strip.offset(0, now).0 as f64 - desktop.at().0.0).abs() < 1e-5);
             assert!((strip.depth(now) as f64 - desktop.at().1).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn a_blocked_hold_neither_slides_nor_recedes() {
+        let mut strip = Strip::default();
+        for frame in 0..240 {
+            let t = frame as f32 / 120.0;
+            strip.follow((0.0, 0.0), 0, 1, true, t);
+            assert_eq!(strip.offset(0, t), (0.0, 0.0));
+            assert_eq!(strip.depth(t), 0.0);
+            assert_eq!(strip.row_depth(t), 0.0);
         }
     }
 

@@ -122,7 +122,7 @@ impl Slide {
     /// on from it as it is now from this one: what it went towards the next
     /// cell is not lost, and no cell come to here is come to again.
     pub fn carried_on(&self, step: i32) -> Slide {
-        Slide { x: if self.flick.is_some() { 0 } else { self.raw_rest(step) }, cell: 0, room: None, notch: self.notch, flick: self.flick.map(|_| Default::default()) }
+        Slide { x: if self.flick.is_some() { 0 } else { self.raw_rest(step) }, cell: 0, room: None, notch: self.notch, flick: self.flick.map(|_| { let mut latch = crate::transition_curve::Latch::default(); latch.rebase(0.0); latch }) }
     }
 }
 

@@ -2,9 +2,9 @@
 //! the settings window. All draw into a memory bitmap, which is then handed to
 //! their window.
 
-use std::ffi::c_void;
+use std::{cell::{Cell, RefCell}, collections::HashMap, ffi::c_void};
 use windows::{
-    core::{w, ComInterface, Result},
+    core::{w, ComInterface, Interface, Result},
     Win32::{
         Foundation::RECT,
         Graphics::{
@@ -17,7 +17,7 @@ use windows::{
                 D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
             },
             DirectWrite::{
-                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+                DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
                 DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                 DWRITE_TEXT_ALIGNMENT, DWRITE_WORD_WRAPPING_NO_WRAP,
@@ -208,17 +208,45 @@ pub fn text_format(
     }
 }
 
+/// Board labels retain DirectWrite shaping while their transforms animate.
+pub struct TextCache {
+    factory: IDWriteFactory,
+    count: Cell<usize>,
+    layouts: RefCell<HashMap<(usize, u32, u32), HashMap<String, IDWriteTextLayout>>>,
+}
+impl TextCache {
+    pub fn new() -> Result<Self> { Ok(Self { factory: dwrite_factory()?, count: Cell::new(0), layouts: RefCell::default() }) }
+    pub fn clear(&self) { self.layouts.borrow_mut().clear(); self.count.set(0); }
+    fn layout(&self, text: &str, format: &IDWriteTextFormat, width: f32, height: f32) -> Result<IDWriteTextLayout> {
+        let key = (format.as_raw() as usize, width.to_bits(), height.to_bits());
+        if self.count.get() >= 512 { self.clear(); }
+        let mut layouts = self.layouts.borrow_mut();
+        let labels = layouts.entry(key).or_default();
+        if let Some(layout) = labels.get(text) { return Ok(layout.clone()); }
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let layout = unsafe { self.factory.CreateTextLayout(&wide, format, width, height)? };
+        labels.insert(text.to_owned(), layout.clone());
+        self.count.set(self.count.get() + 1);
+        Ok(layout)
+    }
+}
+
 /// A render target together with the one brush everything is drawn with.
 /// Only valid between the target's `BeginDraw` and `EndDraw`.
 pub struct Painter<'a> {
     pub target: &'a ID2D1RenderTarget,
     brush: ID2D1SolidColorBrush,
+    text_cache: Option<&'a TextCache>,
 }
 
 impl<'a> Painter<'a> {
     pub fn new(target: &'a ID2D1RenderTarget) -> Result<Painter<'a>> {
         let brush = unsafe { target.CreateSolidColorBrush(&white(1.0), None)? };
-        Ok(Painter { target, brush })
+        Ok(Painter { target, brush, text_cache: None })
+    }
+
+    pub fn cached(target: &'a ID2D1RenderTarget, text_cache: &'a TextCache) -> Result<Self> {
+        Ok(Self { text_cache: Some(text_cache), ..Self::new(target)? })
     }
 
     /// Fills a rectangle with rounded corners.
@@ -247,6 +275,15 @@ impl<'a> Painter<'a> {
 
     /// Writes one line of text, cut off at the edges of `area`.
     pub fn text(&self, text: &str, format: &IDWriteTextFormat, area: &Rect, colour: D2D1_COLOR_F) {
+        if let Some(cache) = self.text_cache {
+            if let Ok(layout) = cache.layout(text, format, area.right - area.left, area.bottom - area.top) {
+                unsafe {
+                    self.brush.SetColor(&colour);
+                    self.target.DrawTextLayout(D2D_POINT_2F { x: area.left, y: area.top }, &layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                }
+                return;
+            }
+        }
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             self.brush.SetColor(&colour);
@@ -282,5 +319,29 @@ impl<'a> Painter<'a> {
         unsafe {
             self.target.DrawBitmap(bitmap, Some(area), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod text_cache_tests {
+    use super::*;
+    #[test]
+    fn cached_labels_keep_their_own_bounds_and_format() {
+        use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING};
+        let cache = TextCache::new().unwrap();
+        let leading = text_format(&cache.factory, 14.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING).unwrap();
+        let centered = text_format(&cache.factory, 14.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER).unwrap();
+        let first = cache.layout("Shelf", &leading, 120.0, 30.0).unwrap();
+        assert_eq!(first.as_raw(), cache.layout("Shelf", &leading, 120.0, 30.0).unwrap().as_raw());
+        let narrow = cache.layout("Shelf", &leading, 60.0, 30.0).unwrap();
+        let other = cache.layout("Shelf", &centered, 120.0, 30.0).unwrap();
+        unsafe {
+            assert!((narrow.GetMaxWidth() - 60.0).abs() < 1e-6);
+            assert!((first.GetMaxWidth() - 120.0).abs() < 1e-6);
+            assert_eq!(other.GetTextAlignment(), DWRITE_TEXT_ALIGNMENT_CENTER);
+            assert_eq!(first.GetTextAlignment(), DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+        cache.clear();
+        assert_eq!(cache.count.get(), 0);
     }
 }

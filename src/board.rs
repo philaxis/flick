@@ -17,7 +17,7 @@ use crate::{
     vd,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     io::Write as _,
@@ -29,16 +29,17 @@ use std::{
 };
 use strip::{Place, Strip};
 use windows::{
-    core::{w, Error, Result},
+    core::{w, ComInterface, Error, Result},
     Foundation::Numerics::Matrix3x2,
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::{
             Direct2D::{
                 Common::{
-                    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
+                    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
                 },
-                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_PROPERTIES,
+                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, ID2D1HwndRenderTarget, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+                D2D1_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_PROPERTIES,
             },
             DirectWrite::{
                 IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -228,21 +229,14 @@ const MOTION_TIMER_ID: usize = 4;
 /// Requested board animation interval; WM_TIMER also runs when vblank stops.
 const MOTION_MS: u32 = 15;
 /// Natural period in seconds of the critically damped board, tile and popup
-/// springs: a jump from rest covers 98% of its distance in about 0.3 seconds.
-const MOTION_RESPONSE: f32 = 0.32;
+/// springs: a jump from rest covers 98% of its distance in about 0.2 seconds.
+const MOTION_RESPONSE: f32 = 0.22;
 /// Angular frequency (rad/s); damping is exactly critical, with no bounce.
 const MOTION_OMEGA: f32 = std::f32::consts::TAU / MOTION_RESPONSE;
-/// Stalls consume at most 64 ms of animation, preserving intermediate frames
-/// on slow machines. Normal frames use their full elapsed time.
-/// shortcut: stalls stretch duration; revisit if the board gains frame pacing.
-const MOTION_LONGEST_STEP: f32 = 0.064;
 /// Under this much left to go, in pixels, a part is in place.
 const SETTLED: f32 = 0.5;
 /// A near-target spring must also be this slow (px/s) before its tail is cut.
 const SETTLED_SPEED: f32 = SETTLED * MOTION_OMEGA;
-/// How far past the first and last cell the hand can pull a row, in cells,
-/// as in the minimap (`overlay::EDGE_GIVE`).
-const EDGE_GIVE: f32 = 0.16;
 /// The longest name a shelf can be given, in characters.
 const NAME_LENGTH: usize = 24;
 /// Sent after the cursor leaves a window that called `TrackMouseEvent`.
@@ -277,7 +271,6 @@ impl FrameClock {
     fn start(&mut self, hwnd: HWND) {
         let shared = &self.shared;
         shared.hwnd.store(hwnd.0, Ordering::SeqCst);
-        shared.fresh.store(true, Ordering::SeqCst);
         shared.running.store(true, Ordering::SeqCst);
         match &self.thread {
             Some(thread) => thread.unpark(),
@@ -313,13 +306,19 @@ fn clock_loop(shared: &ClockShared) {
     loop {
         while !shared.running.load(Ordering::SeqCst) { std::thread::park(); }
         if shared.fresh.swap(false, Ordering::SeqCst) {
-            if let Some(m) = crate::vd::monitors().into_iter().find(|m| m.primary) { pacer.place(m.work); }
+            let mut fastest = None;
+            for monitor in crate::vd::monitors() {
+                pacer.place(monitor.work);
+                if fastest.as_ref().map_or(true, |(_, period)| pacer.period < *period) { fastest = Some((monitor.work, pacer.period)); }
+            }
+            if let Some((area, _)) = fastest { pacer.place(area); }
             frame = Instant::now();
         }
         // Some drivers return from WaitForVBlank immediately; share the validated
         // refresh clock instead of flooding the UI queue with unpaced frames.
         let (_, vblank) = pacer.wait(frame).unwrap_or_default();
-        frame = Instant::now();
+        let now = Instant::now();
+        frame = if vblank { now } else { (frame + pacer.period).max(now - pacer.period) };
         if shared.running.load(Ordering::SeqCst) && !shared.posted.swap(true, Ordering::SeqCst) {
             let hwnd = HWND(shared.hwnd.load(Ordering::SeqCst));
             if unsafe { PostMessageW(hwnd, WM_BOARD_FRAME, WPARAM(vblank as usize), LPARAM(0)) }.is_err() {
@@ -344,6 +343,7 @@ struct TraceFrame {
     dwm: Duration,
     submit: Duration,
     thumbs: usize,
+    updates: usize,
     /// First selected thumbnail: handle, DWM destination/source, transformed tile.
     geometry: Option<(isize, RECT, RECT, Rect)>,
 }
@@ -368,7 +368,7 @@ impl Trace {
     fn from_env() -> Option<Trace> {
         let path = std::env::var_os("FLICK_TRACE").filter(|path| !path.is_empty())?;
         trace_epoch();
-        Some(Trace { path: path.into(), frames: Vec::new(), last: None })
+        Some(Trace { path: path.into(), frames: Vec::with_capacity(1024), last: None })
     }
 
     fn record(&mut self, frame: TraceFrame, started: Instant) {
@@ -386,7 +386,7 @@ impl Trace {
         let mut out = String::new();
         let new = std::fs::metadata(&self.path).map_or(true, |m| m.len() == 0);
         if new {
-            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms\n");
+            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms,thumbnail_updates\n");
         }
         let geometry_path = self.path.with_extension("geometry.csv");
         let mut geometry = if geometry_path.exists() { String::new() } else { "qpc_ms,hwnd,dest_l,dest_t,dest_r,dest_b,source_l,source_t,source_r,source_b,tile_l,tile_t,tile_r,tile_b\n".into() };
@@ -395,10 +395,10 @@ impl Trace {
                 geometry.push_str(&format!("{:.3},{hwnd:x},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}\n", ms(f.at),
                     d.left, d.top, d.right, d.bottom, s.left, s.top, s.right, s.bottom, tile.left, tile.top, tile.right, tile.bottom));
             }
-            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3}\n",
+            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3},{}\n",
                 ms(f.at), f.interval.map_or(String::new(), |i| format!("{:.3}", ms(i))),
                 if f.by_vblank { "vblank" } else { "timer" }, f.hand.0, f.hand.1, f.drawn.0, f.drawn.1, f.drawn.2,
-                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit)));
+                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit), f.updates));
         }
         let written = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
             .and_then(|mut file| file.write_all(out.as_bytes()));
@@ -759,7 +759,7 @@ impl Motion {
     }
 
     fn elapse(&mut self, now: Instant) {
-        let step = self.last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32()).min(MOTION_LONGEST_STEP);
+        let step = self.last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32());
         self.last = Some(now);
         self.rest.retain(|_, rest| {
             *rest = rest.map(|spring| spring.sample(step));
@@ -801,11 +801,13 @@ impl Motion {
 }
 
 /// How far the hand pulls the selected row sideways and the selection up or
-/// down, in cells and rows, kept within a little of the first and last as
-/// in the minimap.
-fn hand_pull(at: (usize, usize), last: (usize, usize), hand: (f32, f32)) -> (f32, f32) {
-    let pull = |at: usize, last: usize, by: f32| (at as f32 + by).clamp(-EDGE_GIVE, last as f32 + EDGE_GIVE) - at as f32;
-    (pull(at.0, last.0, hand.0), pull(at.1, last.1, hand.1))
+/// down, in cells and rows. Unavailable directions never pull the board.
+fn hand_pull(grid: &Grid, at: Pos, hand: (f32, f32)) -> (f32, f32) {
+    let pull = |by: f32, negative, positive| {
+        let dir = if by < 0.0 { negative } else { positive };
+        if grid.target(at, dir).and_then(|to| grid.id_at(to)).is_some() { by } else { 0.0 }
+    };
+    (pull(hand.0, Dir::Left, Dir::Right), pull(hand.1, Dir::Up, Dir::Down))
 }
 
 /// The map of all rows and cells, in the coordinates of the monitor it is on.
@@ -927,6 +929,13 @@ pub struct Board {
     trace: Option<Trace>,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
+    window_target: Option<ID2D1HwndRenderTarget>,
+    window_failed: bool,
+    popup_canvas: Option<Canvas>,
+    popup_icons: HashMap<isize, Option<ID2D1Bitmap>>,
+    text_cache: paint::TextCache,
+    thumbnail_state: RefCell<HashMap<isize, (RECT, RECT, u8, bool, u32)>>,
+    thumbnail_updates: Cell<usize>,
     fonts: Option<Fonts>,
     open: bool,
     model: Model,
@@ -1084,6 +1093,13 @@ impl Board {
                 trace: Trace::from_env(),
                 factory: paint::d2d_factory()?,
                 canvas: None,
+                window_target: None,
+                window_failed: false,
+                popup_canvas: None,
+                popup_icons: HashMap::new(),
+                text_cache: paint::TextCache::new()?,
+                thumbnail_state: RefCell::default(),
+                thumbnail_updates: Cell::new(0),
                 fonts: None,
                 open: false,
                 model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new() },
@@ -1167,6 +1183,7 @@ impl Board {
         self.home = local(&home.bounds);
         if self.scale != home.scale {
             self.fonts = None;
+            self.text_cache.clear();
         }
         self.scale = home.scale;
         self.size = (right - left, bottom - top);
@@ -1181,12 +1198,16 @@ impl Board {
         self.refused = None;
         self.stop_editing();
         self.open = true;
+        self.window_failed = false;
         crate::input::set_board_open(true);
         unsafe {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.size.0, self.size.1, SWP_SHOWWINDOW);
             SetTimer(self.hwnd, ON_TOP_TIMER_ID, ON_TOP_MS, None);
         }
         self.set_model(model, grid);
+        // Warm drawing resources and the clock before the first held movement.
+        self.paint();
+        self.start_motion();
     }
 
     /// Replaces the content, keeping the selection when its cell still exists.
@@ -1195,6 +1216,7 @@ impl Board {
             return;
         }
         self.model = model;
+        self.source_sizes.borrow_mut().clear();
         self.grid = grid;
         if self.grid.find(&self.selected).is_none() {
             self.selected = self.model.current.clone();
@@ -1245,6 +1267,7 @@ impl Board {
         self.settle_strip(Instant::now());
         self.clear_thumbnails();
         self.icons.clear();
+        self.popup_icons.clear();
         // Keep the D2D target for repeated trigger presses; ensure_canvas handles resizing.
         self.press = None;
         self.stop_motion();
@@ -1319,13 +1342,13 @@ impl Board {
         self.strip_cells.clear();
         unregister_strip_thumbnails(&mut self.strip_thumbs);
         self.source_sizes.borrow_mut().clear();
+        self.thumbnail_state.borrow_mut().clear();
     }
 
     /// How far the hand pulls the selection, in cells and rows.
     fn strip_pull(&self, hand: (f32, f32)) -> (f32, f32) {
         let Some(at) = self.grid.find(&self.selected).filter(|_| hand != (0.0, 0.0)) else { return (0.0, 0.0) };
-        let cells = self.grid.rows.get(at.row).map_or(1, |row| row.cells.len());
-        hand_pull((at.col, at.row), (cells.saturating_sub(1), self.grid.rows.len().saturating_sub(1)), hand)
+        hand_pull(&self.grid, at, hand)
     }
 
     /// The held trigger began a hold over the open board: its rows follow
@@ -1390,8 +1413,7 @@ impl Board {
         for map in &self.maps {
             let Some(row) = map.layout.rows.get(at.row) else { continue };
             let Some(first) = row.cells.first() else { continue };
-            let last = (row.cells.len() - 1, map.layout.rows.len() - 1);
-            let (x, y) = hand_pull((at.col, at.row), last, hand);
+            let (x, y) = hand_pull(&self.grid, at, hand);
             if x != 0.0 {
                 parts.insert(Part::Row(map.monitor, first.id.clone()), (-x * map.layout.pitch, 0.0));
             }
@@ -1431,10 +1453,11 @@ impl Board {
             let prepared = started.elapsed();
             match rendered {
                 Some(Ok(())) => self.present_canvas(),
-                Some(Err(e)) => { crate::app::log(&format!("board draw failed: {e}")); self.canvas = None; }
+                Some(Err(e)) => { crate::app::log(&format!("board draw failed: {e}")); self.discard_target(); }
                 None => {}
             }
             let submitted = started.elapsed();
+            self.thumbnail_updates.set(0);
             let geometry = self.update_thumbnails();
             let dwm = started.elapsed() - submitted;
             unsafe {
@@ -1460,6 +1483,7 @@ impl Board {
                     dwm,
                     submit: took - prepared,
                     thumbs: self.thumbs.len() + self.strip_thumbs.len(),
+                    updates: self.thumbnail_updates.get(),
                     geometry,
                 };
                 if let Some(trace) = &mut self.trace {
@@ -1830,6 +1854,7 @@ impl Board {
     // ---- thumbnails -------------------------------------------------------
 
     fn hide_popup(&mut self) {
+        for &(_, thumb) in &self.popup_thumbs { self.thumbnail_state.borrow_mut().remove(&thumb); }
         unregister_thumbnails(&mut self.popup_thumbs);
         self.popup = None;
         self.popup_animation = None;
@@ -1945,6 +1970,7 @@ impl Board {
         unregister_strip_thumbnails(&mut self.strip_thumbs);
         unregister_thumbnails(&mut self.thumbs);
         self.source_sizes.borrow_mut().clear();
+        self.thumbnail_state.borrow_mut().clear();
     }
 
     /// Registers a live thumbnail for every tile and, while the strip
@@ -1955,7 +1981,7 @@ impl Board {
     fn register_thumbnails(&mut self) {
         let mut old = std::mem::take(&mut self.thumbs);
         let mut old_strip = std::mem::take(&mut self.strip_thumbs);
-        self.source_sizes.borrow_mut().clear();
+        self.thumbnail_state.borrow_mut().clear();
         if self.strip_on {
             let wanted: Vec<Vec<HWND>> = self.strip_cells.iter().map(|cell| {
                 let windows = self.model.tile_windows(&cell.id);
@@ -1990,7 +2016,7 @@ impl Board {
     /// strip moves, every time otherwise (a window may change size).
     fn source_rect(&self, thumb: isize, hwnd: HWND) -> Option<ThumbnailSource> {
         if self.strip_on {
-            if let Some(size) = self.source_sizes.borrow().get(&thumb) {
+            if let Some(size) = self.source_sizes.borrow().get(&hwnd.0) {
                 return *size;
             }
         }
@@ -2016,7 +2042,7 @@ impl Board {
             ThumbnailSource { full, frame }
         });
         if self.strip_on {
-            self.source_sizes.borrow_mut().insert(thumb, size);
+            self.source_sizes.borrow_mut().insert(hwnd.0, size);
         }
         size
     }
@@ -2180,7 +2206,13 @@ impl Board {
         }
         unsafe {
             props.opacity = (props.opacity as f32 * opacity).round() as u8;
-            let _ = DwmUpdateThumbnailProperties(thumb, &props);
+            let visible = props.fVisible.as_bool();
+            let state = if visible { (props.rcDestination, props.rcSource, props.opacity, true, props.dwFlags) }
+                else { (RECT::default(), RECT::default(), 0, false, 0) };
+            if self.thumbnail_state.borrow().get(&thumb) != Some(&state) && DwmUpdateThumbnailProperties(thumb, &props).is_ok() {
+                self.thumbnail_state.borrow_mut().insert(thumb, state);
+                self.thumbnail_updates.set(self.thumbnail_updates.get() + 1);
+            }
         }
         props.fVisible.as_bool().then_some((props.rcDestination, props.rcSource))
     }
@@ -2525,24 +2557,49 @@ impl Board {
 
     // ---- drawing ----------------------------------------------------------
 
-    /// The off-screen bitmap the board is drawn into before being copied to
-    /// the window. (Drawing straight to the window with a Direct2D window
-    /// target left the window blank on the machine this was developed on.)
+    /// Present the full board on the GPU; keep the bitmap path for exports
+    /// and machines that cannot create a window target.
     fn ensure_canvas(&mut self) -> Option<ID2D1RenderTarget> {
+        if self.open && !self.window_failed {
+            let size = D2D_SIZE_U { width: self.size.0 as u32, height: self.size.1 as u32 };
+            if self.window_target.as_ref().is_some_and(|t| unsafe { t.GetPixelSize() } != size) {
+                self.window_target = None;
+            }
+            if self.window_target.is_none() {
+                self.icons.clear();
+                let made = unsafe { self.factory.CreateHwndRenderTarget(
+                    &D2D1_RENDER_TARGET_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+                        dpiX: 96.0, dpiY: 96.0, ..Default::default()
+                    },
+                    &D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd: self.hwnd, pixelSize: size, presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY },
+                ) };
+                match made {
+                    Ok(target) => { self.window_target = Some(target); self.canvas = None; }
+                    Err(e) => { crate::app::log(&format!("board GPU target failed, using bitmap: {e}")); self.window_failed = true; }
+                }
+            }
+            if let Some(target) = &self.window_target { return target.cast().ok(); }
+        }
         if !self.canvas.as_ref().is_some_and(|c| c.dib.size == self.size) {
-            // Icons are bitmaps of the target and go with it.
             self.icons.clear();
             self.canvas = Canvas::new(&self.factory, self.size)
-                .map_err(|e| crate::app::log(&format!("board canvas failed: {e}")))
-                .ok();
+                .map_err(|e| crate::app::log(&format!("board canvas failed: {e}"))).ok();
         }
         self.canvas.as_ref().map(|c| c.target.target.clone())
+    }
+
+    fn discard_target(&mut self) {
+        self.window_target = None;
+        self.canvas = None;
+        self.icons.clear();
     }
 
     /// Draws the board into the canvas; `None` when there is no canvas.
     fn draw_to_canvas(&mut self) -> Option<Result<()>> {
         let target = self.ensure_canvas()?;
         if self.fonts.is_none() {
+            self.text_cache.clear();
             self.fonts = make_fonts(self.scale).map_err(|e| crate::app::log(&format!("board fonts failed: {e}"))).ok();
         }
         self.load_icons(&target);
@@ -2559,7 +2616,7 @@ impl Board {
             Some(Err(e)) => {
                 crate::app::log(&format!("board draw failed: {e}"));
                 // Rebuild everything on the next paint.
-                self.canvas = None;
+                self.discard_target();
                 return;
             }
             None => return,
@@ -2567,30 +2624,45 @@ impl Board {
         self.present_canvas();
     }
 
-    fn present_canvas(&self) {
-        if let Some(canvas) = &self.canvas {
-            let (w, h) = canvas.dib.size;
-            unsafe {
-                let window = GetDC(self.hwnd);
-                let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
-                ReleaseDC(self.hwnd, window);
-                let _ = GdiFlush();
-                if let Some(popup) = &self.popup {
-                    // The board underneath stays bare, so the layered panel can fade away.
-                    let target = &canvas.target.target;
-                    target.BeginDraw();
-                    if let (Ok(p), Some(fonts)) = (Painter::new(target), &self.fonts) {
-                        self.draw_popup_panel(&p, fonts);
-                    }
-                    if let Err(error) = target.EndDraw(None, None) {
-                        crate::app::log(&format!("popup draw failed: {error}"));
-                    }
-                    let dc = GetDC(self.popup_hwnd);
-                    let _ = BitBlt(dc, 0, 0, size(&popup.frame).0.ceil() as i32, size(&popup.frame).1.ceil() as i32,
-                        canvas.dib.dc, popup.frame.left.round() as i32, popup.frame.top.round() as i32, SRCCOPY);
-                    ReleaseDC(self.popup_hwnd, dc);
+    fn present_canvas(&mut self) {
+        if self.window_target.is_none() {
+            if let Some(canvas) = &self.canvas {
+                let (w, h) = canvas.dib.size;
+                unsafe {
+                    let window = GetDC(self.hwnd);
+                    let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
+                    ReleaseDC(self.hwnd, window);
+                    let _ = GdiFlush();
                 }
             }
+        }
+        // The translucent popup has its own bitmap and target-bound icons.
+        let Some(popup) = &self.popup else { return };
+        if !self.popup_canvas.as_ref().is_some_and(|c| c.dib.size == self.size) {
+            self.popup_canvas = Canvas::new(&self.factory, self.size).ok();
+            self.popup_icons.clear();
+        }
+        let Some(canvas) = &self.popup_canvas else { return };
+        let target = &canvas.target.target;
+        for (window, _) in self.model.popup_windows(&popup.id) {
+            self.popup_icons.entry(window.hwnd.0).or_insert_with(|| icon_bitmap(target, window.hwnd, (20.0 * self.scale).round() as i32));
+        }
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&paint::backdrop()));
+            if let (Ok(p), Some(fonts)) = (Painter::cached(target, &self.text_cache), &self.fonts) {
+                self.draw_popup_panel(&p, fonts, &self.popup_icons);
+            }
+            if let Err(error) = target.EndDraw(None, None) {
+                crate::app::log(&format!("popup draw failed: {error}"));
+                self.popup_canvas = None;
+                self.popup_icons.clear();
+                return;
+            }
+            let dc = GetDC(self.popup_hwnd);
+            let _ = BitBlt(dc, 0, 0, size(&popup.frame).0.ceil() as i32, size(&popup.frame).1.ceil() as i32,
+                canvas.dib.dc, popup.frame.left.round() as i32, popup.frame.top.round() as i32, SRCCOPY);
+            ReleaseDC(self.popup_hwnd, dc);
         }
     }
 
@@ -2608,7 +2680,7 @@ impl Board {
         unsafe {
             target.Clear(Some(&paint::backdrop()));
         }
-        let p = Painter::new(target)?;
+        let p = Painter::cached(target, &self.text_cache)?;
         // The tiles are placed in the window's coordinates; each map, and the
         // label and the hint of the home monitor, in its monitor's own.
         self.draw_tiles(&p, fonts);
@@ -2693,10 +2765,10 @@ impl Board {
         p.line((x, popup.cell.top - 2.0 * s), (x, end.1 + 8.0 * s), 2.0 * s, accent(0.65 * self.popup_alpha));
         p.line((x, end.1 + 8.0 * s), end, 2.0 * s, accent(0.65 * self.popup_alpha));
         p.disc((x, popup.cell.top - 2.0 * s), 3.0 * s, accent(0.9 * self.popup_alpha));
-        if !self.open { self.draw_popup_panel(p, fonts); }
+        if !self.open { self.draw_popup_panel(p, fonts, &self.icons); }
     }
 
-    fn draw_popup_panel(&self, p: &Painter, fonts: &Fonts) {
+    fn draw_popup_panel(&self, p: &Painter, fonts: &Fonts, icons: &HashMap<isize, Option<ID2D1Bitmap>>) {
         let Some(popup) = &self.popup else { return };
         let s = self.scale;
         p.fill(&popup.frame, 12.0 * s, rgba(0.09, 0.10, 0.13, 1.0));
@@ -2716,7 +2788,7 @@ impl Board {
                 let title = Rect { left: tile.frame.left + 6.0 * s, right: tile.frame.right - 6.0 * s,
                     bottom: tile.thumb.top, ..tile.frame };
                 p.text(&window.title, &fonts.small, &title, white(0.8));
-                if let Some(icon) = self.icons.get(&window.hwnd.0).and_then(Option::as_ref) {
+                if let Some(icon) = icons.get(&window.hwnd.0).and_then(Option::as_ref) {
                     let (cx, cy) = centre(&tile.thumb);
                     p.bitmap(icon, &rect(cx - 12.0 * s, cy - 12.0 * s, 24.0 * s, 24.0 * s), 0.75);
                 }
@@ -3180,6 +3252,7 @@ impl Board {
         self.monitors = vec![self.home];
         self.selected = model.current.clone();
         self.model = model;
+        self.source_sizes.borrow_mut().clear();
         self.grid = grid;
         let now = Instant::now();
         if let Some((from, ms)) = step.filter(|(from, _)| self.grid.id_at(*from).is_some()) {
@@ -4070,15 +4143,15 @@ mod tests {
     }
 
     #[test]
-    fn slow_frames_keep_intermediate_motion_then_cut_the_settled_tail() {
+    fn slow_frames_use_elapsed_time_then_cut_the_settled_tail() {
         let now = Instant::now();
         let row = Part::Row(0, "a".into());
         let mut motion = Motion::default();
         motion.moved(&HashMap::from([(row.clone(), (100.0, 0.0))]), &HashMap::from([(row.clone(), (0.0, 0.0))]), now);
         motion.advance(HashMap::new(), 0, now + Duration::from_millis(500));
-        let expected = Spring { offset: 100.0, velocity: 0.0 }.sample(MOTION_LONGEST_STEP).offset;
-        assert!((motion.offset(&row).0 - expected).abs() < 0.0001);
-        assert!(motion.offset(&row).0 > 50.0);
+        let expected = Spring { offset: 100.0, velocity: 0.0 }.sample(0.5).offset;
+        assert!(expected < SETTLED);
+        assert_eq!(motion.offset(&row).0, 0.0);
         for frame in 1..=40 {
             motion.advance(HashMap::new(), 0, now + Duration::from_millis(500 + frame * 16));
         }
@@ -4169,11 +4242,16 @@ mod tests {
     }
 
     #[test]
-    fn the_hand_pulls_a_little_past_the_ends_only() {
-        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4;
-        assert!(near(hand_pull((0, 0), (3, 2), (-1.0, 0.0)), (-EDGE_GIVE, 0.0)));
-        assert!(near(hand_pull((1, 1), (3, 2), (0.5, -0.25)), (0.5, -0.25)));
-        assert!(near(hand_pull((3, 2), (3, 2), (2.0, 2.0)), (EDGE_GIVE, EDGE_GIVE)));
+    fn the_hand_stops_at_every_edge() {
+        let grid = Grid { rows: vec![
+            Row { cells: vec!["a".into(), "b".into()], ..Default::default() },
+            Row::default(),
+            Row { cells: vec!["c".into()], ..Default::default() },
+        ], ..Default::default() };
+        assert_eq!(hand_pull(&grid, Pos { row: 0, col: 0 }, (-100.0, -100.0)), (0.0, 0.0));
+        assert_eq!(hand_pull(&grid, Pos { row: 0, col: 1 }, (100.0, 100.0)), (0.0, 0.0));
+        assert_eq!(hand_pull(&grid, Pos { row: 2, col: 0 }, (100.0, 100.0)), (0.0, 0.0));
+        assert_eq!(hand_pull(&grid, Pos { row: 0, col: 1 }, (-0.125, 0.0)), (-0.125, 0.0));
     }
 
     /// Going to a row with more or fewer windows pinned to it, or none, the
