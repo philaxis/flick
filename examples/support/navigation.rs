@@ -127,6 +127,12 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                         let ok = vdapi::get_current_desktop().unwrap().id() == ids[0];
                         failures += usize::from(!ok);
                         report += &format!("follow={follow} minimap={minimap} subthreshold-no-fling: {ok}\n");
+                        goto(2);
+                        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(340, 0, 240);
+                        mouse(MOUSEEVENTF_XUP, 0, 0); wait(2400);
+                        let ok = vdapi::get_current_desktop().unwrap().id() == ids[3];
+                        failures += usize::from(!ok);
+                        report += &format!("follow={follow} minimap={minimap} next-hold-after-subthreshold: {ok}\n");
                     }
                     // Colored, differently proportioned native windows expose source-frame fitting errors.
                     let mut windows = Vec::new();
@@ -143,6 +149,19 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     let opened = IsWindowVisible(board).as_bool();
                     failures += usize::from(!opened);
                     report += &format!("follow={follow} minimap={minimap} board-open: {opened}\n");
+                    if follow && !minimap {
+                        for title in ["F wide", "F tall"] {
+                            use windows::Win32::{Foundation::RECT, Graphics::Dwm::*};
+                            let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title));
+                            let mut outer = RECT::default(); let mut frame = RECT::default();
+                            GetWindowRect(hwnd, &mut outer).unwrap();
+                            DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut frame as *mut _ as _, std::mem::size_of::<RECT>() as u32).unwrap();
+                            let thumbnail = DwmRegisterThumbnail(board, hwnd).unwrap();
+                            let source = DwmQueryThumbnailSourceSize(thumbnail).unwrap();
+                            DwmUnregisterThumbnail(thumbnail).unwrap();
+                            report += &format!("{title} source={}x{} outer={outer:?} visible={frame:?}\n", source.cx, source.cy);
+                        }
+                    }
                     for (label, vk) in [("right", 0x27), ("left", 0x25), ("down", 0x28), ("up", 0x26)] {
                         let _ = label;
                         let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(vk), LPARAM(0)); wait(1400);

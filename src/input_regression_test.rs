@@ -306,6 +306,21 @@ fn letting_go_of_the_touchpad_keeps_where_the_hand_was() {
 }
 
 #[test]
+fn follow_off_switches_immediately_at_the_same_full_distance() {
+    let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    reset();
+    let s = settings();
+    press(Source::XButton2);
+    advance(&s, s.step_x - 1, 0);
+    let posted = || api::CALLS.with(|c| c.borrow().messages.iter().filter(|m| m.0 == WM_SLIDE).count());
+    assert_eq!(posted(), 0);
+    advance(&s, 1, 0);
+    assert_eq!(posted(), 1);
+    assert!(followed().holding && followed().ways == 0);
+    reset();
+}
+
+#[test]
 fn touchpad_follow_keeps_sub_count_precision_and_the_other_axis_immediate() {
     let posted = |message| api::CALLS.with(|c| c.borrow().messages.iter().filter(|m| m.0 == message).count());
     let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());

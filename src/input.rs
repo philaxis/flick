@@ -832,8 +832,8 @@ fn press(source: Source) {
         FOLLOWING.store(follow.unwrap_or(0), Ordering::SeqCst);
         let (notch_x, notch_y) = notch.unwrap_or((crate::slide::notch::DEFAULT_X, crate::slide::FIRMEST));
         let mut plane = Plane::configured(notch_x, notch_y, BOARD_OPEN.load(Ordering::SeqCst));
-        let ways = SETTINGS.with(|s| s.borrow().as_ref().map_or(0, |s| if source == Source::Touchpad { s.touchpad_follow } else { s.mouse_follow }));
-        plane.enable_f(ways & FOLLOW_X != 0, ways & FOLLOW_Y != 0);
+        // Distance always means a full commit; follow only changes when Windows switches.
+        plane.enable_f(true, true);
         PLANE.set(plane);
         DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
@@ -1290,7 +1290,7 @@ fn directed<T: std::ops::Neg<Output = T>>(delta: (T, T), reverse: bool) -> (T, T
 fn travel(s: &Settings, dx: i32, dy: i32) {
     let (dx, dy) = directed((dx, dy), s.mouse_reverse);
     let mut lock = MOUSE_AXIS.get();
-    lock.f_mode = s.mouse_follow != 0;
+    lock.f_mode = true;
     let before = lock.at;
     let step = [s.step_x as f64, s.step_y as f64];
     lock.travel([dx as f64, dy as f64], step, 12.0, unsafe { GetMessageTime() } as u32);

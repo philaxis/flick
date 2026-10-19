@@ -389,6 +389,20 @@ mod tests {
     }
 
     #[test]
+    fn board_and_desktop_keys_share_position_and_depth() {
+        let mut strip = Strip::default();
+        let mut desktop = crate::follow::Step::new(0.0, (1, 0));
+        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.0);
+        for i in 1..200 {
+            let now = i as f32 / 120.0;
+            strip.follow((0.0, 0.0), 0, 1, false, now);
+            desktop.advance(now as f64);
+            assert!((1.0 - strip.offset(0, now).0 as f64 - desktop.at().0.0).abs() < 1e-5);
+            assert!((strip.depth(now) as f64 - desktop.at().1).abs() < 1e-5);
+        }
+    }
+
+    #[test]
     fn commit_and_release_preserve_the_drawn_position() {
         let mut strip = Strip::default();
         strip.follow((0.0, 0.0), 0, 1, true, 0.0);

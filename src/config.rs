@@ -45,7 +45,7 @@ sleep_after_minutes = 0
 #   step: movement needed to commit the next cell, after the axis dead zone; the full Distance is the threshold.
 #   follow: variant F commits after the full Distance, pulls at most 20%, and springs into the next cell.
 #     The picture recedes to 70%; Windows switches once when the hand lets go, without fling prediction.
-#     Off keeps the immediate desktop switching behavior.
+#     Off switches Windows immediately at the same full-distance threshold.
 #   notch_x/y: legacy values accepted for compatibility; variant F uses its fixed curve.
 #   reverse: with true the desktops go the other way from the hand, as if pushing the screen like scrolling content on a touchpad; with false they follow it.
 #     Keyboard shortcuts are not affected.
@@ -110,7 +110,7 @@ pub struct Mouse {
     /// Raw mouse counts for one cell and one shelf; physical travel depends on mouse DPI.
     pub step_x: i32,
     pub step_y: i32,
-    /// Legacy notch values, retained for config compatibility and immediate mode.
+    /// Legacy notch values, retained for config compatibility.
     pub notch_x: u32,
     pub notch_y: u32,
     /// The screen moving along with the hand between desktops, the desktop

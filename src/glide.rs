@@ -1037,10 +1037,11 @@ impl View {
                 let (at, settled) = session.follow.settle(now);
                 let receded = session.follow.depth();
                 if settled {
+                    // A subthreshold release must also retire the app's hold.
+                    tell(WM_GLIDE_SETTLED, to, session.hold);
                     if to == (0, 0) {
                         done = true;
                     } else {
-                        tell(WM_GLIDE_SETTLED, to, session.hold);
                         session.phase = Phase::Arriving(to, Instant::now());
                     }
                 }
