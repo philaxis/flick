@@ -6,13 +6,14 @@ This branch starts at `0078a16ab337d8ae14eb24805d60aead5a07081b` (`release/0.6.0
 
 - P1: input coordinates retain floating-point precision. Each input sample carries a receiver `Instant`/QPC timeline, the separate OS millisecond timestamp, and, for PTP, the device scan time. The 16-bit 100 µs PTP clock handles wrap, idle resets and implausible timestamps. Raw mouse input has no hardware QPC; receipt time is used, without pretending that `GetMessageTime` has sub-millisecond precision.
 - P2: the normal overlay integrates successive targets at their input times. Rendering samples a copy at the frame time; a late event cannot rewind the canonical spring. The board consumes an ordered batch and uses one sampled strip for its painted geometry and thumbnails. Depth continues settling without further input. A bounded visual prediction uses the latest three reports, rejects stale/stationary/reversed/changed-axis input, and cannot commit a desktop. It is capped at half a report interval and 8 ms; intervals below 2 ms are not extrapolated.
-- An opt-in DirectComposition scene hosts shared live-thumbnail visuals and the board's D2D surface. Float transforms and one scene commit replace independently rounded thumbnail updates for that host. Shared thumbnail dimensions are retained at registration. The normal-view banner and the board popup remain separate windows; multiple monitor hosts do not share one atomic device transaction.
+- A DirectComposition scene hosts shared live-thumbnail visuals (and, opt-in, the board's opaque D2D surface). It is on by default for the normal view (`compositor = "auto"`); see the final trial below. Float transforms and one scene commit replace independently rounded thumbnail updates for that host. Shared thumbnail dimensions are retained at registration. The normal-view banner and the board popup remain separate windows; multiple monitor hosts do not share one atomic device transaction.
 - P3: optional slower visual commits/settling, with unchanged logical latch, HOLD plateau, damping and default tracking coefficients. Tracking returns to its normal response when real held input resumes pulling.
-- Optional blur is a separate prototype: two faint directional copies per public DWM thumbnail. It is not a captured-texture convolution or motion-compensated frame generation.
+- Optional blur is a separate prototype: two faint directional copies per public DWM thumbnail. It is not a captured-texture convolution or motion-compensated frame generation. Trails appear only above 4 px of travel per frame, so slow drags get none, and the frame after motion stops is drawn once more to clear them.
+- Settings has an "Experimental · smoother-looking motion" group: the blur switch and the Default/Gentle/Slow commit spring. Both are off/default; a change applies from the next move without a restart.
 
 ## Run the experiments
 
-Append to `%APPDATA%\Flick\config.toml` (or edit the existing table):
+Use the settings window's Experimental group, or append to `%APPDATA%\Flick\config.toml` (or edit the existing table):
 
 ```toml
 [experimental]
@@ -20,16 +21,15 @@ commit_speed = "default" # default: 35/32; gentle: 28/25; slow: 24/24
 motion_blur = false
 ```
 
-Compare one option at a time. Restart Flick when changing the blur experiment so every thumbnail is registered consistently. The default remains `default` / `false`.
+Compare one option at a time. Both apply from the next move. The normal view registers its thumbnails per hold; the board registers them when it opens, so reopen it after changing blur. The default remains `default` / `false`. Blur needs public thumbnails, so while it is on the normal view uses the public path.
 
-For the private compositor prototype, launch a fresh process from PowerShell:
+The compositor is chosen once at startup by a root config key:
 
-```powershell
-$env:FLICK_COMPOSITION = '1'
-.\Flick.exe --portable
+```toml
+compositor = "auto" # normal view composed; "off": public thumbnails everywhere; "all": the board too
 ```
 
-Remove that environment variable to return to the public API. It is deliberately not enabled by default. The experiment is gated to Windows build families 22621, 22631, 26100 and 26200 and falls back on shared-thumbnail creation errors; this is an ABI guard, not compatibility certification. Blur and the compositor prototype are evaluated independently; the compositor path does not create public blur trails.
+`FLICK_COMPOSITION=0` forces `off` and any other value forces `all` for one process (used by the probes). Composition is gated to Windows build families 22621, 22631, 26100 and 26200 and falls back per thumbnail on shared-thumbnail creation errors; this is an ABI guard, not compatibility certification. Each window's shared-thumbnail size is reused while `GetWindowRect` reports the same size, so a hold does not pay a public register/query/unregister round trip per window.
 
 ## Measurement contract
 
@@ -60,7 +60,7 @@ GPU counters are a separate instrumented run. Per-process 3D-engine utilization/
 
 ## Evidence and results
 
-**The zero-stall / <10% displayed-increment CV goal is not achieved.** Timestamp integration is implemented, but these measurements do not establish a universal pacing improvement. The ordinary public DWM path remains the default; slower visual settling, blur and private composition are experiments.
+**The <10% displayed-increment CV goal is reached for the normal view only on the composed path** (final trial below). The board stays on the public path by default; slower visual settling, blur and the composed board are experiments. Sections before the final recheck describe earlier trials and are kept for the record.
 
 Early detector/marker trials are not used as proof: the first detector included wallpaper colors, the baseline board marker was clipped, and an early shared-visual prototype placed normal-view windows behind the wallpaper. [`AddVisual` with a null sibling](https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-idcompositionvisual-addvisual) inserts above all children only when `insertAbove` is `FALSE`; this was corrected for the final trial. A high update count with missing content is a failure.
 
@@ -113,13 +113,36 @@ For normal-view fast mouse input, the measured peak is **196 → 173 → 150.5 p
 - The 125 Hz/60 Hz beat is plausible, but its isolated contribution is not proven by these end-to-end trials: receipt jitter, coordinate quantization, spring dynamics and composition all contribute. A perfect 8 ms clock supplies two reports in 55 refreshes and three in five refreshes per second, not strict 2/3 alternation every frame. Timestamp-preserving integration removes the assumption that every input batch arrived at render time; it does not eliminate integer raster steps.
 - App submission remains insufficient evidence: the main timestamped normal fast-mouse trace has median/p95 gaps 16.66/16.84 ms while displayed increments remain irregular. DComp board slow-mouse update/commit work has median/p95 11.29/21.82 ms, versus 0.08/0.75 ms for public-thumbnail updates; the board paint cost moves in the opposite direction. This does not isolate the driver wait inside that aggregate call block.
 
-### Final recheck, compositor and blur/GPU trial
+### Final recheck: composed normal view by default, composed board opt-in
 
-FINAL_TRIAL_PENDING
+Trials: `bridge-57b94919` (commit `a1f4283`, variants `off`/`auto`/`all`, all 16 cases each) and a normal-view recheck `bridge-7c07a28c` (`871f0ac`, `off`/`auto`, five follow cases). Summaries: `docs/measurements/compositor-motion/final-{timed,default,composition}.json` (`timed` = `off`). Same laptop, single ~60 Hz 1920×1080 output, Desktop Duplication as above; individual trials, not confidence intervals.
+
+**Board diagnosis.** The earlier composed board's poor cadence was not Commit overhead as such. On the public path the board's D2D repaint already costs Flick ~44% of the 3D engine at 60 Hz (DWM ~23%) and `EndDraw` on the HWND target blocks ~14 ms; in the composed scene the same wait moves into `Commit` (draw 0.5 ms, commit 12–15 ms). The prototype surface was premultiplied, so DWM blended a full-screen layer every frame; making it opaque (`DXGI_ALPHA_MODE_IGNORE`, as the public window target already is) brought the app-side interval p95 from 24.5 to 17.5 ms and capture losses from 71 to 1 (board-mouse-slow). The full-surface redraw still finishes late on this GPU: in board-ptp-fast the composed board left 69 refreshes without a new image, mostly single-refresh gaps about every 33 ms in long stretches, against 2 on the public path. That is why the board stays public by default. Fixing it needs a retained scene (rows/plates as their own surfaces moved by transforms, not a full repaint per frame) or a cheaper board paint; neither was attempted here.
+
+**Normal view.** It has no painted surface in the scene; only shared thumbnail visuals move. It meets the steady-tracking goal and keeps cadence, so it is the default. Its first visible movement is about 35 ms later than the public path in both trials: the hold's windows (and with them the composition device) were dropped after every hold and a new D3D/D2D/DComp device was created before the first frame; the reuse of the size query (`871f0ac`) did not change this. The latest commit keeps one device per thread and creates it when the config is read; it is compile-checked only (see Validation).
+
+| Measure (scenario) | Public path (`off`) | Default (`auto`) | Composed board (`all`) |
+|---|---:|---:|---:|
+| Steady tracking CV %, normal view, slow mouse (trial / recheck) | 34.8 / 33.9 | **10.5 / 9.0** | 7.6 |
+| Steady tracking CV %, normal view, slow PTP | 34.8 / 34.8 | **9.2 / 10.9** | 12.0 |
+| Refreshes with no new image, normal view slow mouse | 129 / 139 | **0 / 1** | 2 |
+| Normal-view frame work p50/p95 ms (slow mouse) | 0.45 / 2.83 | **0.13 / 0.33** | 0.14 / 0.33 |
+| Normal-view frame gap p95 ms (slow mouse) | 16.79 | 16.76 | 16.75 |
+| Onset after dead zone ms, normal view fast mouse (trial / recheck) | 35.6 / 35.4 | 72.8 / 71.1 (regression, see above) | 71.9 |
+| Board thumbnail vs D2D steps >1 px, slow mouse / slow PTP | 32/93 / 4/142 | same path as `off` | **0/135 / 0/93** |
+| Board pixel repeats while moving, slow mouse | 93/252 | 88/239 | 37/299 |
+| Board app interval p95 ms, slow mouse (premultiplied prototype: 24.5) | 19.6 | 19.0 | 17.5 |
+| Board refreshes with no new image, fast PTP | 2 | 10 | **69** |
+
+Slow-mouse board tracking CV is 51.0 (`off`) vs 76.5 (`all`) because the composed board alternates 0 px and ~3 px steps where it misses a refresh; the composed slow PTP board has 11.9 vs 33.0. Blur was not re-measured: its new rule (no trail under 4 px of travel per frame, one clearing redraw after motion) is covered by a unit test, not by composed-pixel evidence.
 
 ### Validation
 
-VALIDATION_PENDING
+- Local: `cargo check --target x86_64-pc-windows-msvc --all-targets` (and with `--features motion-probe`) after each change.
+- Windows (shared laptop): `cargo test --release` 156 passed, 0 failed at `a1f4283` and at `871f0ac`; `cargo build --release --locked` succeeded; the motion-probe E2E ran once per commit (`scripts/compositor-final-e2e.ps1`, modes `final` and `final-follow`), each in one job that stages, runs and restores the config.
+- The settings window was rendered (`--render-settings`) at `871f0ac` and checked: the Experimental group shows the blur switch and the Default/Gentle/Slow spring choice.
+- Not verified on Windows: the last code commit (one composition device per thread, created when the config is read, and the notice alignment in settings). Its expected effect is removing the ~35 ms normal-view onset regression; one `final-follow` run would confirm it.
+- Not covered: multiple monitors, other refresh rates, other Windows builds, device loss, protected content, physical HID input; blur and slower springs were only unit-tested in this round.
 
 
 ## Why these changes, and what remains risky
@@ -128,7 +151,7 @@ Rust is not a 60 Hz rendering limit. The previous application's frame-clock trac
 
 The analytic 35/.78 unit spring advances by about 0.240406 cells in its fastest 60 Hz interval (the unit test checks this). At a fixed half-scale 1920 px desktop with a .07 gap, that example is about 247 px/frame. This is a calculation, not a measured universal maximum: live depth, focus, prior velocity and clipping differ. Slower experimental springs trade lower peak movement for longer completion; the default stays unchanged.
 
-The compositor prototype uses undocumented `dwmapi` ordinal 147. Window resizing, device loss/recreation, minimization, protected surfaces, other Windows revisions and mixed-monitor atomicity still need broader validation. The public path remains the default. Compositor-side `IDCompositionAnimation` playback of the coupled damped springs/focus/depth has not been implemented: an approximation would need interruption and curve-error validation. The existing normal overlay already has a dedicated render thread and a display-driven clock; simply adding another timer or changing language would not resolve these image-position issues.
+The compositor prototype uses undocumented `dwmapi` ordinal 147. Window resizing, device loss/recreation, minimization, protected surfaces, other Windows revisions and mixed-monitor atomicity still need broader validation. The normal view uses it by default with a per-thumbnail public fallback and `compositor = "off"`; the board stays public by default. Compositor-side `IDCompositionAnimation` playback of the coupled damped springs/focus/depth has not been implemented: an approximation would need interruption and curve-error validation. The existing normal overlay already has a dedicated render thread and a display-driven clock; simply adding another timer or changing language would not resolve these image-position issues.
 
 Blur triples registered thumbnails (one original plus two copies), adds property submissions, can soften text, and can worsen frame delivery on this laptop. Its trail is half a frame's travel, capped at 32 px before the two fractional offsets; copy alpha is 12% and 6%, and stale samples suppress the trail. It remains off by default regardless of how visually appealing an individual screenshot appears.
 
