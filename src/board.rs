@@ -344,6 +344,8 @@ struct TraceFrame {
     dwm: Duration,
     submit: Duration,
     thumbs: usize,
+    /// First selected thumbnail: handle, DWM destination/source, transformed tile.
+    geometry: Option<(isize, RECT, RECT, Rect)>,
 }
 
 /// The board's frames written to the CSV file `FLICK_TRACE` names: kept in
@@ -386,7 +388,13 @@ impl Trace {
         if new {
             out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms\n");
         }
+        let geometry_path = self.path.with_extension("geometry.csv");
+        let mut geometry = if geometry_path.exists() { String::new() } else { "qpc_ms,hwnd,dest_l,dest_t,dest_r,dest_b,source_l,source_t,source_r,source_b,tile_l,tile_t,tile_r,tile_b\n".into() };
         for f in self.frames.drain(..) {
+            if let Some((hwnd, d, s, tile)) = f.geometry {
+                geometry.push_str(&format!("{:.3},{hwnd:x},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}\n", ms(f.at),
+                    d.left, d.top, d.right, d.bottom, s.left, s.top, s.right, s.bottom, tile.left, tile.top, tile.right, tile.bottom));
+            }
             out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3}\n",
                 ms(f.at), f.interval.map_or(String::new(), |i| format!("{:.3}", ms(i))),
                 if f.by_vblank { "vblank" } else { "timer" }, f.hand.0, f.hand.1, f.drawn.0, f.drawn.1, f.drawn.2,
@@ -396,6 +404,9 @@ impl Trace {
             .and_then(|mut file| file.write_all(out.as_bytes()));
         if let Err(e) = written {
             crate::app::log(&format!("board trace not written: {e}"));
+        }
+        if let Err(e) = std::fs::OpenOptions::new().create(true).append(true).open(geometry_path).and_then(|mut file| file.write_all(geometry.as_bytes())) {
+            crate::app::log(&format!("board geometry trace not written: {e}"));
         }
     }
 }
@@ -932,7 +943,7 @@ pub struct Board {
     scale: f32,
     /// (source window, thumbnail handle) of every tile, in stacking order.
     thumbs: Vec<(isize, isize)>,
-    icons: HashMap<isize, ID2D1Bitmap>,
+    icons: HashMap<isize, Option<ID2D1Bitmap>>,
     hover: Hit,
     press: Option<Press>,
     cursor: (f32, f32),
@@ -1421,7 +1432,7 @@ impl Board {
                 None => {}
             }
             let submitted = started.elapsed();
-            self.update_thumbnails();
+            let geometry = self.update_thumbnails();
             let dwm = started.elapsed() - submitted;
             unsafe {
                 ValidateRect(self.hwnd, None);
@@ -1446,6 +1457,7 @@ impl Board {
                     dwm,
                     submit: took - prepared,
                     thumbs: self.thumbs.len() + self.strip_thumbs.len(),
+                    geometry,
                 };
                 if let Some(trace) = &mut self.trace {
                     trace.record(frame, now);
@@ -2036,7 +2048,8 @@ impl Board {
 
     /// Puts every thumbnail where its tile is drawn, or under the cursor
     /// while its window is being dragged.
-    fn update_thumbnails(&self) {
+    fn update_thumbnails(&self) -> Option<(isize, RECT, RECT, Rect)> {
+        let mut geometry = None;
         let at = self.grid.find(&self.selected);
         let windows = self.tile_windows();
         let placing = |hwnd: isize| {
@@ -2051,7 +2064,13 @@ impl Board {
         for &(hwnd, thumb) in &self.thumbs {
             let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd);
             let minimized = windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized);
-            let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), self.dragged_window() == Some(hwnd), 1.0, placing(hwnd));
+            let place = placing(hwnd);
+            let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), self.dragged_window() == Some(hwnd), 1.0, place);
+            if self.trace.is_some() && geometry.is_none() {
+                if let (Some((dest, source)), Some(tile), Some((place, _, _))) = (_shown, tile, place) {
+                    geometry = Some((hwnd, dest, source, place.rect(&tile.thumb)));
+                }
+            }
             #[cfg(feature = "debug-log")]
             placed.push(format!("{hwnd:x}={_shown:?}"));
         }
@@ -2077,6 +2096,7 @@ impl Board {
                 self.put_thumbnail(thumb, tile, minimized, offset, false, self.popup_alpha, Some((Place::SAME, None, 1.0)));
             }
         }
+        geometry
     }
 
     /// Shows the live picture `thumb` of a tile's window where the tile is
@@ -2085,7 +2105,7 @@ impl Board {
     /// place. `offset` is where the window it is shown in is. Says where it
     /// went.
     #[allow(clippy::too_many_arguments)]
-    fn put_thumbnail(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, offset: (f32, f32), dragged: bool, opacity: f32, placing: Option<(Place, Option<Rect>, f32)>) -> Option<RECT> {
+    fn put_thumbnail(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, offset: (f32, f32), dragged: bool, opacity: f32, placing: Option<(Place, Option<Rect>, f32)>) -> Option<(RECT, RECT)> {
         // Round the transformed edges exactly as the screen plate does.
         let to_rect = |r: &Rect| {
             let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
@@ -2162,7 +2182,7 @@ impl Board {
             props.opacity = (props.opacity as f32 * opacity).round() as u8;
             let _ = DwmUpdateThumbnailProperties(thumb, &props);
         }
-        props.fVisible.as_bool().then_some(props.rcDestination)
+        props.fVisible.as_bool().then_some((props.rcDestination, props.rcSource))
     }
 
     /// Thumbnails stack in registration order; re-register the one that will
@@ -2578,11 +2598,8 @@ impl Board {
         let size = (20.0 * self.scale).round() as i32;
         let in_cells = self.model.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.windows);
         for window in in_cells.chain(&self.model.pinned) {
-            if !self.icons.contains_key(&window.hwnd.0) {
-                if let Some(bitmap) = icon_bitmap(target, window.hwnd, size) {
-                    self.icons.insert(window.hwnd.0, bitmap);
-                }
-            }
+            // Cache absent icons too: asking another process every frame stalls motion.
+            self.icons.entry(window.hwnd.0).or_insert_with(|| icon_bitmap(target, window.hwnd, size));
         }
     }
 
@@ -2699,7 +2716,7 @@ impl Board {
                 let title = Rect { left: tile.frame.left + 6.0 * s, right: tile.frame.right - 6.0 * s,
                     bottom: tile.thumb.top, ..tile.frame };
                 p.text(&window.title, &fonts.small, &title, white(0.8));
-                if let Some(icon) = self.icons.get(&window.hwnd.0) {
+                if let Some(icon) = self.icons.get(&window.hwnd.0).and_then(Option::as_ref) {
                     let (cx, cy) = centre(&tile.thumb);
                     p.bitmap(icon, &rect(cx - 12.0 * s, cy - 12.0 * s, 24.0 * s, 24.0 * s), 0.75);
                 }
@@ -2860,7 +2877,7 @@ impl Board {
         p.fill(&tile.frame, 9.0 * s, rgba(0.125, 0.135, 0.165, dim));
         // Stand-in under the live thumbnail (and all there is for a minimized window).
         p.fill_square(&tile.thumb, rgba(0.075, 0.08, 0.095, dim));
-        if let Some(bitmap) = self.icons.get(&tile.hwnd.0) {
+        if let Some(bitmap) = self.icons.get(&tile.hwnd.0).and_then(Option::as_ref) {
             p.bitmap(bitmap, &tile.icon, dim);
             let (cx, cy) = centre(&tile.thumb);
             p.bitmap(bitmap, &rect(cx - 20.0 * s, cy - 20.0 * s, 40.0 * s, 40.0 * s), 0.8 * dim);
@@ -3081,7 +3098,7 @@ impl Board {
     /// App icons, each with how many windows it has when more than one.
     fn draw_badges(&self, p: &Painter, fonts: &Fonts, badges: &[AppBadge], dim: f32) {
         for badge in badges {
-            match self.icons.get(&badge.hwnd.0) {
+            match self.icons.get(&badge.hwnd.0).and_then(Option::as_ref) {
                 Some(bitmap) => p.bitmap(bitmap, &badge.icon, dim),
                 None => p.fill(&badge.icon, 4.0 * self.scale, white(0.25 * dim)),
             }
@@ -3143,7 +3160,7 @@ impl Board {
             // With no thumbnail to follow the cursor (it could not be
             // registered), the window's icon does.
             if !self.thumbs.iter().any(|&(h, _)| h == hwnd) {
-                if let Some(bitmap) = self.icons.get(&hwnd) {
+                if let Some(bitmap) = self.icons.get(&hwnd).and_then(Option::as_ref) {
                     p.bitmap(bitmap, &rect(cx - 16.0 * s, cy - 16.0 * s, 32.0 * s, 32.0 * s), 1.0);
                 }
             }

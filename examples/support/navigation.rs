@@ -35,8 +35,9 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 }
             }
         }
-        "run" | "motion" => unsafe {
-            let motion = mode == "motion";
+        "run" | "motion" | "geometry" => unsafe {
+            let geometry = mode == "geometry";
+            let motion = mode != "run";
             let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();
             let ids: Vec<_> = ids.lines().collect();
             let all = vdapi::get_desktops().unwrap();
@@ -63,6 +64,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             let mut report = String::new();
             let mut failures = 0;
             for (follow, minimap) in [(true, false), (true, true), (false, true)] {
+                if geometry && (!follow || minimap) { continue; }
                 let config = format!("config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = {minimap}\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = {follow}\nfollow_y = {follow}\nreverse = false\n");
                 std::fs::write(cfg.join("config.toml"), config).unwrap();
                 goto(0);
@@ -71,6 +73,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 wait(3000);
                 let app = FindWindowW(w!("flick.main"), None);
                 assert!(app.0 != 0, "Flick did not start");
+                if !geometry {
                 for (label, start, moves, target) in [
                     ("mouse-right", 0, vec![(340, 8)], 1),
                     ("mouse-up-then-right", 4, vec![(4, -340), (340, 4)], 3),
@@ -120,9 +123,10 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     report += &format!("follow={follow} minimap={minimap} rapid-up-then-right: {} actual={got}\n", got == ids[3]);
                     failures += usize::from(got != ids[3]);
                 }
+                }
                 if motion {
                     goto(0);
-                    if follow {
+                    if follow && !geometry {
                         mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(180, 0, 100); mouse(MOUSEEVENTF_XUP, 0, 0); wait(if motion { 2400 } else { 1800 });
                         let ok = vdapi::get_current_desktop().unwrap().id() == ids[0];
                         failures += usize::from(!ok);
@@ -149,18 +153,24 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     let opened = IsWindowVisible(board).as_bool();
                     failures += usize::from(!opened);
                     report += &format!("follow={follow} minimap={minimap} board-open: {opened}\n");
+                    std::fs::write(out.join("report.txt"), &report).unwrap();
                     if follow && !minimap {
+                        let geometry_window = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("F geometry probe"), WS_POPUP, 0, 0, 1, 1, None, None, None, None);
+                        assert!(geometry_window.0 != 0);
                         for title in ["F wide", "F tall"] {
-                            use windows::Win32::{Foundation::RECT, Graphics::Dwm::*};
+                            use windows::Win32::{Foundation::{POINT, RECT}, Graphics::{Dwm::*, Gdi::ClientToScreen}};
                             let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title));
                             let mut outer = RECT::default(); let mut frame = RECT::default();
                             GetWindowRect(hwnd, &mut outer).unwrap();
                             DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut frame as *mut _ as _, std::mem::size_of::<RECT>() as u32).unwrap();
-                            let thumbnail = DwmRegisterThumbnail(board, hwnd).unwrap();
+                            let thumbnail = DwmRegisterThumbnail(geometry_window, hwnd).unwrap();
                             let source = DwmQueryThumbnailSourceSize(thumbnail).unwrap();
                             DwmUnregisterThumbnail(thumbnail).unwrap();
-                            report += &format!("{title} source={}x{} outer={outer:?} visible={frame:?}\n", source.cx, source.cy);
+                            let mut client = RECT::default(); let mut client_origin = POINT::default();
+                            GetClientRect(hwnd, &mut client).unwrap(); ClientToScreen(hwnd, &mut client_origin);
+                            report += &format!("{title} hwnd={:x} source={}x{} outer={outer:?} visible={frame:?} client={client:?} client_origin={client_origin:?}\n", hwnd.0, source.cx, source.cy);
                         }
+                        let _ = DestroyWindow(geometry_window);
                     }
                     for (label, vk) in [("right", 0x27), ("left", 0x25), ("down", 0x28), ("up", 0x26)] {
                         let _ = label;
@@ -256,6 +266,6 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             print!("{report}");
             assert_eq!(failures, 0, "navigation probe failed; see report.txt");
         },
-        _ => panic!("navigation stage|run|motion|unstage <out> [flick]"),
+        _ => panic!("navigation stage|run|motion|geometry|unstage <out> [flick]"),
     }
 }

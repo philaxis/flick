@@ -25,6 +25,7 @@ try {
     if ($probeExit) { Write-Warning 'Probe failed; collecting its trace before reporting the result' }
 } finally {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process drive -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $drive -and $_.MainWindowTitle -in @('F wide', 'F tall') } | Stop-Process -Force
     Start-Sleep 1
     & $drive navigation unstage $out
     foreach ($f in 'config.toml', 'state.json') {
@@ -34,7 +35,7 @@ try {
     if (Test-Path "$cfg\log.txt") { Get-Content "$cfg\log.txt" | Select-Object -Skip $logStart | Set-Content "$out\log.txt" }
     if ($was) { Start-Process $was }
 }
-Get-Content "$out\report.txt"
+if (Test-Path "$out\report.txt") { Get-Content "$out\report.txt" }
 
 # Transport succeeds even on an assertion failure so its evidence is retrievable.
 Set-Content (Join-Path $out 'probe-exit.txt') $probeExit
