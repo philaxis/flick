@@ -1837,6 +1837,7 @@ impl App {
         if !unknown.is_empty() {
             warn(&format!("Unknown entries in trigger in config.toml: {}", unknown.join(", ")));
         }
+        crate::transition_curve::configure(config.experimental.commit_speed);
         crate::touchpad::poll(config.touchpad.three_finger);
         input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);

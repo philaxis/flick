@@ -72,6 +72,10 @@ notch_y = 100
 follow_x = true
 follow_y = true
 reverse = true
+
+[experimental]
+# Visual commit/settle only: "default" (35/32), "gentle" (28/25), "slow" (24/24).
+commit_speed = "default"
 "#;
 
 /// Keys of earlier versions, before each device had its own settings: the
@@ -100,6 +104,21 @@ pub struct Config {
     pub minimap: bool,
     pub mouse: Mouse,
     pub touchpad: Touchpad,
+    pub experimental: Experimental,
+}
+
+/// Opt-in visual experiments never change the distance or commit rules.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Experimental { pub commit_speed: CommitSpeed }
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitSpeed { #[default] Default, Gentle, Slow }
+impl CommitSpeed {
+    pub fn omega(self, vertical: bool) -> f64 {
+        match (self, vertical) { (Self::Default,false)=>35.0, (Self::Default,true)=>32.0,
+            (Self::Gentle,false)=>28.0, (Self::Gentle,true)=>25.0, (Self::Slow,_)=>24.0 }
+    }
 }
 
 /// The mouse (and a keyboard trigger, whose hand is on the mouse). `_x` is
@@ -147,6 +166,7 @@ impl Default for Config {
             minimap: false,
             mouse: Mouse::default(),
             touchpad: Touchpad::default(),
+            experimental: Experimental::default(),
         }
     }
 }

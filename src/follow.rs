@@ -84,7 +84,7 @@ impl Step {
         let dt = (now - self.began).max(0.0);
         let mut x = Spring { p: self.from.0, v: self.speed.0 };
         let mut y = Spring { p: self.from.1, v: self.speed.1 };
-        x.position(self.to.0 as f64, dt, false); y.position(self.to.1 as f64, dt, true);
+        x.commit(self.to.0 as f64, dt, false); y.commit(self.to.1 as f64, dt, true);
         let moving = (x.p - self.to.0 as f64).abs() > 0.01 || (y.p - self.to.1 as f64).abs() > 0.01;
         let mut depth = Spring { p: self.receded, v: self.depth_speed };
         depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
@@ -157,6 +157,7 @@ impl Label {
 pub struct Follow {
     pub rows: (i32, i32), pub cols: Vec<(i32, i32)>, pub row: i32,
     along: Vec<Spring>, columns: Vec<Latch>, vertical: Spring, rows_hand: Latch,
+    committing: Vec<bool>, row_committing: bool,
     depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool, path_cursor: usize,
 }
 impl Follow {
@@ -164,7 +165,7 @@ impl Follow {
         let n = (rows.1 - rows.0 + 1).max(1) as usize;
         Self { rows, cols, row: 0, along: vec![Spring::default(); n], columns: vec![Latch::default(); n],
             vertical: Spring::default(), rows_hand: Latch::default(), depth: Spring::default(),
-            last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0 }
+            committing: vec![false; n], row_committing: false, last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0 }
     }
     pub fn cols_of(&self, row: i32) -> (i32, i32) {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
@@ -200,11 +201,15 @@ impl Follow {
         let mut moving = !self.released;
         for i in 0..self.along.len() {
             let target = if !self.released && self.axis == 0 && i == current { self.columns[i].target(self.cols[i]) } else { self.columns[i].cell as f64 };
-            self.along[i].position(target, dt, false);
+            if self.released || self.committing[i] { self.along[i].commit(target,dt,false); }
+            else { self.along[i].position(target,dt,false); }
+            if self.along[i].settled(self.columns[i].cell as f64) { self.committing[i]=false; }
             moving |= (self.along[i].p - self.columns[i].cell as f64).abs() > 0.01;
         }
         let target = if !self.released && self.axis == 1 { self.rows_hand.target(self.rows) } else { self.row as f64 };
-        self.vertical.position(target, dt, true);
+        if self.released || self.row_committing { self.vertical.commit(target,dt,true); }
+        else { self.vertical.position(target,dt,true); }
+        if self.vertical.settled(self.row as f64) { self.row_committing=false; }
         moving |= (self.vertical.p - self.row as f64).abs() > 0.01;
         self.depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
         let done = self.released && self.vertical.settled(self.row as f64)
@@ -227,6 +232,9 @@ impl Follow {
             let i = (self.row - self.rows.0) as usize;
             self.columns[i].track(at.0, self.cols[i])
         };
+        if commits != 0 {
+            if axis == 1 { self.row_committing=true; } else { self.committing[(self.row-self.rows.0) as usize]=true; }
+        }
         self.depth.v += 5.0 * commits.abs() as f64;
         (self.offset(self.row), self.vertical.p)
     }

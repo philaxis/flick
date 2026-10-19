@@ -225,6 +225,7 @@ impl Strip {
             if jump.abs() > 1e-6 {
                 let glide = self.along_mut(row);
                 glide.retarget(jump, now, slide);
+                glide.committed();
                 end = Some(end.unwrap_or(0.0).max(glide.end()));
             }
         }
@@ -232,6 +233,7 @@ impl Strip {
         if rows.abs() > 1e-6 {
             self.across.vertical = true;
             self.across.retarget(rows, now, slide);
+            self.across.committed();
             end = Some(end.unwrap_or(0.0).max(self.across.end()));
             if self.holding {
                 self.row_recede.hold(now);
@@ -268,6 +270,7 @@ impl Strip {
         }
         self.across.vertical = true;
         self.across.retarget(hand.1 - old.1, now, curve::SNAP);
+        if !holding && self.holding { self.along_mut(row).committed(); self.across.committed(); }
         (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
         let rows_moving = self.across.at(now).abs() > 0.01;
         let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01);

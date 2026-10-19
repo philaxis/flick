@@ -20,8 +20,25 @@ $logStart = if (Test-Path "$cfg\log.txt") { (Get-Content "$cfg\log.txt").Count }
 try {
     & $drive navigation stage $out
     if ($LASTEXITCODE) { throw 'stage failed' }
-    & $drive navigation $Mode $out $flick
-    $probeExit = $LASTEXITCODE
+    if ($Mode -eq 'matrix') {
+        $probeExit = 0
+        foreach ($variant in 'baseline','timed','composition','gentle','slow') {
+            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE -ErrorAction SilentlyContinue
+            $exe = $flick
+            if ($variant -eq 'baseline') { $exe = Join-Path (Get-Location) 'baseline.exe' }
+            if ($variant -eq 'composition') { $env:FLICK_COMPOSITION = '1' }
+            if ($variant -in @('gentle','slow')) { $env:FLICK_PROBE_SPEED=$variant; $env:FLICK_SHORT_PROBE='1' }
+            $folder = Join-Path $out $variant
+            New-Item -ItemType Directory -Force $folder | Out-Null
+            Copy-Item "$out\made.txt" $folder
+            & $drive navigation display $folder $exe
+            if ($LASTEXITCODE) { $probeExit=$LASTEXITCODE; break }
+        }
+        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE -ErrorAction SilentlyContinue
+    } else {
+        & $drive navigation $Mode $out $flick
+        $probeExit = $LASTEXITCODE
+    }
     if ($probeExit) { Write-Warning 'Probe failed; collecting its trace before reporting the result' }
 } finally {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force

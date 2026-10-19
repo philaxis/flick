@@ -152,6 +152,11 @@ pub unsafe fn run(out: &Path, flick: &str) {
     let wait = |ms| std::thread::sleep(Duration::from_millis(ms));
     let cfg = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("Flick");
     std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2\"\nminimap = false\nhotkeys = false\n[mouse]\nstep_x = 1000\nstep_y = 1000\nnotch_x = 0\nnotch_y = 0\nfollow_x = true\nfollow_y = true\nreverse = false\n[touchpad]\nthree_finger = true\nstep_x = 12\nstep_y = 12\nnotch_x = 0\nnotch_y = 0\nfollow_x = true\nfollow_y = true\nreverse = false\n").unwrap();
+    if let Ok(speed)=std::env::var("FLICK_PROBE_SPEED") {
+        assert!(["default","gentle","slow"].contains(&speed.as_str()));
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(cfg.join("config.toml")).unwrap(),"\n[experimental]\ncommit_speed = \"{}\"",speed).unwrap();
+    }
     let made=std::fs::read_to_string(out.join("made.txt")).unwrap();
     let ids: Vec<_>=made.lines().collect();
     let all=super::vdapi::get_desktops().unwrap();
@@ -192,7 +197,7 @@ pub unsafe fn run(out: &Path, flick: &str) {
         let mut csv=String::from("qpc,accumulated,capture_ms,magenta_l,magenta_t,magenta_r,magenta_b,magenta_n,cyan_l,cyan_t,cyan_r,cyan_b,cyan_n,yellow_l,yellow_t,yellow_r,yellow_b,yellow_n,marker_l,marker_t,marker_r,marker_b,marker_n,magenta_x,cyan_x,yellow_x,marker_x\n");
         let(mut frames,mut missed)=(0,0);
         while start.elapsed()<Duration::from_millis(7200) {
-            if let Some((info,boxes,centers,ms))=capture.frame(start.elapsed()>Duration::from_millis(1000)).unwrap() {
+            if let Some((info,boxes,centers,ms))=capture.frame(kind=="mouse" && scenario=="fast" && start.elapsed()>Duration::from_millis(1000)).unwrap() {
                 frames+=1;missed+=info.AccumulatedFrames.saturating_sub(1);
                 write!(csv,"{},{},{ms:.3}",info.LastPresentTime,info.AccumulatedFrames).unwrap();
                 for b in boxes {write!(csv,",{},{},{},{},{}",b.0,b.1,b.2,b.3,b.4).unwrap();}
