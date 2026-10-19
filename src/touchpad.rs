@@ -122,9 +122,17 @@ impl Frame {
             return None;
         }
         if count > 0 {
-            self.scan = Some(scan);
-            self.expected = count;
-            self.records.clear();
+            // Per-contact reports may repeat the frame's count; new ids in the same scan continue it.
+            let continues = self.scan == Some(scan)
+                && self.expected == count
+                && records
+                    .iter()
+                    .all(|(id, _)| !self.records.iter().any(|(seen, _)| seen == id));
+            if !continues {
+                self.scan = Some(scan);
+                self.expected = count;
+                self.records.clear();
+            }
         } else if self.scan != Some(scan) {
             *self = Self::default();
             return records.iter().all(|(_, c)| c.is_none()).then(Vec::new);
@@ -143,6 +151,43 @@ impl Frame {
         let contacts = self.records.iter().filter_map(|(_, c)| *c).collect();
         *self = Self::default();
         Some(contacts)
+    }
+}
+
+/// Descriptors that put an unsigned maximum in a too-short item read back negative.
+pub fn logical_range(min: i32, max: i32, bits: u16) -> (i32, i32) {
+    if max >= min {
+        return (min, max);
+    }
+    let mask = if (1..32).contains(&bits) { (1u32 << bits) - 1 } else { u32::MAX >> 1 };
+    let max = (max as u32 & mask) as i32;
+    if max > min.max(0) { (min.max(0), max) } else { (0, mask as i32) }
+}
+
+/// Why Windows' own three-finger gestures still act, or None when both are Nothing.
+/// The basic choice is authoritative; only Custom (an unknown value) defers to the advanced mappings.
+pub fn windows_gesture_conflict(
+    slide: Option<u32>,
+    tap: Option<u32>,
+    advanced: [Option<u32>; 5],
+) -> Option<&'static str> {
+    // Missing global values use Windows defaults, which enable gestures.
+    let custom_off = |mappings: &[Option<u32>]| mappings.iter().all(|value| *value == Some(0));
+    let slide_on = match slide {
+        Some(0) => false,
+        None | Some(1..=3) => true,
+        Some(_) => !custom_off(&advanced[..4]),
+    };
+    let tap_on = match tap {
+        Some(0) => false,
+        None | Some(1..=4) => true,
+        Some(_) => !custom_off(&advanced[4..]),
+    };
+    match (slide_on, tap_on) {
+        (true, true) => Some("three-finger swipes and taps are on"),
+        (true, false) => Some("three-finger swipes are on"),
+        (false, true) => Some("three-finger taps are on"),
+        (false, false) => None,
     }
 }
 
@@ -261,6 +306,56 @@ mod tests {
         assert_eq!(f.push(1, 3, &[(0, Some(c[0])), (1, Some(c[1]))]), None);
         assert_eq!(f.push(1, 0, &[(2, Some(c[2])), (0, None)]), Some(c));
         assert_eq!(f.push(2, 1, &[(0, None), (0, None)]), Some(vec![]));
+    }
+    #[test]
+    fn per_contact_reports_with_a_repeated_count_complete_one_frame() {
+        let mut f = Frame::default();
+        let c = hand(3, 0.0);
+        assert_eq!(f.push(7, 3, &[(0, Some(c[0]))]), None);
+        assert_eq!(f.push(7, 3, &[(1, Some(c[1]))]), None);
+        assert_eq!(f.push(7, 3, &[(2, Some(c[2]))]), Some(c.clone()));
+        // A repeated id or a new scan starts the next frame instead of joining a stale one.
+        assert_eq!(f.push(8, 3, &[(0, Some(c[0]))]), None);
+        assert_eq!(f.push(8, 3, &[(0, Some(c[0]))]), None);
+        assert_eq!(f.push(9, 2, &[(1, Some(c[1]))]), None);
+        assert_eq!(f.push(9, 2, &[(2, None)]), Some(vec![c[1]]));
+        // Per-contact count-first frames (count only on the first report) also complete.
+        assert_eq!(f.push(10, 3, &[(0, Some(c[0]))]), None);
+        assert_eq!(f.push(10, 0, &[(1, Some(c[1]))]), None);
+        assert_eq!(f.push(10, 0, &[(2, Some(c[2]))]), Some(c.clone()));
+        let mut g = Gesture::default();
+        assert!(g.update(&c, 0).began);
+    }
+    #[test]
+    fn parallel_reports_skip_unused_zero_slots() {
+        let mut f = Frame::default();
+        let c = hand(3, 0.0);
+        let mut slots: Vec<_> = c.iter().map(|c| (c.id, Some(*c))).collect();
+        slots.extend([(0, None), (0, None)]);
+        assert_eq!(f.push(1, 3, &slots), Some(c));
+    }
+    #[test]
+    fn negative_logical_maximum_reads_as_unsigned() {
+        assert_eq!(logical_range(0, 4095, 12), (0, 4095));
+        assert_eq!(logical_range(0, -1, 16), (0, 0xFFFF));
+        assert_eq!(logical_range(0, -2, 12), (0, 0xFFE));
+        assert_eq!(logical_range(-100, 100, 16), (-100, 100));
+        assert_eq!(logical_range(0, -1, 32), (0, i32::MAX));
+    }
+    #[test]
+    fn basic_nothing_wins_over_stale_advanced_mappings() {
+        let none = [Some(0); 5];
+        let stale = [Some(5), Some(6), Some(7), Some(8), Some(2)];
+        assert_eq!(windows_gesture_conflict(Some(0), Some(0), none), None);
+        assert_eq!(windows_gesture_conflict(Some(0), Some(0), stale), None);
+        assert_eq!(windows_gesture_conflict(Some(0), Some(0), [None; 5]), None);
+        assert!(windows_gesture_conflict(None, Some(0), none).is_some());
+        assert!(windows_gesture_conflict(Some(2), Some(0), none).is_some());
+        assert_eq!(windows_gesture_conflict(Some(0), Some(1), none), Some("three-finger taps are on"));
+        // Custom choices defer to the advanced mappings, which must all exist and be Nothing.
+        assert_eq!(windows_gesture_conflict(Some(0xFFFF), Some(0xFFFF), none), None);
+        assert!(windows_gesture_conflict(Some(0xFFFF), Some(0), stale).is_some());
+        assert!(windows_gesture_conflict(Some(0xFFFF), Some(0), [None; 5]).is_some());
     }
     #[test]
     fn hybrid_frames_include_lift_records_and_ignore_zero_continuations() {
