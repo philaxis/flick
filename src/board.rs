@@ -1084,7 +1084,10 @@ impl Board {
             self.motion.frames += 1;
             self.motion.drawing += took;
             self.motion.slowest = self.motion.slowest.max(took);
-            debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing", self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len());
+            debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}",
+                self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len(),
+                self.motion.rest.values().map(|r| r.0.abs().max(r.1.abs())).fold(0.0, f32::max), hand.along, hand.across,
+                self.motion.hand.values().next());
         }
         if !moving && !crate::input::holding() {
             debug_log!("board: motion settled after {} frames, drawing {:.2} ms a frame on average and {:.2} at most",
