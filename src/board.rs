@@ -2845,10 +2845,16 @@ impl Board {
         let over = dragging && contains(&grow(&section.part, 14.0 * s), self.cursor.0, self.cursor.1);
         let part = section.part;
         let (w, _) = size(&part);
-        let floor = rect(part.left + w * 0.12, part.bottom - 10.0 * s, w * 0.76, 6.0 * s);
-        p.glow(glow, &floor, 70.0 * s, if over { 0.55 } else if dragging { 0.30 } else { 0.13 });
-        p.fill(&part, 16.0 * s, colour(if over { 0.075 } else if dragging { 0.04 } else { 0.016 }));
-        p.sheen(&part, 16.0 * s, if over { 0.05 } else { 0.02 });
+        // Its windows have their own glow; an empty place has a pool of it.
+        let empty = !self.tiles.iter().any(|tile| contains(&part, centre(&tile.frame).0, centre(&tile.frame).1)) && section.more.is_none();
+        if empty || dragging {
+            let floor = rect(part.left + w * 0.12, part.bottom - 10.0 * s, w * 0.76, 6.0 * s);
+            p.glow(glow, &floor, 70.0 * s, if over { 0.55 } else if dragging { 0.30 } else { 0.13 });
+        }
+        if dragging {
+            p.fill(&part, 16.0 * s, colour(if over { 0.075 } else { 0.035 }));
+            p.sheen(&part, 16.0 * s, if over { 0.05 } else { 0.02 });
+        }
     }
 
     /// Draws with everything moved as `place` says, the target having no
