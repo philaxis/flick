@@ -1033,7 +1033,6 @@ fn raw_mouse_input(raw: &RAWINPUT) {
     };
     if dx != 0 || dy != 0 {
         with_settings(|s| {
-            let (dx, dy) = directed((dx, dy), s.mouse_reverse);
             travel(s, dx, dy);
             false
         });
@@ -1053,7 +1052,7 @@ fn touchpad_event(event: crate::touchpad::Event) {
             let (x, y) = (rest.0 + delta.0 * s.step_x as f64, rest.1 + delta.1 * s.step_y as f64);
             let (dx, dy) = (x as i32, y as i32);
             TOUCHPAD_REST.set((x - dx as f64, y - dy as f64));
-            if dx != 0 || dy != 0 { travel(s, dx, dy); }
+            if dx != 0 || dy != 0 { advance(s, dx, dy); }
             if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
         }
         false
@@ -1067,7 +1066,19 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-/// Adds mouse travel and emits steps.
+/// Which way the desktops go for a hand moving by `delta`: against it when
+/// reversed, as if pushing the screen, or with it.
+fn directed<T: std::ops::Neg<Output = T>>(delta: (T, T), reverse: bool) -> (T, T) {
+    if reverse { (-delta.0, -delta.1) } else { delta }
+}
+
+/// Mouse travel, the other way round with `mouse_reverse`.
+fn travel(s: &Settings, dx: i32, dy: i32) {
+    let (dx, dy) = directed((dx, dy), s.mouse_reverse);
+    advance(s, dx, dy);
+}
+
+/// Adds travel and emits steps.
 ///
 /// Each way on its own (`Plane`): one cell per `step_x` of travel as far as
 /// the hand goes, and one row each time up and down travel gathers `step_y`
@@ -1081,13 +1092,7 @@ unsafe extern "system" fn raw_window_proc(hwnd: HWND, message: u32, wparam: WPAR
 /// through every cell it passed. Coming to another row begins a new stretch
 /// along the row, from the cell the app lands on there, with what the hand
 /// went towards the next cell kept.
-/// Which way the desktops go for a hand moving by `delta`: against it when
-/// reversed, as if pushing the screen, or with it.
-fn directed<T: std::ops::Neg<Output = T>>(delta: (T, T), reverse: bool) -> (T, T) {
-    if reverse { (-delta.0, -delta.1) } else { delta }
-}
-
-fn travel(s: &Settings, dx: i32, dy: i32) {
+fn advance(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
