@@ -55,8 +55,7 @@ const GAP: f32 = 7.0;
 const PAD: f32 = 20.0;
 /// Room under the grid for the shelf name.
 const TITLE_H: f32 = 26.0;
-/// Time constants (seconds) of the exponential easing: of a jump in where
-/// the grid is drawn, and of the fading in and out.
+/// Settling and fade time scales, in seconds.
 const SETTLE_TAU: f32 = 0.045;
 const FADE_TAU: f32 = 0.025;
 /// How far past the end of its row the highlight is pushed, in cells.
@@ -98,6 +97,25 @@ impl View {
     }
 }
 
+/// A critically damped correction to a jump in the goal. The hand itself
+/// is not filtered; only a change of reference has anything to settle.
+#[derive(Clone, Copy, Default)]
+struct Spring {
+    offset: f32,
+    velocity: f32,
+}
+
+impl Spring {
+    fn advance(&mut self, dt: f32) {
+        // Keep the same total lag as the former exponential correction.
+        let omega = 2.0 / SETTLE_TAU;
+        let carry = self.velocity + omega * self.offset;
+        let keep = (-omega * dt).exp();
+        self.offset = (self.offset + carry * dt) * keep;
+        self.velocity = (self.velocity - omega * carry * dt) * keep;
+    }
+}
+
 /// Where the grid is drawn: the highlight stays in the middle and the grid
 /// moves under it. The current row follows the hand sideways; the others
 /// stand with the cell a move up or down lands on (`View::anchors`) in line
@@ -118,8 +136,8 @@ struct Camera {
     /// Where the first row is drawn, in rows below the highlight, likewise.
     goal_y: f32,
     /// What is left to ease away of jumps in the goal.
-    rest_x: Vec<f32>,
-    rest_y: f32,
+    rest_x: Vec<Spring>,
+    rest_y: Spring,
     /// Jumps put by in frames where what the goal is counted from changed,
     /// to be eased from the next frame on: a frame drawn while the app's
     /// view and the count of the hand disagree is taken back in the next,
@@ -152,7 +170,7 @@ impl Camera {
         let was = View { cur: Some(from), ..view.clone() };
         let (goal_x, goal_y) = Camera::goals(&was, (0.0, 0.0));
         let zeros = vec![0.0; goal_x.len()];
-        Camera { goal_x, goal_y, rest_x: zeros.clone(), rest_y: 0.0, put_x: zeros.clone(), put_y: 0.0, pace_x: zeros, pace_y: 0.0, counted_from: None }
+        Camera { rest_x: vec![Spring::default(); goal_x.len()], goal_x, goal_y, put_x: zeros.clone(), pace_x: zeros, ..Default::default() }
     }
 
     /// One frame, `dt` seconds after the last. `counted_from` changes
@@ -164,16 +182,31 @@ impl Camera {
         let late = dt > refresh * 2.0;
         if goal_x.len() != self.goal_x.len() {
             // Rows came or went: nothing to ease from.
-            self.rest_x = vec![0.0; goal_x.len()];
+            self.rest_x = vec![Spring::default(); goal_x.len()];
             self.put_x = vec![0.0; goal_x.len()];
             self.pace_x = vec![0.0; goal_x.len()];
-            (self.rest_y, self.put_y, self.pace_y) = (0.0, 0.0, 0.0);
+            (self.rest_y, self.put_y, self.pace_y) = (Spring::default(), 0.0, 0.0);
         } else {
+            if !late && self.counted_from == Some(counted_from) && dt > 0.0 {
+                // The correction takes over speed lost when the goal is rebased.
+                for r in 0..goal_x.len() {
+                    let next = (goal_x[r] - self.goal_x[r]) / dt;
+                    if self.put_x[r] != 0.0 {
+                        self.rest_x[r].velocity += self.pace_x[r] - next;
+                    }
+                    self.pace_x[r] = next;
+                }
+                let next = (goal_y - self.goal_y) / dt;
+                if self.put_y != 0.0 {
+                    self.rest_y.velocity += self.pace_y - next;
+                }
+                self.pace_y = next;
+            }
             if late || self.counted_from == Some(counted_from) {
                 for (rest, put) in self.rest_x.iter_mut().zip(&mut self.put_x) {
-                    *rest += std::mem::take(put);
+                    rest.offset += std::mem::take(put);
                 }
-                self.rest_y += std::mem::take(&mut self.put_y);
+                self.rest_y.offset += std::mem::take(&mut self.put_y);
             }
             if late {
                 self.pace_x.fill(0.0);
@@ -186,17 +219,11 @@ impl Camera {
                     *put += before + pace * step - now;
                 }
                 self.put_y += self.goal_y + self.pace_y * step - goal_y;
-            } else if dt > 0.0 {
-                for ((pace, before), now) in self.pace_x.iter_mut().zip(&self.goal_x).zip(&goal_x) {
-                    *pace = (now - before) / dt;
-                }
-                self.pace_y = (goal_y - self.goal_y) / dt;
             }
-            let keep = (-step / SETTLE_TAU).exp();
             for rest in &mut self.rest_x {
-                *rest *= keep;
+                rest.advance(step);
             }
-            self.rest_y *= keep;
+            self.rest_y.advance(step);
         }
         (self.goal_x, self.goal_y, self.counted_from) = (goal_x, goal_y, Some(counted_from));
     }
@@ -204,12 +231,12 @@ impl Camera {
     /// Where the first cell of `row` is drawn, in cells right of the highlight.
     fn x(&self, row: usize) -> f32 {
         let at = |v: &Vec<f32>| v.get(row).copied().unwrap_or(0.0);
-        at(&self.goal_x) + at(&self.rest_x) + at(&self.put_x)
+        at(&self.goal_x) + self.rest_x.get(row).map_or(0.0, |rest| rest.offset) + at(&self.put_x)
     }
 
     /// Where the first row is drawn, in rows below the highlight.
     fn y(&self) -> f32 {
-        self.goal_y + self.rest_y + self.put_y
+        self.goal_y + self.rest_y.offset + self.put_y
     }
 }
 
@@ -551,7 +578,7 @@ impl Overlay {
         self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
         self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt, self.pacer.period.as_secs_f32());
         #[cfg(feature = "debug-log")]
-        if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.abs() > 0.001 {
+        if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.offset.abs() > 0.001 {
             // Frame by frame where the grid is drawn while it follows the hand.
             log_frame(&self.view, &self.camera, hand);
         }
@@ -987,6 +1014,107 @@ impl Minimap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spring_settles_without_overshoot_and_keeps_its_velocity() {
+        for hz in [30.0, 60.0, 144.0] {
+            for offset in [-2.0, -0.88, 0.88, 2.0] {
+                let mut spring = Spring { offset, velocity: 0.0 };
+                let mut last = offset.abs();
+                for _ in 0..hz as usize {
+                    spring.advance(1.0 / hz);
+                    assert!(spring.offset * offset >= 0.0, "the correction overshot");
+                    assert!(spring.offset.abs() <= last, "the correction went backwards");
+                    last = spring.offset.abs();
+                }
+                assert!(last < 0.0001);
+            }
+        }
+        let mut spring = Spring { offset: 0.88, velocity: -0.2 };
+        let velocity = spring.velocity;
+        spring.offset += 1.0;
+        spring.advance(0.0);
+        assert_eq!(spring.velocity, velocity, "a new target changed speed instantly");
+        spring.advance(0.0000001);
+        let omega = 2.0 / SETTLE_TAU;
+        let acceleration = (spring.velocity - velocity) / 0.0000001;
+        assert!((acceleration - (-2.0 * omega * velocity - omega * omega * 1.88)).abs() < 1.0,
+            "the spring is not critically damped");
+    }
+
+    #[test]
+    fn a_spring_is_independent_of_frame_subdivision() {
+        for (offset, velocity) in [(0.88, 0.0), (-1.0, 2.0), (0.3, -0.5)] {
+            let mut whole = Spring { offset, velocity };
+            whole.advance(0.1);
+            for pieces in [2, 6, 14, 30] {
+                let mut split = Spring { offset, velocity };
+                for _ in 0..pieces {
+                    split.advance(0.1 / pieces as f32);
+                }
+                assert!((split.offset - whole.offset).abs() < 0.00001);
+                assert!((split.velocity - whole.velocity).abs() < 0.00001);
+            }
+        }
+    }
+
+    #[test]
+    fn a_detent_arrival_keeps_the_camera_position_and_velocity() {
+        for hz in [30.0, 60.0, 144.0] {
+            let dt = 1.0 / hz;
+            let mut view = View {
+                rows: vec![vec![CellView::default()]; 4],
+                cur: Some(Pos { row: 1, col: 0 }),
+                ..Default::default()
+            };
+            let mut detent = crate::slide::Detent::new();
+            let mut camera = Camera::default();
+            camera.advance(&view, (0.0, 0.0), (0, 0), dt, dt);
+            for travel in [390, 9] {
+                assert!(!detent.travel(travel, 400));
+                camera.advance(&view, (0.0, detent.lean(400)), (0, 0), dt, dt);
+            }
+            let before = camera.y();
+            let velocity = camera.pace_y + camera.rest_y.velocity;
+            assert!(detent.travel(1, 400));
+            let across = detent.cell() as f32 + detent.lean(400);
+            camera.advance(&view, (0.0, across), (0, 1), 0.0, dt);
+            assert!((camera.y() - before).abs() < 0.000001);
+            assert_eq!(camera.pace_y + camera.rest_y.velocity, velocity);
+            camera.advance(&view, (0.0, across), (0, 1), 0.0000001, dt);
+            assert!((camera.pace_y + camera.rest_y.velocity - velocity).abs() < 0.001,
+                "settling began with a speed discontinuity at {hz} Hz");
+            // The app changes row, then the hand's reference catches up.
+            view.cur = Some(Pos { row: 2, col: 0 });
+            for (hand, reference) in [(across, (1, 1)), (detent.lean(400), (1, 2))] {
+                let before = camera.y();
+                let velocity = camera.pace_y + camera.rest_y.velocity;
+                camera.advance(&view, (0.0, hand), reference, 0.0, dt);
+                assert!((camera.y() - before).abs() < 0.000001);
+                assert_eq!(camera.pace_y + camera.rest_y.velocity, velocity);
+            }
+            for _ in 0..hz as usize {
+                camera.advance(&view, (0.0, 0.0), (1, 2), dt, dt);
+                assert!(camera.y() >= -2.000001, "row arrival overshot");
+            }
+            assert!((camera.y() + 2.0).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn ordinary_hand_motion_is_not_filtered() {
+        let view = View {
+            rows: vec![vec![CellView::default(); 3]; 3],
+            cur: Some(Pos { row: 1, col: 1 }),
+            ..Default::default()
+        };
+        let mut camera = Camera::default();
+        for (along, across) in [(0.0, 0.0), (0.1, 0.01), (0.2, 0.02), (0.2, 0.02), (-0.2, -0.02)] {
+            camera.advance(&view, (along, across), (0, 0), 1.0 / 60.0, 1.0 / 60.0);
+            assert!((camera.x(1) + 1.0 + along).abs() < 0.000001);
+            assert!((camera.y() + 1.0 + across).abs() < 0.000001);
+        }
+    }
 
     #[cfg(windows)]
     #[test]
