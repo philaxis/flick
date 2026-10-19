@@ -847,7 +847,6 @@ impl Settings {
         }
 
         // Ways to make motion look smoother; both start off.
-        let line = |i: f32| Rect { top: row(i).top, bottom: row(i).bottom, ..inner(i) };
         p.text(tr("Experimental · smoother-looking motion", "실험 · 더 부드럽게 보이는 움직임", "实验 · 看起来更顺滑的运动"), &fonts.title, &row(EXPERIMENT_ROW), white(0.92));
         label(EXPERIMENT_ROW + 1.0, tr("Motion blur trails on fast moves", "빠른 이동에 모션 블러 잔상", "快速移动时的动态模糊残影"));
         self.draw_switch(&p, &layout.blur, view.motion_blur, Hit::Blur);
@@ -861,7 +860,7 @@ impl Settings {
         p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle.",
             "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다.",
             "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。"),
-            &fonts.notice, &Rect { bottom: line(EXPERIMENT_ROW + 3.0).top + ROWS.1 * s, ..line(EXPERIMENT_ROW + 3.0) }, white(0.62));
+            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 3.0).top + ROWS.1 * s, ..row(EXPERIMENT_ROW + 3.0) }, white(0.62));
 
         let hot = self.hover == Hit::File;
         p.text(tr("More settings: config.toml", "추가 설정: config.toml", "更多设置：config.toml"), &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));

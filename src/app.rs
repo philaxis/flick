@@ -1842,6 +1842,7 @@ impl App {
         crate::transition_curve::configure(config.experimental.commit_speed);
         crate::composition::configure_blur(config.experimental.motion_blur);
         crate::composition::configure(config.compositor);
+        self.glide.warm();
         crate::touchpad::poll(config.touchpad.three_finger);
         input::install(self.hwnd, triggers, &config);
         self.register_hotkeys(config.hotkeys);

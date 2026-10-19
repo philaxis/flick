@@ -25,6 +25,9 @@ struct Scenes { hosts: HashMap<isize,Scene>, thumbs: HashMap<isize,Thumbnail>,
     /// Each source's thumbnail size, kept while its window keeps the size it had (`GetWindowRect`).
     sizes: HashMap<isize,(SIZE,SIZE)> }
 thread_local! { static SCENES: RefCell<Scenes> = RefCell::default(); }
+// One device per thread outlives its hosts: the normal view's windows go with each hold, and a
+// new D3D/D2D/DComp device costs about two refreshes before the first frame.
+thread_local! { static DEVICE: RefCell<Option<IDCompositionDesktopDevice>> = RefCell::default(); }
 
 static BLUR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn configure_blur(on: bool) { BLUR.store(on, std::sync::atomic::Ordering::Relaxed); }
@@ -77,14 +80,23 @@ fn mode() -> u8 { *MODE.get_or_init(|| resolve(crate::config::Compositor::Auto))
 pub fn follow_enabled() -> bool { mode() >= 1 && !blur() }
 pub fn board_enabled() -> bool { mode() == 2 }
 
+unsafe fn device() -> Result<IDCompositionDesktopDevice> {
+    if let Some(device)=DEVICE.with(|d|d.borrow().clone()) {return Ok(device);}
+    let mut gpu=None;
+    D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE(0), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut gpu), None, None)?;
+    let dxgi=gpu.unwrap().cast::<IDXGIDevice>()?;
+    let factory: ID2D1Factory1=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,None)?;
+    let d2d=factory.CreateDevice(&dxgi)?;
+    let device: IDCompositionDesktopDevice=DCompositionCreateDevice3(&d2d)?;
+    DEVICE.with(|d|*d.borrow_mut()=Some(device.clone()));
+    Ok(device)
+}
+/// Creates this thread's device ahead of the first hold.
+pub fn warm() { if follow_enabled() { if let Err(e)=unsafe {device()} {crate::app::log(&format!("composition device failed: {e}"));} } }
+
 impl Scene {
     unsafe fn new(hwnd: HWND) -> Result<Self> {
-        let mut gpu=None;
-        D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE(0), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut gpu), None, None)?;
-        let dxgi=gpu.unwrap().cast::<IDXGIDevice>()?;
-        let factory: ID2D1Factory1=D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,None)?;
-        let d2d=factory.CreateDevice(&dxgi)?;
-        let device: IDCompositionDesktopDevice=DCompositionCreateDevice3(&d2d)?;
+        let device=device()?;
         let target=device.CreateTargetForHwnd(hwnd,true)?;
         let root=device.CreateVisual()?;
         target.SetRoot(&root)?;
@@ -196,12 +208,13 @@ pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4])
 }
 
 pub fn commit(hwnd: HWND) -> Result<()> {
-    SCENES.with(|scenes| {let scenes=scenes.borrow();match scenes.hosts.get(&hwnd.0) {Some(scene)=>unsafe {scene.device.Commit()},None=>Ok(())}})
+    let done=SCENES.with(|scenes| {let scenes=scenes.borrow();match scenes.hosts.get(&hwnd.0) {Some(scene)=>unsafe {scene.device.Commit()},None=>Ok(())}});
+    // A lost device is made anew for the next host.
+    if done.is_err() {DEVICE.with(|d|*d.borrow_mut()=None);}
+    done
 }
 pub fn forget(hwnd: HWND) {
-    SCENES.with(|scenes| {let mut scenes=scenes.borrow_mut();scenes.thumbs.retain(|_,t|t.host!=hwnd.0);scenes.hosts.remove(&hwnd.0);
-        // Closed windows' handles can be reused; forget sizes with the host.
-        if scenes.hosts.is_empty() {scenes.sizes.clear();}});
+    SCENES.with(|scenes| {let mut scenes=scenes.borrow_mut();scenes.thumbs.retain(|_,t|t.host!=hwnd.0);scenes.hosts.remove(&hwnd.0);});
 }
 
 /// Begin/EndDraw pairs ensure D2D pixels and thumbnail transforms share a commit.

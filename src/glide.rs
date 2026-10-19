@@ -146,6 +146,8 @@ enum Request {
     Rebase(Scene),
     Arrived(u32),
     Cancel,
+    /// The config is read: make the compositor's device before the first hold.
+    Warm,
 }
 
 /// The desktop a hold settled on, once decided: hold << 32 | row << 16 |
@@ -210,6 +212,10 @@ impl Glide {
 
     pub fn cancel(&self) {
         let _ = self.requests.send(Request::Cancel);
+    }
+
+    pub fn warm(&self) {
+        let _ = self.requests.send(Request::Warm);
     }
 }
 
@@ -803,6 +809,7 @@ impl View {
                 }
             }
             Request::Cancel => self.finish(),
+            Request::Warm => crate::composition::warm(),
         }
     }
 
