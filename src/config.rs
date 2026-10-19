@@ -37,6 +37,12 @@ hotkeys = true
 # desktops around while it follows the hand, so it is off unless turned on.
 minimap = false
 
+# How window pictures move. "auto": the normal view places them at fractional pixels in one
+# DirectComposition commit on Windows 11 22H2..25H2 builds, falling back to the public thumbnails;
+# the board keeps the public path. "off": public thumbnails everywhere. "all": the board too
+# (still experimental). Takes effect when Flick starts.
+compositor = "auto"
+
 # Lets Windows compress or page out the memory of apps in a shelf not visited for this long (minutes).
 # Coming back may stutter for a moment. 0 turns it off.
 sleep_after_minutes = 0
@@ -104,19 +110,27 @@ pub struct Config {
     pub sleep_after_minutes: u32,
     /// The minimap while moving (`overlay`).
     pub minimap: bool,
+    /// Which views place window pictures through `composition`.
+    pub compositor: Compositor,
     pub mouse: Mouse,
     pub touchpad: Touchpad,
     pub experimental: Experimental,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compositor { #[default] Auto, Off, All }
+
 /// Opt-in visual experiments never change the distance or commit rules.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Experimental { pub commit_speed: CommitSpeed, pub motion_blur: bool }
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommitSpeed { #[default] Default, Gentle, Slow }
 impl CommitSpeed {
+    /// As written in config.toml.
+    pub fn name(self) -> &'static str { match self { Self::Default=>"default", Self::Gentle=>"gentle", Self::Slow=>"slow" } }
     pub fn omega(self, vertical: bool) -> f64 {
         match (self, vertical) { (Self::Default,false)=>35.0, (Self::Default,true)=>32.0,
             (Self::Gentle,false)=>28.0, (Self::Gentle,true)=>25.0, (Self::Slow,_)=>24.0 }
@@ -166,6 +180,7 @@ impl Default for Config {
             hotkeys: true,
             sleep_after_minutes: 0,
             minimap: false,
+            compositor: Compositor::Auto,
             mouse: Mouse::default(),
             touchpad: Touchpad::default(),
             experimental: Experimental::default(),
@@ -398,6 +413,8 @@ mod tests {
         let opt: Config=toml::from_str("[experimental]\ncommit_speed='gentle'\nmotion_blur=true").unwrap();
         assert_eq!(opt.experimental.commit_speed.omega(true),25.0);assert!(opt.experimental.motion_blur);
         assert!(toml::from_str::<Config>("[experimental]\ncommit_speed='unknown'").is_err());
+        assert_eq!(default.compositor,Compositor::Auto);
+        assert_eq!(toml::from_str::<Config>("compositor='off'").unwrap().compositor,Compositor::Off);
     }
     #[test]
     fn new_notches_default_to_forty_but_saved_off_stays_off() {

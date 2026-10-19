@@ -251,7 +251,7 @@ struct Thumb {
 
 impl Thumb {
     fn new(screen: &Screen, source_window: HWND, at: (i32, i32), source: Option<RECT>) -> Option<Thumb> {
-        let id = unsafe { crate::composition::register(screen.hwnd, source_window) }.ok()?;
+        let id = unsafe { crate::composition::register(screen.hwnd, source_window, crate::composition::follow_enabled()) }.ok()?;
         // Drawn one to one from the corner of the frame; its size is the
         // source's, which can be a pixel off the frame's.
         let size = match source {
@@ -1104,7 +1104,8 @@ impl View {
         session.farthest_y = session.farthest_y.max(strip.y.abs());
         let mut moves = 0;
         let drawing = Instant::now();
-        if focus_changed || session.shown.as_ref() != Some(&strip) {
+        // A blur trail left from the last move is drawn away once it stops.
+        if focus_changed || session.shown.as_ref() != Some(&strip) || crate::composition::trails_shown() {
             moves = draw(session, &strip);
             session.stats.updates += moves;
             session.shown = Some(strip.clone());

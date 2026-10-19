@@ -134,7 +134,7 @@ pub fn place(plate: &Rect, at: (f32, f32), size: f32, spacing: f32) -> Place {
     let (px, py) = pitch(plate, spacing);
     let (ox, oy) = (cx + at.0 * px, cy + at.1 * py);
     #[cfg(windows)]
-    let precise = crate::composition::enabled();
+    let precise = crate::composition::board_enabled();
     #[cfg(not(windows))]
     let precise = false;
     let pixel = |v: f32| if precise { v } else { v.round() };

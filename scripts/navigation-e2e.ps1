@@ -20,9 +20,9 @@ $logStart = if (Test-Path "$cfg\log.txt") { (Get-Content "$cfg\log.txt").Count }
 try {
     & $drive navigation stage $out
     if ($LASTEXITCODE) { throw 'stage failed' }
-    if ($Mode -in @('matrix','final-matrix','gpu')) {
+    if ($Mode -in @('matrix','final-matrix','gpu','final')) {
         $probeExit = 0
-        $variants = if ($Mode -eq 'gpu') { @('baseline-recheck','timed-recheck','composition','timed','blur') } elseif ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
+        $variants = if ($Mode -eq 'final') { @('timed','default','composition') } elseif ($Mode -eq 'gpu') { @('baseline-recheck','timed-recheck','composition','timed','blur') } elseif ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
         foreach ($variant in $variants) {
             Write-Output "VARIANT=$variant"
             Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE,Env:FLICK_PROBE_CASES -ErrorAction SilentlyContinue
@@ -31,7 +31,9 @@ try {
             $exe = $flick
             if ($variant -in @('baseline','baseline-recheck')) { $exe = Join-Path (Get-Location) 'baseline.exe' }
             if ($variant -eq 'blur') { $env:FLICK_PROBE_BLUR='1' }
-            if ($variant -eq 'composition') { $env:FLICK_COMPOSITION = '1' }
+            # The normal view is composed by default now; earlier variants measured the public path.
+            $env:FLICK_COMPOSITION = if ($variant -eq 'composition') { '1' } elseif ($variant -eq 'default') { $null } else { '0' }
+            if ($null -eq $env:FLICK_COMPOSITION) { Remove-Item Env:FLICK_COMPOSITION -ErrorAction SilentlyContinue }
             if ($variant -in @('gentle','slow')) { $env:FLICK_PROBE_SPEED=$variant; $env:FLICK_SHORT_PROBE='1' }
             $folder = Join-Path $out $variant
             New-Item -ItemType Directory -Force $folder | Out-Null

@@ -1560,6 +1560,8 @@ impl Board {
                 self.motion.slowest.as_secs_f32() * 1000.0);
             (self.motion.frames, self.motion.drawing, self.motion.slowest) = (0, Duration::ZERO, Duration::ZERO);
             self.stop_motion();
+            // Clear any blur trail of the last moving frame.
+            if crate::composition::trails_shown() { self.update_thumbnails(); }
             if was_strip {
                 self.settle_strip(now);
             }
@@ -2051,7 +2053,7 @@ impl Board {
             let given = strip::budget(&wanted.iter().map(Vec::len).collect::<Vec<_>>(), strip::MAX_THUMBS);
             for ((cell, hwnds), given) in self.strip_cells.iter().zip(&wanted).zip(given) {
                 for hwnd in &hwnds[..given] {
-                    if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, *hwnd) } {
+                    if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, *hwnd, crate::composition::board_enabled()) } {
                         self.strip_thumbs.push((cell.id.clone(), hwnd.0, thumb));
                     }
                 }
@@ -2060,7 +2062,7 @@ impl Board {
         let mut wanted: Vec<(HWND, bool)> = self.tile_windows().into_iter().map(|(w, everywhere)| (w.hwnd, everywhere)).collect();
         wanted.sort_by_key(|(_, everywhere)| *everywhere);
         for (hwnd, _) in wanted {
-            if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, hwnd) } {
+            if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, hwnd, crate::composition::board_enabled()) } {
                 self.thumbs.push((hwnd.0, thumb));
             }
         }
@@ -2287,7 +2289,7 @@ impl Board {
             let (_, old) = self.thumbs.remove(i);
             unsafe {
                 let _ = crate::composition::unregister(old);
-                if let Ok(thumb) = crate::composition::register(self.hwnd, HWND(hwnd)) {
+                if let Ok(thumb) = crate::composition::register(self.hwnd, HWND(hwnd), crate::composition::board_enabled()) {
                     self.thumbs.push((hwnd, thumb));
                 }
             }
@@ -2659,7 +2661,7 @@ impl Board {
 
     /// Draws the board into the canvas; `None` when there is no canvas.
     fn draw_to_canvas(&mut self) -> Option<Result<()>> {
-        if self.open && crate::composition::enabled() {
+        if self.open && crate::composition::board_enabled() {
             if self.window_target.is_some() || self.canvas.is_some() { self.discard_target(); }
             match unsafe { crate::composition::begin_paint(self.hwnd, self.size) } {
                 Ok((surface, target, offset)) => {
@@ -2703,7 +2705,7 @@ impl Board {
     }
 
     fn present_canvas(&mut self) {
-        if self.window_target.is_none() && !crate::composition::enabled() {
+        if self.window_target.is_none() && !crate::composition::board_enabled() {
             if let Some(canvas) = &self.canvas {
                 let (w, h) = canvas.dib.size;
                 unsafe {

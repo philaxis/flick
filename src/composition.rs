@@ -26,35 +26,54 @@ thread_local! { static SCENES: RefCell<Scenes> = RefCell::default(); }
 
 static BLUR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn configure_blur(on: bool) { BLUR.store(on, std::sync::atomic::Ordering::Relaxed); }
-struct Trails { ids: [isize;2], last: Option<([f32;4], std::time::Instant)> }
+pub fn blur() -> bool { BLUR.load(std::sync::atomic::Ordering::Relaxed) }
+struct Trails { ids: [isize;2], last: Option<([f32;4], std::time::Instant)>, shown: bool }
 thread_local! { static TRAILS: RefCell<HashMap<isize, Trails>> = RefCell::default(); }
-pub fn needs_update(id: isize) -> bool { enabled() || TRAILS.with(|t|t.borrow().contains_key(&id)) }
+/// Composed thumbnails keep fractional edges their rounded state cannot compare; trails fade each frame.
+pub fn needs_update(id: isize) -> bool {
+    SCENES.with(|s|s.borrow().thumbs.contains_key(&id)) || TRAILS.with(|t|t.borrow().contains_key(&id))
+}
+/// A trail is still on screen: draw once more, even without movement, so it clears.
+pub fn trails_shown() -> bool { TRAILS.with(|t|t.borrow().values().any(|t|t.shown)) }
 
 // A half-refresh shutter, bounded so a late frame cannot leave a huge ghost.
+// Slow drags and settling (under 4 px a frame) get none: a ghost there only blurs text.
 fn trail(previous: [f32;4], current: [f32;4], elapsed: f32) -> (f32,f32) {
     if !(0.001..=0.05).contains(&elapsed) { return (0.0,0.0); }
     let dx=(current[0]+current[2]-previous[0]-previous[2])*0.25;
     let dy=(current[1]+current[3]-previous[1]-previous[3])*0.25;
+    if dx.hypot(dy) < 2.0 { return (0.0,0.0); }
     let scale=(32.0/dx.hypot(dy).max(32.0)).min(1.0);
     (dx*scale,dy*scale)
 }
 
-pub unsafe fn register(destination: HWND, source: HWND) -> Result<isize> {
+/// `composed`: the host shows shared visuals (`follow_enabled`, `board_enabled`).
+pub unsafe fn register(destination: HWND, source: HWND, composed: bool) -> Result<isize> {
     // shortcut: public DWM trails are discrete exposures, use captured textures for a true convolution.
-    if !BLUR.load(std::sync::atomic::Ordering::Relaxed) || enabled() { return register_inner(destination,source); }
-    let id=register_inner(destination,source)?;
+    if !blur() || composed { return register_inner(destination,source,composed); }
+    let id=register_inner(destination,source,false)?;
     // Later registrations overlay the opaque source, softening its contents as well as its edge.
     let a=match DwmRegisterThumbnail(destination,source) {Ok(a)=>a,Err(e)=>{let _=DwmUnregisterThumbnail(id);return Err(e)}};
     let b=match DwmRegisterThumbnail(destination,source) {Ok(b)=>b,Err(e)=>{let _=DwmUnregisterThumbnail(a);let _=DwmUnregisterThumbnail(id);return Err(e)}};
-    TRAILS.with(|t|t.borrow_mut().insert(id,Trails{ids:[a,b],last:None}));
+    TRAILS.with(|t|t.borrow_mut().insert(id,Trails{ids:[a,b],last:None,shown:false}));
     Ok(id)
 }
 
-pub fn enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("FLICK_COMPOSITION").is_some()
-        && crate::vdapi::windows_build().is_some_and(|(build,_)| matches!(build,22621|22631|26100|26200)))
+/// 0: public thumbnails, 1: the normal view composed, 2: the board too. Fixed for the process.
+static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+/// The first config read decides; `FLICK_COMPOSITION` (0 off, otherwise all) overrides it.
+pub fn configure(mode: crate::config::Compositor) { let _ = MODE.set(resolve(mode)); }
+fn resolve(mode: crate::config::Compositor) -> u8 {
+    use crate::config::Compositor;
+    let mode = match std::env::var("FLICK_COMPOSITION").as_deref() { Ok("0")=>Compositor::Off, Ok(_)=>Compositor::All, Err(_)=>mode };
+    // An ABI guard for ordinal 147, not compatibility certification.
+    let supported = crate::vdapi::windows_build().is_some_and(|(build,_)| matches!(build,22621|22631|26100|26200));
+    match mode { Compositor::Off=>0, _ if !supported=>0, Compositor::Auto=>1, Compositor::All=>2 }
 }
+fn mode() -> u8 { *MODE.get_or_init(|| resolve(crate::config::Compositor::Auto)) }
+/// Public trails need public thumbnails, so blur keeps the normal view on them.
+pub fn follow_enabled() -> bool { mode() >= 1 && !blur() }
+pub fn board_enabled() -> bool { mode() == 2 }
 
 impl Scene {
     unsafe fn new(hwnd: HWND) -> Result<Self> {
@@ -71,8 +90,8 @@ impl Scene {
     }
 }
 
-unsafe fn register_inner(destination: HWND, source: HWND) -> Result<isize> {
-    if !enabled() {return DwmRegisterThumbnail(destination,source);}
+unsafe fn register_inner(destination: HWND, source: HWND, composed: bool) -> Result<isize> {
+    if !composed {return DwmRegisterThumbnail(destination,source);}
     let legacy=DwmRegisterThumbnail(destination,source)?;
     let size=match DwmQueryThumbnailSourceSize(legacy) {Ok(size)=>size,Err(e)=>{let _=DwmUnregisterThumbnail(legacy);return Err(e)}};
     let result=SCENES.with(|scenes| -> Result<isize> {
@@ -129,6 +148,7 @@ pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4])
             let now=std::time::Instant::now();
             let (dx,dy)=trails.last.map_or((0.0,0.0),|(last,at)|trail(last,dest,now.duration_since(at).as_secs_f32()));
             trails.last=Some((dest,now));
+            trails.shown=false;
             for (i,id) in trails.ids.iter().enumerate() {
                 let mut ghost=*props;
                 let part=(i+1) as f32/3.0;
@@ -137,7 +157,8 @@ pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4])
                 ghost.rcDestination.top+=y;ghost.rcDestination.bottom+=y;
                 ghost.dwFlags|=DWM_TNP_OPACITY|DWM_TNP_VISIBLE;
                 ghost.opacity=(props.opacity as f32*[0.12,0.06][i]*dx.hypot(dy).min(1.0)) as u8;
-                ghost.fVisible=(props.fVisible.as_bool() && (x!=0 || y!=0) && BLUR.load(std::sync::atomic::Ordering::Relaxed)).into();
+                ghost.fVisible=(props.fVisible.as_bool() && (x!=0 || y!=0) && blur()).into();
+                trails.shown|=ghost.fVisible.as_bool();
                 DwmUpdateThumbnailProperties(*id,&ghost)?;
             }
         }
@@ -173,7 +194,8 @@ pub unsafe fn begin_paint(hwnd: HWND, size: (i32,i32)) -> Result<(IDCompositionS
         if !scenes.hosts.contains_key(&hwnd.0) {scenes.hosts.insert(hwnd.0,Scene::new(hwnd)?);}
         let scene=scenes.hosts.get_mut(&hwnd.0).unwrap();
         if scene.surface.as_ref().map(|s|s.1)!=Some(size) {
-            let surface=scene.device.CreateSurface(size.0 as u32,size.1 as u32,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_PREMULTIPLIED)?;
+            // Opaque like the public board's window target: nothing beneath needs blending.
+            let surface=scene.device.CreateSurface(size.0 as u32,size.1 as u32,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_ALPHA_MODE_IGNORE)?;
             scene.root.SetContent(&surface)?;
             scene.surface=Some((surface,size));
         }
@@ -201,6 +223,8 @@ mod tests {
         assert_eq!(trail(a,b,0.1),(0.0,0.0));
         assert_eq!(trail(a,a,0.016),(0.0,0.0));
         let t=trail(a,[1000.0,0.0,1100.0,100.0],0.016);assert!(t.0.hypot(t.1)<=32.0);
+        // A slow drag (3 px a frame) and a settled frame leave no trail.
+        assert_eq!(trail(a,[3.0,0.0,103.0,100.0],0.016),(0.0,0.0));
     }
     #[test]
     fn cropped_sources_keep_fractional_destination_edges() {

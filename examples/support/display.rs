@@ -194,7 +194,7 @@ pub unsafe fn run(out: &Path, flick: &str) {
     let mut timing=windows::Win32::Graphics::Dwm::DWM_TIMING_INFO {cbSize:std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_TIMING_INFO>() as u32,..Default::default()};
     windows::Win32::Graphics::Dwm::DwmGetCompositionTimingInfo(HWND(0),&mut timing).unwrap();
     let refresh_ticks = timing.qpcRefreshPeriod;
-    std::fs::write(out.join("display-meta.json"),serde_json::json!({"frequency":frequency,"refresh_ticks":refresh_ticks,"composition":std::env::var_os("FLICK_COMPOSITION").is_some(),"capture":"desktop duplication, not panel scanout","width":1920}).to_string()).unwrap();
+    std::fs::write(out.join("display-meta.json"),serde_json::json!({"frequency":frequency,"refresh_ticks":refresh_ticks,"composition":std::env::var("FLICK_COMPOSITION").map_or("auto".to_string(),|v| if v=="0" {"off".into()} else {"all".into()}),"capture":"desktop duplication, not panel scanout","width":1920}).to_string()).unwrap();
     for mode in ["follow","board"] { for kind in ["mouse","ptp"] { for scenario in ["slow","normal","fast","mixed"] {
         if std::env::var_os("FLICK_SHORT_PROBE").is_some() && scenario != "fast" && scenario != "mixed" { continue; }
         super::vdapi::switch_desktop(home).unwrap(); wait(500);
