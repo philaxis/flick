@@ -199,6 +199,7 @@ pub unsafe fn run(out: &Path, flick: &str) {
         if std::env::var_os("FLICK_SHORT_PROBE").is_some() && scenario != "fast" && scenario != "mixed" { continue; }
         super::vdapi::switch_desktop(home).unwrap(); wait(500);
         let label=format!("{mode}-{kind}-{scenario}");
+        if std::env::var("FLICK_PROBE_CASES").is_ok_and(|cases| !cases.split(',').any(|c|c==label)) { continue; }
         let mut child=Command::new(flick).arg("--portable").env("FLICK_INPUT_TRACE",out.join(format!("{label}-received.csv"))).env("FLICK_TRACE",out.join(format!("{label}-app.csv")))
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         wait(1200);

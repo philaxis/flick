@@ -1802,10 +1802,10 @@ fn probe_flush() {
         unsafe {let _=windows::Win32::System::Performance::QueryPerformanceCounter(&mut tick);let _=windows::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency);}
         let now=Instant::now();
         let file=std::path::Path::new(&path).with_extension("samples.csv");
-        let mut csv=std::fs::read_to_string(&file).unwrap_or_else(|_|"sample_qpc,received_qpc,os_ms,scan_time,x,y,axis,holding\n".into());
+        let mut csv=std::fs::read_to_string(&file).unwrap_or_else(|_|"sample_qpc,received_qpc,os_ms,scan_time,x,y,axis,holding,hand_along,hand_across,counted_from\n".into());
         for s in v.borrow_mut().drain(..) {
             let stamp=|at:Instant|tick-(now.saturating_duration_since(at).as_secs_f64()*frequency as f64).round() as i64;
-            let _=writeln!(csv,"{},{},{},{},{:.9},{:.9},{},{}",stamp(s.at),stamp(s.received),s.os_ms,s.scan_time.map_or(String::new(),|s|s.to_string()),s.followed.x,s.followed.y,s.axis,s.followed.holding);
+            let _=writeln!(csv,"{},{},{},{},{:.9},{:.9},{},{},{:.9},{:.9},{}",stamp(s.at),stamp(s.received),s.os_ms,s.scan_time.map_or(String::new(),|s|s.to_string()),s.followed.x,s.followed.y,s.axis,s.followed.holding,s.hand.along,s.hand.across,s.hand.counted_from);
         }
         let _=std::fs::write(file,csv);
     });

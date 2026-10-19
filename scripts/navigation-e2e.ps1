@@ -22,13 +22,14 @@ try {
     if ($LASTEXITCODE) { throw 'stage failed' }
     if ($Mode -in @('matrix','final-matrix','gpu')) {
         $probeExit = 0
-        $variants = if ($Mode -eq 'gpu') { @('timed','blur') } elseif ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
+        $variants = if ($Mode -eq 'gpu') { @('baseline-recheck','timed-recheck','timed','blur') } elseif ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('baseline','timed','blur','composition','gentle','slow') }
         foreach ($variant in $variants) {
             Write-Output "VARIANT=$variant"
-            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE -ErrorAction SilentlyContinue
-            if ($Mode -eq 'gpu') { $env:FLICK_GPU_TRACE='1' }
+            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE,Env:FLICK_PROBE_CASES -ErrorAction SilentlyContinue
+            if ($Mode -eq 'gpu' -and $variant -notlike '*-recheck') { $env:FLICK_GPU_TRACE='1' }
+            if ($variant -like '*-recheck') { $env:FLICK_PROBE_CASES='follow-mouse-slow,follow-ptp-slow,board-mouse-slow,board-ptp-slow' }
             $exe = $flick
-            if ($variant -eq 'baseline') { $exe = Join-Path (Get-Location) 'baseline.exe' }
+            if ($variant -in @('baseline','baseline-recheck')) { $exe = Join-Path (Get-Location) 'baseline.exe' }
             if ($variant -eq 'blur') { $env:FLICK_PROBE_BLUR='1' }
             if ($variant -eq 'composition') { $env:FLICK_COMPOSITION = '1' }
             if ($variant -in @('gentle','slow')) { $env:FLICK_PROBE_SPEED=$variant; $env:FLICK_SHORT_PROBE='1' }
@@ -38,7 +39,7 @@ try {
             & $drive navigation display $folder $exe
             if ($LASTEXITCODE) { $probeExit=$LASTEXITCODE; break }
         }
-        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE -ErrorAction SilentlyContinue
+        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR,Env:FLICK_GPU_TRACE,Env:FLICK_PROBE_CASES -ErrorAction SilentlyContinue
     } else {
         & $drive navigation $Mode $out $flick
         $probeExit = $LASTEXITCODE

@@ -114,12 +114,12 @@ def report(folder):
                 if pos(a,c) is not None and pos(b,c) is not None: settle_steps.append(abs(pos(b,c)-pos(a,c)))
         p95 = sorted(marker_errors)[int(len(marker_errors)*.95)] if marker_errors else math.nan
         line = dict(scenario=label, updates=len(active), capture_losses=losses, repeat_pairs=repeats, pairs=len(changes), no_update_refreshes=gaps,
-                    step_cv=cv(list(map(abs,changes))), first_response_ms=first, input_step_cv=input_cv, marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95, settling_max_step_px=max(settle_steps,default=0), tracking_cv=cv(list(map(abs,tracking))), tracking_repeats=sum(abs(d)<0.01 for d in tracking), tracking_frames=len(tracking), tracking_unknown=tracking_unknown)
+                    step_cv=cv(list(map(abs,changes))), first_response_ms=first, input_step_cv=input_cv, marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95, input_interval_max_ms=max(intervals,default=0), settling_max_step_px=max(settle_steps,default=0), tracking_cv=cv(list(map(abs,tracking))), tracking_repeats=sum(abs(d)<0.01 for d in tracking), tracking_frames=len(tracking), tracking_unknown=tracking_unknown)
         data.append(line)
         first_text = f'{first:.1f}' if first is not None else 'missing'
         onset=f'{line["eligible_response_ms"]:.1f}' if first is not None else 'missing'
         print(f'|{label}|{len(active)}|{losses}|{repeats}/{len(changes)}|{gaps}|{line["step_cv"]:.1f}|{first_text}|{input_cv:.1f}|{p95:.2f}|{line["max_step_px"]:.1f}|{onset}|{cadence_p95:.2f}|')
-    (folder / 'display-summary.json').write_text(json.dumps(data, indent=2))
+    (folder / 'display-summary.json').write_text(json.dumps([{k: None if isinstance(v,float) and not math.isfinite(v) else v for k,v in row.items()} for row in data], indent=2, allow_nan=False))
     print('CV includes intentional F-curve latching and reversal; it is not residual judder. First response is motion onset, not steady-state latency.')
     return data
 
