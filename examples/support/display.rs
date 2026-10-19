@@ -157,6 +157,10 @@ pub unsafe fn run(out: &Path, flick: &str) {
         use std::io::Write;
         writeln!(std::fs::OpenOptions::new().append(true).open(cfg.join("config.toml")).unwrap(),"\n[experimental]\ncommit_speed = \"{}\"",speed).unwrap();
     }
+    if std::env::var_os("FLICK_PROBE_BLUR").is_some() {
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(cfg.join("config.toml")).unwrap(),"\n[experimental]\nmotion_blur = true").unwrap();
+    }
     let made=std::fs::read_to_string(out.join("made.txt")).unwrap();
     let ids: Vec<_>=made.lines().collect();
     let all=super::vdapi::get_desktops().unwrap();

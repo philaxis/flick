@@ -23,6 +23,32 @@ struct Scene {
 struct Scenes { hosts: HashMap<isize,Scene>, thumbs: HashMap<isize,Thumbnail> }
 thread_local! { static SCENES: RefCell<Scenes> = RefCell::default(); }
 
+static BLUR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn configure_blur(on: bool) { BLUR.store(on, std::sync::atomic::Ordering::Relaxed); }
+struct Trails { ids: [isize;2], last: Option<([f32;4], std::time::Instant)> }
+thread_local! { static TRAILS: RefCell<HashMap<isize, Trails>> = RefCell::default(); }
+pub fn needs_update(id: isize) -> bool { enabled() || TRAILS.with(|t|t.borrow().contains_key(&id)) }
+
+// A half-refresh shutter, bounded so a late frame cannot leave a huge ghost.
+fn trail(previous: [f32;4], current: [f32;4], elapsed: f32) -> (f32,f32) {
+    if !(0.001..=0.05).contains(&elapsed) { return (0.0,0.0); }
+    let dx=(current[0]+current[2]-previous[0]-previous[2])*0.25;
+    let dy=(current[1]+current[3]-previous[1]-previous[3])*0.25;
+    let scale=(32.0/dx.hypot(dy).max(32.0)).min(1.0);
+    (dx*scale,dy*scale)
+}
+
+pub unsafe fn register(destination: HWND, source: HWND) -> Result<isize> {
+    // shortcut: public DWM trails are discrete exposures, use captured textures for a true convolution.
+    if !BLUR.load(std::sync::atomic::Ordering::Relaxed) || enabled() { return register_inner(destination,source); }
+    let a=DwmRegisterThumbnail(destination,source)?;
+    let b=match DwmRegisterThumbnail(destination,source) {Ok(b)=>b,Err(e)=>{let _=DwmUnregisterThumbnail(a);return Err(e)}};
+    match register_inner(destination,source) {
+        Ok(id)=>{TRAILS.with(|t|t.borrow_mut().insert(id,Trails{ids:[a,b],last:None}));Ok(id)},
+        Err(e)=>{let _=DwmUnregisterThumbnail(a);let _=DwmUnregisterThumbnail(b);Err(e)}
+    }
+}
+
 pub fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("FLICK_COMPOSITION").is_some()
@@ -44,7 +70,7 @@ impl Scene {
     }
 }
 
-pub unsafe fn register(destination: HWND, source: HWND) -> Result<isize> {
+unsafe fn register_inner(destination: HWND, source: HWND) -> Result<isize> {
     if !enabled() {return DwmRegisterThumbnail(destination,source);}
     let legacy=DwmRegisterThumbnail(destination,source)?;
     let size=match DwmQueryThumbnailSourceSize(legacy) {Ok(size)=>size,Err(e)=>{let _=DwmUnregisterThumbnail(legacy);return Err(e)}};
@@ -75,6 +101,7 @@ pub unsafe fn register(destination: HWND, source: HWND) -> Result<isize> {
 }
 
 pub unsafe fn unregister(id: isize) -> Result<()> {
+    TRAILS.with(|t| {if let Some(trails)=t.borrow_mut().remove(&id) {for id in trails.ids {let _=DwmUnregisterThumbnail(id);}}});
     let removed=SCENES.with(|scenes| -> Result<bool> {
         let mut scenes=scenes.borrow_mut();
         if let Some(thumb)=scenes.thumbs.remove(&id) {
@@ -88,6 +115,26 @@ pub unsafe fn unregister(id: isize) -> Result<()> {
 
 /// Precise edges reach the compositor; public thumbnails keep their rounded RECT.
 pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4]) -> Result<()> {
+    TRAILS.with(|trails| -> Result<()> {
+        let mut trails=trails.borrow_mut();
+        if let Some(trails)=trails.get_mut(&id) {
+            let now=std::time::Instant::now();
+            let (dx,dy)=trails.last.map_or((0.0,0.0),|(last,at)|trail(last,dest,now.duration_since(at).as_secs_f32()));
+            trails.last=Some((dest,now));
+            for (i,id) in trails.ids.iter().enumerate() {
+                let mut ghost=*props;
+                let part=(i+1) as f32/3.0;
+                let (x,y)=((-dx*part).round() as i32,(-dy*part).round() as i32);
+                ghost.rcDestination.left+=x;ghost.rcDestination.right+=x;
+                ghost.rcDestination.top+=y;ghost.rcDestination.bottom+=y;
+                ghost.dwFlags|=DWM_TNP_OPACITY|DWM_TNP_VISIBLE;
+                ghost.opacity=(props.opacity as f32*[0.12,0.06][i]*dx.hypot(dy).min(1.0)) as u8;
+                ghost.fVisible=(props.fVisible.as_bool() && (x!=0 || y!=0) && BLUR.load(std::sync::atomic::Ordering::Relaxed)).into();
+                DwmUpdateThumbnailProperties(*id,&ghost)?;
+            }
+        }
+        Ok(())
+    })?;
     let updated=SCENES.with(|scenes| -> Result<bool> {
         let scenes=scenes.borrow();
         let Some(thumb)=scenes.thumbs.get(&id) else {return Ok(false)};
@@ -138,6 +185,15 @@ fn transform(source: RECT, dest: [f32;4]) -> Matrix3x2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trails_follow_direction_but_disappear_after_stalls() {
+        let a=[0.0,0.0,100.0,100.0];let b=[20.0,-10.0,120.0,90.0];
+        assert_eq!(trail(a,b,1.0/60.0),(10.0,-5.0));
+        assert_eq!(trail(b,a,1.0/144.0),(-10.0,5.0));
+        assert_eq!(trail(a,b,0.1),(0.0,0.0));
+        assert_eq!(trail(a,a,0.016),(0.0,0.0));
+        let t=trail(a,[1000.0,0.0,1100.0,100.0],0.016);assert!(t.0.hypot(t.1)<=32.0);
+    }
     #[test]
     fn cropped_sources_keep_fractional_destination_edges() {
         let source=RECT {left:17,top:31,right:817,bottom:631};

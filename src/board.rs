@@ -2265,7 +2265,7 @@ impl Board {
             let visible = props.fVisible.as_bool();
             let state = if visible { (props.rcDestination, props.rcSource, props.opacity, true, props.dwFlags) }
                 else { (RECT::default(), RECT::default(), 0, false, 0) };
-            if (crate::composition::enabled() || self.thumbnail_state.borrow().get(&thumb) != Some(&state)) && crate::composition::update(thumb, &props, precise).is_ok() {
+            if (crate::composition::needs_update(thumb) || self.thumbnail_state.borrow().get(&thumb) != Some(&state)) && crate::composition::update(thumb, &props, precise).is_ok() {
                 self.thumbnail_state.borrow_mut().insert(thumb, state);
                 self.thumbnail_updates.set(self.thumbnail_updates.get() + 1);
             }

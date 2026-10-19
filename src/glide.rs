@@ -286,7 +286,7 @@ impl Thumb {
         });
         let rect = rect.filter(|r| r.right > 0 && r.bottom > 0 && r.left < size.0 && r.top < size.1 && r.right > r.left && r.bottom > r.top);
         let drawn = rect.map(|rect| (rect, opacity)).filter(|_| opacity > 0);
-        if drawn == self.drawn && !crate::composition::enabled() {
+        if drawn == self.drawn && !crate::composition::needs_update(self.id) {
             return false;
         }
         self.drawn = drawn;

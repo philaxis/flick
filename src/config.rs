@@ -76,6 +76,8 @@ reverse = true
 [experimental]
 # Visual commit/settle only: "default" (35/32), "gentle" (28/25), "slow" (24/24).
 commit_speed = "default"
+# Prototype: two faint DWM trails, costs three thumbnails per source; reopen the board.
+motion_blur = false
 "#;
 
 /// Keys of earlier versions, before each device had its own settings: the
@@ -110,7 +112,7 @@ pub struct Config {
 /// Opt-in visual experiments never change the distance or commit rules.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct Experimental { pub commit_speed: CommitSpeed }
+pub struct Experimental { pub commit_speed: CommitSpeed, pub motion_blur: bool }
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommitSpeed { #[default] Default, Gentle, Slow }
