@@ -703,10 +703,12 @@ pub struct Board {
 
 /// The parts of `area` the tiles go into: all in one, or when some windows
 /// are pinned, those in parts of their own at the left, where they stay
-/// whichever cell is looked at (`tiles::pin_parts`). Each part has a
-/// heading, or none.
+/// whichever cell is looked at (`tiles::pin_parts`), room being kept for
+/// `row_most` windows pinned to the row, the most any row has here. Each
+/// part has a heading, or none.
 fn split_area<'a>(
     here: &[(&'a WindowModel, bool)],
+    row_most: usize,
     area: &Rect,
     s: f32,
 ) -> Vec<(Rect, Option<&'static str>, Vec<(&'a WindowModel, bool)>)> {
@@ -718,7 +720,7 @@ fn split_area<'a>(
         return vec![(*area, None, here.to_vec())];
     }
     let (head, gap) = (24.0 * s, 20.0 * s);
-    let parts = tiles::pin_parts(all.len(), row.len(), size(area), gap, head, tile_least(s));
+    let parts = tiles::pin_parts(all.len(), row.len(), row_most, size(area), gap, head, tile_least(s));
     let place = |(x, y, w, h): tiles::Part| Rect { top: area.top + y + head, ..rect(area.left + x, area.top + y, w, h) };
     let mut out = Vec::new();
     for (part, name, group) in [(parts.all, "All rows", all), (parts.row, "This row", row)] {
@@ -1220,7 +1222,11 @@ impl Board {
                 bottom: monitor.top + layout.top - 26.0 * s,
             };
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
-            for (part, name, group) in split_area(&here, &area, s) {
+            // The part of the windows on every desktop is the same in every row.
+            let row_most = self.model.rows.iter()
+                .map(|row| row.cells.iter().flat_map(|cell| &cell.windows).filter(|w| w.follows && self.monitor_of(w) == m).count())
+                .max().unwrap_or(0);
+            for (part, name, group) in split_area(&here, row_most, &area, s) {
                 if let Some(name) = name {
                     sections.push((Rect { top: part.top - 24.0 * s, bottom: part.top, ..part }, part, name));
                 }
@@ -3352,5 +3358,25 @@ mod tests {
         assert!(near(hand_pull((0, 0), (3, 2), (-1.0, 0.0)), (-EDGE_GIVE, 0.0)));
         assert!(near(hand_pull((1, 1), (3, 2), (0.5, -0.25)), (0.5, -0.25)));
         assert!(near(hand_pull((3, 2), (3, 2), (2.0, 2.0)), (EDGE_GIVE, EDGE_GIVE)));
+    }
+
+    /// Going to a row with more or fewer windows pinned to it, or none, the
+    /// windows on every desktop keep their part, and so their tiles.
+    #[test]
+    fn windows_on_every_desktop_stay_whichever_row() {
+        let everywhere = window(1, false);
+        let (followers, own) = ([window(2, true), window(3, true)], window(4, false));
+        let area = rect(40.0, 64.0, 1840.0, 640.0);
+        let parts = |row: &[WindowModel]| {
+            let here: Vec<(&WindowModel, bool)> = [(&everywhere, true), (&own, false)].into_iter().chain(row.iter().map(|w| (w, false))).collect();
+            let parts = split_area(&here, 2, &area, 1.0);
+            let all = parts.iter().find(|(_, name, _)| *name == Some("All rows")).map(|(part, _, _)| *part).unwrap();
+            let tiles = layout_tiles(&[(&everywhere, true)], &all, 1.0, &HashMap::new());
+            (all, tiles[0].frame, parts.iter().any(|(_, name, _)| *name == Some("This row")))
+        };
+        let (none, one, two) = (parts(&[]), parts(&followers[..1]), parts(&followers));
+        assert_eq!((none.0, none.1), (two.0, two.1));
+        assert_eq!((one.0, one.1), (two.0, two.1));
+        assert_eq!((none.2, one.2, two.2), (false, true, true));
     }
 }
