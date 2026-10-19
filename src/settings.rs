@@ -790,10 +790,10 @@ impl Settings {
             let line = |i: f32| Rect { top: row(i).top, bottom: row(i).bottom, ..column };
             let title = [tr("Sideways · along a shelf", "좌우 · 같은 셸프(행)", "左右 · 同一架子（行）"), tr("Up and down · to another shelf", "위아래 · 다른 셸프(행)", "上下 · 切换架子（行）")][way];
             p.text(title, &fonts.title, &line(TAB_ROWS.0), white(0.92));
-            p.text(tr("Distance to switch", "넘어가는 데 필요한 거리", "切换所需距离"), &fonts.label, &line(TAB_ROWS.0 + 1.0), white(0.62));
+            p.text(tr("Distance", "거리", "距离"), &fonts.label, &line(TAB_ROWS.0 + 1.0), white(0.62));
             let words = distance_words(tab, hand.steps[way]);
             self.draw_slider(&p, fonts, &layout.steps[way], column.right, hand.steps[way], distances, &words, Hit::Step(way));
-            p.text(tr("F · move this distance to commit", "F · 이 거리만큼 움직이면 다음 칸으로", "F · 移动此距离后切换到下一格"), &fonts.notice, &line(TAB_ROWS.0 + 2.0), white(0.62));
+            p.text(tr("Movement needed to switch", "다음 칸으로 넘어가는 데 필요한 이동 거리", "切换到下一格所需的移动距离"), &fonts.notice, &line(TAB_ROWS.0 + 2.0), white(0.62));
             p.text(tr("Follows the hand", "손 따라가기", "跟随手"), &fonts.label, &line(TAB_ROWS.0 + 3.0), white(0.62));
             self.draw_switch(&p, &layout.follows[way], hand.follows[way], Hit::Follow(way));
         }

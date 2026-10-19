@@ -4,7 +4,6 @@ pub const GAP: f64 = 0.07;
 pub const GLOW: f64 = 0.55;
 pub const LIFT: f64 = 0.0;
 pub const DIM: f64 = 0.55;
-pub fn firmness(_notch: u32, _touchpad: bool, _vertical: bool) -> f64 { 0.0 }
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
 pub fn scale(depth: f64) -> f64 { 1.0 - 0.3 * depth.clamp(0.0, 1.0) }
 /// Where `rect` (left, top, right, bottom on a screen `size` across and
@@ -39,7 +38,7 @@ pub fn emphasis(apart: (f64, f64)) -> f64 {
 /// `DIM` at most). Whole, everything is as it is.
 pub fn standing_out(emphasis: f64, receded: f64) -> (f64, f64) {
     let (emphasis, receded) = (emphasis.clamp(0.0, 1.0), receded.clamp(0.0, 1.0));
-    (1.0 + LIFT * emphasis * receded, DIM * (1.0 - emphasis) * receded)
+    (1.0 + LIFT * emphasis * receded, DIM * (1.0 - emphasis))
 }
 
 /// Where a row stands sideways in a single step (`Step`), the strip at
@@ -63,26 +62,25 @@ impl Step {
     pub fn new(now: f64, to: (i32, i32)) -> Self {
         Self { from: (0.0, 0.0), to, began: now, receded: 0.0, speed: (0.0, 0.0), depth_speed: 6.0 }
     }
-    fn states(&self, now: f64) -> (Spring, Spring, Spring) {
-        let t = (now - self.began).max(0.0);
+    pub fn advance(&mut self, now: f64) {
+        let dt = (now - self.began).max(0.0);
         let mut x = Spring { p: self.from.0, v: self.speed.0 };
         let mut y = Spring { p: self.from.1, v: self.speed.1 };
-        x.position(self.to.0 as f64, t, false); y.position(self.to.1 as f64, t, true);
+        x.position(self.to.0 as f64, dt, false); y.position(self.to.1 as f64, dt, true);
+        let moving = (x.p - self.to.0 as f64).abs() > 0.01 || (y.p - self.to.1 as f64).abs() > 0.01;
         let mut depth = Spring { p: self.receded, v: self.depth_speed };
-        depth.advance(1.0, t.min(0.5), 22.0, 1.0);
-        if t > 0.5 { depth.advance(0.0, t - 0.5, 14.0, 1.0); }
-        (x, y, depth)
+        depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
+        (self.from, self.speed, self.receded, self.depth_speed, self.began) = ((x.p, y.p), (x.v, y.v), depth.p, depth.v, now);
     }
     pub fn then(&self, now: f64, to: (i32, i32)) -> Self {
-        let (x, y, depth) = self.states(now);
-        Self { from: (x.p, y.p), speed: (x.v, y.v), receded: depth.p, depth_speed: depth.v + 6.0, began: now, to }
+        let mut next = *self;
+        next.advance(now); next.to = to; next.depth_speed += 6.0; next
     }
-    pub fn at(&self, now: f64) -> ((f64, f64), f64) {
-        let (x, y, depth) = self.states(now); ((x.p, y.p), depth.p.clamp(0.0, 1.0))
-    }
-    pub fn done(&self, now: f64) -> bool {
-        let (x, y, depth) = self.states(now);
-        x.settled(self.to.0 as f64) && y.settled(self.to.1 as f64) && now - self.began > 0.5 && depth.settled(0.0)
+    pub fn at(&self) -> ((f64, f64), f64) { (self.from, self.receded.clamp(0.0, 1.0)) }
+    pub fn done(&self) -> bool {
+        Spring { p: self.from.0, v: self.speed.0 }.settled(self.to.0 as f64)
+            && Spring { p: self.from.1, v: self.speed.1 }.settled(self.to.1 as f64)
+            && Spring { p: self.receded, v: self.depth_speed }.settled(0.0)
     }
 }
 /// How long the name of the row above the picture takes to go over to
@@ -144,7 +142,7 @@ pub struct Follow {
     depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool,
 }
 impl Follow {
-    pub fn new(rows: (i32, i32), cols: Vec<(i32, i32)>, _firm: (f64, f64)) -> Self {
+    pub fn new(rows: (i32, i32), cols: Vec<(i32, i32)>) -> Self {
         let n = (rows.1 - rows.0 + 1).max(1) as usize;
         Self { rows, cols, row: 0, along: vec![Spring::default(); n], columns: vec![Latch::default(); n],
             vertical: Spring::default(), rows_hand: Latch::default(), depth: Spring::default(),
@@ -155,8 +153,12 @@ impl Follow {
     }
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
-    pub fn carry(&mut self, at: (f64, f64), depth: f64) {
-        self.along[(-self.rows.0) as usize].p = at.0; self.vertical.p = at.1; self.depth.p = depth;
+    pub fn velocity(&self) -> ((f64, f64), f64) {
+        ((self.along[(self.row - self.rows.0) as usize].v, self.vertical.v), self.depth.v)
+    }
+    pub fn carry(&mut self, at: (f64, f64), speed: (f64, f64), depth: f64, depth_speed: f64) {
+        self.along[(-self.rows.0) as usize] = Spring { p: at.0, v: speed.0 };
+        self.vertical = Spring { p: at.1, v: speed.1 }; self.depth = Spring { p: depth, v: depth_speed };
     }
     fn advance(&mut self, now: f64) -> ((f64, f64), bool) {
         let dt = self.last.replace(now).map_or(0.0, |last| (now - last).max(0.0));
@@ -220,7 +222,7 @@ mod tests {
     use super::*;
     #[test]
     fn down_then_right_commits_without_waiting_and_releases_without_fling() {
-        let mut f = Follow::new((0, 2), vec![(0, 3); 3], (0.0, 0.0));
+        let mut f = Follow::new((0, 2), vec![(0, 3); 3]);
         f.track_locked(0.0, (0.0, 1.0), 1);
         assert_eq!(f.row, 1);
         f.track_locked(0.01, (1.0, 1.0), 0);
@@ -230,18 +232,36 @@ mod tests {
         assert!(f.settle(3.0).1);
     }
     #[test]
+    fn a_key_step_uses_the_same_position_and_depth_springs() {
+        let mut step = Step::new(0.0, (1, 0));
+        let mut hand = Follow::new((0, 0), vec![(0, 2)]);
+        hand.track_locked(0.0, (1.0, 0.0), 0);
+        hand.depth.v += 1.0; // Keys kick by six; a held commit by five.
+        hand.let_go(0.0, (1.0, 0.0));
+        for i in 1..200 {
+            let now = i as f64 / 120.0;
+            step.advance(now);
+            let (at, _) = hand.settle(now);
+            assert!((step.at().0.0 - at.0).abs() < 1e-9);
+            assert!((step.at().1 - hand.depth()).abs() < 1e-9);
+        }
+        assert!(step.done());
+        let old_speed = step.speed;
+        assert_eq!(step.then(199.0 / 120.0, (2, 0)).speed, old_speed);
+    }
+    #[test]
     fn compressed_input_keeps_turns_and_reversals() {
         let mut path = Vec::new();
         for point in [(0.0, 0.5, 1), (0.0, 1.0, 1), (0.5, 1.0, 0), (9.0, 1.0, 0), (8.0, 1.0, 0)] { remember(&mut path, point); }
         assert_eq!(path, vec![(0.0, 1.0, 1), (9.0, 1.0, 0), (8.0, 1.0, 0)]);
-        let mut f = Follow::new((0, 2), vec![(0, 2); 3], (0.0, 0.0));
+        let mut f = Follow::new((0, 2), vec![(0, 2); 3]);
         assert_eq!(f.finish_path(&path), (1, 1));
     }
     #[test]
     fn missed_frames_keep_commits_and_edge_reversal_responds() {
-        let mut f = Follow::new((-2, 0), vec![(0, 2); 3], (0.0, 0.0));
+        let mut f = Follow::new((-2, 0), vec![(0, 2); 3]);
         assert_eq!(f.finish_path(&[(0.0, -1.0, 1), (1.0, -1.0, 0)]), (1, -1));
-        let mut f = Follow::new((0, 0), vec![(-2, 0)], (0.0, 0.0));
+        let mut f = Follow::new((0, 0), vec![(-2, 0)]);
         f.track_locked(0.0, (9.0, 0.0), 0);
         f.track_locked(0.01, (8.0, 0.0), 0);
         assert_eq!(f.let_go(0.02, (8.0, 0.0)), (-1, 0));

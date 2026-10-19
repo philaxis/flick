@@ -45,7 +45,7 @@ use windows::{
                 DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             },
             Dwm::{
-                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+                DwmFlush, DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
@@ -1415,14 +1415,16 @@ impl Board {
             let started = Instant::now();
             let rendered = self.draw_to_canvas();
             let prepared = started.elapsed();
-            self.update_thumbnails();
-            let dwm = started.elapsed() - prepared;
             match rendered {
                 Some(Ok(())) => self.present_canvas(),
                 Some(Err(e)) => { crate::app::log(&format!("board draw failed: {e}")); self.canvas = None; }
                 None => {}
             }
+            let submitted = started.elapsed();
+            self.update_thumbnails();
+            let dwm = started.elapsed() - submitted;
             unsafe {
+                let _ = DwmFlush();
                 ValidateRect(self.hwnd, None);
             }
             let took = started.elapsed();
@@ -1664,6 +1666,12 @@ impl Board {
         let (x, y) = self.strip.offset(pos.row, t);
         let size = strip::scale(self.strip.depth(t));
         strip::place(plate, (mark.0 + pos.col as f32 + x, mark.1 + y), size, size)
+    }
+
+    fn picture_shade(&self, pos: Pos) -> f32 {
+        let Some(mark) = self.strip_marks.get(pos.row) else { return 1.0 };
+        let (x, y) = self.strip.offset(pos.row, self.strip_at);
+        strip::shade((mark.0 + pos.col as f32 + x).hypot(mark.1 + y))
     }
 
     /// How the windows pinned to the selected row are drawn on monitor
@@ -1931,7 +1939,9 @@ impl Board {
     /// registered: those beside go under the selected cell's, and the
     /// windows on every desktop, which never move, over everything.
     fn register_thumbnails(&mut self) {
-        self.clear_thumbnails();
+        let mut old = std::mem::take(&mut self.thumbs);
+        let mut old_strip = std::mem::take(&mut self.strip_thumbs);
+        self.source_sizes.borrow_mut().clear();
         if self.strip_on {
             let wanted: Vec<Vec<HWND>> = self.strip_cells.iter().map(|cell| {
                 let windows = self.model.tile_windows(&cell.id);
@@ -1957,6 +1967,9 @@ impl Board {
             }
         }
         self.update_thumbnails();
+        // Keep the old pictures until their replacements are visible.
+        unregister_strip_thumbnails(&mut old_strip);
+        unregister_thumbnails(&mut old);
     }
 
     /// How large the window of `thumb` is. Asked of DWM once while the
@@ -2027,13 +2040,12 @@ impl Board {
     fn update_thumbnails(&self) {
         let at = self.grid.find(&self.selected);
         let windows = self.tile_windows();
-        let depth = if self.strip_on { self.strip.depth(self.strip_at) } else { 0.0 };
         let placing = |hwnd: isize| {
             let (window, everywhere) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd)?;
             let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd)?;
             let Some(at) = at else { return Some((Place::SAME, None, 1.0)) };
             let (place, clip) = self.tile_place(at, Carried::of(window, *everywhere), &tile.frame)?;
-            Some((place, clip, 1.0))
+            Some((place, clip, if Carried::of(window, *everywhere) == Carried::Own { self.picture_shade(at) } else { 1.0 }))
         };
         #[cfg(feature = "debug-log")]
         let mut placed = Vec::new();
@@ -2042,7 +2054,7 @@ impl Board {
             let minimized = windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized);
             let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), self.dragged_window() == Some(hwnd), 1.0, placing(hwnd));
             #[cfg(feature = "debug-log")]
-            placed.push(format!("{hwnd:x}={_shown}"));
+            placed.push(format!("{hwnd:x}={_shown:?}"));
         }
         for (id, hwnd, thumb) in &self.strip_thumbs {
             let Some(cell) = self.strip_cells.iter().find(|cell| cell.id == *id) else {
@@ -2053,7 +2065,7 @@ impl Board {
             let window = windows.iter().find(|(w, _)| w.hwnd.0 == *hwnd);
             let tile = cell.cell.tiles.iter().find(|tile| tile.hwnd.0 == *hwnd);
             let placing = window.zip(tile).and_then(|((w, everywhere), tile)| self.tile_place(cell.pos, Carried::of(w, *everywhere), &tile.frame))
-                .map(|(place, clip)| (place, clip, strip::shade(depth, false)));
+                .map(|(place, clip)| (place, clip, self.picture_shade(cell.pos)));
             self.put_thumbnail(*thumb, tile, window.is_some_and(|(w, _)| w.minimized), (0.0, 0.0), false, 1.0, placing);
         }
         debug_log!("board: thumbnails {}", placed.join(" "));
@@ -2074,7 +2086,7 @@ impl Board {
     /// place. `offset` is where the window it is shown in is. Says where it
     /// went.
     #[allow(clippy::too_many_arguments)]
-    fn put_thumbnail(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, offset: (f32, f32), dragged: bool, opacity: f32, placing: Option<(Place, Option<Rect>, f32)>) -> String {
+    fn put_thumbnail(&self, thumb: isize, tile: Option<&TileLayout>, minimized: bool, offset: (f32, f32), dragged: bool, opacity: f32, placing: Option<(Place, Option<Rect>, f32)>) -> Option<RECT> {
         // Round the transformed edges exactly as the screen plate does.
         let to_rect = |r: &Rect| {
             let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
@@ -2151,8 +2163,7 @@ impl Board {
             props.opacity = (props.opacity as f32 * opacity).round() as u8;
             let _ = DwmUpdateThumbnailProperties(thumb, &props);
         }
-        let r = props.rcDestination;
-        format!("{},{},{},{}", r.left, r.top, r.right, r.bottom)
+        props.fVisible.as_bool().then_some(props.rcDestination)
     }
 
     /// Thumbnails stack in registration order; re-register the one that will
@@ -2544,6 +2555,7 @@ impl Board {
                 let window = GetDC(self.hwnd);
                 let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
                 ReleaseDC(self.hwnd, window);
+                let _ = GdiFlush();
                 if let Some(popup) = &self.popup {
                     // The board underneath stays bare, so the layered panel can fade away.
                     let target = &canvas.target.target;
@@ -2763,11 +2775,10 @@ impl Board {
         }
         if depth > 0.001 {
             self.placed(p, place, || {
+                p.fill(&plate, 14.0 * s / place.s, rgba(0.0, 0.0, 0.0, 1.0 - self.picture_shade(pos)));
                 if middle {
                     p.stroke(&grow(&plate, 1.0 * s / place.s), 14.0 * s / place.s, 1.5 * s / place.s, accent(0.85 * depth));
                 } else {
-                    // Darker than the middle, its live previews as well (`strip::shade`).
-                    p.fill(&plate, 14.0 * s / place.s, rgba(0.0, 0.0, 0.0, strip::DIM * depth));
                     p.stroke(&plate, 14.0 * s / place.s, 1.0 * s / place.s, white(0.10 * depth));
                 }
             });

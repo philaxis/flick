@@ -131,8 +131,6 @@ pub struct Scene {
     /// it (`Follow::new`).
     pub rows: (i32, i32),
     pub cols: Vec<(i32, i32)>,
-    /// How firm the notches are each way (`follow::firmness`).
-    pub firm: (f64, f64),
     pub shots: Vec<Shot>,
     /// The name of each row from `rows.0` to `rows.1`.
     pub names: Vec<String>,
@@ -775,17 +773,17 @@ impl View {
             Request::Begin(scene) => {
                 // Monitors as they were are kept, so the picture stays up
                 // from one hold to the next, going on from where it was.
-                let (carry, receded) = self.carried();
+                let (carry, speed, receded, depth_speed) = self.carried();
                 let (screens, leftover) = self.session.take().map(|s| s.retire(self.trace.as_deref())).unwrap_or_default();
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
-                    new.follow.carry(carry, receded);
+                    new.follow.carry(carry, speed, receded, depth_speed);
                 }
             }
             Request::Step(scene, to) => {
-                let (carry, receded) = self.carried();
+                let (carry, speed, receded, depth_speed) = self.carried();
                 let (screens, leftover) = self.session.take().map(|s| s.retire(self.trace.as_deref())).unwrap_or_default();
-                let step = Step { from: carry, receded, ..Step::new(0.0, to) };
+                let step = Step { from: carry, speed, receded, depth_speed: depth_speed + 6.0, ..Step::new(0.0, to) };
                 self.begin(scene, screens, leftover, Phase::Stepping(step));
             }
             Request::Retarget(hold, to) => {
@@ -825,11 +823,15 @@ impl View {
 
     /// Where the picture up now is from the desktop it was going to, which
     /// the next hold begins on, and how far it has receded.
-    fn carried(&self) -> ((f64, f64), f64) {
-        let Some(session) = &self.session else { return ((0.0, 0.0), 0.0) };
-        let Some((to, strip)) = session.heading() else { return ((0.0, 0.0), 0.0) };
+    fn carried(&self) -> ((f64, f64), (f64, f64), f64, f64) {
+        let Some(session) = &self.session else { return ((0.0, 0.0), (0.0, 0.0), 0.0, 0.0) };
+        let Some((to, strip)) = session.heading() else { return ((0.0, 0.0), (0.0, 0.0), 0.0, 0.0) };
         let along = strip.along(session.follow.rows, to.1);
-        ((along - to.0 as f64, strip.y - to.1 as f64), strip.receded)
+        let (speed, depth_speed) = match session.phase {
+            Phase::Stepping(step) => (step.speed, step.depth_speed),
+            _ => session.follow.velocity(),
+        };
+        ((along - to.0 as f64, strip.y - to.1 as f64), speed, strip.receded, depth_speed)
     }
 
     fn begin(&mut self, scene: Scene, mut screens: Vec<Screen>, mut leftover: Vec<Thumb>, phase: Phase) {
@@ -892,7 +894,7 @@ impl View {
             veils = self.veils(&screens);
         }
         let stats = Stats { setup: started.elapsed().as_secs_f64() * 1000.0, thumbnails: shots.len(), ..Stats::default() };
-        let follow = Follow::new(scene.rows, scene.cols, scene.firm);
+        let follow = Follow::new(scene.rows, scene.cols);
         let visible = screens.iter().any(|screen| screen.walls.iter().any(|wall| wall.drawn.is_some()));
         let trace = self.trace.as_ref().map(|_| Trace { lines: Vec::with_capacity(512), last: None });
         self.session = Some(Session {
@@ -1051,9 +1053,11 @@ impl View {
                 }
                 (at, receded, false)
             }
-            Phase::Stepping(step) => {
-                let (at, receded) = step.at(now);
-                if step.done(now) {
+            Phase::Stepping(mut step) => {
+                step.advance(now);
+                session.phase = Phase::Stepping(step);
+                let (at, receded) = step.at();
+                if step.done() {
                     tell(WM_GLIDE_SETTLED, step.to, session.hold);
                     session.phase = Phase::Arriving(step.to, Instant::now());
                 }

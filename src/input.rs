@@ -1191,7 +1191,14 @@ fn touchpad_event(event: crate::touchpad::Event) {
                     let at = directed((counts[0] as f64 + event.lean.0, counts[1] as f64 + event.lean.1), s.touchpad_reverse);
                     let raw = [(at.0 * s.step_x as f64).round() as i32, (at.1 * s.step_y as f64).round() as i32];
                     let old = PAD_RAW.replace(raw);
-                    advance(s, raw[0] - old[0], raw[1] - old[1]);
+                    let steps = event.steps.iter().fold([0, 0], |mut by, step| {
+                        use crate::touchpad::Dir;
+                        match step { Dir::Left => by[0] -= s.step_x, Dir::Right => by[0] += s.step_x, Dir::Up => by[1] -= s.step_y, Dir::Down => by[1] += s.step_y }
+                        by
+                    });
+                    let steps = directed((steps[0], steps[1]), s.touchpad_reverse);
+                    advance(s, if s.touchpad_follow & FOLLOW_X != 0 { raw[0] - old[0] } else { steps.0 },
+                        if s.touchpad_follow & FOLLOW_Y != 0 { raw[1] - old[1] } else { steps.1 });
                 } else if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
                 return false;
             }

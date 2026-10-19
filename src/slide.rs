@@ -381,6 +381,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn f_distance_commits_a_row_then_a_cell_without_carrying_the_old_anchor() {
+        let mut plane = Plane::linear(); plane.enable_f(true, true);
+        plane.rows.set_room(1, 1, 220); plane.cols.set_room(0, 1, 220);
+        assert!(!plane.travel(0, 219, (220, 220)).row);
+        assert!(plane.travel(0, 1, (220, 220)).row);
+        plane.cols.set_room(0, 1, 220);
+        assert!(!plane.travel(219, 0, (220, 220)).cell);
+        assert!(plane.travel(1, 0, (220, 220)).cell);
+        assert_eq!((plane.cols.cell(), plane.rows.cell()), (1, 1));
+        plane.travel(900, 0, (220, 220));
+        assert!(plane.travel(-220, 0, (220, 220)).cell);
+        assert_eq!(plane.cols.cell(), 0);
+    }
+    #[test]
     fn display_notches_leave_selection_and_rebasing_alone() {
         let step = 1000;
         for notch in [0, 40, 100, 200] {

@@ -40,7 +40,14 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();
             let ids: Vec<_> = ids.lines().collect();
             let all = vdapi::get_desktops().unwrap();
-            let goto = |i: usize| { vdapi::switch_desktop(*all.iter().find(|d| d.id() == ids[i]).unwrap()).unwrap(); wait(900); };
+            let goto = |i: usize| {
+                let desktop = *all.iter().find(|d| d.id() == ids[i]).unwrap();
+                for _ in 0..3 {
+                    vdapi::switch_desktop(desktop).unwrap(); wait(900);
+                    if vdapi::get_current_desktop().unwrap().id() == ids[i] { return; }
+                }
+                panic!("probe could not establish starting desktop {i}");
+            };
             let mouse = |flags, dx, dy| {
                 let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: 2, dwFlags: flags, ..Default::default() } } };
                 assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
@@ -74,15 +81,15 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     goto(start);
                     mouse(MOUSEEVENTF_XDOWN, 0, 0);
                     wait(80);
-                    for (dx, dy) in moves { stroke(dx, dy, if motion { 240 } else { 450 }); if !motion { wait(250); } }
+                    for (dx, dy) in moves { stroke(dx, dy, if motion && follow { 240 } else { 450 }); if !motion || !follow { wait(250); } }
                     if follow {
                         let still = vdapi::get_current_desktop().unwrap().id() == ids[start];
                         failures += usize::from(!still);
                         report += &format!("follow={follow} minimap={minimap} {label} Windows-stays-until-release: {still}\n");
                     }
-                    let _ = Command::new(&me).args(["shot", out.join(format!("{follow}-{minimap}-{label}.raw")).to_str().unwrap()]).status();
+                    if !motion { let _ = Command::new(&me).args(["shot", out.join(format!("{follow}-{minimap}-{label}.raw")).to_str().unwrap()]).status(); }
                     mouse(MOUSEEVENTF_XUP, 0, 0);
-                    wait(1800);
+                    wait(if motion { 2400 } else { 1800 });
                     let got = vdapi::get_current_desktop().unwrap().id();
                     let ok = got == ids[target];
                     failures += usize::from(!ok);
@@ -94,7 +101,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
                     if !up { wait(80); stroke(340, 8, 450); wait(250); }
                 }
-                wait(1800);
+                wait(if motion { 2400 } else { 1800 });
                 let got = vdapi::get_current_desktop().unwrap().id();
                 report += &format!("follow={follow} minimap={minimap} keyboard-trigger: {} actual={got}\n", got == ids[1]);
                 failures += usize::from(got != ids[1]);
@@ -116,7 +123,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 if motion {
                     goto(0);
                     if follow {
-                        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(180, 0, 100); mouse(MOUSEEVENTF_XUP, 0, 0); wait(1800);
+                        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(180, 0, 100); mouse(MOUSEEVENTF_XUP, 0, 0); wait(if motion { 2400 } else { 1800 });
                         let ok = vdapi::get_current_desktop().unwrap().id() == ids[0];
                         failures += usize::from(!ok);
                         report += &format!("follow={follow} minimap={minimap} subthreshold-no-fling: {ok}\n");
@@ -137,15 +144,26 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                     failures += usize::from(!opened);
                     report += &format!("follow={follow} minimap={minimap} board-open: {opened}\n");
                     for (label, vk) in [("right", 0x27), ("left", 0x25), ("down", 0x28), ("up", 0x26)] {
-                        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(vk), LPARAM(0)); wait(150);
-                        let _ = Command::new(&me).args(["shot", out.join(format!("board-{follow}-{minimap}-{label}.raw")).to_str().unwrap()]).status();
-                        wait(1050);
+                        let _ = label;
+                        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(vk), LPARAM(0)); wait(1400);
                     }
-                    let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)); wait(800);
+                    if follow && !minimap {
+                        // Capture only after the held springs settle: BitBlt stalls DWM on this laptop.
+                        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(110, 0, 250); wait(900);
+                        let _ = Command::new(&me).args(["shot", out.join("board-held-wide.raw").to_str().unwrap()]).status();
+                        mouse(MOUSEEVENTF_XUP, 0, 0); wait(1500);
+                        let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x27), LPARAM(0)); wait(1500);
+                        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80); stroke(-110, 0, 250); wait(900);
+                        let _ = Command::new(&me).args(["shot", out.join("board-held-tall.raw").to_str().unwrap()]).status();
+                        mouse(MOUSEEVENTF_XUP, 0, 0); wait(1500);
+                    }
+                    let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)); wait(1500);
                     goto(2);
                     let _ = PostMessageW(app, WM_APP + 2, WPARAM(0), LPARAM(0)); wait(700);
                     mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
-                    stroke(4, 340, 240); stroke(340, 4, 240);
+                    stroke(4, 340, if follow { 240 } else { 450 });
+                    if !follow { wait(250); }
+                    stroke(340, 4, if follow { 240 } else { 450 });
                     mouse(MOUSEEVENTF_XUP, 0, 0); wait(1500);
                     let _ = PostMessageW(board, WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)); wait(1200);
                     let got = vdapi::get_current_desktop().unwrap().id();

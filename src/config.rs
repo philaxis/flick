@@ -110,9 +110,7 @@ pub struct Mouse {
     /// Raw mouse counts for one cell and one shelf; physical travel depends on mouse DPI.
     pub step_x: i32,
     pub step_y: i32,
-    /// How firmly a cell or row holds, 0 to 100 (`Detent`); 0 follows the
-    /// hand evenly (`Slide`). Sideways changes the display, not selection; following
-    /// the hand, the picture holds back the same way (`follow`).
+    /// Legacy notch values, retained for config compatibility and immediate mode.
     pub notch_x: u32,
     pub notch_y: u32,
     /// The screen moving along with the hand between desktops, the desktop
@@ -199,13 +197,13 @@ fn migrated(text: &str) -> Result<(Config, Option<String>), toml::de::Error> {
     }
     let mut file = text.to_owned();
     if config.config_version < 2 {
-    for key in ["mouse.notch_x", "touchpad.notch_x"] {
-        let notch = if key.starts_with("mouse") { &mut config.mouse.notch_x } else { &mut config.touchpad.notch_x };
-        if *notch == 0 {
-            *notch = 40;
-            file = with_value(&file, key, "40");
+        for key in ["mouse.notch_x", "touchpad.notch_x"] {
+            let notch = if key.starts_with("mouse") { &mut config.mouse.notch_x } else { &mut config.touchpad.notch_x };
+            if *notch == 0 {
+                *notch = 40;
+                file = with_value(&file, key, "40");
+            }
         }
-    }
     }
     (config.mouse.step_x, config.mouse.step_y) = (220, 220);
     (config.touchpad.step_x, config.touchpad.step_y) = (12.0, 12.0);

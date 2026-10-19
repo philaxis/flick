@@ -2,12 +2,9 @@
 pub const COMMIT: f64 = 1.0;
 pub const EDGE: f64 = 0.15;
 pub const PULL: f64 = 0.2;
-pub const STEP: f32 = 1.5;
 pub const SLIDE_START: f32 = 0.0;
 pub const SLIDE_END: f32 = 0.65;
-pub const STEP_RECEDE: f32 = 0.25;
 pub const SNAP: f32 = SLIDE_END;
-pub const RECEDE_SCALE: f32 = 0.7;
 
 pub fn scale(depth: f32) -> f32 { 1.0 - 0.3 * depth.clamp(0.0, 1.0) }
 
@@ -112,6 +109,12 @@ impl Recede {
     pub fn settled(&self, t: f32) -> bool { t >= self.fall && self.sample(t).settled(0.0) }
     pub fn kick(&mut self, now: f32, velocity: f64) {
         self.state = self.sample(now); self.start = now; self.state.v += velocity;
+    }
+    pub fn moving(&mut self, now: f32, moving: bool) {
+        if self.fall.is_infinite() != moving {
+            self.kick(now, 0.0);
+            self.fall = if moving { f32::INFINITY } else { now };
+        }
     }
     pub fn step(&mut self, now: f32, end: f32) { self.kick(now, 6.0); self.fall = end; }
     pub fn hold(&mut self, now: f32) { self.kick(now, 0.0); self.fall = f32::INFINITY; }

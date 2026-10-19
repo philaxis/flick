@@ -1071,13 +1071,6 @@ impl App {
                 }
             }
         }
-        let touchpad = ways & input::FOLLOW_TOUCHPAD != 0;
-        let (notch_x, notch_y) = if touchpad {
-            (self.config.touchpad.notch_x, self.config.touchpad.notch_y)
-        } else {
-            (self.config.mouse.notch_x, self.config.mouse.notch_y)
-        };
-        let firm = (follow::firmness(notch_x, touchpad, false), follow::firmness(notch_y, touchpad, true));
         // A window carried along stays where it is, as one on every desktop.
         let carried = self.carry_held().then(|| unsafe { GetForegroundWindow() });
         let mut shots: Vec<(i32, Shot)> = Vec::new();
@@ -1106,7 +1099,7 @@ impl App {
                 crate::grid::row_title(&self.grid.rows[at].name, at)
             })
             .collect();
-        Some(Scene { hold, origin: from, anchors: self.grid.rows.iter().map(|r| r.anchor()).collect(), rows, cols, firm, shots, names })
+        Some(Scene { hold, origin: from, anchors: self.grid.rows.iter().map(|r| r.anchor()).collect(), rows, cols, shots, names })
     }
 
     /// Hold `hold` began to move: the picture follows it the ways it is set
@@ -1126,7 +1119,7 @@ impl App {
         let Some(desktops) = self.sync() else { return };
         let origin = self.heading(&desktops);
         let Some(scene) = self.glide_scene(&desktops, &origin, hold, hand.ways) else { return };
-        let fallback = follow::Follow::new(scene.rows, scene.cols.clone(), scene.firm);
+        let fallback = follow::Follow::new(scene.rows, scene.cols.clone());
         self.glide.begin(scene);
         self.gliding = Some(Gliding { hold, fallback: Some(fallback), origin, landing: None, step: None, carry: false });
     }

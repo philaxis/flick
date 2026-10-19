@@ -11,8 +11,7 @@
 //! cell a vertical move would land on (their anchor), as in the map.
 //!
 //! How things move is `transition_curve`: a discrete move recedes, slides
-//! and comes forward in `STEP`; moves made while one is under way carry on
-//! from where the strip is; the hand moves it one to one.
+//! and comes forward on settling; retargets carry their speed through a short elastic pull.
 
 use crate::{
     grid::{CellId, Grid, Pos},
@@ -157,9 +156,7 @@ pub fn clip(dest: &Rect, within: &Rect, source: (f32, f32)) -> Option<(Rect, Rec
 }
 
 /// How bright a picture is when the strip is `depth` back.
-pub fn shade(depth: f32, middle: bool) -> f32 {
-    if middle { 1.0 } else { 1.0 - DIM * depth.clamp(0.0, 1.0) }
-}
+pub fn shade(distance: f32) -> f32 { 1.0 - DIM * distance.clamp(0.0, 1.0) }
 
 /// The size of a picture `depth` back.
 pub fn scale(depth: f32) -> f32 {
@@ -233,7 +230,7 @@ impl Strip {
 
     /// One frame at `now` with the hand pulling the selected `row` by `hand`
     /// (cells), counted from `counted_from`. A hold recedes the strip; let
-    /// go, it settles and comes forward, going on as fast as the hand went.
+    /// go, it settles on the committed cell without predicting a fling.
     pub fn follow(&mut self, hand: (f32, f32), row: usize, counted_from: u64, holding: bool, now: f32) {
         let hand = if holding { hand } else { (0.0, 0.0) };
         if holding && !self.holding {
@@ -254,11 +251,10 @@ impl Strip {
         }
         self.across.vertical = true;
         self.across.retarget(hand.1 - old.1, now, curve::SNAP);
-        if self.holding && !holding {
-            self.recede.release(now, now + 0.4);
-            self.row_recede.release(now, now + 0.4);
-        }
         (self.hand, self.hand_row, self.counted_from, self.holding) = (hand, row, Some(counted_from), holding);
+        let rows_moving = self.across.at(now).abs() > 0.01;
+        self.recede.moving(now, holding || rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01));
+        self.row_recede.moving(now, rows_moving || holding && hand.1.abs() > 0.01);
     }
 
     /// How far the cells of `row` are drawn from where they are laid out,
@@ -368,9 +364,9 @@ mod tests {
     /// The neighbours darken as the strip goes back; the middle never.
     #[test]
     fn neighbours_darken_with_depth_only() {
-        assert!(near(shade(0.0, false), 1.0));
-        assert!(near(shade(1.0, false), 1.0 - DIM));
-        assert!(near(shade(1.0, true), 1.0));
+        assert!(near(shade(0.0), 1.0));
+        assert!(near(shade(1.0), 1.0 - DIM));
+        assert!(near(shade(0.0), 1.0));
         assert!(near(scale(1.0), RECEDE) && near(scale(0.0), 1.0));
     }
 
