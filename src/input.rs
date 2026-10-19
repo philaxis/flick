@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn touchpad_hold_swallows_motion_scroll_and_complete_clicks() {
-        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, touchpad_reverse: true };
+        let settings = Settings { target: 0, triggers: vec![], step_x: 260, step_y: 400, touchpad_reverse: false };
         let info = MSLLHOOKSTRUCT::default();
         TOUCHPAD_ON.set(true);
         HELD.with(|held| { held.borrow_mut().press(Source::Touchpad); });
