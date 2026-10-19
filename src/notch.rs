@@ -12,6 +12,9 @@ pub const MAX_STRENGTH: f32 = 2.0;
 /// Strength is bounded to 0..2; integers stay fixed at every strength.
 pub fn position(p: f32, strength: f32) -> f32 {
     let strength = strength.max(0.0).min(MAX_STRENGTH);
+    if strength == 0.0 {
+        return p;
+    }
     let whole = p.floor();
     let mut t = p - whole;
     let bend = |t: f32, k: f32| t - k * (std::f32::consts::TAU * t).sin() / std::f32::consts::TAU;
@@ -38,7 +41,7 @@ mod tests {
                 assert!(shown >= previous - 1e-6, "p={p}, k={k}");
                 assert!((position(1.0 - p, k) - (1.0 - shown)).abs() < 1e-6);
                 if k == 0.0 {
-                    assert!((shown - p).abs() < 1e-6);
+                    assert_eq!(shown, p);
                 }
                 previous = shown;
             }
