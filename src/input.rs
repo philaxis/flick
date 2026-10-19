@@ -313,10 +313,8 @@ fn remember_follow() {
     let received = Instant::now();
     let stamp = SAMPLE_TIME.get();
     let os_ms = unsafe { GetMessageTime() } as u32;
-    let age = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } as u32;
-    let age = age.wrapping_sub(os_ms);
-    // Keep sub-ms receipt precision unless a queued OS message is measurably older.
-    let at = stamp.map_or_else(|| if (2..=250).contains(&age) {received-std::time::Duration::from_millis(age as u64)} else {received}, |s|s.0);
+    // WM_INPUT has no hardware QPC: retain its ms stamp separately, integrate receipt QPC.
+    let at = stamp.map_or(received, |s|s.0);
     let at = LAST_SAMPLE.replace(Some(at)).map_or(at, |last| last.max(at));
     LAST_SAMPLE.set(Some(at));
     let sample = TimedHand { at, received, scan_time: stamp.map(|s|s.1), os_ms,
