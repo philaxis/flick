@@ -1374,6 +1374,10 @@ impl App {
         self.board_opened_on = desktops.current.clone();
         debug_log!("ui: board open");
         self.board.open(model, self.usage_grid());
+        if !self.grid.board_hints_seen {
+            self.grid.board_hints_seen = true;
+            self.save();
+        }
         self.record_foreground(self.board.hwnd());
         if resume {
             self.board.select(left_on, self.usage_grid());

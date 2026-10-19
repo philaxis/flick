@@ -82,6 +82,10 @@ pub struct Grid {
     /// shown by itself again.
     #[serde(default)]
     pub guide_seen: bool,
+    /// The board was opened once: what can be done there is no longer
+    /// said at its bottom unless asked for (?).
+    #[serde(default)]
+    pub board_hints_seen: bool,
 }
 
 impl Grid {

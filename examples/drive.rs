@@ -14,6 +14,7 @@
 //!   drive holds <hold arguments>...  (several windows in one process)
 //!   drive navigation shelves <out dir> <flick exe>
 //!   drive pinprobe <flick exe> <out dir>
+//!   drive boardshot <flick exe> <out dir>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
 //! (src/input.rs) and `WM_OPEN_SETTINGS` (src/app.rs).
 // The app is a binary only; its door to the virtual desktops is compiled in
@@ -70,6 +71,7 @@ fn main() {
                 });
             },
             Some("pinprobe") => pinprobe(&args[2], &args[3]),
+            Some("boardshot") => boardshot(&args[2], &args[3]),
             Some("clickprobe") => boardstress(0, 0, "post", "still"),
             Some("boardstress") => boardstress(args[2].parse().unwrap(), args[3].parse().unwrap(), &args[4], &args[5]),
             Some("step") => post(WM_APP + 1, args[2].parse().unwrap()),
@@ -891,6 +893,153 @@ fn pinprobe(flick: &str, out: &str) {
             None => { let _ = std::fs::remove_file(&state); }
         }
         println!("RESULT probe done");
+    }
+}
+
+/// Opens the board over a window pinned to every desktop, one pinned to
+/// its row and two of the cell's own, and captures the screen: as it comes
+/// up (its hints shown, the first time), resting on a preview, and pointing
+/// at a cell of the map. Puts everything back as it was.
+#[cfg(windows)]
+fn boardshot(flick: &str, out: &str) {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use windows::core::{w, HSTRING};
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        Graphics::Gdi::*,
+        System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+        UI::WindowsAndMessaging::*,
+    };
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        assert!(vdapi::select(false).is_some());
+        if FindWindowW(w!("flick.main"), None).0 != 0 {
+            println!("RESULT another Flick is running; not capturing");
+            return;
+        }
+        let home = vdapi::get_current_desktop().unwrap();
+        let made: Vec<_> = (0..3).map(|_| vdapi::create_desktop().unwrap()).collect();
+        let me = std::env::current_exe().unwrap();
+        let row_exe = out.join("shot-row.exe");
+        std::fs::copy(&me, &row_exe).unwrap();
+        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        let spawn = |exe: &std::path::Path, rgb: &str, title: &str, x: i32, y: i32, w: i32, h: i32| {
+            let mut args: Vec<String> = vec!["hold".into()];
+            args.extend(rgb.split(' ').map(String::from));
+            args.extend([title.to_owned(), x.to_string(), y.to_string(), w.to_string(), h.to_string(), "120".into()]);
+            Command::new(exe).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        };
+        let mut holds = vec![
+            spawn(&me, "70 90 140", "Notes everywhere", sw / 10, sh / 10, sw * 2 / 5, sh * 2 / 5),
+            spawn(&row_exe, "40 120 110", "Shelf chat", sw / 5, sh / 5, sw * 2 / 5, sh * 2 / 5),
+            spawn(&me, "150 110 60", "Report draft", sw / 3, sh / 4, sw / 2, sh / 2),
+            spawn(&me, "90 60 120", "Reference", sw / 4, sh / 3, sw / 3, sh / 2),
+            spawn(&me, "60 130 70", "Next door", sw / 4, sh / 4, sw / 3, sh / 3),
+        ];
+        let find = |title: &str| {
+            for _ in 0..200 {
+                let window = FindWindowW(w!("flick.test.hold"), &HSTRING::from(title));
+                if window.0 != 0 {
+                    return window;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            panic!("{title} did not come up");
+        };
+        let (all, next) = (find("Notes everywhere"), find("Next door"));
+        let _ = (find("Shelf chat"), find("Report draft"), find("Reference"));
+        println!("pin: {:?}, move: {:?}", vdapi::pin_window(all), vdapi::move_window_to_desktop(made[0], next));
+
+        let dir = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("Flick");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state.json");
+        let saved = std::fs::read(&state).ok();
+        let others: Vec<String> = vdapi::get_desktops().unwrap().into_iter().map(|d| d.id())
+            .filter(|id| *id != home.id() && !made.iter().any(|d| d.id() == *id)).collect();
+        let mut first = vec![home.id(), made[0].id()];
+        first.extend(others);
+        let grid = serde_json::json!({
+            "rows": [{"name": "Work", "cells": first, "last": null}, {"name": "Later", "cells": [made[1].id(), made[2].id()], "last": null}],
+            "follow_apps": ["shot-row.exe"],
+            "guide_seen": true,
+        });
+        std::fs::write(&state, serde_json::to_string_pretty(&grid).unwrap()).unwrap();
+
+        let mut app = Command::new(flick).arg("--portable").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut main = HWND(0);
+        for _ in 0..200 {
+            main = FindWindowW(w!("flick.main"), None);
+            if main.0 != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(2500));
+        let _ = SetCursorPos(sw - 4, sh / 2);
+        let _ = PostMessageW(main, WM_APP + 2, WPARAM(0), LPARAM(0));
+        std::thread::sleep(Duration::from_millis(1500));
+        let board = FindWindowW(w!("flick.board"), None);
+        println!("flick {:x} board {:x} visible {}", main.0, board.0, IsWindowVisible(board).as_bool());
+
+        let (x0, y0) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let (w, h) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(screen);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+        SelectObject(dc, bitmap);
+        let pixels = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+        let shot = |name: &str| {
+            let _ = BitBlt(dc, 0, 0, w, h, screen, x0, y0, SRCCOPY);
+            let mut raw = Vec::with_capacity(pixels.len() + 8);
+            raw.extend_from_slice(&w.to_le_bytes());
+            raw.extend_from_slice(&h.to_le_bytes());
+            raw.extend_from_slice(pixels);
+            std::fs::write(out.join(format!("{name}.raw")), raw).unwrap();
+        };
+        shot("board");
+        // Resting on the cell's own windows, right of the pinned places.
+        let _ = SetCursorPos(sw * 3 / 5, sh / 4);
+        std::thread::sleep(Duration::from_millis(1500));
+        shot("resting");
+        // Across the bottom of the map, where its cells are.
+        for x in (sw / 3..sw * 2 / 3).step_by((sw / 40).max(1) as usize) {
+            let _ = SetCursorPos(x, sh * 4 / 5);
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        // Where the cells are depends on the screen: a few places on it.
+        for (i, (fx, fy)) in [(0.47, 0.80), (0.56, 0.80), (0.47, 0.87), (0.56, 0.87)].into_iter().enumerate() {
+            let _ = SetCursorPos((sw as f32 * fx) as i32, (sh as f32 * fy) as i32);
+            std::thread::sleep(Duration::from_millis(500));
+            shot(&format!("map-{i}"));
+        }
+
+        // Everything back as it was.
+        let _ = app.kill();
+        let _ = app.wait();
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = vdapi::switch_desktop(home);
+        println!("unpin: {:?}", vdapi::unpin_window(all));
+        for hold in &mut holds {
+            let _ = hold.kill();
+            let _ = hold.wait();
+        }
+        for desktop in made {
+            let _ = vdapi::remove_desktop(desktop, home);
+        }
+        let _ = std::fs::remove_file(&row_exe);
+        match saved {
+            Some(saved) => std::fs::write(&state, saved).unwrap(),
+            None => { let _ = std::fs::remove_file(&state); }
+        }
+        println!("RESULT shots done");
     }
 }
 
