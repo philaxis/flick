@@ -1115,8 +1115,9 @@ impl App {
         self.focus_before_board = unsafe { GetForegroundWindow() };
         debug_log!("ui: open board model");
         let model = self.model(&desktops);
-        // Left by Esc, a click outside or any other close, the board keeps
-        // the cell it was on, as long as Windows is still on the same desktop.
+        // Left without going to its selection (losing the keyboard), the
+        // board keeps the cell it was on, as long as Windows is still on the
+        // same desktop.
         let left_on = self.board.selected();
         let resume = desktops.current == self.board_opened_on && left_on != desktops.current && self.grid.find(&left_on).is_some();
         self.board_opened_on = desktops.current.clone();
@@ -1188,7 +1189,7 @@ impl App {
                 debug_log!("app: board closed, having lost the keyboard");
             }
             Action::Cancel => {
-                debug_log!("app: board closed");
+                debug_log!("app: board closed at its selection");
             }
             Action::Go(id, _) => {
                 debug_log!("app: board closed to go to cell {}", &id[..4.min(id.len())]);
@@ -1277,8 +1278,15 @@ impl App {
         self.refresh_board();
     }
 
-    /// Closes the board and gives focus back to where it was.
+    /// Esc or a click on nothing: closes the board at its selection, going
+    /// there as Enter would, with the row anchors as left in the board. On
+    /// the current desktop already, it only gives focus back.
     fn cancel_board(&mut self) {
+        let selected = self.board.selected();
+        let current = self.sync().map(|d| d.current);
+        if let Some(id) = current.as_deref().and_then(|current| dismissal_target(&selected, current)) {
+            return self.leave_board(id, None);
+        }
         self.board.close();
         if unsafe { IsWindow(self.focus_before_board) }.as_bool() {
             vd::force_foreground(self.focus_before_board);
@@ -2416,5 +2424,24 @@ pub fn render_settings(path: &str) {
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
         write_raw(path, size, &pixels);
+    }
+}
+
+/// The cell closing the board by Esc or a click on nothing goes to: the
+/// selection, unless that is the current desktop or a window shown on every
+/// desktop (an empty id).
+fn dismissal_target<'a>(selected: &'a str, current: &str) -> Option<&'a str> {
+    (!selected.is_empty() && selected != current).then_some(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_the_board_goes_to_a_selection_moved_off_the_current_desktop() {
+        assert_eq!(dismissal_target("b", "a"), Some("b"));
+        assert_eq!(dismissal_target("a", "a"), None);
+        assert_eq!(dismissal_target("", "a"), None);
     }
 }

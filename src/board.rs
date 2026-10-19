@@ -165,7 +165,8 @@ pub enum Action {
     None,
     /// Move the board selection and save its row anchor without switching desktops.
     Step(Dir),
-    /// Close without going anywhere and give focus back.
+    /// Esc or a click on nothing: close and go to the selected cell, or,
+    /// that being the current desktop, give focus back.
     Cancel,
     /// The board lost focus; close without touching focus.
     Dismiss,
@@ -1644,7 +1645,8 @@ impl Board {
             Hit::AddRowTop => Action::AddRow { top: true },
             // Renaming takes a double click.
             Hit::RowName(_) => Action::None,
-            // A click on nothing dismisses the board, like Task View.
+            // A click on nothing dismisses the board, like Task View, at its
+            // selection.
             Hit::Nothing => Action::Cancel,
         }
     }
