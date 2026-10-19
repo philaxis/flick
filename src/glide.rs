@@ -42,7 +42,7 @@ use windows::{
             Direct2D::{Common::D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE},
             DirectWrite::{IDWriteFactory, IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS},
             Dwm::{
-                DwmFlush, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+                DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
@@ -603,6 +603,7 @@ struct Session {
     /// picture would be without windows for a moment.
     leftover: Vec<Thumb>,
     phase: Phase,
+    hide_after: Option<Instant>,
     began: Instant,
     /// Where the hand was last seen.
     hand: (f64, f64),
@@ -815,11 +816,12 @@ impl View {
                 }
             }
             Request::Arrived(hold) => {
-                if self.session.as_ref().is_some_and(|session| session.hold == hold) {
-                    self.finish(true);
+                if let Some(session) = self.session.as_mut().filter(|session| session.hold == hold) {
+                    // Keep serving new holds while the underlying desktop reaches the display.
+                    session.hide_after = Some(Instant::now() + self.period * 2);
                 }
             }
-            Request::Cancel => self.finish(false),
+            Request::Cancel => self.finish(),
         }
     }
 
@@ -905,6 +907,7 @@ impl View {
             veils,
             leftover,
             phase,
+            hide_after: None,
             began: Instant::now(),
             hand: (0.0, 0.0),
             replay: crate::input::follow_hold(scene.hold).filter(|s| !s.hand.holding).map(|s| s.path.into()).unwrap_or_default(),
@@ -949,17 +952,10 @@ impl View {
             .collect()
     }
 
-    /// Takes the picture down; `flushed` once what Windows shows under it
-    /// is on screen.
-    fn finish(&mut self, flushed: bool) {
+    /// Takes the picture down after arrival, cancellation or an empty gesture.
+    fn finish(&mut self) {
         let Some(session) = self.session.take() else { return };
         *DRAWN.lock().unwrap() = None;
-        if flushed {
-            unsafe {
-                let _ = DwmFlush();
-                let _ = DwmFlush();
-            }
-        }
         // Out of sight in one go first; then what was in it.
         for screen in &session.screens {
             screen.hide();
@@ -1026,6 +1022,9 @@ impl View {
                 if hand.hold == session.hold {
                     session.hand = (hand.x, hand.y);
                 }
+                if !hand.holding && session.stats.frames == 0 && session.replay.is_empty() {
+                    if let Some(saved) = &saved { session.replay = saved.path.clone().into(); }
+                }
                 if let Some(&(x, y, axis)) = session.replay.front() {
                     let at = session.follow.track_locked(now, (x, y), axis);
                     if session.follow.caught_up((x, y), axis) { session.replay.pop_front(); }
@@ -1065,13 +1064,13 @@ impl View {
                 (at, receded, true)
             }
             Phase::Arriving(_, since) => {
-                done = since.elapsed() >= ARRIVAL_WAIT;
+                done = since.elapsed() >= ARRIVAL_WAIT || session.hide_after.is_some_and(|at| Instant::now() >= at);
                 let strip = session.shown.clone().unwrap_or_default();
                 ((0.0, strip.y), strip.receded, false)
             }
         };
         if done {
-            return self.finish(false);
+            return self.finish();
         }
         let Some(session) = &mut self.session else { return };
         let strip = match session.phase {
