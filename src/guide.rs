@@ -17,7 +17,7 @@ use windows::{
         Globalization::GetUserDefaultUILanguage,
         Graphics::{
             Direct2D::{Common::D2D1_COLOR_F, ID2D1Factory, ID2D1RenderTarget},
-            DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING},
+            DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_WRAP},
             Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE},
             Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
         },
@@ -66,10 +66,10 @@ pub struct Words {
 const ENGLISH: Words = Words {
     title: "Flick is running",
     scenes: [
-        "Hold the side button and move sideways: the next desktop",
-        "Up and down goes to another row",
+        "Hold {trigger} + move sideways: next desktop",
+        "Up and down goes to another shelf (row)",
         "Click it once: every desktop and window",
-        "Pin a window to keep it on every desktop",
+        "Pin: Off → This shelf → All shelves",
     ],
     hold: "hold + move",
     click: "click once",
@@ -78,16 +78,16 @@ const ENGLISH: Words = Words {
     button: "Got it",
     balloon: ("Flick is running here", "Right-click this icon for Settings and How to use."),
     menu: "How to use",
-    admin_front: ("Flick can't hear its button now", "A window run as administrator is in front. Click another window, or start Flick again and let it run as administrator."),
+    admin_front: ("Flick can't hear its button now", "A window run as administrator is in front. Click another window, or enable Run as administrator in Settings."),
 };
 
 const KOREAN: Words = Words {
     title: "Flick 이 켜졌어요",
     scenes: [
-        "옆 단추를 누른 채 옆으로: 옆 데스크톱",
-        "위아래로: 다른 줄",
+        "{trigger} 누른 채 옆으로: 옆 데스크톱",
+        "위아래로: 다른 셸프(행)",
         "한 번 누르면: 모든 데스크톱과 창",
-        "창을 고정하면 모든 데스크톱에 보여요",
+        "고정: 끄기 → 이 셸프 → 모든 셸프",
     ],
     hold: "누른 채 움직이기",
     click: "한 번 누르기",
@@ -96,12 +96,12 @@ const KOREAN: Words = Words {
     button: "알겠어요",
     balloon: ("Flick 이 여기서 돌고 있어요", "이 아이콘을 오른쪽 클릭하면 설정과 쓰는 법이 있어요."),
     menu: "쓰는 법",
-    admin_front: ("지금은 Flick 버튼이 안 들려요", "관리자 권한 창이 앞에 있어요. 다른 창을 누르거나, Flick 을 다시 켜고 관리자 권한을 허용하세요."),
+    admin_front: ("지금은 Flick 버튼이 안 들려요", "관리자 권한 창이 앞에 있어요. 다른 창을 누르거나, 설정에서 관리자 권한 실행을 켜세요."),
 };
 
 const CHINESE: Words = Words {
     title: "Flick 已在运行",
-    scenes: ["按住侧键左右移动：下一个桌面", "上下移动：换一行", "按一下：所有桌面和窗口", "固定窗口，让它出现在每个桌面"],
+    scenes: ["按住 {trigger} 左右移动：下一个桌面", "上下移动：切换架子（行）", "按一下：所有桌面和窗口", "固定：关闭 → 本架子 → 所有架子"],
     hold: "按住并移动",
     click: "按一下",
     screen: "你的屏幕",
@@ -109,15 +109,15 @@ const CHINESE: Words = Words {
     button: "知道了",
     balloon: ("Flick 正在这里运行", "右键点击此图标可打开设置和使用方法。"),
     menu: "使用方法",
-    admin_front: ("Flick 现在听不到按键", "前面是以管理员身份运行的窗口。点一下别的窗口，或重新启动 Flick 并允许它以管理员身份运行。"),
+    admin_front: ("Flick 现在听不到按键", "前面是以管理员身份运行的窗口。点一下别的窗口，或在设置中开启以管理员身份运行。"),
 };
 
 /// The words for the language Windows is shown in: Korean, Chinese, or
 /// English for any other.
 pub fn words() -> &'static Words {
-    match unsafe { GetUserDefaultUILanguage() } & 0x3FF {
-        0x12 => &KOREAN,
-        0x04 => &CHINESE,
+    match crate::i18n::language(unsafe { GetUserDefaultUILanguage() }) {
+        1 => &KOREAN,
+        2 => &CHINESE,
         _ => &ENGLISH,
     }
 }
@@ -142,9 +142,11 @@ impl Fonts {
         let factory = paint::dwrite_factory()?;
         let left = DWRITE_TEXT_ALIGNMENT_LEADING;
         let centre = DWRITE_TEXT_ALIGNMENT_CENTER;
+        let text = paint::text_format(&factory, 14.0 * s, 400, left)?;
+        unsafe { text.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?; }
         Ok(Fonts {
             title: paint::text_format(&factory, 18.0 * s, 600, left)?,
-            text: paint::text_format(&factory, 14.0 * s, 400, left)?,
+            text,
             small: paint::text_format(&factory, 12.0 * s, 400, left)?,
             small_centred: paint::text_format(&factory, 11.5 * s, 400, centre)?,
             button: paint::text_format(&factory, 13.5 * s, 600, centre)?,
@@ -192,6 +194,7 @@ pub struct Guide {
     canvas: Option<Canvas>,
     fonts: Option<Fonts>,
     words: &'static Words,
+    trigger: String,
     size: (i32, i32),
     scale: f32,
     started: Instant,
@@ -246,6 +249,7 @@ impl Guide {
                 canvas: None,
                 fonts: None,
                 words,
+                trigger: "XButton2".into(),
                 size: (0, 0),
                 scale: 1.0,
                 started: Instant::now(),
@@ -259,6 +263,8 @@ impl Guide {
     pub fn hwnd(&self) -> HWND {
         self.hwnd
     }
+
+    pub fn set_trigger(&mut self, trigger: String) { self.trigger = trigger; self.invalidate(); }
 
     pub fn words(&self) -> &'static Words {
         self.words
@@ -513,7 +519,7 @@ impl Guide {
             }
         }
 
-        p.text(words.scenes[scene], &fonts.text, &r(24.0, 252.0, 472.0, 26.0), white(0.85));
+        p.text(&scene_text(words.scenes[scene], &self.trigger), &fonts.text, &r(24.0, 248.0, 472.0, 48.0), white(0.85));
 
         // Where Flick is: by the clock, perhaps hidden under ^, and how it
         // is dragged out. The drawing has room of its own under the words.
@@ -543,5 +549,18 @@ impl Guide {
         self.set_scale(scale);
         let _ = self.draw_to_canvas()?;
         Some((self.size, self.canvas.as_ref()?.dib.pixels().to_vec()))
+    }
+}
+
+fn scene_text(template: &str, trigger: &str) -> String { template.replace("{trigger}", trigger) }
+#[cfg(test)]
+mod wording_tests {
+    #[test]
+    fn guide_names_the_current_trigger_in_every_language() {
+        for words in [&super::ENGLISH, &super::KOREAN, &super::CHINESE] {
+            let text = super::scene_text(words.scenes[0], "F13");
+            assert!(text.contains("F13"));
+            assert!(!text.contains("{trigger}"));
+        }
     }
 }

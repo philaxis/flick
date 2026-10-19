@@ -623,3 +623,34 @@ pub fn put_away_stuck_notice() -> bool {
         }
     }
 }
+
+/// Runtime shelf pins carry a property on the actual window, not just its reusable handle.
+#[derive(Default)]
+pub struct WindowPins(std::collections::HashMap<isize, isize>);
+impl WindowPins {
+    const PROPERTY: windows::core::PCWSTR = w!("Flick.ShelfPin.Instance");
+    pub fn contains(&self, hwnd: &isize) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+        self.0.get(hwnd).is_some_and(|tag| crate::pin::same_window(*tag, unsafe { GetPropW(HWND(*hwnd), Self::PROPERTY) }.0))
+    }
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn insert(&mut self, hwnd: isize) -> bool {
+        use std::sync::atomic::{AtomicIsize, Ordering};
+        use windows::Win32::{Foundation::HANDLE, UI::WindowsAndMessaging::SetPropW};
+        static NEXT: AtomicIsize = AtomicIsize::new(1);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        if unsafe { SetPropW(HWND(hwnd), Self::PROPERTY, HANDLE(tag)) }.is_err() { return false; }
+        self.0.insert(hwnd, tag);
+        true
+    }
+    pub fn remove(&mut self, hwnd: &isize) {
+        if self.contains(hwnd) {
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::RemovePropW(HWND(*hwnd), Self::PROPERTY) };
+        }
+        self.0.remove(hwnd);
+    }
+    pub fn prune(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+        self.0.retain(|hwnd, tag| crate::pin::same_window(*tag, unsafe { GetPropW(HWND(*hwnd), Self::PROPERTY) }.0));
+    }
+}

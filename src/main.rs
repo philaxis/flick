@@ -5,6 +5,9 @@
 mod debuglog;
 
 mod config;
+mod pin;
+#[cfg(windows)]
+mod i18n;
 #[cfg(any(windows, test))]
 mod follow;
 mod grid;

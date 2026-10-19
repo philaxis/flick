@@ -85,6 +85,11 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// Only completing the first guide earns the tray-location notification.
+    pub fn complete_guide(&mut self) -> bool {
+        !std::mem::replace(&mut self.guide_seen, true)
+    }
+
     /// Drops removed desktops and credits too old to affect the display.
     pub fn prune_usage(&mut self, now: u64) {
         self.usage.retain(|id, usage| {
@@ -431,5 +436,17 @@ mod tests {
         assert_eq!(nearest(&g, "b2").as_deref(), Some("a3"));
         assert_eq!(nearest(&g, "c1").as_deref(), Some("b1"));
         assert_eq!(nearest(&g, "a1").as_deref(), Some("b1"));
+    }
+}
+
+#[cfg(test)]
+mod onboarding_tests {
+    #[test]
+    fn guide_completion_is_only_announced_once_even_after_restart() {
+        let mut grid = super::Grid::default();
+        assert!(grid.complete_guide());
+        assert!(!grid.complete_guide());
+        let mut restored: super::Grid = serde_json::from_str(&serde_json::to_string(&grid).unwrap()).unwrap();
+        assert!(!restored.complete_guide());
     }
 }

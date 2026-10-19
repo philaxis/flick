@@ -10,7 +10,7 @@
 
 ---
 
-**Your desktops become a grid.** Left and right are the screens of one job. Up and down are other jobs.
+**Your desktops become a grid.** A shelf (row) holds the desktops for one job; up and down leads to other shelves. Only shelves have names.
 
 **Hold and flick.** Hold the trigger, push the mouse, and you move one desktop that way. The pointer stays where it was.
 
@@ -22,17 +22,23 @@
 
 **Three-finger touchpad.** Enable it in Settings after setting Windows’ three-finger swipes and taps to Nothing; tap for the board, or hold and move about 1 cm per desktop. By default the desktops go the other way from the fingers, as if pushing the screen like scrolling; the mouse follows the hand.
 
-**Mouse and touchpad each their own way.** Settings has a tab for each, *Mouse* and *Touchpad*. In each you set sideways (along a row) and up and down (to another row) apart: how far to move for one desktop (pixels for the mouse, millimetres for the touchpad) and how firmly each desktop holds (*Notch*; Off follows the hand evenly). *Reverse direction* turns that hand around.
+**Mouse and touchpad each their own way.** Settings has a tab for each, *Mouse* and *Touchpad*. In each you set sideways (along a shelf) and up and down (to another shelf) apart: how far to move for one desktop (raw mouse counts for the mouse (physical travel depends on mouse DPI, not screen pixels), millimetres for the touchpad) and how firmly each desktop holds (*Notch*; Off follows the hand evenly). *Reverse direction* turns that hand around.
 
-**The screen follows the hand.** With *Follows the hand* on (the default, set for each way), the desktops slide along with the mouse or the fingers as on a Mac, the next ones coming into view, and the desktop changes once, when you let go: to the nearest one, or on to where a quick flick carries it. Windows pinned to every shelf stay put, and windows pinned to a shelf stay put sideways. Turned off, each desktop is gone to at once as the hand reaches it. The same settings are under `[mouse]` and `[touchpad]` in config.toml; a config.toml from an earlier version is read as the mouse settings.
+**The screen follows the hand.** With *Follows the hand* on (the default, set for each way), the desktops slide along with the mouse or the fingers as on a Mac, the next ones coming into view, and the desktop changes once, when you let go: to the nearest one, or on to where a quick flick carries it. Windows pinned to every shelf stay put, and windows pinned to a shelf stay put sideways. Turned off, each desktop is gone to at once as the hand reaches it. The Mouse tab’s follow switches also control keyboard shortcut animations. The same settings are under `[mouse]` and `[touchpad]` in config.toml; a config.toml from an earlier version is read as the mouse settings.
 
 **The screen shows where you are.** While you move, the screen steps back so that a desktop each way, slantwise too, is in sight; the one in the middle stands out, a little larger and brighter than the rest, and the shelf’s name shows at the top. Moving along a shelf slides that shelf only; the shelves above and below stay where they are. The small minimap that used to come up while moving is off by default: turn on *Minimap while moving* in Settings (or `minimap = true` in config.toml) to have it back.
+
+**Pinning and always on top are separate.** The board cycles a window through *Off → This shelf → All shelves → Off*. The pin menu (`Ctrl+Alt+Win+P`) uses the same choices; select a checked choice to turn it off. *On top* is a separate button. An *App:* pin is inherited by every window of that app and can only be changed through the menu’s App choices; clicking a window never unpins its whole app.
+
+**Settings with the keyboard.** Tab / Shift+Tab move the visible focus, arrow keys adjust a focused slider, and Space / Enter activate a button or toggle. Ctrl+Tab switches device tabs; 1 / 2 still work. The window fits the monitor’s work area and scrolls vertically when needed, with the wheel, scrollbar or Page Up / Page Down; keyboard focus scrolls into view. Settings and the guide use the Windows UI language (Korean, Chinese, or English otherwise), and the guide names the current trigger.
+
+**Startup stays quiet.** Elevation is opt-in through *Run as administrator* in Settings, so declining or postponing it never triggers another UAC request on startup. Turning it off affects the next launch; the current process keeps its privileges until restarted. The tray-location balloon appears only when the first guide is completed. Hover previews still appear immediately: the obsolete `dwell_ms` key is ignored and can be removed from older config files.
 
 ## Get started
 
 1. Download with the button above and run it. It installs itself and starts with Windows.
 2. Hold the trigger and flick the mouse sideways.
-3. Tap the trigger and press **+** on the map to add a desktop or a new row.
+3. Tap the trigger and press **+** on the map to add a desktop or a new shelf.
 
 ## Good to know
 
