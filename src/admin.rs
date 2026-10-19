@@ -1,10 +1,10 @@
-//! Running as administrator, which the installed Flick always asks for.
+//! Running as administrator, enabled explicitly from Settings.
 //!
 //! Windows keeps what is typed and clicked on a window run as administrator
 //! from the hooks of a process that is not, and lets such a process neither
 //! close that window nor move it. So Flick is started by a scheduled task
 //! that runs it with the highest privileges: Windows asks for permission
-//! once, when the task is made (`turn_on`, at each start until it is).
+//! only when the user enables the task in Settings (`turn_on`).
 //!
 //! Flick runs as administrator while there is a task. Started in any other
 //! way it hands over to the task (`hand_over`).
@@ -38,10 +38,6 @@ static PORTABLE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_portable(portable: bool) {
     PORTABLE.store(portable, Ordering::SeqCst);
-}
-
-pub fn portable() -> bool {
-    PORTABLE.load(Ordering::SeqCst)
 }
 
 /// The name of the scheduled task, and of the entry in the registry that
@@ -189,6 +185,7 @@ fn run_elevated(arguments: &str) -> bool {
 pub fn helper(arguments: &[String]) -> i32 {
     let done = match arguments {
         [on, at_sign_in, user] if on == "on" => write_task(user, at_sign_in == "1"),
+        [off] if off == "off" => remove_task(),
         _ => false,
     };
     !done as i32
@@ -235,6 +232,11 @@ pub fn turn_on(at_sign_in: bool) -> bool {
     }
     // The other one waits for this one to go (`main`).
     schtasks(&["/Run", "/TN", &task_name()]).is_some()
+}
+
+/// Stop elevating future launches; the current process keeps its token until restart.
+pub fn turn_off() -> bool {
+    if elevated() { remove_task() } else { run_elevated(&format!("--admin off{}", portable_flag())) && !enabled() }
 }
 
 /// Sets whether the task starts Flick at sign-in, keeping whom it is for.

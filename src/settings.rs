@@ -10,6 +10,7 @@ use crate::{
     config::{Mouse, Touchpad},
     paint::{self, accent, rect, white, Canvas, Painter, Rect},
     vd,
+    i18n::text as tr,
 };
 use windows::{
     core::{w, Error, Result},
@@ -27,12 +28,14 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             HiDpi::AdjustWindowRectExForDpi,
+            Controls::SetScrollInfo,
             Input::KeyboardAndMouse::{
-                ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_TAB,
+                GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_TAB,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, GetClientRect, IsWindowVisible, LoadCursorW, RegisterClassW, SetWindowPos,
                 ShowWindow, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+                WM_MOUSEWHEEL, WM_VSCROLL, GetScrollInfo, SCROLLINFO, SIF_ALL, SB_VERT, WS_VSCROLL,
                 WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
                 WNDCLASSW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_SYSMENU,
             },
@@ -53,18 +56,18 @@ const ROWS: (f32, f32) = (14.0, 44.0);
 const EDGES: (f32, f32) = (28.0, 628.0);
 /// The tab's rows, the first with the tabs themselves above it, and the
 /// link to the file below them.
-const TAB_ROWS: (f32, f32) = (4.0, 12.0);
-const FILE_ROW: f32 = 13.0;
+const TAB_ROWS: (f32, f32) = (5.0, 13.0);
+const FILE_ROW: f32 = 14.0;
 /// How far the tab's controls stand in from its edges, and the room
 /// between its two ways.
 const INSET: f32 = 16.0;
 const GAP: f32 = 24.0;
 /// The width of a way's labels and of the value after its sliders.
 const LABEL: f32 = 76.0;
-const VALUE: f32 = 64.0;
+const VALUE: f32 = 90.0;
 /// What the sliders span, and the step they move in: the mouse's distances
-/// in pixels, the touchpad's in tenths of a mm, notches in percent.
-const PIXELS: (i32, i32, i32) = (80, 600, 10);
+/// in raw counts, the touchpad's in tenths of a mm, notches in percent.
+const COUNTS: (i32, i32, i32) = (80, 600, 10);
 const TENTHS_MM: (i32, i32, i32) = (40, 300, 5);
 const NOTCH: (i32, i32, i32) = (0, crate::slide::FIRMEST as i32, 10);
 
@@ -76,6 +79,7 @@ pub struct View {
     /// Waiting for the user to press what the trigger should become.
     pub capturing: bool,
     pub autostart: bool,
+    pub admin: bool,
     /// See `Config::minimap`, `mouse`, `touchpad`.
     pub minimap: bool,
     pub mouse: Mouse,
@@ -93,6 +97,7 @@ pub enum Action {
     /// Start (or give up) waiting for a new trigger to be pressed.
     Capture(bool),
     Autostart(bool),
+    Admin(bool),
     /// Open the config file, which has the settings not shown here.
     OpenFile,
     TouchpadSettings,
@@ -111,12 +116,13 @@ pub enum Tab {
 /// to row (1), as `_x` and `_y` in the config.
 const WAYS: [usize; 2] = [0, 1];
 
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 enum Hit {
     #[default]
     Nothing,
     Trigger,
     Autostart,
+    Admin,
     Minimap,
     Tab(Tab),
     /// A way's distance, notches and following the hand.
@@ -133,6 +139,7 @@ enum Hit {
 struct Layout {
     trigger: Rect,
     autostart: Rect,
+    admin: Rect,
     minimap: Rect,
     tabs: [Rect; 2],
     /// The tab's area under the tabs.
@@ -167,6 +174,7 @@ impl Layout {
             trigger: right(0.0, 64.0, 30.0),
             autostart: right(1.0, 44.0, 24.0),
             minimap: right(2.0, 44.0, 24.0),
+            admin: right(3.0, 44.0, 24.0),
             tabs: [tab(0.0), tab(1.0)],
             panel: rect(EDGES.0 * s, top * s, (EDGES.1 - EDGES.0) * s, (bottom - top) * s),
             columns: WAYS.map(|way| {
@@ -183,36 +191,32 @@ impl Layout {
         }
     }
 
-    /// What is at (`x`, `y`) with `tab` shown.
-    fn hit(&self, tab: Tab, x: f32, y: f32) -> Hit {
-        let inside = |r: &Rect| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
-        let touchpad = tab == Tab::Touchpad;
-        let none = Rect::default();
-        [
-            (self.trigger, Hit::Trigger),
-            (self.autostart, Hit::Autostart),
-            (self.minimap, Hit::Minimap),
-            (self.tabs[0], Hit::Tab(Tab::Mouse)),
-            (self.tabs[1], Hit::Tab(Tab::Touchpad)),
-            (self.steps[0], Hit::Step(0)),
-            (self.steps[1], Hit::Step(1)),
-            (self.notches[0], Hit::Notch(0)),
-            (self.notches[1], Hit::Notch(1)),
-            (self.follows[0], Hit::Follow(0)),
-            (self.follows[1], Hit::Follow(1)),
+    fn controls(&self, tab: Tab, conflict: bool) -> Vec<(Rect, Hit)> {
+        let mut controls = vec![
+            (self.trigger, Hit::Trigger), (self.autostart, Hit::Autostart),
+            (self.minimap, Hit::Minimap), (self.admin, Hit::Admin),
+            (self.tabs[0], Hit::Tab(Tab::Mouse)), (self.tabs[1], Hit::Tab(Tab::Touchpad)),
+            (self.steps[0], Hit::Step(0)), (self.notches[0], Hit::Notch(0)), (self.follows[0], Hit::Follow(0)),
+            (self.steps[1], Hit::Step(1)), (self.notches[1], Hit::Notch(1)), (self.follows[1], Hit::Follow(1)),
             (self.reverse, Hit::Reverse),
-            (if touchpad { self.touchpad } else { none }, Hit::Touchpad),
-            (if touchpad { self.touchpad_settings } else { none }, Hit::TouchpadSettings),
-            (self.file, Hit::File),
-        ]
-        .into_iter()
-        .find(|(area, _)| inside(area))
-        .map_or(Hit::Nothing, |(_, hit)| hit)
+        ];
+        if tab == Tab::Touchpad {
+            controls.push((self.touchpad, Hit::Touchpad));
+            if conflict { controls.push((self.touchpad_settings, Hit::TouchpadSettings)); }
+        }
+        controls.push((self.file, Hit::File));
+        controls
     }
+    fn hit(&self, tab: Tab, conflict: bool, x: f32, y: f32) -> Hit {
+        self.controls(tab, conflict).into_iter()
+            .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            .map_or(Hit::Nothing, |(_, hit)| hit)
+    }
+
 }
 
 /// One hand's settings as the tab shows them, sliders in their own units
-/// (`PIXELS`, `TENTHS_MM`, `NOTCH`).
+/// (`COUNTS`, `TENTHS_MM`, `NOTCH`).
 #[derive(Clone, Copy)]
 struct Hand {
     steps: [i32; 2],
@@ -287,13 +291,13 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
 /// A distance on `tab` in words, from the slider's units.
 fn distance_words(tab: Tab, step: i32) -> String {
     match tab {
-        Tab::Mouse => format!("{step} px"),
+        Tab::Mouse => format!("{step} {}", tr("counts", "카운트", "计数")),
         Tab::Touchpad => format!("{}.{} mm", step / 10, step % 10),
     }
 }
 
 fn notch_words(notch: i32) -> String {
-    if notch == 0 { "Off".into() } else { format!("{notch}%") }
+    if notch == 0 { tr("Off", "끄기", "关闭").into() } else { format!("{notch}%") }
 }
 
 struct Fonts {
@@ -330,6 +334,8 @@ pub struct Settings {
     hover: Hit,
     press: Option<Press>,
     tab: Tab,
+    focus: Hit,
+    scroll: i32,
 }
 
 /// The mouse button is down.
@@ -362,8 +368,8 @@ impl Settings {
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 class,
-                w!("Flick Settings"),
-                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                &windows::core::HSTRING::from(tr("Flick Settings", "Flick 설정", "Flick 设置")),
+                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VSCROLL,
                 0,
                 0,
                 0,
@@ -393,6 +399,8 @@ impl Settings {
                 hover: Hit::Nothing,
                 press: None,
                 tab: Tab::Mouse,
+                focus: Hit::Trigger,
+                scroll: 0,
             })
         }
     }
@@ -418,16 +426,18 @@ impl Settings {
         }
         let monitors = vd::monitors();
         let Some(home) = monitors.iter().find(|m| m.primary) else { return };
-        self.set_scale(home.scale);
+        self.set_scale(fitting_scale(home.scale, home.work.right - home.work.left));
+        self.scroll = 0;
+        self.focus = Hit::Trigger;
         self.hover = Hit::Nothing;
         self.press = None;
         let mut frame = RECT { left: 0, top: 0, right: self.size.0, bottom: self.size.1 };
         unsafe {
             let dpi = (home.scale * 96.0).round() as u32;
-            let _ = AdjustWindowRectExForDpi(&mut frame, WS_POPUP | WS_CAPTION | WS_SYSMENU, false, WS_EX_TOOLWINDOW, dpi);
+            let _ = AdjustWindowRectExForDpi(&mut frame, WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VSCROLL, false, WS_EX_TOOLWINDOW, dpi);
             let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
-            let (x, y) = ((home.work.left + home.work.right - w) / 2, (home.work.top + home.work.bottom - h) / 2);
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+            let fitted = fit_frame((home.work.left + home.work.right - w) / 2, (home.work.top + home.work.bottom - h) / 2, w, h, &home.work);
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, fitted.left, fitted.top, fitted.right - fitted.left, fitted.bottom - fitted.top, SWP_SHOWWINDOW);
         }
     }
 
@@ -442,6 +452,7 @@ impl Settings {
 
     pub fn set_view(&mut self, view: View) {
         self.view = view;
+        if !self.controls().iter().any(|(_, hit)| *hit == self.focus) { self.focus = Hit::Tab(self.tab); }
         self.invalidate();
     }
 
@@ -463,6 +474,7 @@ impl Settings {
     pub fn handle(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<Action> {
         // Mouse messages carry the position as two signed 16-bit numbers.
         let (x, y) = ((lparam.0 & 0xFFFF) as i16 as f32, ((lparam.0 >> 16) & 0xFFFF) as i16 as f32);
+        let y = y + self.scroll as f32;
         let capturing = self.view.capturing;
         let pressed = |code: u8| message == WM_KEYDOWN && wparam.0 == code as usize && !capturing;
         Some(match message {
@@ -483,7 +495,37 @@ impl Settings {
                 Action::None
             }
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => Action::Close,
-            _ if pressed(VK_TAB.0 as u8) => self.show(if self.tab == Tab::Mouse { Tab::Touchpad } else { Tab::Mouse }),
+            _ if pressed(VK_TAB.0 as u8) => {
+                if unsafe { GetKeyState(0x11) } < 0 {
+                    self.focus = Hit::Tab(if self.tab == Tab::Mouse { Tab::Touchpad } else { Tab::Mouse });
+                    self.show(if self.tab == Tab::Mouse { Tab::Touchpad } else { Tab::Mouse })
+                } else {
+                    self.move_focus(unsafe { GetKeyState(0x10) } < 0);
+                    Action::None
+                }
+            }
+            _ if pressed(0x20) || pressed(0x0d) => self.activate(self.focus),
+            _ if pressed(0x25) || pressed(0x26) => self.adjust_slider(-1),
+            _ if pressed(0x27) || pressed(0x28) => self.adjust_slider(1),
+            _ if pressed(0x21) || pressed(0x22) => {
+                self.scroll_by(if wparam.0 == 0x21 { -self.size.1 } else { self.size.1 });
+                Action::None
+            }
+            WM_MOUSEWHEEL => {
+                self.scroll_by(-((wparam.0 >> 16) as i16 as i32) * 44 / 120);
+                Action::None
+            }
+            WM_VSCROLL => {
+                let mut info = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_ALL, ..Default::default() };
+                let _ = unsafe { GetScrollInfo(self.hwnd, SB_VERT, &mut info) };
+                let to = match wparam.0 & 0xffff {
+                    0 => self.scroll - 44, 1 => self.scroll + 44,
+                    2 => self.scroll - self.size.1, 3 => self.scroll + self.size.1,
+                    4 | 5 => info.nTrackPos, 6 => 0, 7 => self.content_height(), _ => self.scroll,
+                };
+                self.scroll_by(to - self.scroll);
+                Action::None
+            }
             _ if pressed(b'1') => self.show(Tab::Mouse),
             _ if pressed(b'2') => self.show(Tab::Touchpad),
             _ if pressed(b'R') => self.toggle(Hit::Reverse),
@@ -496,11 +538,16 @@ impl Settings {
             WM_DPICHANGED => {
                 // Moved to a monitor with another scaling: Windows says where
                 // the window should be now.
-                self.set_scale((wparam.0 & 0xFFFF) as f32 / 96.0);
                 unsafe {
                     let to = *(lparam.0 as *const RECT);
-                    let (w, h) = (to.right - to.left, to.bottom - to.top);
-                    let _ = SetWindowPos(self.hwnd, None, to.left, to.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                    let monitors = vd::monitors();
+                    if let Some(home) = monitors.iter().max_by_key(|m| overlap(&to, &m.bounds)) {
+                        self.set_scale(fitting_scale((wparam.0 & 0xffff) as f32 / 96.0, home.work.right - home.work.left));
+                        let mut frame = RECT { right: self.size.0, bottom: self.size.1, ..Default::default() };
+                        let _ = AdjustWindowRectExForDpi(&mut frame, WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VSCROLL, false, WS_EX_TOOLWINDOW, (wparam.0 & 0xffff) as u32);
+                        let fitted = fit_frame(to.left, to.top, frame.right - frame.left, frame.bottom - frame.top, &home.work);
+                        let _ = SetWindowPos(self.hwnd, None, fitted.left, fitted.top, fitted.right - fitted.left, fitted.bottom - fitted.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
                 }
                 self.invalidate();
                 Action::None
@@ -511,6 +558,8 @@ impl Settings {
 
     fn show(&mut self, tab: Tab) -> Action {
         self.tab = tab;
+        if !self.controls().iter().any(|(_, hit)| *hit == self.focus) { self.focus = Hit::Tab(tab); }
+        self.reveal_focus();
         self.invalidate();
         Action::None
     }
@@ -535,7 +584,7 @@ impl Settings {
     /// it spans.
     fn slider(&self, hit: Hit) -> Option<(i32, (i32, i32, i32))> {
         let hand = self.view.hand(self.tab);
-        let distances = if self.tab == Tab::Mouse { PIXELS } else { TENTHS_MM };
+        let distances = if self.tab == Tab::Mouse { COUNTS } else { TENTHS_MM };
         match hit {
             Hit::Step(way) => Some((hand.steps[way], distances)),
             Hit::Notch(way) => Some((hand.notches[way], NOTCH)),
@@ -566,8 +615,9 @@ impl Settings {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32) -> Action {
-        let hit = Layout::new(self.scale).hit(self.tab, x, y);
+        let hit = Layout::new(self.scale).hit(self.tab, self.conflict(), x, y);
         let before = self.slider(hit).map_or(0.0, |(value, _)| value as f32);
+        self.focus = hit;
         self.press = Some(Press { hit, before });
         unsafe {
             SetCapture(self.hwnd);
@@ -581,7 +631,7 @@ impl Settings {
         if self.press.is_some() {
             return self.drag(x);
         }
-        let hover = Layout::new(self.scale).hit(self.tab, x, y);
+        let hover = Layout::new(self.scale).hit(self.tab, self.conflict(), x, y);
         if hover != self.hover {
             self.hover = hover;
             self.invalidate();
@@ -608,18 +658,20 @@ impl Settings {
         if let Some((now, _)) = self.slider(hit) {
             // A drag ended: what it arrived at is kept.
             let Some(key) = key(self.tab, hit) else { return Action::None };
-            let value = match (self.tab, hit) {
-                (Tab::Touchpad, Hit::Step(_)) => format!("{}.{}", now / 10, now % 10),
-                _ => now.to_string(),
-            };
+            let value = slider_value(self.tab, hit, now);
             return if now as f32 == before { Action::None } else { Action::Set(key, value) };
         }
-        if Layout::new(self.scale).hit(self.tab, x, y) != hit {
+        if Layout::new(self.scale).hit(self.tab, self.conflict(), x, y) != hit {
             return Action::None;
         }
+        self.activate(hit)
+    }
+
+    fn activate(&mut self, hit: Hit) -> Action {
         match hit {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
+            Hit::Admin => Action::Admin(!self.view.admin),
             Hit::Tab(tab) => self.show(tab),
             Hit::Follow(_) | Hit::Reverse | Hit::Touchpad | Hit::Minimap => self.toggle(hit),
             Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
@@ -628,11 +680,40 @@ impl Settings {
         }
     }
 
+    fn conflict(&self) -> bool { self.view.touchpad_status == crate::touchpad::Status::Conflict }
+    fn controls(&self) -> Vec<(Rect, Hit)> { Layout::new(self.scale).controls(self.tab, self.conflict()) }
+    fn content_height(&self) -> i32 { (SIZE.1 * self.scale).round() as i32 }
+    fn scroll_by(&mut self, by: i32) {
+        let next = (self.scroll + by).clamp(0, (self.content_height() - self.size.1).max(0));
+        if self.scroll != next { self.scroll = next; self.invalidate(); }
+        let info = SCROLLINFO { cbSize: std::mem::size_of::<SCROLLINFO>() as u32, fMask: SIF_ALL,
+            nMin: 0, nMax: self.content_height() - 1, nPage: self.size.1.max(0) as u32, nPos: self.scroll, ..Default::default() };
+        unsafe { SetScrollInfo(self.hwnd, SB_VERT, &info, true); }
+    }
+    fn reveal_focus(&mut self) {
+        if let Some((area, _)) = self.controls().into_iter().find(|(_, hit)| *hit == self.focus) {
+            let next = reveal(self.scroll, self.size.1, area.top as i32 - 6, area.bottom as i32 + 6);
+            self.scroll_by(next - self.scroll);
+        }
+    }
+    fn move_focus(&mut self, backwards: bool) {
+        let controls = self.controls();
+        self.focus = next_focus(&controls, self.focus, backwards);
+        self.reveal_focus();
+        self.invalidate();
+    }
+    fn adjust_slider(&mut self, direction: i32) -> Action {
+        let Some((value, span)) = self.slider(self.focus) else { return Action::None };
+        let Some(key) = key(self.tab, self.focus) else { return Action::None };
+        let next = slider_step(value, span, direction);
+        Action::Set(key, slider_value(self.tab, self.focus, next))
+    }
+
     // ---- drawing ----------------------------------------------------------
 
     fn draw_to_canvas(&mut self) -> Option<Result<()>> {
-        if !self.canvas.as_ref().is_some_and(|c| c.dib.size == self.size) {
-            self.canvas = Canvas::new(&self.factory, self.size)
+        if !self.canvas.as_ref().is_some_and(|c| c.dib.size == (self.size.0, self.content_height().max(self.size.1))) {
+            self.canvas = Canvas::new(&self.factory, (self.size.0, self.content_height().max(self.size.1)))
                 .map_err(|e| crate::app::log(&format!("settings canvas failed: {e}")))
                 .ok();
         }
@@ -653,6 +734,7 @@ impl Settings {
         if unsafe { GetClientRect(self.hwnd, &mut inside) }.is_ok() && inside.right > 0 {
             self.size = (inside.right, inside.bottom);
         }
+        self.scroll_by(0);
         match self.draw_to_canvas() {
             Some(Ok(())) => {}
             Some(Err(e)) => {
@@ -663,10 +745,10 @@ impl Settings {
             None => return,
         }
         if let Some(canvas) = &self.canvas {
-            let (w, h) = canvas.dib.size;
+            let (w, h) = self.size;
             unsafe {
                 let window = GetDC(self.hwnd);
-                let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
+                let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, self.scroll, SRCCOPY);
                 ReleaseDC(self.hwnd, window);
             }
         }
@@ -687,23 +769,26 @@ impl Settings {
         let row = |i: f32| rect(EDGES.0 * s, (ROWS.0 + i * ROWS.1) * s, (EDGES.1 - EDGES.0) * s, ROWS.1 * s);
         let label = |i: f32, text: &str| p.text(text, &fonts.label, &row(i), white(0.62));
 
-        label(0.0, "Trigger");
+        label(0.0, tr("Trigger", "트리거", "触发键"));
         let (words, colour) = match view.capturing {
-            true => ("Press the button or key to use", accent(1.0)),
+            true => (tr("Press the button or key to use", "사용할 버튼이나 키를 누르세요", "请按要使用的按钮或按键"), accent(1.0)),
             false => (view.trigger.as_str(), white(0.92)),
         };
         p.text(words, &fonts.value, &Rect { right: layout.trigger.left - 12.0 * s, ..row(0.0) }, colour);
-        self.draw_button(&p, fonts, &layout.trigger, if view.capturing { "Cancel" } else { "Change" }, Hit::Trigger);
+        self.draw_button(&p, fonts, &layout.trigger, if view.capturing { tr("Cancel", "취소", "取消") } else { tr("Change", "변경", "更改") }, Hit::Trigger);
 
-        label(1.0, "Start with Windows");
+        label(1.0, tr("Start with Windows", "Windows와 함께 시작", "随 Windows 启动"));
         self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
 
-        label(2.0, "Minimap while moving");
+        label(2.0, tr("Minimap while moving", "이동 중 미니맵 표시", "移动时显示小地图"));
         self.draw_switch(&p, &layout.minimap, view.minimap, Hit::Minimap);
+
+        label(3.0, tr("Run as administrator (off takes effect after restart)", "관리자 권한 실행 (끄기는 재시작 후 적용)", "以管理员身份运行（关闭后重启生效）"));
+        self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
 
         // The tabs, the one shown lit and joined to its area below.
         p.fill(&layout.panel, 10.0 * s, white(0.045));
-        for (area, this, text) in [(&layout.tabs[0], Tab::Mouse, "Mouse (1)"), (&layout.tabs[1], Tab::Touchpad, "Touchpad (2)")] {
+        for (area, this, text) in [(&layout.tabs[0], Tab::Mouse, tr("Mouse (1)", "마우스 (1)", "鼠标 (1)")), (&layout.tabs[1], Tab::Touchpad, tr("Touchpad (2)", "터치패드 (2)", "触摸板 (2)"))] {
             let on = tab == this;
             let hot = self.hover == Hit::Tab(this);
             if on {
@@ -715,51 +800,57 @@ impl Settings {
         }
 
         let inner = |i: f32| Rect { left: (EDGES.0 + INSET) * s, right: (EDGES.1 - INSET) * s, ..row(i) };
-        let distances = if tab == Tab::Mouse { PIXELS } else { TENTHS_MM };
+        let distances = if tab == Tab::Mouse { COUNTS } else { TENTHS_MM };
         for way in WAYS {
             let column = layout.columns[way];
             let line = |i: f32| Rect { top: row(i).top, bottom: row(i).bottom, ..column };
-            let title = ["Sideways · along a row", "Up and down · to another row"][way];
+            let title = [tr("Sideways · along a shelf", "좌우 · 같은 셸프(행)", "左右 · 同一架子（行）"), tr("Up and down · to another shelf", "위아래 · 다른 셸프(행)", "上下 · 切换架子（行）")][way];
             p.text(title, &fonts.title, &line(TAB_ROWS.0), white(0.92));
-            p.text("Distance", &fonts.label, &line(TAB_ROWS.0 + 1.0), white(0.62));
+            p.text(tr("Distance", "거리", "距离"), &fonts.label, &line(TAB_ROWS.0 + 1.0), white(0.62));
             let words = distance_words(tab, hand.steps[way]);
             self.draw_slider(&p, fonts, &layout.steps[way], column.right, hand.steps[way], distances, &words, Hit::Step(way));
-            p.text("Notch", &fonts.label, &line(TAB_ROWS.0 + 2.0), white(0.62));
+            p.text(tr("Notch", "걸림", "卡点"), &fonts.label, &line(TAB_ROWS.0 + 2.0), white(0.62));
             let words = notch_words(hand.notches[way]);
             self.draw_slider(&p, fonts, &layout.notches[way], column.right, hand.notches[way], NOTCH, &words, Hit::Notch(way));
-            p.text("Follows the hand", &fonts.label, &line(TAB_ROWS.0 + 3.0), white(0.62));
+            p.text(tr("Follows the hand", "손 따라가기", "跟随手"), &fonts.label, &line(TAB_ROWS.0 + 3.0), white(0.62));
             self.draw_switch(&p, &layout.follows[way], hand.follows[way], Hit::Follow(way));
         }
 
-        p.text("Reverse direction (R)", &fonts.label, &inner(TAB_ROWS.0 + 4.0), white(0.62));
+        p.text(tr("Reverse direction (R)", "방향 반전 (R)", "反向 (R)"), &fonts.label, &inner(TAB_ROWS.0 + 4.0), white(0.62));
         self.draw_switch(&p, &layout.reverse, hand.reverse, Hit::Reverse);
 
         let notice = match tab {
             Tab::Mouse => {
-                "Hold the trigger and move the mouse: sideways along a row, up and down from row to row. \
-                 Following the hand, the screen slides along and the desktop changes on letting go."
+                tr("Hold the trigger and move between shelves (rows). Distance is raw mouse counts, not pixels; travel depends on mouse DPI. Follows the hand also animates keyboard shortcuts.",
+                    "트리거를 누르고 셸프(행) 사이로 움직이세요. 거리는 픽셀이 아닌 원시 마우스 카운트이며 이동량은 마우스 DPI에 따라 달라집니다. 손 따라가기는 키보드 전환 애니메이션에도 적용됩니다.",
+                    "按住触发键在架子（行）间移动。距离是原始鼠标计数，并非像素；实际距离取决于鼠标 DPI。跟随手也控制键盘切换动画。")
             }
             Tab::Touchpad => {
-                p.text("Three-finger touchpad (T)", &fonts.label, &inner(TAB_ROWS.0 + 5.0), white(0.62));
+                p.text(tr("Three-finger touchpad (T)", "세 손가락 터치패드 (T)", "三指触摸板 (T)"), &fonts.label, &inner(TAB_ROWS.0 + 5.0), white(0.62));
                 self.draw_switch(&p, &layout.touchpad, view.touchpad.three_finger, Hit::Touchpad);
                 match view.touchpad_status {
-                    crate::touchpad::Status::Absent => "No precision touchpad detected",
-                    crate::touchpad::Status::Off => "Off. Enable to use three fingers as the trigger.",
-                    crate::touchpad::Status::Active => "Ready. Tap for the board; move the distances above to go from desktop to desktop.",
-                    crate::touchpad::Status::Conflict => crate::touchpad::NOTICE,
-                    crate::touchpad::Status::Unavailable => "Touchpad reports could not be read on this device.",
+                    crate::touchpad::Status::Absent => tr("No precision touchpad detected", "정밀 터치패드를 찾지 못했습니다", "未检测到精密触摸板"),
+                    crate::touchpad::Status::Off => tr("Off. Enable to use three fingers as the trigger.", "끄기 상태입니다. 켜면 세 손가락이 트리거가 됩니다.", "已关闭。开启后三指可作为触发键。"),
+                    crate::touchpad::Status::Active => tr("Ready. Tap for the board; move the distances above to go from desktop to desktop.", "준비됐습니다. 탭하면 전체 보기, 움직이면 데스크톱 전환입니다.", "已就绪。轻点打开总览，移动可切换桌面。"),
+                    crate::touchpad::Status::Conflict => tr(crate::touchpad::NOTICE, "Windows의 세 손가락 살짝 밀기와 탭을 모두 ‘아무것도 안 함’으로 설정하세요.", "请将 Windows 的三指轻扫和点击均设为‘无’。"),
+                    crate::touchpad::Status::Unavailable => tr("Touchpad reports could not be read on this device.", "이 장치의 터치패드 입력을 읽지 못했습니다.", "无法读取此设备的触摸板输入。"),
                 }
             }
         };
         // A row of its own under the switches, the button in the next.
         let area = inner(TAB_ROWS.0 + if tab == Tab::Mouse { 5.0 } else { 6.0 });
+        let area = Rect { bottom: area.top + if tab == Tab::Mouse { 3.0 } else { 1.0 } * ROWS.1 * s, ..area };
         p.text(notice, &fonts.notice, &area, white(0.62));
         if tab == Tab::Touchpad && view.touchpad_status == crate::touchpad::Status::Conflict {
-            self.draw_button(&p, fonts, &layout.touchpad_settings, "Open Windows touchpad settings (W)", Hit::TouchpadSettings);
+            self.draw_button(&p, fonts, &layout.touchpad_settings, tr("Open Windows touchpad settings (W)", "Windows 터치패드 설정 열기 (W)", "打开 Windows 触摸板设置 (W)"), Hit::TouchpadSettings);
         }
 
         let hot = self.hover == Hit::File;
-        p.text("More settings: config.toml", &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
+        p.text(tr("More settings: config.toml", "추가 설정: config.toml", "更多设置：config.toml"), &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
+        if let Some((area, _)) = self.controls().into_iter().find(|(_, hit)| *hit == self.focus) {
+            let ring = Rect { left: area.left - 3.0 * s, top: area.top - 3.0 * s, right: area.right + 3.0 * s, bottom: area.bottom + 3.0 * s };
+            p.stroke(&ring, 5.0 * s, 2.0 * s, accent(1.0));
+        }
         Ok(())
     }
 
@@ -808,4 +899,76 @@ impl Settings {
 /// Where a slider's knob travels: from and to, inside its row.
 fn slider_ends(area: &Rect, s: f32) -> (f32, f32) {
     (area.left + 8.0 * s, area.right - 14.0 * s)
+}
+
+fn overlap(a: &RECT, b: &RECT) -> i64 {
+    (a.right.min(b.right) - a.left.max(b.left)).max(0) as i64
+        * (a.bottom.min(b.bottom) - a.top.max(b.top)).max(0) as i64
+}
+fn fit_frame(x: i32, y: i32, width: i32, height: i32, work: &RECT) -> RECT {
+    let w = width.min(work.right - work.left);
+    let h = height.min(work.bottom - work.top);
+    let left = x.clamp(work.left, work.right - w);
+    let top = y.clamp(work.top, work.bottom - h);
+    RECT { left, top, right: left + w, bottom: top + h }
+}
+fn fitting_scale(dpi_scale: f32, work_width: i32) -> f32 {
+    dpi_scale.min(((work_width - 40).max(1) as f32) / SIZE.0)
+}
+fn reveal(scroll: i32, height: i32, top: i32, bottom: i32) -> i32 {
+    if top < scroll { top.max(0) } else if bottom > scroll + height { (bottom - height).max(0) } else { scroll }
+}
+fn next_focus(controls: &[(Rect, Hit)], focus: Hit, backwards: bool) -> Hit {
+    let index = controls.iter().position(|(_, hit)| *hit == focus);
+    let next = match index { Some(i) if backwards => (i + controls.len() - 1) % controls.len(),
+        Some(i) => (i + 1) % controls.len(), None if backwards => controls.len() - 1, None => 0 };
+    controls[next].1
+}
+fn slider_step(value: i32, (low, high, step): (i32, i32, i32), direction: i32) -> i32 {
+    (value + step * direction).clamp(low, high)
+}
+fn slider_value(tab: Tab, hit: Hit, value: i32) -> String {
+    match (tab, hit) { (Tab::Touchpad, Hit::Step(_)) => format!("{}.{}", value / 10, value % 10), _ => value.to_string() }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn focus_visits_all_visible_controls_and_wraps_both_ways() {
+        for tab in [Tab::Mouse, Tab::Touchpad] {
+            for conflict in [false, true] {
+                let controls = Layout::new(1.0).controls(tab, conflict);
+                let mut focus = controls[0].1;
+                for (_, expected) in controls.iter().skip(1).chain(controls.iter().take(1)) {
+                    focus = next_focus(&controls, focus, false);
+                    assert_eq!(focus, *expected);
+                }
+                assert_eq!(next_focus(&controls, focus, true), controls.last().unwrap().1);
+                assert_eq!(controls.iter().any(|(_, h)| *h == Hit::TouchpadSettings), tab == Tab::Touchpad && conflict);
+            }
+        }
+    }
+    #[test]
+    fn keyboard_sliders_clamp_and_keep_touchpad_units() {
+        assert_eq!(slider_step(600, COUNTS, 1), 600);
+        assert_eq!(slider_step(80, COUNTS, -1), 80);
+        assert_eq!(slider_step(260, COUNTS, 1), 270);
+        let saved = slider_value(Tab::Touchpad, Hit::Step(0), 105);
+        assert_eq!(saved, "10.5");
+        assert!((saved.parse::<f64>().unwrap() - 10.5).abs() < 1e-9);
+    }
+    #[test]
+    fn high_dpi_content_stays_accessible_in_a_short_work_area() {
+        assert!((fitting_scale(2.0, 1920) - 2.0).abs() < 1e-6);
+        assert!(SIZE.0 * fitting_scale(2.0, 1000) <= 960.01);
+        let work = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        let fitted = fit_frame(-1600, -100, 1312, 1400, &work);
+        assert!(fitted.left >= work.left && fitted.right <= work.right);
+        assert_eq!((fitted.top, fitted.bottom), (0, 1040));
+        assert!(overlap(&fitted, &work) > overlap(&fitted, &RECT { left: 0, top: 0, right: 1920, bottom: 1080 }));
+        let bottom = (SIZE.1 * 2.0) as i32;
+        let scroll = reveal(0, 1000, bottom - 60, bottom);
+        assert_eq!(scroll + 1000, bottom);
+        assert_eq!(reveal(scroll, 1000, 10, 50), 10);
+    }
 }

@@ -10,6 +10,7 @@ mod strip;
 
 use crate::{
     grid::{self, CellId, Dir, Grid, Pos, Row},
+    pin::Pin,
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Painter, Rect},
     tiles::{self, Space},
     usage,
@@ -94,6 +95,8 @@ pub struct WindowModel {
     pub app_name: String,
     /// Follows the user from cell to cell inside its row.
     pub follows: bool,
+    /// The app owns this pin; a window button cannot remove it.
+    pub pin_from_app: bool,
     /// Kept above the other windows.
     pub topmost: bool,
 }
@@ -133,7 +136,7 @@ impl Model {
         self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)
     }
 
-    /// Popup membership keeps row followers but leaves out All rows windows.
+    /// Popup membership keeps row followers but leaves out All shelves windows.
     fn popup_windows(&self, id: &str) -> Vec<(&WindowModel, bool)> {
         self.tile_windows(id).into_iter().filter(|(_, all)| !all).collect()
     }
@@ -457,8 +460,8 @@ impl Carried {
 
     fn of_section(name: &str) -> Carried {
         match name {
-            "All rows" => Carried::Fixed,
-            "This row" => Carried::Row,
+            "All shelves" => Carried::Fixed,
+            "This shelf" => Carried::Row,
             _ => Carried::Own,
         }
     }
@@ -508,37 +511,14 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-/// How a window is pinned, as the one pin button of its tile shows it.
-/// Clicking the button goes on to the next state.
-#[derive(Clone, Copy, PartialEq)]
-enum Pin {
-    Off,
-    /// Follows the user within its shelf.
-    Row,
-    /// Shown on every desktop.
-    Everywhere,
-}
-
 impl Pin {
     fn of(window: &WindowModel, everywhere: bool) -> Pin {
-        match (window.follows, everywhere) {
-            (_, true) => Pin::Everywhere,
-            (true, _) => Pin::Row,
-            _ => Pin::Off,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Pin::Off => "Pin",
-            Pin::Row => "This row",
-            Pin::Everywhere => "All rows",
-        }
+        Pin::from_flags(window.follows, everywhere)
     }
 
     /// Width of the button, unscaled: the same in every state, so that a
     /// click changes what it says and nothing else.
-    const WIDTH: f32 = 74.0;
+    const WIDTH: f32 = 112.0;
     /// Width of the "above the others" button that goes with it.
     const TOP_WIDTH: f32 = 46.0;
 }
@@ -1032,7 +1012,7 @@ fn split_area<'a>(
     let parts = tiles::pin_parts(all.len(), row.len(), row_most, size(area), gap, head, tile_least(s));
     let place = |(x, y, w, h): tiles::Part| Rect { top: area.top + y + head, ..rect(area.left + x, area.top + y, w, h) };
     let mut out = Vec::new();
-    for (part, name, group) in [(parts.all, "All rows", all), (parts.row, "This row", row)] {
+    for (part, name, group) in [(parts.all, "All shelves", all), (parts.row, "This shelf", row)] {
         if let Some(part) = part {
             out.push((place(part), Some(name), group));
         }
@@ -1633,7 +1613,7 @@ impl Board {
         // the windows on every desktop, which never moves.
         for (m, plate) in self.plates.iter_mut().enumerate() {
             let monitor = self.monitors[m];
-            for (_, part, _) in sections.iter().filter(|(_, part, name)| *name == "All rows" && contains(&monitor, centre(part).0, centre(part).1)) {
+            for (_, part, _) in sections.iter().filter(|(_, part, name)| *name == "All shelves" && contains(&monitor, centre(part).0, centre(part).1)) {
                 plate.left = plate.left.max(part.right + 14.0 * s);
             }
         }
@@ -2494,11 +2474,7 @@ impl Board {
             Hit::Pin(hwnd) => {
                 let windows = self.tile_windows();
                 let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
-                let (row, all) = match Pin::of(window, *everywhere) {
-                    Pin::Off => (true, false),
-                    Pin::Row => (false, true),
-                    Pin::Everywhere => (false, false),
-                };
+                let (row, all) = Pin::of(window, *everywhere).next().flags();
                 Action::SetPin { window: HWND(hwnd), row, all }
             }
             Hit::Top(hwnd) => {
@@ -2822,18 +2798,18 @@ impl Board {
         match name {
             // What stays on every desktop is on screen wherever the user
             // goes: its part stands out from the rest, in its pin's colour.
-            "All rows" => {
+            "All shelves" => {
                 p.fill(&panel, 12.0 * s, everywhere(0.08));
                 p.stroke(&panel, 12.0 * s, 1.2 * s, everywhere(0.55));
                 let (_, cy) = centre(&Rect { bottom: head.bottom - 4.0 * s, ..*head });
                 p.disc((head.left + 4.0 * s, cy), 4.0 * s, everywhere(1.0));
                 let text = Rect { left: head.left + 14.0 * s, ..*head };
-                p.text("All rows · on every desktop", &fonts.title, &text, everywhere(1.0));
+                p.text(crate::i18n::text("All shelves · on every desktop", "모든 셸프 · 모든 데스크톱에 표시", "所有架子 · 显示在每个桌面"), &fonts.title, &text, everywhere(1.0));
             }
-            "This row" => {
+            "This shelf" => {
                 p.fill(&panel, 12.0 * s, accent(0.04));
                 p.stroke(&panel, 12.0 * s, 1.0 * s, accent(0.30));
-                p.text("This row · on every cell of it", &fonts.small, head, accent(0.85));
+                p.text(crate::i18n::text("This shelf · on every cell of it", "이 셸프 · 셸프의 모든 칸에 표시", "本架子 · 显示在每一格"), &fonts.small, head, accent(0.85));
             }
             _ => {
                 p.text(name, &fonts.small, head, white(0.45));
@@ -2905,7 +2881,10 @@ impl Board {
         };
         if show_pin {
             p.fill(&tile.pin, 5.0 * s, colour);
-            p.text(pin.label(), &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
+            let label = if window.pin_from_app {
+                format!("{}: {}", crate::i18n::text("App", "앱", "应用"), pin.label())
+            } else { pin.label().to_owned() };
+            p.text(&label, &fonts.centered, &tile.pin, white(if pin != Pin::Off || over { 1.0 } else { 0.50 } * dim));
         }
         if show_top {
             // One of a pair with the pin button: same height, same corners.
@@ -2913,7 +2892,7 @@ impl Board {
             let fill = if window.topmost { warm(0.92 * dim) } else { white(if over { 0.20 } else { 0.07 } * dim) };
             p.fill(&tile.top, 5.0 * s, fill);
             let ink = if window.topmost { rgba(0.10, 0.09, 0.07, dim) } else { white(if over { 1.0 } else { 0.50 } * dim) };
-            p.text("On top", &fonts.centered, &tile.top, ink);
+            p.text(crate::i18n::text("On top", "항상 위", "置顶"), &fonts.centered, &tile.top, ink);
         }
 
         if self.refused.is_some_and(|(hwnd, at)| hwnd == tile.hwnd.0 && at.elapsed().as_millis() < REFUSAL_MS) {
@@ -3794,7 +3773,7 @@ mod tests {
 
     fn window(hwnd: isize, follows: bool) -> WindowModel {
         WindowModel { hwnd: HWND(hwnd), rect: RECT { right: 1280, bottom: 720, ..Default::default() },
-            follows, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
+            follows, pin_from_app: false, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
             icon_key: 0, app_name: String::new(), topmost: false }
     }
 
@@ -3925,6 +3904,7 @@ mod tests {
                     icon_key,
                     app_name: String::new(),
                     follows: false,
+                    pin_from_app: false,
                     topmost: false,
                 })
                 .collect();
@@ -4178,9 +4158,9 @@ mod tests {
         let parts = |row: &[WindowModel]| {
             let here: Vec<(&WindowModel, bool)> = [(&everywhere, true), (&own, false)].into_iter().chain(row.iter().map(|w| (w, false))).collect();
             let parts = split_area(&here, 2, &area, 1.0);
-            let all = parts.iter().find(|(_, name, _)| *name == Some("All rows")).map(|(part, _, _)| *part).unwrap();
+            let all = parts.iter().find(|(_, name, _)| *name == Some("All shelves")).map(|(part, _, _)| *part).unwrap();
             let tiles = layout_tiles(&[(&everywhere, true)], &all, 1.0, &HashMap::new());
-            (all, tiles[0].frame, parts.iter().any(|(_, name, _)| *name == Some("This row")))
+            (all, tiles[0].frame, parts.iter().any(|(_, name, _)| *name == Some("This shelf")))
         };
         let (none, one, two) = (parts(&[]), parts(&followers[..1]), parts(&followers));
         assert_eq!((none.0, none.1), (two.0, two.1));

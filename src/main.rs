@@ -7,6 +7,9 @@ mod debuglog;
 #[cfg(any(windows, test))]
 mod axis;
 mod config;
+mod pin;
+#[cfg(windows)]
+mod i18n;
 #[cfg(any(windows, test))]
 mod follow;
 mod grid;

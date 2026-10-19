@@ -54,7 +54,8 @@ sleep_after_minutes = 0
 #     Keyboard shortcuts are not affected.
 
 [mouse]
-# Distances in pixels.
+# Distances in raw mouse counts, not screen pixels; physical travel depends on mouse DPI.
+# follow_x/y also animate keyboard desktop shortcuts.
 step_x = 260
 step_y = 400
 notch_x = 40
@@ -95,8 +96,6 @@ pub struct Config {
     #[serde(default)]
     pub config_version: u32,
     pub trigger: String,
-    /// Accepted from older config files; hover previews appear immediately.
-    pub dwell_ms: u32,
     pub carry_modifier: String,
     pub hotkeys: bool,
     pub sleep_after_minutes: u32,
@@ -111,7 +110,7 @@ pub struct Config {
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Mouse {
-    /// Pixels of travel for one cell, and for one row.
+    /// Raw mouse counts for one cell and one shelf; physical travel depends on mouse DPI.
     pub step_x: i32,
     pub step_y: i32,
     /// How firmly a cell or row holds, 0 to 100 (`Detent`); 0 follows the
@@ -147,7 +146,6 @@ impl Default for Config {
         Config {
             config_version: CONFIG_VERSION,
             trigger: "xbutton2".into(),
-            dwell_ms: 500,
             carry_modifier: "shift".into(),
             hotkeys: true,
             sleep_after_minutes: 0,
@@ -545,6 +543,6 @@ mod tests {
         let added = with_value(&changed, "dwell_ms", "300");
         assert_eq!(added, format!("{changed}dwell_ms = 300\n"));
         let config = parse(&format!("{added}vertical_angle = 26.6\n")).unwrap();
-        assert_eq!((config.trigger.as_str(), config.mouse.step_x, config.dwell_ms), ("f13", 260, 300));
+        assert_eq!((config.trigger.as_str(), config.mouse.step_x), ("f13", 260));
     }
 }

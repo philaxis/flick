@@ -1,6 +1,6 @@
 //! Notification-area icon, the menus, and the "run at startup" registry entry.
 
-use crate::config::APP_NAME;
+use crate::{config::APP_NAME, i18n::text as tr};
 use windows::{
     core::{w, HSTRING, PCWSTR},
     Win32::{
@@ -125,15 +125,15 @@ fn pick(menu: HMENU, owner: HWND) -> usize {
 /// Shows the tray icon's menu at the cursor and returns what was picked.
 pub fn menu(hwnd: HWND) -> Option<Command> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
-    add_item(menu, Command::Peek as usize, w!("Overview"), false);
-    add_item(menu, Command::Settings as usize, w!("Settings…"), false);
+    add_item(menu, Command::Peek as usize, PCWSTR(HSTRING::from(tr("Overview", "전체 보기", "总览")).as_ptr()), false);
+    add_item(menu, Command::Settings as usize, PCWSTR(HSTRING::from(tr("Settings…", "설정…", "设置…")).as_ptr()), false);
     let guide = HSTRING::from(crate::guide::words().menu);
     add_item(menu, Command::Guide as usize, PCWSTR(guide.as_ptr()), false);
     if crate::debuglog::ON {
         add_item(menu, Command::DebugLog as usize, w!("Show the debug log file"), false);
     }
     add_separator(menu);
-    add_item(menu, Command::Exit as usize, w!("Exit"), false);
+    add_item(menu, Command::Exit as usize, PCWSTR(HSTRING::from(tr("Exit", "종료", "退出")).as_ptr()), false);
     unsafe {
         let _ = SetForegroundWindow(hwnd);
     }
@@ -165,14 +165,8 @@ pub fn set_autostart(enabled: bool) {
     }
 }
 
-/// Which kinds of pinning a window currently has.
-#[derive(Clone, Copy, Default)]
-pub struct PinState {
-    pub row_window: bool,
-    pub row_app: bool,
-    pub all_window: bool,
-    pub all_app: bool,
-}
+pub use crate::pin::PinState;
+use crate::pin::Pin;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum PinCommand {
@@ -186,12 +180,24 @@ pub enum PinCommand {
 /// `owner` the foreground window first (see `pick`).
 pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
-    // In the words of the pin button on the board's tiles.
-    add_item(menu, PinCommand::RowWindow as usize, w!("This window: pin to this row"), state.row_window);
-    add_item(menu, PinCommand::RowApp as usize, w!("This app: pin to this row"), state.row_app);
-    add_separator(menu);
-    add_item(menu, PinCommand::AllWindow as usize, w!("This window: pin to all rows"), state.all_window);
-    add_item(menu, PinCommand::AllApp as usize, w!("This app: pin to all rows"), state.all_app);
+    for (command, subject, pin, checked) in [
+        (PinCommand::RowWindow, "Window", Pin::Row, state.row_window && !state.all_window),
+        (PinCommand::AllWindow, "Window", Pin::Everywhere, state.all_window),
+        (PinCommand::RowApp, "App", Pin::Row, state.row_app && !state.all_app),
+        (PinCommand::AllApp, "App", Pin::Everywhere, state.all_app),
+    ] {
+        let subject_label = if subject == "Window" { tr("Window", "창", "窗口") } else { tr("App", "앱", "应用") };
+        let label = HSTRING::from(format!("{subject_label}: {}", pin.label()));
+        if subject == "Window" && state.inherited() {
+            if command == PinCommand::RowWindow {
+                let effective = Pin::from_flags(state.row_app, state.all_app);
+                add_note(menu, &format!("{subject_label}: {} ({})", effective.label(), tr("from app", "앱에서 상속", "来自应用")));
+            }
+        } else {
+            add_item(menu, command as usize, PCWSTR(label.as_ptr()), checked);
+        }
+    }
+    add_note(menu, tr("Select the checked choice for Off. Always on top is separate.", "체크된 항목을 선택하면 꺼집니다. 항상 위는 별도입니다.", "再次选择已勾选项即关闭。置顶单独设置。"));
     let picked = pick(menu, owner);
     [PinCommand::RowWindow, PinCommand::RowApp, PinCommand::AllWindow, PinCommand::AllApp]
         .into_iter()
@@ -211,10 +217,10 @@ pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowComman
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     add_note(menu, summary);
     add_separator(menu);
-    add_item(menu, RowCommand::CloseWindows as usize, w!("Close all windows…"), false);
+    add_item(menu, RowCommand::CloseWindows as usize, PCWSTR(HSTRING::from(tr("Close all windows…", "모든 창 닫기…", "关闭所有窗口…")).as_ptr()), false);
     if removable {
         // Its windows are not closed; they go to the nearest cell that stays.
-        add_item(menu, RowCommand::Remove as usize, w!("Remove the shelf only"), false);
+        add_item(menu, RowCommand::Remove as usize, PCWSTR(HSTRING::from(tr("Remove the shelf only", "셸프만 제거", "仅删除架子")).as_ptr()), false);
     }
     let picked = pick(menu, owner);
     [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as usize == picked)

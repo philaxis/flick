@@ -187,7 +187,7 @@ struct App {
     gliding: Option<Gliding>,
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
-    following: HashSet<isize>,
+    following: vd::WindowPins,
     /// A pin menu to show once the current handler has returned.
     pending_menu: Option<(HWND, PinState)>,
     /// Likewise the menu of a shelf in the board.
@@ -324,9 +324,10 @@ pub fn warn(text: &str) {
     }
 }
 
-fn window_model(follows: bool, window: vd::WindowInfo) -> WindowModel {
+fn window_model(follows: bool, pin_from_app: bool, window: vd::WindowInfo) -> WindowModel {
     WindowModel {
         follows,
+        pin_from_app,
         app: vd::exe_name(window.pid).unwrap_or_default(),
         icon_key: crate::board::icon_key(window.hwnd),
         app_name: vd::app_label(window.pid),
@@ -379,7 +380,7 @@ impl App {
             rowing: None,
             glide: Glide::spawn(hwnd),
             gliding: None,
-            following: HashSet::new(),
+            following: vd::WindowPins::default(),
             pending_menu: None,
             pending_row_menu: None,
             seen: HashMap::new(),
@@ -584,71 +585,55 @@ impl App {
         }
     }
 
-    /// Toggles one kind of pinning, as picked from the pin menu.
+    /// The menu and board both choose one exclusive scope; app choices stay explicit.
     fn apply_pin(&mut self, hwnd: HWND, command: PinCommand) {
         let state = self.pin_state(hwnd);
-        let result = match command {
-            PinCommand::RowWindow => {
-                if !self.following.remove(&hwnd.0) {
-                    self.following.insert(hwnd.0);
-                }
-                Ok(())
+        match command {
+            PinCommand::RowWindow | PinCommand::AllWindow => {
+                let current = crate::pin::Pin::from_flags(state.row_window, state.all_window);
+                let choice = if command == PinCommand::RowWindow { crate::pin::Pin::Row } else { crate::pin::Pin::Everywhere };
+                let (row, all) = current.choose(choice).flags();
+                self.set_pin(hwnd, row, all);
             }
-            PinCommand::RowApp => {
-                if let Some(exe) = vd::exe_of_window(hwnd) {
-                    if state.row_app {
-                        self.grid.follow_apps.retain(|e| *e != exe);
-                    } else {
-                        self.grid.follow_apps.push(exe);
-                    }
-                }
-                Ok(())
+            PinCommand::RowApp | PinCommand::AllApp => {
+                let Some(exe) = vd::exe_of_window(hwnd) else { return };
+                let current = crate::pin::Pin::from_flags(state.row_app, state.all_app);
+                let choice = if command == PinCommand::RowApp { crate::pin::Pin::Row } else { crate::pin::Pin::Everywhere };
+                let (row, all) = current.choose(choice).flags();
+                let result = if all { vdapi::pin_app(hwnd) } else if state.all_app { vdapi::unpin_app(hwnd) } else { Ok(()) };
+                if let Err(e) = result { log(&format!("app pin change failed: {e:?}")); return; }
+                self.grid.follow_apps.retain(|e| *e != exe);
+                if row { self.grid.follow_apps.push(exe); }
             }
-            PinCommand::AllWindow if state.all_window => vdapi::unpin_window(hwnd),
-            PinCommand::AllWindow => vdapi::pin_window(hwnd),
-            PinCommand::AllApp if state.all_app => vdapi::unpin_app(hwnd),
-            PinCommand::AllApp => vdapi::pin_app(hwnd),
-        };
-        if let Err(e) = result {
-            log(&format!("pin change failed: {e:?}"));
         }
         self.save();
         self.refresh_board();
     }
 
-    /// Sets how one window is pinned, as cycled through on its tile: within
-    /// its row, on every desktop, or neither.
+    /// Window scope never changes an app-wide pin or the separate topmost setting.
     fn set_pin(&mut self, window: HWND, row: bool, all: bool) {
-        // A window that gets pinned is, as a rule, one to keep in sight: it
-        // goes above the others, which its tile can turn off again. Unpinned,
-        // it goes back, unless it was above the others before we came.
-        let was = self.following.contains(&window.0) || vdapi::is_pinned_window(window).unwrap_or(false);
-        match (was, row || all) {
-            (false, true) if !vd::is_topmost(window) => self.set_top(window, true),
-            (true, false) if self.grid.kept_on_top.iter().any(|(hwnd, _)| *hwnd == window.0) => self.set_top(window, false),
-            _ => {}
+        let state = self.pin_state(window);
+        let requested = crate::pin::Pin::from_flags(row, all);
+        if state.window_change(requested).is_none() {
+            tray::notify(self.hwnd, "Flick", crate::i18n::text(
+                "This pin comes from the app. Change App in the pin menu (Ctrl+Alt+Win+P).",
+                "앱에서 상속된 고정입니다. 고정 메뉴(Ctrl+Alt+Win+P)에서 앱 항목을 바꾸세요.",
+                "此固定来自应用。请在固定菜单（Ctrl+Alt+Win+P）中更改应用选项。"));
+            return;
         }
-        if row {
-            self.following.insert(window.0);
-        } else {
-            self.following.remove(&window.0);
+        // Tag first so failure cannot leave a shell pin removed without its replacement.
+        if row && !self.following.insert(window.0) {
+            log("could not identify the window for its shelf pin");
+            return;
         }
-        let result = if all {
-            vdapi::pin_window(window)
-        } else {
-            // Being shown everywhere can also come from its app being pinned.
-            if vdapi::is_pinned_app(window).unwrap_or(false) {
-                let _ = vdapi::unpin_app(window);
-            }
-            if vdapi::is_pinned_window(window).unwrap_or(false) {
-                vdapi::unpin_window(window)
-            } else {
-                Ok(())
-            }
-        };
+        let result = if all { vdapi::pin_window(window) }
+            else if state.all_window { vdapi::unpin_window(window) } else { Ok(()) };
         if let Err(e) = result {
+            if row && !state.row_window { self.following.remove(&window.0); }
             log(&format!("pin change failed: {e:?}"));
+            return;
         }
+        if !row { self.following.remove(&window.0); }
         self.restack();
     }
 
@@ -718,7 +703,7 @@ impl App {
     /// Forgets the windows put above the others that are gone (a handle may
     /// by now be another app's window).
     fn forget_gone_windows(&mut self) {
-        self.following.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
+        self.following.prune();
         self.grid.kept_on_top.retain(|(hwnd, exe)| {
             unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && vd::exe_of_window(HWND(*hwnd)).unwrap_or_default() == *exe
         });
@@ -1344,7 +1329,7 @@ impl App {
                         let (here, rest): (Vec<_>, Vec<_>) = windows.drain(..).partition(|w| w.desktop == *id);
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
-                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
+                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), self.grid.follow_apps.contains(&vd::exe_name(w.pid).unwrap_or_default()), w)).collect();
                         CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now), windows }
                     })
                     .collect();
@@ -1356,7 +1341,7 @@ impl App {
                 }
             })
             .collect();
-        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, w)).collect();
+        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, vdapi::is_pinned_app(w.hwnd).unwrap_or(false), w)).collect();
         Model { rows, pinned, current: desktops.current.clone() }
     }
 
@@ -1692,6 +1677,7 @@ impl App {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
             capturing: self.capturing,
             autostart: self.autostart,
+            admin: self.admin,
             minimap: self.config.minimap,
             mouse: self.config.mouse,
             touchpad: self.config.touchpad,
@@ -1740,7 +1726,9 @@ impl App {
     /// it takes the keyboard; shown unasked (the first run), it does not, or
     /// the Enter or Esc of what they were typing would put it away unseen.
     fn open_guide(&mut self, asked: bool) {
+        let trigger = self.settings_view().trigger;
         if let Some(guide) = &mut self.guide {
+            guide.set_trigger(trigger);
             guide.open(asked);
             if asked {
                 vd::force_foreground(guide.hwnd());
@@ -1754,9 +1742,8 @@ impl App {
         let Some(guide) = &mut self.guide else { return };
         guide.close();
         let (title, text) = guide.words().balloon;
-        tray::notify(self.hwnd, title, text);
-        if !self.grid.guide_seen {
-            self.grid.guide_seen = true;
+        if self.grid.complete_guide() {
+            tray::notify(self.hwnd, title, text);
             self.save();
         }
     }
@@ -1807,6 +1794,17 @@ impl App {
             settings::Action::Set(key, value) => self.set_config(key, &value),
             settings::Action::Capture(on) => self.capture_trigger(on),
             settings::Action::Autostart(on) => self.set_autostart(on),
+            settings::Action::Admin(on) => {
+                if on {
+                    let taken_over = admin::turn_on(self.autostart);
+                    if admin::enabled() { tray::set_autostart(false); }
+                    if taken_over { unsafe { PostQuitMessage(0); } }
+                } else if admin::turn_off() {
+                    tray::set_autostart(self.autostart);
+                }
+                self.read_startup();
+                self.refresh_settings();
+            }
             settings::Action::OpenFile => unsafe {
                 let path = HSTRING::from(config::config_path().as_os_str());
                 ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
@@ -1849,6 +1847,8 @@ impl App {
         }
         self.minimap.set_enabled(config.minimap);
         self.config = config;
+        let trigger = self.settings_view().trigger;
+        if let Some(guide) = &mut self.guide { guide.set_trigger(trigger); }
         self.refresh_settings();
         if crate::touchpad::status() == crate::touchpad::Status::Conflict && !self.settings.is_open() {
             self.settings.open(self.settings_view());
@@ -2283,22 +2283,7 @@ pub fn run(first_run: bool) {
     if first_run {
         tray::set_autostart(true);
     }
-    // Flick runs as administrator: run as the user, it hears nothing of its
-    // trigger while a window run as administrator is in front. Each start
-    // that is not, Windows asks once to make the task that runs it so, which
-    // then takes over; declined, Flick goes on as it is this time. Not for
-    // a copy tried out (`--portable`, debug builds).
-    if !admin::portable() && !cfg!(debug_assertions) && !admin::elevated() && !admin::enabled() {
-        let autostart = tray::autostart_enabled();
-        let taken_over = admin::turn_on(autostart);
-        // The task starts it with Windows from here on.
-        if admin::enabled() && autostart {
-            tray::set_autostart(false);
-        }
-        if taken_over {
-            return;
-        }
-    }
+    // Elevation is opt-in in Settings; a cancelled request is never retried at startup.
     let board = match Board::new(wndproc) {
         Ok(board) => board,
         Err(e) => return warn(&format!("Flick could not create its windows: {e}")),
@@ -2611,6 +2596,7 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             let (w, h): (i32, i32) = (w.parse().ok()?, h.parse().ok()?);
             Some(WindowModel {
                 follows: false,
+                pin_from_app: false,
                 app: format!("sample{i}"),
                 icon_key: 0,
                 app_name: String::new(),
@@ -2706,6 +2692,7 @@ pub fn render_settings(path: &str, touchpad: bool) {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
         autostart: true,
+        admin: false,
         minimap: config.minimap,
         mouse: config.mouse,
         touchpad: config.touchpad,
