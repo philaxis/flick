@@ -10,7 +10,7 @@ mod sheet;
 mod strip;
 
 use crate::{
-    grid::{self, CellId, Dir, Grid, Pos, Row},
+    grid::{self, CellId, Dir, Grid, Pos},
     pin::Pin,
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Glow, Painter, Rect},
     tiles::{self, Space},
@@ -1598,9 +1598,7 @@ impl Board {
         }
         let s = self.scale;
         let margin = 40.0 * s;
-        // Each row is shifted so that the cell a vertical move would land on
-        // sits in the same column for all rows.
-        let anchors: Vec<usize> = self.grid.rows.iter().map(Row::anchor).collect();
+        let anchors = map_anchors(&self.grid, &self.selected);
         let mut maps = Vec::new();
         let mut areas = Vec::new();
         for (m, monitor) in self.monitors.iter().enumerate() {
@@ -3859,6 +3857,18 @@ fn group_apps<'a>(windows: impl Iterator<Item = &'a WindowModel>) -> Vec<(&'a Wi
 /// there is room: room is kept for any row to be shifted as far as it can
 /// go, so that moving about only slides rows under a still spine. Only rows
 /// too long for that are packed by their anchors, and the names then move.
+/// Each row of the map is shifted so that the cell it was last turned to
+/// (where a vertical move lands) sits in the same column for all rows; the
+/// selected row by the selection, which may not be that cell when the board
+/// was left without going to it and Windows stayed where it was.
+fn map_anchors(grid: &Grid, selected: &str) -> Vec<usize> {
+    let at = grid.find(selected);
+    grid.rows.iter().enumerate().map(|(r, row)| match at {
+        Some(at) if at.row == r => at.col,
+        _ => row.anchor(),
+    }).collect()
+}
+
 fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> MapLayout {
     let (w, h) = size;
     let (margin, header_w, gap) = (60.0 * s, 170.0 * s, 10.0 * s);
@@ -3944,6 +3954,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::Row;
 
     fn window(hwnd: isize, follows: bool) -> WindowModel {
         WindowModel { hwnd: HWND(hwnd), rect: RECT { right: 1280, bottom: 720, ..Default::default() },
@@ -4298,6 +4309,21 @@ mod tests {
                 assert!(component(&motion).abs() < 10.0);
             }
         }
+    }
+
+    /// Left without going to its selection, the board opens again on the
+    /// cell Windows stayed on: that row is laid out by it, the others by the
+    /// cell each was last turned to.
+    #[test]
+    fn the_selected_row_lies_on_the_spine_even_off_its_anchor() {
+        let mut grid = Grid { rows: vec![
+            Row { cells: vec!["a1".into(), "a2".into(), "a3".into()], ..Default::default() },
+            Row { cells: vec!["b1".into(), "b2".into()], ..Default::default() },
+        ], ..Default::default() };
+        grid.visit("a3");
+        grid.visit("b2");
+        assert_eq!(map_anchors(&grid, "a1"), [0, 1]);
+        assert_eq!(map_anchors(&grid, "a3"), [2, 1]);
     }
 
     #[test]
