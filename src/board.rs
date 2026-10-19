@@ -46,8 +46,8 @@ use windows::{
                 DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             },
             Dwm::{
-                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
-                DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
+                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+                DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -934,6 +934,7 @@ pub struct Board {
     popup_canvas: Option<Canvas>,
     popup_icons: HashMap<isize, Option<ID2D1Bitmap>>,
     text_cache: paint::TextCache,
+    paint_origin: std::cell::Cell<(f32, f32)>,
     thumbnail_state: RefCell<HashMap<isize, (RECT, RECT, u8, bool, u32)>>,
     thumbnail_updates: Cell<usize>,
     fonts: Option<Fonts>,
@@ -1098,6 +1099,7 @@ impl Board {
                 popup_canvas: None,
                 popup_icons: HashMap::new(),
                 text_cache: paint::TextCache::new()?,
+                paint_origin: std::cell::Cell::new((0.0, 0.0)),
                 thumbnail_state: RefCell::default(),
                 thumbnail_updates: Cell::new(0),
                 fonts: None,
@@ -1474,6 +1476,7 @@ impl Board {
             let submitted = started.elapsed();
             self.thumbnail_updates.set(0);
             let geometry = self.update_thumbnails();
+            if let Err(e) = crate::composition::commit(self.hwnd) { crate::app::log(&format!("board composition commit failed: {e}")); }
             let dwm = started.elapsed() - submitted;
             unsafe {
                 ValidateRect(self.hwnd, None);
@@ -2007,7 +2010,7 @@ impl Board {
             let given = strip::budget(&wanted.iter().map(Vec::len).collect::<Vec<_>>(), strip::MAX_THUMBS);
             for ((cell, hwnds), given) in self.strip_cells.iter().zip(&wanted).zip(given) {
                 for hwnd in &hwnds[..given] {
-                    if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, *hwnd) } {
+                    if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, *hwnd) } {
                         self.strip_thumbs.push((cell.id.clone(), hwnd.0, thumb));
                     }
                 }
@@ -2016,7 +2019,7 @@ impl Board {
         let mut wanted: Vec<(HWND, bool)> = self.tile_windows().into_iter().map(|(w, everywhere)| (w.hwnd, everywhere)).collect();
         wanted.sort_by_key(|(_, everywhere)| *everywhere);
         for (hwnd, _) in wanted {
-            if let Ok(thumb) = unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
+            if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, hwnd) } {
                 self.thumbs.push((hwnd.0, thumb));
             }
         }
@@ -2162,6 +2165,7 @@ impl Board {
             let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
             RECT { left, top, right: (r.right - offset.0).round() as i32, bottom: (r.bottom - offset.1).round() as i32 }
         };
+        let mut precise = [0.0; 4];
         let mut props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
             opacity: 255,
@@ -2182,7 +2186,9 @@ impl Board {
                 let (tw, th) = size(&tile.thumb);
                 let (cx, cy) = self.cursor;
                 let w = tw.min(200.0 * self.scale);
-                props.rcDestination = to_rect(&fitted(&rect(cx - w / 2.0, cy - th / 2.0, w, th)));
+                let dest = fitted(&rect(cx - w / 2.0, cy - th / 2.0, w, th));
+                precise = [dest.left-offset.0,dest.top-offset.1,dest.right-offset.0,dest.bottom-offset.1];
+                props.rcDestination = to_rect(&dest);
                 props.opacity = 215;
             }
             (Some(tile), Some((place, clip, bright))) => {
@@ -2190,9 +2196,11 @@ impl Board {
                 // fills it; in one that had to be made wider or higher
                 // for its buttons the picture sits in the middle.
                 let dest = place.rect(&fitted(&tile.thumb));
+                precise = [dest.left-offset.0,dest.top-offset.1,dest.right-offset.0,dest.bottom-offset.1];
                 match (clip, source) {
                     (Some(clip), Some(source)) => match strip::clip(&dest, &clip, source) {
                         Some((shown, from)) => {
+                            precise = [shown.left-offset.0,shown.top-offset.1,shown.right-offset.0,shown.bottom-offset.1];
                             props.rcDestination = to_rect(&shown);
                             props.rcSource = RECT {
                                 left: from.left.round() as i32,
@@ -2223,7 +2231,7 @@ impl Board {
             let visible = props.fVisible.as_bool();
             let state = if visible { (props.rcDestination, props.rcSource, props.opacity, true, props.dwFlags) }
                 else { (RECT::default(), RECT::default(), 0, false, 0) };
-            if self.thumbnail_state.borrow().get(&thumb) != Some(&state) && DwmUpdateThumbnailProperties(thumb, &props).is_ok() {
+            if (crate::composition::enabled() || self.thumbnail_state.borrow().get(&thumb) != Some(&state)) && crate::composition::update(thumb, &props, precise).is_ok() {
                 self.thumbnail_state.borrow_mut().insert(thumb, state);
                 self.thumbnail_updates.set(self.thumbnail_updates.get() + 1);
             }
@@ -2237,8 +2245,8 @@ impl Board {
         if let Some(i) = self.thumbs.iter().position(|&(h, _)| h == hwnd) {
             let (_, old) = self.thumbs.remove(i);
             unsafe {
-                let _ = DwmUnregisterThumbnail(old);
-                if let Ok(thumb) = DwmRegisterThumbnail(self.hwnd, HWND(hwnd)) {
+                let _ = crate::composition::unregister(old);
+                if let Ok(thumb) = crate::composition::register(self.hwnd, HWND(hwnd)) {
                     self.thumbs.push((hwnd, thumb));
                 }
             }
@@ -2610,6 +2618,21 @@ impl Board {
 
     /// Draws the board into the canvas; `None` when there is no canvas.
     fn draw_to_canvas(&mut self) -> Option<Result<()>> {
+        if self.open && crate::composition::enabled() {
+            if self.window_target.is_some() || self.canvas.is_some() { self.discard_target(); }
+            match unsafe { crate::composition::begin_paint(self.hwnd, self.size) } {
+                Ok((surface, target, offset)) => {
+                    self.paint_origin.set((offset.x as f32, offset.y as f32));
+                    if self.fonts.is_none() { self.fonts = make_fonts(self.scale).ok(); }
+                    self.load_icons(&target);
+                    unsafe { self.set_transform(&target, Matrix3x2::identity()); }
+                    let drawn = self.draw(&target);
+                    self.paint_origin.set((0.0, 0.0));
+                    return Some(unsafe { surface.EndDraw() }.and(drawn));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
         let target = self.ensure_canvas()?;
         if self.fonts.is_none() {
             self.text_cache.clear();
@@ -2635,10 +2658,11 @@ impl Board {
             None => return,
         }
         self.present_canvas();
+        let _ = crate::composition::commit(self.hwnd);
     }
 
     fn present_canvas(&mut self) {
-        if self.window_target.is_none() {
+        if self.window_target.is_none() && !crate::composition::enabled() {
             if let Some(canvas) = &self.canvas {
                 let (w, h) = canvas.dib.size;
                 unsafe {
@@ -2688,6 +2712,12 @@ impl Board {
         }
     }
 
+    unsafe fn set_transform(&self, target: &ID2D1RenderTarget, mut matrix: Matrix3x2) {
+        let origin = self.paint_origin.get();
+        matrix.M31 += origin.0; matrix.M32 += origin.1;
+        target.SetTransform(&matrix);
+    }
+
     fn draw(&self, target: &ID2D1RenderTarget) -> Result<()> {
         let Some(fonts) = &self.fonts else { return Ok(()) };
         unsafe {
@@ -2699,16 +2729,16 @@ impl Board {
         self.draw_tiles(&p, fonts);
         for map in &self.maps {
             unsafe {
-                target.SetTransform(&Matrix3x2::translation(map.area.left, map.area.top));
+                self.set_transform(target, Matrix3x2::translation(map.area.left, map.area.top));
             }
             self.draw_map(&p, fonts, map);
         }
         unsafe {
-            target.SetTransform(&Matrix3x2::translation(self.home.left, self.home.top));
+            self.set_transform(target, Matrix3x2::translation(self.home.left, self.home.top));
         }
         self.draw_captions(&p, fonts);
         unsafe {
-            target.SetTransform(&Matrix3x2::identity());
+            self.set_transform(target, Matrix3x2::identity());
         }
         self.draw_popup(&p, fonts);
         Ok(())
@@ -2944,11 +2974,11 @@ impl Board {
             return draw();
         }
         unsafe {
-            p.target.SetTransform(&Matrix3x2 { M11: place.s, M12: 0.0, M21: 0.0, M22: place.s, M31: place.dx, M32: place.dy });
+            self.set_transform(p.target, Matrix3x2 { M11: place.s, M12: 0.0, M21: 0.0, M22: place.s, M31: place.dx, M32: place.dy });
         }
         draw();
         unsafe {
-            p.target.SetTransform(&Matrix3x2::identity());
+            self.set_transform(p.target, Matrix3x2::identity());
         }
     }
 
@@ -3037,11 +3067,11 @@ impl Board {
             return draw();
         }
         unsafe {
-            p.target.SetTransform(&Matrix3x2::translation(base.0 + by.0, base.1 + by.1));
+            self.set_transform(p.target, Matrix3x2::translation(base.0 + by.0, base.1 + by.1));
         }
         draw();
         unsafe {
-            p.target.SetTransform(&Matrix3x2::translation(base.0, base.1));
+            self.set_transform(p.target, Matrix3x2::translation(base.0, base.1));
         }
     }
 
@@ -3341,14 +3371,14 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, message: u32, wparam: WPARAM
 fn unregister_strip_thumbnails(thumbs: &mut Vec<(CellId, isize, isize)>) {
     for (_, _, thumb) in thumbs.drain(..) {
         unsafe {
-            let _ = DwmUnregisterThumbnail(thumb);
+            let _ = crate::composition::unregister(thumb);
         }
     }
 }
 
 fn unregister_thumbnails(thumbs: &mut Vec<(isize, isize)>) {
     for (_, thumb) in thumbs.drain(..) {
-        unsafe { let _ = DwmUnregisterThumbnail(thumb); }
+        unsafe { let _ = crate::composition::unregister(thumb); }
     }
 }
 

@@ -133,7 +133,12 @@ pub fn place(plate: &Rect, at: (f32, f32), size: f32, spacing: f32) -> Place {
     let (cx, cy) = ((plate.left + plate.right) / 2.0, (plate.top + plate.bottom) / 2.0);
     let (px, py) = pitch(plate, spacing);
     let (ox, oy) = (cx + at.0 * px, cy + at.1 * py);
-    let place = Place { s: size, dx: (ox - size * cx).round(), dy: (oy - size * cy).round() };
+    #[cfg(windows)]
+    let precise = crate::composition::enabled();
+    #[cfg(not(windows))]
+    let precise = false;
+    let pixel = |v: f32| if precise { v } else { v.round() };
+    let place = Place { s: size, dx: pixel(ox - size * cx), dy: pixel(oy - size * cy) };
     if (size - 1.0).abs() < 1e-6 && place.dx == 0.0 && place.dy == 0.0 { Place::SAME } else { place }
 }
 

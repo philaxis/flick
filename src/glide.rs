@@ -42,8 +42,8 @@ use windows::{
             Direct2D::{Common::D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE},
             DirectWrite::{IDWriteFactory, IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS},
             Dwm::{
-                DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
-                DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
+                DwmQueryThumbnailSourceSize,
+                DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Gdi::{
@@ -252,7 +252,7 @@ struct Thumb {
 
 impl Thumb {
     fn new(screen: &Screen, source_window: HWND, at: (i32, i32), source: Option<RECT>) -> Option<Thumb> {
-        let id = unsafe { DwmRegisterThumbnail(screen.hwnd, source_window) }.ok()?;
+        let id = unsafe { crate::composition::register(screen.hwnd, source_window) }.ok()?;
         // Drawn one to one from the corner of the frame; its size is the
         // source's, which can be a pixel off the frame's.
         let size = match source {
@@ -261,7 +261,7 @@ impl Thumb {
                 Ok(size) => (size.cx, size.cy),
                 Err(_) => {
                     unsafe {
-                        let _ = DwmUnregisterThumbnail(id);
+                        let _ = crate::composition::unregister(id);
                     }
                     return None;
                 }
@@ -286,7 +286,7 @@ impl Thumb {
         });
         let rect = rect.filter(|r| r.right > 0 && r.bottom > 0 && r.left < size.0 && r.top < size.1 && r.right > r.left && r.bottom > r.top);
         let drawn = rect.map(|rect| (rect, opacity)).filter(|_| opacity > 0);
-        if drawn == self.drawn {
+        if drawn == self.drawn && !crate::composition::enabled() {
             return false;
         }
         self.drawn = drawn;
@@ -303,7 +303,8 @@ impl Thumb {
             props.rcSource = source;
         }
         unsafe {
-            let _ = DwmUpdateThumbnailProperties(self.id, &props);
+            let precise = at.unwrap_or([0.0; 4]).map(|v| v as f32);
+            let _ = crate::composition::update(self.id, &props, precise);
         }
         true
     }
@@ -312,7 +313,7 @@ impl Thumb {
 impl Drop for Thumb {
     fn drop(&mut self) {
         unsafe {
-            let _ = DwmUnregisterThumbnail(self.id);
+            let _ = crate::composition::unregister(self.id);
         }
     }
 }
@@ -323,6 +324,7 @@ impl Drop for Screen {
         self.walls.clear();
         self.banner = None;
         unsafe {
+            crate::composition::forget(self.hwnd);
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -1094,6 +1096,9 @@ impl View {
         }
         if let Some(ink) = &mut self.ink {
             show_banners(ink, session, now);
+        }
+        for screen in &session.screens {
+            if let Err(e) = crate::composition::commit(screen.hwnd) { crate::app::log(&format!("composition commit failed: {e}")); }
         }
         let drawn_in = drawing.elapsed().as_secs_f64() * 1000.0;
         // The hold before's thumbnails go now this one's are drawn over them.
