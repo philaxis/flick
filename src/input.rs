@@ -575,6 +575,8 @@ thread_local! {
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     /// Where the hand is up and down in this hold, and along the row in this
     /// stretch of it.
+    static PAD_COUNTS: Cell<[i32; 2]> = const { Cell::new([0; 2]) };
+    static PAD_RAW: Cell<[i32; 2]> = const { Cell::new([0; 2]) };
     static MOUSE_AXIS: Cell<crate::axis::Lock> = Cell::new(crate::axis::Lock::default());
     static PLANE: Cell<Plane> = const { Cell::new(Plane::new()) };
     /// How far the hand went the ways the screen follows in this hold: in
@@ -812,6 +814,7 @@ fn press(source: Source) {
         });
         FOLLOWED.set(((0, 0), (0.0, 0.0)));
         MOUSE_AXIS.set(crate::axis::Lock::default());
+        PAD_COUNTS.set([0; 2]); PAD_RAW.set([0; 2]);
         AXIS.store(0, Ordering::SeqCst);
         // Up and down by the notches of the hand that began the hold, the
         // mouse's for a button or key; on the board after the hand. The
@@ -830,7 +833,10 @@ fn press(source: Source) {
         let follow = follow.filter(|ways| ways & (FOLLOW_X | FOLLOW_Y) != 0 && !BOARD_OPEN.load(Ordering::SeqCst));
         FOLLOWING.store(follow.unwrap_or(0), Ordering::SeqCst);
         let (notch_x, notch_y) = notch.unwrap_or((crate::slide::notch::DEFAULT_X, crate::slide::FIRMEST));
-        PLANE.set(Plane::configured(notch_x, notch_y, BOARD_OPEN.load(Ordering::SeqCst)));
+        let mut plane = Plane::configured(notch_x, notch_y, BOARD_OPEN.load(Ordering::SeqCst));
+        let ways = SETTINGS.with(|s| s.borrow().as_ref().map_or(0, |s| if source == Source::Touchpad { s.touchpad_follow } else { s.mouse_follow }));
+        plane.enable_f(ways & FOLLOW_X != 0, ways & FOLLOW_Y != 0);
+        PLANE.set(plane);
         DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
@@ -1176,6 +1182,21 @@ fn touchpad_event(event: crate::touchpad::Event) {
         }
         if HELD.with(|held| held.borrow().has(Source::Touchpad)) {
             if event.ended.is_none() { AXIS.store(event.axis.map_or(0, |a| a as u32 + 1), Ordering::SeqCst); }
+            if s.touchpad_follow != 0 {
+                if event.ended.is_none() {
+                    let mut counts = PAD_COUNTS.get();
+                    for step in &event.steps {
+                        use crate::touchpad::Dir;
+                        match step { Dir::Left => counts[0] -= 1, Dir::Right => counts[0] += 1, Dir::Up => counts[1] -= 1, Dir::Down => counts[1] += 1 }
+                    }
+                    PAD_COUNTS.set(counts);
+                    let at = directed((counts[0] as f64 + event.lean.0, counts[1] as f64 + event.lean.1), s.touchpad_reverse);
+                    let raw = [(at.0 * s.step_x as f64).round() as i32, (at.1 * s.step_y as f64).round() as i32];
+                    let old = PAD_RAW.replace(raw);
+                    advance(s, raw[0] - old[0], raw[1] - old[1]);
+                } else if let Some(tap) = event.ended { finish_release(s, Source::Touchpad, Some(tap)); }
+                return false;
+            }
             // The pad judged which way each step goes (`touchpad::Rails`); a whole step each is
             // exactly one cell or row of the plane, so no mouse rounding comes into it.
             // `touchpad_reverse` turns the steps and the lean between them around alike.
@@ -1255,6 +1276,7 @@ fn directed<T: std::ops::Neg<Output = T>>(delta: (T, T), reverse: bool) -> (T, T
 fn travel(s: &Settings, dx: i32, dy: i32) {
     let (dx, dy) = directed((dx, dy), s.mouse_reverse);
     let mut lock = MOUSE_AXIS.get();
+    lock.f_mode = s.mouse_follow != 0;
     let before = lock.at;
     let step = [s.step_x as f64, s.step_y as f64];
     lock.travel([dx as f64, dy as f64], step, 12.0, unsafe { GetMessageTime() } as u32);

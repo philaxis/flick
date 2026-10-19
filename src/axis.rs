@@ -9,11 +9,14 @@ pub struct Lock {
     recent: [f64; 2],
     last: Option<u32>,
     turn: Option<(usize, f64, f64, usize, u32)>,
+    pub f_mode: bool,
+    row: crate::transition_curve::Latch,
+    unlock: bool,
 }
 
 impl Default for Lock {
     fn default() -> Self {
-        Self { axis: None, at: [0.0; 2], start: [0.0; 2], off: 0.0, along: 0.0, recent: [0.0; 2], last: None, turn: None }
+        Self { axis: None, at: [0.0; 2], start: [0.0; 2], off: 0.0, along: 0.0, recent: [0.0; 2], last: None, turn: None, f_mode: false, row: crate::transition_curve::Latch::default(), unlock: false }
     }
 }
 
@@ -22,6 +25,10 @@ impl Lock {
     /// visible sample is zero; travel used to choose the axis is consumed.
     pub fn travel(&mut self, delta: [f64; 2], step: [f64; 2], dead: f64, ms: u32) -> [f64; 2] {
         let before = self.at;
+        if self.unlock {
+            self.axis = None; self.start = [0.0; 2]; self.off = 0.0; self.along = 0.0;
+            self.recent = [0.0; 2]; self.turn = None; self.unlock = false;
+        }
         if let Some((axis, from, to, next, since)) = self.turn {
             let t = (ms.wrapping_sub(since) as f64 / 150.0).clamp(0.0, 1.0);
             self.at[axis] = from + (to - from) * t * t * (3.0 - 2.0 * t);
@@ -45,8 +52,9 @@ impl Lock {
         let side = 1 - axis;
         self.off += delta[side];
         self.along += delta[axis].abs();
-        if self.off.abs() >= step[side] * 0.5 && self.recent[side].abs() > self.recent[axis].abs() * 2.0 {
-            self.turn = Some((axis, self.at[axis], self.at[axis].round(), side, ms));
+        if self.off.abs() >= if self.f_mode { dead } else { step[side] * 0.5 } && self.recent[side].abs() > self.recent[axis].abs() * 2.0 {
+            if self.f_mode { self.axis = Some(side); }
+            else { self.turn = Some((axis, self.at[axis], self.at[axis].round(), side, ms)); }
             self.off = 0.0;
             self.along = 0.0;
             self.recent = [0.0; 2];
@@ -57,6 +65,7 @@ impl Lock {
                 self.along = 0.0;
             }
         }
+        if self.f_mode && axis == 1 && self.row.track(self.at[1], (i32::MIN + 1, i32::MAX - 1)) != 0 { self.unlock = true; }
         std::array::from_fn(|i| self.at[i] - before[i])
     }
 }

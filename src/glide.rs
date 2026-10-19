@@ -779,11 +779,11 @@ impl View {
             Request::Begin(scene) => {
                 // Monitors as they were are kept, so the picture stays up
                 // from one hold to the next, going on from where it was.
-                let (_, receded) = self.carried();
+                let (carry, receded) = self.carried();
                 let (screens, leftover) = self.session.take().map(|s| s.retire(self.trace.as_deref())).unwrap_or_default();
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
-                    new.receded_from = receded;
+                    new.follow.carry(carry, receded);
                 }
             }
             Request::Step(scene, to) => {
@@ -806,11 +806,11 @@ impl View {
                     return;
                 }
                 let (hand, visible, began, farthest_y, trace) = (old.hand, old.visible, old.began, old.farthest_y, old.trace.take());
-                let histories = (std::mem::take(&mut old.follow.x.history), std::mem::take(&mut old.follow.y.history));
+                let follow = old.follow.clone();
                 let (screens, leftover) = old.retire(self.trace.as_deref());
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
-                    (new.follow.x.history, new.follow.y.history) = histories;
+                    new.follow = follow;
                     (new.hand, new.visible, new.began, new.farthest_y) = (hand, visible, began, farthest_y);
                     new.trace = trace.or(new.trace.take());
                 }
@@ -1012,7 +1012,7 @@ impl View {
         let tell = |message: u32, to: (i32, i32), hold: u32| unsafe {
             let _ = PostMessageW(app, message, WPARAM(pack(to)), LPARAM(hold as isize));
         };
-        let receding = follow::recede_from(session.receded_from, now);
+
         // Where the strip is, how far receded, and whether the rows go as
         // in a single step (`follow::step_along`).
         let ((x, y), receded, stepping) = match session.phase {
@@ -1028,24 +1028,22 @@ impl View {
                 if let Some(&(x, y, axis)) = session.replay.front() {
                     let at = session.follow.track_locked(now, (x, y), axis);
                     if session.follow.caught_up((x, y), axis) { session.replay.pop_front(); }
-                    (at, receding, false)
+                    (at, session.follow.depth(), false)
                 } else if hand.hold == session.hold && hand.holding {
-                    (session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis)), receding, false)
+                    { let at = session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis)); (at, session.follow.depth(), false) }
                 } else {
                     let to = session.follow.let_go(now, session.hand);
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
                     debug_log!("glide {}: let go of at {:?}, settling on {to:?}", session.hold, session.hand);
                     tell(WM_GLIDE_TARGET, to, session.hold);
-                    let settle = [session.follow.x.snap, session.follow.y.snap].iter().flatten().map(|snap| snap.time).fold(0.0, f64::max);
-                    let forward = now + follow::forward_after(settle);
-                    session.phase = Phase::Settling(to, forward);
-                    (session.follow.settle(now).0, receding, false)
+                    session.phase = Phase::Settling(to, now);
+                    (session.follow.settle(now).0, session.follow.depth(), false)
                 }
             }
-            Phase::Settling(to, forward) => {
+            Phase::Settling(to, _) => {
                 let (at, settled) = session.follow.settle(now);
-                let receded = receding.min(follow::come_forward(now - forward));
-                if settled && now >= forward + follow::FORWARD_TIME {
+                let receded = session.follow.depth();
+                if settled {
                     if to == (0, 0) {
                         done = true;
                     } else {

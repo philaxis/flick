@@ -104,8 +104,8 @@ pub enum Dir {
     Down,
 }
 
-/// Pad travel for one step either way, in mm (the 1 cm a step always was), unless set otherwise.
-pub const STEP_MM: f64 = 10.0;
+/// Movement needed to commit a cell in either direction, in millimetres.
+pub const STEP_MM: f64 = 4.0;
 /// Pad travel for one step sideways and up and down as set (`Config::touchpad`), in hundredths of
 /// a mm; none set is `STEP_MM`.
 static STEP_SET: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
@@ -137,7 +137,9 @@ impl Default for Rails {
 
 impl Rails {
     pub fn new(step: [f64; 2]) -> Self {
-        Self { step, lock: crate::axis::Lock::default(), counts: [0; 2] }
+        let mut lock = crate::axis::Lock::default();
+        lock.f_mode = true;
+        Self { step, lock, counts: [0; 2] }
     }
 
     pub fn lean(&self) -> (f64, f64) {
@@ -318,15 +320,17 @@ mod tests {
             .collect()
     }
     #[test]
-    fn rails_share_the_dead_zone_and_never_lean_off_axis() {
-        let mut rails = Rails::default();
+    fn rails_share_the_dead_zone_and_keep_the_raw_origin_across_turns() {
+        let mut rails = Rails::new([10.0; 2]);
         for ms in 0..5 { assert!(rails.travel((0.4, 0.1), ms * 8).is_empty()); assert_eq!(rails.lean(), (0.0, 0.0)); }
         let steps = drive(&mut rails, &mut 40, line((0.0, 0.0), (35.0, 4.0), 0.5));
         assert_eq!(steps, vec![Dir::Right; 3]);
         assert_eq!(rails.lean().1, 0.0);
         let steps = drive(&mut rails, &mut 1000, line((35.0, 4.0), (35.0, -36.0), 0.5));
         assert!(steps.contains(&Dir::Up));
-        assert!(rails.lean().0.abs() < 1e-9);
+        let x = rails.lean().0;
+        rails.travel((0.0, -0.5), 2000);
+        assert!((rails.lean().0 - x).abs() < 1e-9);
     }
 
     #[test]
@@ -359,8 +363,11 @@ mod tests {
         two.reverse();
         let e = g.update(&two, 200);
         assert_eq!(e, Event { axis: Some(0), ..Event::default() });
-        assert_eq!(g.update(&hand(2, 6.0), 300).delta, (1.0, 0.0));
-        assert_eq!(g.update(&hand(1, 9.0), 400), Event { axis: Some(0), ..Event::default() });
+        let previous = g.update(&hand(2, 6.0), 300);
+        assert_eq!(previous.delta, (1.0, 0.0));
+        let rebased = g.update(&hand(1, 9.0), 400);
+        assert_eq!(rebased.delta, (0.0, 0.0));
+        assert_eq!(rebased.lean, previous.lean);
         assert_eq!(g.update(&hand(1, 10.0), 500).delta, (1.0, 0.0));
         assert_eq!(g.update(&[], 600).ended, Some(false));
     }

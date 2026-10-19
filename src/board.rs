@@ -45,7 +45,7 @@ use windows::{
                 DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
             },
             Dwm::{
-                DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+                DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
                 DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
@@ -68,7 +68,7 @@ use windows::{
                 },
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, PostMessageW, WM_APP, DrawIconEx, GetClassLongPtrW, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
+                CreateWindowExW, DefWindowProcW, PostMessageW, WM_APP, DrawIconEx, GetClassLongPtrW, GetWindowRect, GetWindow, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, SetLayeredWindowAttributes, ShowWindow, LWA_ALPHA, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
                 GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOREDRAW, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SWP_SHOWWINDOW, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
@@ -934,7 +934,7 @@ pub struct Board {
     areas: Vec<Rect>,
     plates: Vec<Rect>,
     /// How large each thumbnail's window is, asked of DWM once while moving.
-    source_sizes: RefCell<HashMap<isize, Option<(f32, f32)>>>,
+    source_sizes: RefCell<HashMap<isize, Option<Rect>>>,
     trace: Option<Trace>,
     factory: ID2D1Factory,
     canvas: Option<Canvas>,
@@ -1425,7 +1425,7 @@ impl Board {
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
         self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
-        if holding { if let Some(axis) = crate::input::axis() { self.strip.lock_axis(axis); } }
+
         self.strip_at = t;
         let strip_moving = self.strip.active(t);
         if strip_moving && !self.strip_on {
@@ -1438,9 +1438,15 @@ impl Board {
         if holding { if let Some(axis) = crate::input::axis() { self.motion.lock_axis(axis); } }
         if was_moving || moving {
             let started = Instant::now();
+            let rendered = self.draw_to_canvas();
+            let prepared = started.elapsed();
             self.update_thumbnails();
-            let dwm = started.elapsed();
-            self.paint();
+            let dwm = started.elapsed() - prepared;
+            match rendered {
+                Some(Ok(())) => self.present_canvas(),
+                Some(Err(e)) => { crate::app::log(&format!("board draw failed: {e}")); self.canvas = None; }
+                None => {}
+            }
             unsafe {
                 ValidateRect(self.hwnd, None);
             }
@@ -1979,13 +1985,24 @@ impl Board {
 
     /// How large the window of `thumb` is. Asked of DWM once while the
     /// strip moves, every time otherwise (a window may change size).
-    fn source_size(&self, thumb: isize) -> Option<(f32, f32)> {
+    fn source_rect(&self, thumb: isize, hwnd: HWND) -> Option<Rect> {
         if self.strip_on {
             if let Some(size) = self.source_sizes.borrow().get(&thumb) {
                 return *size;
             }
         }
-        let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().map(|s| (s.cx.max(1) as f32, s.cy.max(1) as f32));
+        let size = unsafe { DwmQueryThumbnailSourceSize(thumb) }.ok().map(|s| {
+            let mut outer = RECT::default();
+            let mut visible = RECT::default();
+            let whole = rect(0.0, 0.0, s.cx.max(1) as f32, s.cy.max(1) as f32);
+            // Layout uses visible frame bounds; DWM includes invisible resize borders.
+            if unsafe { GetWindowRect(hwnd, &mut outer) }.is_ok()
+                && unsafe { DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut visible as *mut _ as _, std::mem::size_of::<RECT>() as u32) }.is_ok()
+                && outer.right - outer.left == s.cx && outer.bottom - outer.top == s.cy {
+                Rect { left: (visible.left - outer.left).max(0) as f32, top: (visible.top - outer.top).max(0) as f32,
+                    right: (visible.right - outer.left).min(s.cx) as f32, bottom: (visible.bottom - outer.top).min(s.cy) as f32 }
+            } else { whole }
+        });
         if self.strip_on {
             self.source_sizes.borrow_mut().insert(thumb, size);
         }
@@ -2085,8 +2102,7 @@ impl Board {
         // grow and shrink by a pixel as its two edges round differently.
         let to_rect = |r: &Rect| {
             let (left, top) = ((r.left - offset.0).round() as i32, (r.top - offset.1).round() as i32);
-            let (w, h) = ((r.right - r.left).round() as i32, (r.bottom - r.top).round() as i32);
-            RECT { left, top, right: left + w, bottom: top + h }
+            RECT { left, top, right: (r.right - offset.0).round() as i32, bottom: (r.bottom - offset.1).round() as i32 }
         };
         let mut props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
@@ -2095,7 +2111,9 @@ impl Board {
             fSourceClientAreaOnly: false.into(),
             ..Default::default()
         };
-        let source = self.source_size(thumb);
+        let source_rect = tile.and_then(|tile| self.source_rect(thumb, tile.hwnd));
+        let source = source_rect.as_ref().map(size);
+        if let Some(r) = source_rect { props.rcSource = to_rect(&r); props.dwFlags |= DWM_TNP_RECTSOURCE; }
         // The picture as large as fits into `w` by `h` without being
         // distorted or made larger than the window is.
         let fitted = |w: f32, h: f32| match source {
@@ -2127,10 +2145,10 @@ impl Board {
                         Some((shown, from)) => {
                             props.rcDestination = to_rect(&shown);
                             props.rcSource = RECT {
-                                left: from.left.round() as i32,
-                                top: from.top.round() as i32,
-                                right: from.right.round() as i32,
-                                bottom: from.bottom.round() as i32,
+                                left: (from.left + source_rect.unwrap().left).round() as i32,
+                                top: (from.top + source_rect.unwrap().top).round() as i32,
+                                right: (from.right + source_rect.unwrap().left).round() as i32,
+                                bottom: (from.bottom + source_rect.unwrap().top).round() as i32,
                             };
                             props.dwFlags |= DWM_TNP_RECTSOURCE;
                         }
@@ -2537,6 +2555,10 @@ impl Board {
             }
             None => return,
         }
+        self.present_canvas();
+    }
+
+    fn present_canvas(&self) {
         if let Some(canvas) = &self.canvas {
             let (w, h) = canvas.dib.size;
             unsafe {

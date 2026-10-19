@@ -16,7 +16,7 @@ const DEFAULT_CONFIG: &str = r#"# Flick settings. Saving this file applies them 
 # Trigger, distances and the rest can also be changed in the window at tray icon → "Settings…".
 
 # Which version of this file it is, for bringing older ones up to date. Leave it as it is.
-config_version = 2
+config_version = 3
 
 # The button to hold while moving the mouse to go from cell to cell. Several can be listed with commas.
 #   Mouse: "xbutton1" (back), "xbutton2" (forward), "middle" (wheel button)
@@ -42,22 +42,19 @@ minimap = false
 sleep_after_minutes = 0
 
 # Each device on its own. _x is sideways (along a shelf), _y is up and down (from shelf to shelf).
-#   step: how far to move for one cell sideways or one shelf up or down. The longer vertical distance keeps you from changing shelf by accident.
-#   notch: 0 to 100, how firmly the displayed hand holds near each cell or shelf.
-#     0 follows the hand evenly. Sideways selection still changes a little past halfway.
-#     Vertical notches keep the whole-distance shelf step and lean then snap.
-#     Touchpad vertical strength is doubled: 100 composes two monotone notches.
-#   follow: the screen moves along with the hand between desktops, and the desktop changes once, on letting go:
-#     to the nearest one, or on to where a quick flick carries it.
-#     Off, each desktop is gone to at once as the hand comes to it.
+#   step: movement needed to commit the next cell, after the axis dead zone; the full Distance is the threshold.
+#   follow: variant F commits after the full Distance, pulls at most 20%, and springs into the next cell.
+#     The picture recedes to 70%; Windows switches once when the hand lets go, without fling prediction.
+#     Off keeps the immediate desktop switching behavior.
+#   notch_x/y: legacy values accepted for compatibility; variant F uses its fixed curve.
 #   reverse: with true the desktops go the other way from the hand, as if pushing the screen like scrolling content on a touchpad; with false they follow it.
 #     Keyboard shortcuts are not affected.
 
 [mouse]
 # Distances in raw mouse counts, not screen pixels; physical travel depends on mouse DPI.
 # follow_x/y also animate keyboard desktop shortcuts.
-step_x = 260
-step_y = 400
+step_x = 100
+step_y = 100
 notch_x = 40
 notch_y = 100
 follow_x = true
@@ -68,8 +65,8 @@ reverse = false
 # Three-finger precision touchpad trigger (Windows three-finger swipes and taps must be Nothing).
 three_finger = false
 # Distances in millimetres on the pad.
-step_x = 10.0
-step_y = 10.0
+step_x = 4.0
+step_y = 4.0
 notch_x = 40
 notch_y = 100
 follow_x = true
@@ -158,7 +155,7 @@ impl Default for Config {
 
 impl Default for Mouse {
     fn default() -> Self {
-        Mouse { step_x: 260, step_y: 400, notch_x: 40, notch_y: 100, follow_x: true, follow_y: true, reverse: false }
+        Mouse { step_x: 100, step_y: 100, notch_x: 40, notch_y: 100, follow_x: true, follow_y: true, reverse: false }
     }
 }
 
@@ -178,9 +175,10 @@ impl Default for Touchpad {
 }
 
 /// The version of the config file this one writes (`Config::config_version`).
+/// 3: Distance is the full commit threshold; old distances reset once to 100 counts / 4 mm.
 /// 2: sideways notches of 0 in a file of no version are the template of
 /// 0.6.0-pre.1, not the user's choice, and are read as 40 (`migrated`).
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 /// Reads a config file. Keys of earlier versions (`LEGACY`) are read as the
 /// ones that took their place, unless the file gives those too.
@@ -200,12 +198,19 @@ fn migrated(text: &str) -> Result<(Config, Option<String>), toml::de::Error> {
         return Ok((config, None));
     }
     let mut file = text.to_owned();
+    if config.config_version < 2 {
     for key in ["mouse.notch_x", "touchpad.notch_x"] {
         let notch = if key.starts_with("mouse") { &mut config.mouse.notch_x } else { &mut config.touchpad.notch_x };
         if *notch == 0 {
             *notch = 40;
             file = with_value(&file, key, "40");
         }
+    }
+    }
+    (config.mouse.step_x, config.mouse.step_y) = (100, 100);
+    (config.touchpad.step_x, config.touchpad.step_y) = (4.0, 4.0);
+    for (key, value) in [("mouse.step_x", "100"), ("mouse.step_y", "100"), ("touchpad.step_x", "4.0"), ("touchpad.step_y", "4.0")] {
+        file = with_value(&file, key, value);
     }
     config.config_version = CONFIG_VERSION;
     Ok((config, Some(versioned(&file))))
@@ -334,8 +339,8 @@ pub fn set_value(key: &str, value: &str) -> io::Result<()> {
     fs::create_dir_all(dir())?;
     // A value set in a file of no version yet is the user's: versioned, a
     // sideways notch of 0 set now is not taken for the old template's.
-    let text = match parse_as_is(&text) {
-        Ok(config) if config.config_version < CONFIG_VERSION => versioned(&text),
+    let text = match migrated(&text) {
+        Ok((_, Some(updated))) => updated,
         _ => text,
     };
     fs::write(path, with_value(&text, key, value))
@@ -412,7 +417,7 @@ mod tests {
         let (config, rewritten) = migrated(PRE1_CONFIG).unwrap();
         assert_eq!((config.mouse.notch_x, config.touchpad.notch_x, config.config_version), (40, 40, CONFIG_VERSION));
         let rewritten = rewritten.expect("the file is brought up to date");
-        assert!(rewritten.contains("three_finger = true") && rewritten.contains("step_x = 260"), "{rewritten}");
+        assert!(rewritten.contains("three_finger = true") && rewritten.contains("step_x = 100"), "{rewritten}");
         let (again, none) = migrated(&rewritten).unwrap();
         assert_eq!((again.mouse.notch_x, again.touchpad.notch_x), (40, 40));
         assert!(none.is_none(), "only once");
@@ -448,15 +453,15 @@ mod tests {
     /// touchpad's distances, which it had none of, are the defaults.
     #[test]
     fn an_old_config_is_read_as_the_mouse_settings() {
-        let config = parse(OLD_CONFIG).unwrap();
+        let config = parse_as_is(OLD_CONFIG).unwrap();
         let mouse = Mouse { step_x: 300, step_y: 500, notch_y: 0, reverse: true, ..Mouse::default() };
         assert_eq!(config.mouse, mouse);
         assert_eq!(config.touchpad, Touchpad { three_finger: true, reverse: false, ..Touchpad::default() });
         assert!(!config.hotkeys);
         assert_eq!(parse("vertical_sticky = true").unwrap().mouse.notch_y, 100);
         // Where both are given, the new key is the one.
-        let both = parse("step_x = 300\n[mouse]\nstep_x = 200\n").unwrap();
-        assert_eq!((both.mouse.step_x, both.mouse.step_y), (200, 400));
+        let both = parse_as_is("step_x = 300\n[mouse]\nstep_x = 200\n").unwrap();
+        assert_eq!((both.mouse.step_x, both.mouse.step_y), (200, 100));
     }
 
     /// Every setting of either device written into a file, new or old, is
@@ -493,7 +498,7 @@ mod tests {
         };
         for file in [DEFAULT_CONFIG, OLD_CONFIG, "", "# only a comment"] {
             let text = values.iter().fold(file.to_owned(), |text, (key, value)| with_value(&text, key, value));
-            let config = parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+            let config = parse(&versioned(&text)).unwrap_or_else(|e| panic!("{e}\n{text}"));
             assert_eq!((config.mouse, config.touchpad), (mouse, touchpad), "{text}");
             let top: toml::Table = toml::from_str(&text).unwrap();
             for (old, ..) in LEGACY {
@@ -503,11 +508,23 @@ mod tests {
         // The rest of an old file stays, and a top-level key goes before the tables.
         let text = with_value(&with_value(OLD_CONFIG, "mouse.step_x", "200"), "carry_modifier", "\"ctrl\"");
         assert!(text.contains("# mine\nstep_y = 500\n"));
-        let config = parse(&text).unwrap();
+        let config = parse(&versioned(&text)).unwrap();
         assert_eq!((config.mouse.step_x, config.mouse.step_y, config.carry_modifier.as_str()), (200, 500, "ctrl"));
         let text = with_value(DEFAULT_CONFIG, "hotkeys", "false");
         assert!(!parse(&text).unwrap().hotkeys);
         assert!(text.find("hotkeys = false").unwrap() < text.find("[mouse]").unwrap());
+    }
+
+    #[test]
+    fn distance_migration_runs_once_and_preserves_later_choices() {
+        let old = "config_version = 2\nminimap = true\n[mouse]\nstep_x = 260\nstep_y = 400\nnotch_x = 0\n[touchpad]\nstep_x = 17.0\nstep_y = 12.0\n";
+        let (c, text) = migrated(old).unwrap();
+        assert_eq!((c.mouse.step_x, c.mouse.step_y, c.mouse.notch_x), (100, 100, 0));
+        assert!((c.touchpad.step_x - 4.0).abs() < 1e-9 && (c.touchpad.step_y - 4.0).abs() < 1e-9 && c.minimap);
+        let text = with_value(&with_value(&text.unwrap(), "mouse.step_x", "170"), "touchpad.step_y", "6.5");
+        let (c, rewrite) = migrated(&text).unwrap();
+        assert_eq!((c.mouse.step_x, c.mouse.step_y), (170, 100));
+        assert!((c.touchpad.step_y - 6.5).abs() < 1e-9 && rewrite.is_none());
     }
 
     /// Older state files have no usage field. New credits survive the same
@@ -543,6 +560,6 @@ mod tests {
         let added = with_value(&changed, "dwell_ms", "300");
         assert_eq!(added, format!("{changed}dwell_ms = 300\n"));
         let config = parse(&format!("{added}vertical_angle = 26.6\n")).unwrap();
-        assert_eq!((config.trigger.as_str(), config.mouse.step_x), ("f13", 260));
+        assert_eq!((config.trigger.as_str(), config.mouse.step_x), ("f13", 100));
     }
 }

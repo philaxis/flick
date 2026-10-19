@@ -66,10 +66,9 @@ const GAP: f32 = 24.0;
 const LABEL: f32 = 76.0;
 const VALUE: f32 = 90.0;
 /// What the sliders span, and the step they move in: the mouse's distances
-/// in raw counts, the touchpad's in tenths of a mm, notches in percent.
-const COUNTS: (i32, i32, i32) = (80, 600, 10);
-const TENTHS_MM: (i32, i32, i32) = (40, 300, 5);
-const NOTCH: (i32, i32, i32) = (0, crate::slide::FIRMEST as i32, 10);
+/// in raw counts, the touchpad's in tenths of a mm.
+const COUNTS: (i32, i32, i32) = (20, 600, 10);
+const TENTHS_MM: (i32, i32, i32) = (10, 300, 5);
 
 /// What the window shows.
 #[derive(Clone, Default)]
@@ -125,9 +124,8 @@ enum Hit {
     Admin,
     Minimap,
     Tab(Tab),
-    /// A way's distance, notches and following the hand.
+    /// A way's distance and following the hand.
     Step(usize),
-    Notch(usize),
     Follow(usize),
     Reverse,
     Touchpad,
@@ -147,7 +145,6 @@ struct Layout {
     /// Each way's column, its sliders' tracks and its switch.
     columns: [Rect; 2],
     steps: [Rect; 2],
-    notches: [Rect; 2],
     follows: [Rect; 2],
     reverse: Rect,
     touchpad: Rect,
@@ -182,7 +179,6 @@ impl Layout {
                 rect(left * s, row(TAB_ROWS.0) * s, (right - left) * s, ROWS.1 * s)
             }),
             steps: WAYS.map(|way| slider(way, TAB_ROWS.0 + 1.0)),
-            notches: WAYS.map(|way| slider(way, TAB_ROWS.0 + 2.0)),
             follows: WAYS.map(|way| at(column(way).1, TAB_ROWS.0 + 3.0, 44.0, 24.0)),
             reverse: at(inner.1, TAB_ROWS.0 + 4.0, 44.0, 24.0),
             touchpad: at(inner.1, TAB_ROWS.0 + 5.0, 44.0, 24.0),
@@ -196,8 +192,8 @@ impl Layout {
             (self.trigger, Hit::Trigger), (self.autostart, Hit::Autostart),
             (self.minimap, Hit::Minimap), (self.admin, Hit::Admin),
             (self.tabs[0], Hit::Tab(Tab::Mouse)), (self.tabs[1], Hit::Tab(Tab::Touchpad)),
-            (self.steps[0], Hit::Step(0)), (self.notches[0], Hit::Notch(0)), (self.follows[0], Hit::Follow(0)),
-            (self.steps[1], Hit::Step(1)), (self.notches[1], Hit::Notch(1)), (self.follows[1], Hit::Follow(1)),
+            (self.steps[0], Hit::Step(0)), (self.follows[0], Hit::Follow(0)),
+            (self.steps[1], Hit::Step(1)), (self.follows[1], Hit::Follow(1)),
             (self.reverse, Hit::Reverse),
         ];
         if tab == Tab::Touchpad {
@@ -216,11 +212,10 @@ impl Layout {
 }
 
 /// One hand's settings as the tab shows them, sliders in their own units
-/// (`COUNTS`, `TENTHS_MM`, `NOTCH`).
+/// (`COUNTS`, `TENTHS_MM`).
 #[derive(Clone, Copy)]
 struct Hand {
     steps: [i32; 2],
-    notches: [i32; 2],
     follows: [bool; 2],
     reverse: bool,
 }
@@ -232,7 +227,6 @@ impl View {
                 let m = &self.mouse;
                 Hand {
                     steps: [m.step_x, m.step_y],
-                    notches: [m.notch_x as i32, m.notch_y as i32],
                     follows: [m.follow_x, m.follow_y],
                     reverse: m.reverse,
                 }
@@ -242,7 +236,6 @@ impl View {
                 let tenths = |mm: f64| (mm * 10.0).round() as i32;
                 Hand {
                     steps: [tenths(t.step_x), tenths(t.step_y)],
-                    notches: [t.notch_x as i32, t.notch_y as i32],
                     follows: [t.follow_x, t.follow_y],
                     reverse: t.reverse,
                 }
@@ -251,19 +244,16 @@ impl View {
     }
 
     fn set_hand(&mut self, tab: Tab, hand: Hand) {
-        let notch = |n: i32| n.max(0) as u32;
         match tab {
             Tab::Mouse => {
                 let m = &mut self.mouse;
                 [m.step_x, m.step_y] = hand.steps;
-                [m.notch_x, m.notch_y] = hand.notches.map(notch);
                 [m.follow_x, m.follow_y] = hand.follows;
                 m.reverse = hand.reverse;
             }
             Tab::Touchpad => {
                 let t = &mut self.touchpad;
                 [t.step_x, t.step_y] = hand.steps.map(|tenths| tenths as f64 / 10.0);
-                [t.notch_x, t.notch_y] = hand.notches.map(notch);
                 [t.follow_x, t.follow_y] = hand.follows;
                 t.reverse = hand.reverse;
             }
@@ -277,8 +267,6 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
     Some(match hit {
         Hit::Step(0) => if mouse { "mouse.step_x" } else { "touchpad.step_x" },
         Hit::Step(_) => if mouse { "mouse.step_y" } else { "touchpad.step_y" },
-        Hit::Notch(0) => if mouse { "mouse.notch_x" } else { "touchpad.notch_x" },
-        Hit::Notch(_) => if mouse { "mouse.notch_y" } else { "touchpad.notch_y" },
         Hit::Follow(0) => if mouse { "mouse.follow_x" } else { "touchpad.follow_x" },
         Hit::Follow(_) => if mouse { "mouse.follow_y" } else { "touchpad.follow_y" },
         Hit::Reverse => if mouse { "mouse.reverse" } else { "touchpad.reverse" },
@@ -296,9 +284,7 @@ fn distance_words(tab: Tab, step: i32) -> String {
     }
 }
 
-fn notch_words(notch: i32) -> String {
-    if notch == 0 { tr("Off", "끄기", "关闭").into() } else { format!("{notch}%") }
-}
+
 
 struct Fonts {
     label: IDWriteTextFormat,
@@ -587,7 +573,6 @@ impl Settings {
         let distances = if self.tab == Tab::Mouse { COUNTS } else { TENTHS_MM };
         match hit {
             Hit::Step(way) => Some((hand.steps[way], distances)),
-            Hit::Notch(way) => Some((hand.notches[way], NOTCH)),
             _ => None,
         }
     }
@@ -606,7 +591,6 @@ impl Settings {
         let mut hand = self.view.hand(self.tab);
         match hit {
             Hit::Step(way) => hand.steps[way] = along(&layout.steps[way]),
-            Hit::Notch(way) => hand.notches[way] = along(&layout.notches[way]),
             _ => return Action::None,
         }
         self.view.set_hand(self.tab, hand);
@@ -806,12 +790,10 @@ impl Settings {
             let line = |i: f32| Rect { top: row(i).top, bottom: row(i).bottom, ..column };
             let title = [tr("Sideways · along a shelf", "좌우 · 같은 셸프(행)", "左右 · 同一架子（行）"), tr("Up and down · to another shelf", "위아래 · 다른 셸프(행)", "上下 · 切换架子（行）")][way];
             p.text(title, &fonts.title, &line(TAB_ROWS.0), white(0.92));
-            p.text(tr("Distance", "거리", "距离"), &fonts.label, &line(TAB_ROWS.0 + 1.0), white(0.62));
+            p.text(tr("Distance to switch", "넘어가는 데 필요한 거리", "切换所需距离"), &fonts.label, &line(TAB_ROWS.0 + 1.0), white(0.62));
             let words = distance_words(tab, hand.steps[way]);
             self.draw_slider(&p, fonts, &layout.steps[way], column.right, hand.steps[way], distances, &words, Hit::Step(way));
-            p.text(tr("Notch", "걸림", "卡点"), &fonts.label, &line(TAB_ROWS.0 + 2.0), white(0.62));
-            let words = notch_words(hand.notches[way]);
-            self.draw_slider(&p, fonts, &layout.notches[way], column.right, hand.notches[way], NOTCH, &words, Hit::Notch(way));
+            p.text(tr("F · move this distance to commit", "F · 이 거리만큼 움직이면 다음 칸으로", "F · 移动此距离后切换到下一格"), &fonts.notice, &line(TAB_ROWS.0 + 2.0), white(0.62));
             p.text(tr("Follows the hand", "손 따라가기", "跟随手"), &fonts.label, &line(TAB_ROWS.0 + 3.0), white(0.62));
             self.draw_switch(&p, &layout.follows[way], hand.follows[way], Hit::Follow(way));
         }
@@ -951,7 +933,7 @@ mod tests {
     #[test]
     fn keyboard_sliders_clamp_and_keep_touchpad_units() {
         assert_eq!(slider_step(600, COUNTS, 1), 600);
-        assert_eq!(slider_step(80, COUNTS, -1), 80);
+        assert_eq!(slider_step(20, COUNTS, -1), 20);
         assert_eq!(slider_step(260, COUNTS, 1), 270);
         let saved = slider_value(Tab::Touchpad, Hit::Step(0), 105);
         assert_eq!(saved, "10.5");

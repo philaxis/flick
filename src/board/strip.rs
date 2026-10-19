@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// How large a receded picture is, of the plate.
-pub const RECEDE: f32 = 0.64;
+pub const RECEDE: f32 = 0.7;
 /// Between two pictures, of the plate's shorter side at full size.
 pub const GAP: f32 = 0.04;
 /// How much darker the neighbours are than the cell in the middle, all the
@@ -218,6 +218,7 @@ impl Strip {
         }
         let rows = before.first().zip(after.first()).map_or(0.0, |(was, is)| was.1 - is.1);
         if rows.abs() > 1e-6 {
+            self.across.vertical = true;
             self.across.retarget(rows, now, slide);
             end = Some(end.unwrap_or(0.0).max(self.across.end()));
             if self.holding {
@@ -226,8 +227,9 @@ impl Strip {
                 self.row_recede.step(now, self.across.end());
             }
         }
-        if let (Some(end), false) = (end, self.holding) {
-            self.recede.step(now, end);
+        if let Some(end) = end {
+            if self.holding { self.recede.kick(now, 5.0); }
+            else { self.recede.step(now, end); }
         }
     }
 
@@ -243,37 +245,21 @@ impl Strip {
         if holding && hand.1.abs() > 0.02 {
             self.row_recede.hold(now);
         }
-        let changed = self.counted_from.is_some_and(|from| from != counted_from);
+        // Hand targets change; carry the displayed position and velocity through
+        // every change of origin, including commit and release.
+        let old = self.hand;
+        let old_row = self.hand_row;
+        if old_row != row {
+            self.along_mut(old_row).retarget(-old.0, now, curve::SNAP);
+            self.along_mut(row).retarget(hand.0, now, curve::SNAP);
+        } else {
+            self.along_mut(row).retarget(hand.0 - old.0, now, curve::SNAP);
+        }
+        self.across.vertical = true;
+        self.across.retarget(hand.1 - old.1, now, curve::SNAP);
         if self.holding && !holding {
-            // Let go: what the hand had pulled is left to go, at its speed.
-            let (old, old_row, speed) = (self.hand, self.hand_row, self.speed);
-            if old.0 != 0.0 || speed.0 != 0.0 {
-                self.along_mut(old_row).release(-old.0, -speed.0, now);
-            }
-            if old.1 != 0.0 || speed.1 != 0.0 {
-                self.across.release(-old.1, -speed.1, now);
-            }
-            let end = self.along.iter().chain([&self.across]).map(Glide::end).fold(now, f32::max);
-            self.recede.release(now, end);
-            self.row_recede.release(now, end);
-        } else if changed {
-            // Counted from elsewhere: the jump is left to go, so nothing jumps.
-            let (old, old_row) = (self.hand, self.hand_row);
-            if old.0 != 0.0 {
-                self.along_mut(old_row).retarget(-old.0, now, curve::SNAP);
-            }
-            if hand.0 != 0.0 {
-                self.along_mut(row).retarget(hand.0, now, curve::SNAP);
-            }
-            if old.1 != hand.1 {
-                self.across.retarget(hand.1 - old.1, now, curve::SNAP);
-            }
-        } else if holding {
-            if let Some(heard) = self.heard.filter(|heard| now > *heard + 1e-4) {
-                let dt = now - heard;
-                let blend = |was: f32, is: f32| 0.5 * was + 0.5 * is;
-                self.speed = (blend(self.speed.0, (hand.0 - self.hand.0) / dt), blend(self.speed.1, (hand.1 - self.hand.1) / dt));
-            }
+            self.recede.release(now, now + 0.4);
+            self.row_recede.release(now, now + 0.4);
         }
         (self.hand, self.hand_row, self.counted_from, self.holding, self.heard) = (hand, row, Some(counted_from), holding, Some(now));
     }
@@ -376,8 +362,8 @@ mod tests {
         assert!((middle.right - middle.left - 1840.0 * s).abs() < 1.5);
         assert!(((middle.left + middle.right) / 2.0 - 960.0).abs() <= 1.0);
         let (right, below) = (place(&plate, (1.0, 0.0), s, s).rect(&plate), place(&plate, (0.0, 1.0), s, s).rect(&plate));
-        assert!(right.left > middle.right && right.left < plate.right - 100.0, "{right:?}");
-        assert!(below.top > middle.bottom && below.top < plate.bottom - 60.0, "{below:?}");
+        assert!(right.left > middle.right && right.left < plate.right, "{right:?}");
+        assert!(below.top > middle.bottom && below.top < plate.bottom, "{below:?}");
         assert!(((right.left - middle.right) - (below.top - middle.bottom)).abs() <= 2.0);
         // Moved by whole pixels.
         let p = place(&plate, (0.37, -0.21), 0.8, 0.8);
@@ -408,122 +394,37 @@ mod tests {
         (0..=((until - from) / FRAME).ceil() as usize).map(move |i| from + i as f32 * FRAME)
     }
 
-    /// A move right: the strip recedes, the selected row slides one cell
-    /// with no jump while the other rows stay, and in about `STEP` the cell
-    /// gone to is in front in the middle and all is still.
     #[test]
-    fn a_step_sideways_slides_its_row_only_and_settles_in_front() {
-        let g = grid(&[(3, 0), (3, 0), (3, 0)]);
-        let before = marks(&g, Pos { row: 1, col: 0 });
-        let mut g2 = g.clone();
-        g2.visit("1.1");
-        let after = marks(&g2, Pos { row: 1, col: 1 });
-        let mut strip = Strip::default();
-        strip.moved(&before, &after, 0.0);
-        // Drawn where it was at once: the old cell in the middle.
-        assert!(near(strip.offset(1, 0.0).0, 1.0));
-        let mut last = strip.offset(1, 0.0).0;
-        let mut deepest = 0.0f32;
-        for t in times(0.0, curve::STEP + 1e-3) {
-            let (x, y) = strip.offset(1, t);
-            assert!(x >= -0.06 && x <= 1.0 + 1e-5 && (last - x).abs() < 0.1, "{t}: {last} to {x}");
-            let other = strip.offset(0, t);
-            assert!(near(other.0, 0.0) && near(other.1, 0.0), "other rows stay");
-            assert!(near(y, 0.0));
-            assert!(strip.active(t) || t >= curve::STEP - 1e-3);
-            deepest = deepest.max(strip.depth(t));
-            last = x;
-        }
-        assert!(deepest > 0.99);
-        assert!(strip.row_depth(0.2) < 1e-6, "this row's windows stay");
-        let end = curve::STEP + 1e-3;
-        assert!(strip.offset(1, end).0.abs() < 1e-6 && strip.depth(end) < 1e-6 && !strip.active(end + 1e-3));
-    }
-
-    /// A move down slides every row up together, and takes the windows
-    /// pinned to the row back with it.
-    #[test]
-    fn a_step_down_slides_all_rows_and_takes_row_windows_back() {
-        let g = grid(&[(3, 1), (3, 2), (2, 0)]);
-        let before = marks(&g, Pos { row: 0, col: 1 });
-        let after = marks(&g, Pos { row: 1, col: 2 });
-        let mut strip = Strip::default();
-        strip.moved(&before, &after, 0.0);
-        for row in 0..3 {
-            let (x, y) = strip.offset(row, 0.0);
-            assert!(near(after[row].0 + x, before[row].0) && near(after[row].1 + y, before[row].1), "row {row}");
-        }
-        assert!(strip.row_depth(0.2) > 0.99);
-        assert!(strip.offset(2, curve::STEP + 1e-3).1.abs() < 1e-6);
-    }
-
-    /// Moves in a row carry on without a jump in place or speed and stay
-    /// back between them.
-    #[test]
-    fn moves_in_a_row_carry_on() {
-        let mut strip = Strip::default();
-        let at = |col: f32| vec![(0.0, 0.0), (-col, 0.0)];
-        strip.moved(&at(0.0), &at(1.0), 0.0);
-        let mut target = 1.0;
-        // Where the middle of the strip is, in cells from the first.
-        let mut last = target - strip.offset(1, 0.0).0;
-        for t in times(0.0, 1.0) {
-            if (t - 0.12).abs() < FRAME / 2.0 || (t - 0.24).abs() < FRAME / 2.0 {
-                strip.moved(&at(target), &at(target + 1.0), t);
-                target += 1.0;
-            }
-            let x = target - strip.offset(1, t).0;
-            assert!((x - last).abs() < 0.08, "{t}: {last} to {x}");
-            assert!(x <= target + 0.15);
-            if t > curve::STEP_RECEDE && t < 0.3 {
-                assert!(strip.depth(t) > 0.99, "{t}");
-            }
-            last = x;
-        }
-        assert!(near(target - strip.offset(1, 1.0).0, 3.0) && strip.depth(1.0) < 1e-6);
-    }
-
-    /// The hand moves the strip one to one; the app getting to the next
-    /// cell changes nothing drawn; let go, it settles on the cell and comes
-    /// forward with no jump.
-    #[test]
-    fn the_hand_moves_it_one_to_one_and_nothing_jumps() {
-        let mut strip = Strip::default();
-        let drawn = |strip: &Strip, layout: f32, t: f32| layout + strip.offset(0, t).0;
-        strip.follow((0.0, 0.0), 0, 1, true, 0.0);
-        assert!(strip.active(0.0));
-        strip.follow((0.5, 0.0), 0, 1, true, 0.1);
-        assert!(near(drawn(&strip, 0.0, 0.1), -0.5));
-        strip.follow((0.98, 0.0), 0, 1, true, 0.15);
-        assert!(strip.depth(0.15) > 0.99);
-        let was = drawn(&strip, 0.0, 0.15);
-        // The app gets there first, then the hand is counted from it.
-        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.16);
-        strip.follow((-0.02, 0.0), 0, 2, true, 0.16);
-        assert!((drawn(&strip, -1.0, 0.16) - was).abs() < 0.01);
-        // Let go.
-        strip.follow((0.0, 0.0), 0, 3, false, 0.17);
-        assert!((drawn(&strip, -1.0, 0.17) - was).abs() < 0.02);
-        let mut last = drawn(&strip, -1.0, 0.17);
-        for t in times(0.17, 0.8) {
-            let x = drawn(&strip, -1.0, t);
-            assert!((x - last).abs() < 0.06, "{t}");
-            last = x;
-        }
-        assert!(near(drawn(&strip, -1.0, 0.8), -1.0) && strip.depth(0.8) < 1e-6 && !strip.active(0.8));
-    }
-    #[test]
-    fn a_locked_strip_has_no_animation_left_on_the_other_axis() {
+    fn both_axes_use_f_and_carry_speed_through_retargets() {
         for axis in 0..2 {
             let mut strip = Strip::default();
-            strip.moved(&[(0.0, 0.0)], &[(-1.0, -1.0)], 0.0);
-            strip.follow((0.3, 0.4), 0, 1, true, 0.1);
-            strip.lock_axis(axis);
-            for frame in 0..60 {
-                let (x, y) = strip.offset(0, 0.1 + frame as f32 / 120.0);
-                assert!((if axis == 0 { y } else { x }).abs() < 1e-6);
-            }
+            let marks = |n: f32| if axis == 0 { vec![(-n, 0.0)] } else { vec![(0.0, -n)] };
+            strip.moved(&marks(0.0), &marks(1.0), 0.0);
+            let get = |s: &Strip, t| { let p = s.offset(0, t); if axis == 0 { p.0 } else { p.1 } };
+            assert!((get(&strip, 0.0) - 1.0).abs() < 1e-6);
+            assert!(get(&strip, 0.3) < 0.0, "arrival ticks past the target");
+            let before = get(&strip, 0.1);
+            let velocity = (get(&strip, 0.10001) - before) / 0.00001;
+            strip.moved(&marks(1.0), &marks(2.0), 0.1);
+            assert!((get(&strip, 0.1) - 1.0 - before).abs() < 1e-5);
+            assert!(((get(&strip, 0.10001) - get(&strip, 0.1)) / 0.00001 - velocity).abs() < 0.05);
+            assert!(strip.depth(0.3) > 0.95);
+            assert!(get(&strip, 2.0).abs() < 0.001 && strip.depth(2.0) < 0.001 && !strip.active(2.0));
         }
     }
 
+    #[test]
+    fn commit_and_release_preserve_the_drawn_position() {
+        let mut strip = Strip::default();
+        strip.follow((0.0, 0.0), 0, 1, true, 0.0);
+        strip.follow((0.12, 0.0), 0, 1, true, 0.1);
+        let before = strip.offset(0, 0.15).0;
+        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.15);
+        strip.follow((-0.2, 0.0), 0, 2, true, 0.15);
+        assert!((strip.offset(0, 0.15).0 - 1.0 - before).abs() < 1e-5);
+        let before = strip.offset(0, 0.2).0;
+        strip.follow((0.0, 0.0), 0, 3, false, 0.2);
+        assert!((strip.offset(0, 0.2).0 - before).abs() < 1e-5);
+        assert!(strip.offset(0, 2.0).0.abs() < 0.001 && !strip.active(2.0));
+    }
 }

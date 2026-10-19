@@ -31,11 +31,12 @@ pub struct Slide {
     /// How many cells the row has to the left and to the right of the cell
     /// set out from, once the app has said.
     room: Option<(i32, i32)>,
+    flick: Option<crate::transition_curve::Latch>,
 }
 
 impl Slide {
     pub const fn new() -> Slide {
-        Slide { x: 0, notch: notch::DEFAULT_X, cell: 0, room: None }
+        Slide { x: 0, notch: notch::DEFAULT_X, cell: 0, room: None, flick: None }
     }
 
     pub fn cell(&self) -> i32 {
@@ -49,6 +50,10 @@ impl Slide {
     /// Display travel from the selected cell, in counts. Periodicity keeps
     /// cell + rest / step continuous when the selection changes its reference.
     pub fn rest(&self, step: i32) -> i32 {
+        if let Some(latch) = self.flick {
+            let room = self.room.map_or((-10000, 10000), |(l, r)| (-l, r));
+            return ((latch.target(room) - latch.cell as f64) * step as f64).round() as i32;
+        }
         let step = step.max(1);
         (self.display(self.raw_rest(step) as f32 / step as f32) * step as f32).round() as i32
     }
@@ -72,7 +77,7 @@ impl Slide {
     /// of it meanwhile is taken back to that end, to push against.
     pub fn set_room(&mut self, left: i32, right: i32, step: i32) {
         self.room = Some((left, right));
-        self.keep_in_row(step);
+        if self.flick.is_none() { self.keep_in_row(step); }
     }
 
     fn keep_in_row(&mut self, step: i32) {
@@ -86,6 +91,13 @@ impl Slide {
     /// is come to a little past halfway there and each further one a whole
     /// `step` on, so the cell is always the one the hand is nearest to.
     pub fn travel(&mut self, dx: i32, step: i32, may_step: bool) {
+        if let Some(latch) = &mut self.flick {
+            self.x = self.x.saturating_add(dx);
+            let room = self.room.map_or((-10000, 10000), |(l, r)| (-l, r));
+            latch.track(self.x as f64 / step.max(1) as f64, room);
+            self.cell = latch.cell;
+            return;
+        }
         if let Some((left, right)) = self.room {
             // Coming away from the end of the row counts from the last cell
             // itself, not from how far the hand had pushed past it.
@@ -107,7 +119,7 @@ impl Slide {
     /// on from it as it is now from this one: what it went towards the next
     /// cell is not lost, and no cell come to here is come to again.
     pub fn carried_on(&self, step: i32) -> Slide {
-        Slide { x: self.raw_rest(step), cell: 0, room: None, notch: self.notch }
+        Slide { x: if self.flick.is_some() { 0 } else { self.raw_rest(step) }, cell: 0, room: None, notch: self.notch, flick: self.flick.map(|_| Default::default()) }
     }
 }
 
@@ -340,6 +352,11 @@ impl Plane {
             plane.rows = Rows::Linear(Slide::firm(notch_y));
         }
         plane
+    }
+
+    pub fn enable_f(&mut self, x: bool, y: bool) {
+        if x { self.cols.flick = Some(Default::default()); }
+        if y { self.rows = Rows::Linear(Slide { flick: Some(Default::default()), ..Slide::new() }); }
     }
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
