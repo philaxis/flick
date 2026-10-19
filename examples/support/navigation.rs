@@ -90,6 +90,20 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 let got = vdapi::get_current_desktop().unwrap().id();
                 report += &format!("follow={follow} minimap={minimap} keyboard-trigger: {} actual={got}\n", got == ids[1]);
                 failures += usize::from(got != ids[1]);
+                // The second press arrives before the first picture can settle.
+                if follow {
+                    goto(4);
+                    for (dx, dy) in [(4, -440), (300, 4)] {
+                        mouse(MOUSEEVENTF_XDOWN, 0, 0);
+                        stroke(dx, dy, 50);
+                        mouse(MOUSEEVENTF_XUP, 0, 0);
+                        wait(5);
+                    }
+                    wait(2200);
+                    let got = vdapi::get_current_desktop().unwrap().id();
+                    report += &format!("follow={follow} minimap={minimap} rapid-up-then-right: {} actual={got}\n", got == ids[3]);
+                    failures += usize::from(got != ids[3]);
+                }
                 // Fifty physical button taps interleaved with holds, 100 ms apart.
                 let measuring = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
                 let running = measuring.clone();
