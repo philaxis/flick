@@ -125,7 +125,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
                 for i in 0..50 {
                     mouse(MOUSEEVENTF_XDOWN, 0, 0);
                     wait(10);
-                    if i % 3 == 0 { stroke(if i % 2 == 0 { 90 } else { -90 }, 3, 20); }
+                    if i % 3 == 0 { stroke(if i % 2 == 0 { 180 } else { -180 }, 3, 20); }
                     mouse(MOUSEEVENTF_XUP, 0, 0);
                     if let Some(left) = Duration::from_millis((i + 1) * 100).checked_sub(started.elapsed()) { std::thread::sleep(left); }
                 }
