@@ -392,6 +392,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn visual_experiments_are_off_unless_explicitly_selected() {
+        let default: Config=toml::from_str("").unwrap();
+        assert!(!default.experimental.motion_blur);assert_eq!(default.experimental.commit_speed.omega(false),35.0);
+        let opt: Config=toml::from_str("[experimental]\ncommit_speed='gentle'\nmotion_blur=true").unwrap();
+        assert_eq!(opt.experimental.commit_speed.omega(true),25.0);assert!(opt.experimental.motion_blur);
+        assert!(toml::from_str::<Config>("[experimental]\ncommit_speed='unknown'").is_err());
+    }
+    #[test]
     fn new_notches_default_to_forty_but_saved_off_stays_off() {
         for config in [Config::default(), parse(DEFAULT_CONFIG).unwrap(), parse("").unwrap(), parse(OLD_CONFIG).unwrap()] {
             assert_eq!((config.mouse.notch_x, config.touchpad.notch_x), (40, 40));

@@ -173,6 +173,7 @@ impl Follow {
     pub fn sampled_vertical(&self) -> f64 { self.vertical.p }
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
     pub fn selected(&self) -> (i32, i32) { (self.columns[(self.row - self.rows.0) as usize].cell, self.row) }
+    pub fn start_picture(&mut self) { self.depth = Spring::default(); }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
     pub fn reframe(&mut self, rows: (i32, i32), cols: Vec<(i32, i32)>, hand: (f64, f64), row_changed: bool) {
         if row_changed {
@@ -294,6 +295,13 @@ pub fn remember(path: &mut Vec<(f64, f64, usize)>, point: (f64, f64, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preparing_the_first_picture_does_not_spend_the_dead_zone_zooming() {
+        let mut f=Follow::new((0,0),vec![(0,3)]);
+        f.track_locked(0.0,(0.0,0.0),0);f.track_locked(3.0,(0.01,0.0),0);
+        let (selected,offset)=(f.selected(),f.offset(0));
+        f.start_picture();assert_eq!(f.depth(),0.0);assert_eq!(f.selected(),selected);assert_eq!(f.offset(0),offset);
+    }
     #[test]
     fn selected_size_changes_by_spring_and_cells_do_not_overlap() {
         let mut focus = Focus::default();

@@ -563,7 +563,7 @@ const TRACE_HEADER: &str =
     "hold,qpc_ms,gap_ms,vblank,flush_ms,timer_ms,phase,hand_x,hand_y,x,y,scale,work_ms,thumbnail_ms,moves,thumbnails";
 
 /// The performance counter now, in ms.
-fn qpc_ms() -> f64 {
+pub(crate) fn qpc_ms() -> f64 {
     let (mut count, mut frequency) = (0i64, 0i64);
     unsafe {
         let _ = QueryPerformanceCounter(&mut count);
@@ -1025,6 +1025,7 @@ impl View {
                         session.follow.consumed_path(&saved.path);
                     }
                 }
+                if session.stats.frames == 0 && !session.visible { session.follow.start_picture(); }
                 if hand.hold == session.hold && hand.holding {
                     let prediction = follow::resample(&session.input_samples, now);
                     let frame = session.follow.sampled(now, prediction);

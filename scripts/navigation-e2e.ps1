@@ -20,12 +20,15 @@ $logStart = if (Test-Path "$cfg\log.txt") { (Get-Content "$cfg\log.txt").Count }
 try {
     & $drive navigation stage $out
     if ($LASTEXITCODE) { throw 'stage failed' }
-    if ($Mode -eq 'matrix') {
+    if ($Mode -in @('matrix','final-matrix')) {
         $probeExit = 0
-        foreach ($variant in 'baseline','timed','composition','gentle','slow') {
-            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE -ErrorAction SilentlyContinue
+        $variants = if ($Mode -eq 'matrix') { @('baseline','timed','composition','gentle','slow') } else { @('timed','blur','composition','gentle','slow') }
+        foreach ($variant in $variants) {
+            Write-Output "VARIANT=$variant"
+            Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR -ErrorAction SilentlyContinue
             $exe = $flick
             if ($variant -eq 'baseline') { $exe = Join-Path (Get-Location) 'baseline.exe' }
+            if ($variant -eq 'blur') { $env:FLICK_PROBE_BLUR='1' }
             if ($variant -eq 'composition') { $env:FLICK_COMPOSITION = '1' }
             if ($variant -in @('gentle','slow')) { $env:FLICK_PROBE_SPEED=$variant; $env:FLICK_SHORT_PROBE='1' }
             $folder = Join-Path $out $variant
@@ -34,7 +37,7 @@ try {
             & $drive navigation display $folder $exe
             if ($LASTEXITCODE) { $probeExit=$LASTEXITCODE; break }
         }
-        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE -ErrorAction SilentlyContinue
+        Remove-Item Env:FLICK_COMPOSITION,Env:FLICK_PROBE_SPEED,Env:FLICK_SHORT_PROBE,Env:FLICK_PROBE_BLUR -ErrorAction SilentlyContinue
     } else {
         & $drive navigation $Mode $out $flick
         $probeExit = $LASTEXITCODE

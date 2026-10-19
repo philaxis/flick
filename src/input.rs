@@ -288,20 +288,22 @@ pub struct TimedHand {
     pub followed: Followed,
     pub axis: usize,
 }
-thread_local! { static SAMPLE_TIME: Cell<Option<(Instant, u32)>> = const { Cell::new(None) }; }
+thread_local! {
+    static SAMPLE_TIME: Cell<Option<(Instant, u32)>> = const { Cell::new(None) };
+    static LAST_SAMPLE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 static BOARD_SAMPLES: Mutex<std::collections::VecDeque<TimedHand>> = Mutex::new(std::collections::VecDeque::new());
 
 /// One immutable frame snapshot; old coordinate origins are never replayed into a new cell.
 pub fn board_frame() -> (Hand, bool, Option<usize>, Vec<TimedHand>) {
+    let mut queue = BOARD_SAMPLES.lock().unwrap();
     let (current, holding, axis) = loop {
         let before = WRITING.load(Ordering::SeqCst);
         if before % 2 != 0 { std::hint::spin_loop(); continue; }
         let state = (hand(), holding(), axis());
         if before == WRITING.load(Ordering::SeqCst) { break state; }
     };
-    let samples: Vec<TimedHand> = BOARD_SAMPLES.lock().map(|mut queue| {
-        queue.drain(..).filter(|s| s.hand.counted_from == current.counted_from).collect()
-    }).unwrap_or_default();
+    let samples: Vec<TimedHand> = queue.drain(..).filter(|s| s.hand.counted_from == current.counted_from).collect();
     let (current, holding) = samples.last().map_or((current, holding), |s| (s.hand, s.followed.holding));
     (current, holding, axis, samples)
 }
@@ -310,8 +312,17 @@ fn remember_follow() {
     let followed = followed();
     let received = Instant::now();
     let stamp = SAMPLE_TIME.get();
-    let sample = TimedHand { at: stamp.map_or(received, |s| s.0), received, scan_time: stamp.map(|s|s.1), os_ms: unsafe { GetMessageTime() } as u32,
+    let os_ms = unsafe { GetMessageTime() } as u32;
+    let age = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() } as u32;
+    let age = age.wrapping_sub(os_ms);
+    // Keep sub-ms receipt precision unless a queued OS message is measurably older.
+    let at = stamp.map_or_else(|| if (2..=250).contains(&age) {received-std::time::Duration::from_millis(age as u64)} else {received}, |s|s.0);
+    let at = LAST_SAMPLE.replace(Some(at)).map_or(at, |last| last.max(at));
+    LAST_SAMPLE.set(Some(at));
+    let sample = TimedHand { at, received, scan_time: stamp.map(|s|s.1), os_ms,
         hand: hand(), followed, axis: axis().unwrap_or(0) };
+    #[cfg(feature = "motion-probe")]
+    PROBE_HAND.with(|v| v.borrow_mut().push(sample));
     if BOARD_OPEN.load(Ordering::SeqCst) {
         if let Ok(mut queue) = BOARD_SAMPLES.lock() {
             if queue.len() == 2048 { queue.pop_front(); }
@@ -1765,6 +1776,8 @@ mod tests {
 
 
 #[cfg(feature = "motion-probe")]
+thread_local! { static PROBE_HAND: RefCell<Vec<TimedHand>> = const {RefCell::new(Vec::new())}; }
+#[cfg(feature = "motion-probe")]
 thread_local! { static PROBE_INPUT: RefCell<Vec<(i64, &'static str, f64, f64)>> = const {RefCell::new(Vec::new())}; }
 #[cfg(feature = "motion-probe")]
 fn probe_input(kind: &'static str, x: f64, y: f64) {
@@ -1776,6 +1789,19 @@ fn probe_input(kind: &'static str, x: f64, y: f64) {
 fn probe_flush() {
     use std::fmt::Write;
     let Some(path) = std::env::var_os("FLICK_INPUT_TRACE") else {return};
+    PROBE_HAND.with(|v| {
+        if v.borrow().is_empty() {return;}
+        let mut tick=0;let mut frequency=0;
+        unsafe {let _=windows::Win32::System::Performance::QueryPerformanceCounter(&mut tick);let _=windows::Win32::System::Performance::QueryPerformanceFrequency(&mut frequency);}
+        let now=Instant::now();
+        let file=std::path::Path::new(&path).with_extension("samples.csv");
+        let mut csv=std::fs::read_to_string(&file).unwrap_or_else(|_|"sample_qpc,received_qpc,os_ms,scan_time,x,y,axis,holding\n".into());
+        for s in v.borrow_mut().drain(..) {
+            let stamp=|at:Instant|tick-(now.saturating_duration_since(at).as_secs_f64()*frequency as f64).round() as i64;
+            let _=writeln!(csv,"{},{},{},{},{:.9},{:.9},{},{}",stamp(s.at),stamp(s.received),s.os_ms,s.scan_time.map_or(String::new(),|s|s.to_string()),s.followed.x,s.followed.y,s.axis,s.followed.holding);
+        }
+        let _=std::fs::write(file,csv);
+    });
     PROBE_INPUT.with(|v| {
         if v.borrow().is_empty() { return; }
         let mut csv = std::fs::read_to_string(&path).unwrap_or_else(|_| String::from("qpc,kind,dx,dy\n"));

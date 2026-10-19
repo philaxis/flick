@@ -346,6 +346,7 @@ struct TraceFrame {
     updates: usize,
     /// First selected thumbnail: handle, DWM destination/source, transformed tile.
     geometry: Option<(isize, RECT, RECT, Rect)>,
+    submitted_qpc_ms: f64,
 }
 
 /// The board's frames written to the CSV file `FLICK_TRACE` names: kept in
@@ -386,19 +387,19 @@ impl Trace {
         let mut out = String::new();
         let new = std::fs::metadata(&self.path).map_or(true, |m| m.len() == 0);
         if new {
-            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms,thumbnail_updates\n");
+            out.push_str("qpc_ms,interval_ms,wake,hand_along,hand_across,drawn_x,drawn_y,drawn_scale,depth,draw_ms,dwm_ms,thumbnails,submit_ms,thumbnail_updates,absolute_qpc_ms\n");
         }
         let geometry_path = self.path.with_extension("geometry.csv");
-        let mut geometry = if geometry_path.exists() { String::new() } else { "qpc_ms,hwnd,dest_l,dest_t,dest_r,dest_b,source_l,source_t,source_r,source_b,tile_l,tile_t,tile_r,tile_b\n".into() };
+        let mut geometry = if geometry_path.exists() { String::new() } else { "qpc_ms,hwnd,dest_l,dest_t,dest_r,dest_b,source_l,source_t,source_r,source_b,tile_l,tile_t,tile_r,tile_b,absolute_qpc_ms\n".into() };
         for f in self.frames.drain(..) {
             if let Some((hwnd, d, s, tile)) = f.geometry {
-                geometry.push_str(&format!("{:.3},{hwnd:x},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}\n", ms(f.at),
-                    d.left, d.top, d.right, d.bottom, s.left, s.top, s.right, s.bottom, tile.left, tile.top, tile.right, tile.bottom));
+                geometry.push_str(&format!("{:.3},{hwnd:x},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3}\n", ms(f.at),
+                    d.left, d.top, d.right, d.bottom, s.left, s.top, s.right, s.bottom, tile.left, tile.top, tile.right, tile.bottom, f.submitted_qpc_ms));
             }
-            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3},{}\n",
+            out.push_str(&format!("{:.3},{},{},{:.4},{:.4},{:.1},{:.1},{:.4},{:.4},{:.3},{:.3},{},{:.3},{},{:.3}\n",
                 ms(f.at), f.interval.map_or(String::new(), |i| format!("{:.3}", ms(i))),
                 if f.by_vblank { "vblank" } else { "timer" }, f.hand.0, f.hand.1, f.drawn.0, f.drawn.1, f.drawn.2,
-                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit), f.updates));
+                f.depth, ms(f.draw), ms(f.dwm), f.thumbs, ms(f.submit), f.updates, f.submitted_qpc_ms));
         }
         let written = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)
             .and_then(|mut file| file.write_all(out.as_bytes()));
@@ -911,6 +912,8 @@ pub struct Board {
     /// being drawn; whether it is moving, with the cells beside the
     /// selection laid out and their live previews registered.
     strip: Strip,
+    #[cfg(feature = "motion-probe")]
+    probe_marker: Cell<Option<f32>>,
     strip_frame: Option<Strip>,
     strip_input: Option<(crate::input::Hand, bool)>,
     strip_samples: Vec<(f64,f64,f64,usize)>,
@@ -1085,6 +1088,8 @@ impl Board {
                 clock: FrameClock::default(),
                 vblank_frame: None,
                 strip: Strip::default(),
+                #[cfg(feature = "motion-probe")]
+                probe_marker: Cell::new(None),
                 strip_frame: None,
                 strip_input: None,
                 strip_samples: Vec::new(),
@@ -1537,6 +1542,7 @@ impl Board {
                     thumbs: self.thumbs.len() + self.strip_thumbs.len(),
                     updates: self.thumbnail_updates.get(),
                     geometry,
+                    submitted_qpc_ms: crate::glide::qpc_ms(),
                 };
                 if let Some(trace) = &mut self.trace {
                     trace.record(frame, now);
@@ -2760,6 +2766,8 @@ impl Board {
         let p = Painter::cached(target, &self.text_cache)?;
         // The tiles are placed in the window's coordinates; each map, and the
         // label and the hint of the home monitor, in its monitor's own.
+        #[cfg(feature = "motion-probe")]
+        self.probe_marker.set(None);
         self.draw_tiles(&p, fonts);
         for map in &self.maps {
             unsafe {
@@ -2775,6 +2783,8 @@ impl Board {
             self.set_transform(target, Matrix3x2::identity());
         }
         self.draw_popup(&p, fonts);
+        #[cfg(feature = "motion-probe")]
+        if let Some(x) = self.probe_marker.get() { p.fill_square(&rect(x-2.0,20.0,4.0,12.0),rgba(0.0,1.0,0.0,1.0)); }
         Ok(())
     }
 
@@ -2967,7 +2977,7 @@ impl Board {
                     if window.title == "F motion 0" {
                         let dest = at.rect(&tile.thumb);
                         let x = (dest.left + dest.right) * 0.5;
-                        p.fill_square(&rect(x - 2.0, 20.0, 4.0, 12.0), rgba(0.0, 1.0, 0.0, 1.0));
+                        self.probe_marker.set(Some(x));
                     }
                 }
             }

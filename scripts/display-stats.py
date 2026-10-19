@@ -21,8 +21,8 @@ def read(path):
         return list(csv.DictReader(f))
 
 
-def position(row, color):
-    if int(row[color + '_n']) < (2 if color=='marker' else 32) or int(row[color + '_l']) <= 1 or int(row[color + '_r']) >= 1918:
+def position(row, color, bounds=(1, 1918)):
+    if int(row[color + '_n']) < (2 if color=='marker' else 32) or int(row[color + '_l']) <= bounds[0] or int(row[color + '_r']) >= bounds[1]:
         return None
     return float(row.get(color + '_x', (float(row[color + '_l']) + float(row[color + '_r'])) / 2))
 
@@ -35,17 +35,24 @@ def report(folder):
     meta = json.loads((folder / 'display-meta.json').read_text())
     frequency, period = meta['frequency'], meta['refresh_ticks']
     print(f"Refresh: {frequency / period:.4f} Hz. Composed pixels, not a photodiode or physical panel scanout.")
-    print('|scenario|updates|capture losses|pixel repeats / pairs|no-update refreshes|step CV %|first response ms|input step CV %|marker error p95 px|')
-    print('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
+    print('|scenario|updates|capture losses|pixel repeats / pairs|no-update refreshes|step CV %|first response ms|input step CV %|marker error p95 px|max adjacent step px|post-dead-zone onset ms|input interval p95 ms|')
+    print('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     data = []
     for path in sorted(folder.glob('*-display.csv')):
         label = path.name.removesuffix('-display.csv')
         frames, inputs = read(path), read(folder / (label + '-input.csv'))
         times = [int(r['qpc']) for r in inputs]
         start, end = times[0], times[-1]
+        bounds=(55,1864) if label.startswith('board') else (1,meta.get('width',1920)-2)
+        pos=lambda r,c: position(r,c,bounds)
+        dead=0.25 if '-ptp-' in label else 0.012
+        eligible=next((int(r['qpc']) for r in inputs if abs(float(r['hand_cells']))>dead),end)
+        intervals=[(b-a)*1000/frequency for a,b in zip(times,times[1:])]
+        cadence_p95=sorted(intervals)[int(len(intervals)*.95)] if intervals else math.nan
         active = [r for r in frames if start <= int(r['qpc']) <= end]
         losses = sum(max(0, int(r['accumulated']) - 1) for r in active)
         repeats = gaps = 0
+        adjacent_changes=[]
         changes, raw_steps, marker_errors = [], [], []
         for a, b in zip(active, active[1:]):
             t0, t1 = int(a['qpc']), int(b['qpc'])
@@ -58,30 +65,32 @@ def report(folder):
             raw_steps.append(hand)
             # Prefer the largest fully visible patch common to both frames.
             candidates = [(min(int(a[c+'_n']), int(b[c+'_n'])), c) for c in COLORS
-                          if position(a,c) is not None and position(b,c) is not None
-                          and abs(int(a[c+'_r'])-int(a[c+'_l'])-int(b[c+'_r'])+int(b[c+'_l'])) <= 2]
+                          if pos(a,c) is not None and pos(b,c) is not None
+]
             if not candidates:
                 continue
             c = max(candidates)[1]
-            dx = position(b,c)-position(a,c)
+            dx = pos(b,c)-pos(a,c)
             changes.append(dx)
+            if abs((t1-t0)/period-1)<0.25: adjacent_changes.append(dx)
             repeats += abs(dx) < 0.01
             gaps += max(0, round((t1-t0)/period)-1)
-            if int(b['marker_n']) and position(b,'magenta') is not None:
-                marker_errors.append(abs(position(b,'magenta')-position(b,'marker')))
+            if int(b['marker_n']) and pos(b,'magenta') is not None:
+                marker_errors.append(abs(pos(b,'magenta')-pos(b,'marker')))
         first = None
-        initial = next((r for r in frames if int(r['qpc']) >= start and position(r,'magenta') is not None), None)
+        initial = next((r for r in frames if int(r['qpc']) >= start and pos(r,'magenta') is not None), None)
         if initial:
-            base = position(initial,'magenta')
-            changed = next((r for r in active if position(r,'magenta') is not None and abs(position(r,'magenta')-base) >= 1), None)
+            base = pos(initial,'magenta')
+            changed = next((r for r in active if pos(r,'magenta') is not None and abs(pos(r,'magenta')-base) >= 1), None)
             if changed:
                 first = (int(changed['qpc'])-start)*1000/frequency
         p95 = sorted(marker_errors)[int(len(marker_errors)*.95)] if marker_errors else math.nan
         line = dict(scenario=label, updates=len(active), capture_losses=losses, repeat_pairs=repeats, pairs=len(changes), no_update_refreshes=gaps,
-                    step_cv=cv(changes), first_response_ms=first, input_step_cv=cv(raw_steps), marker_error_p95=p95, max_step_px=max(map(abs,changes),default=0))
+                    step_cv=cv(changes), first_response_ms=first, input_step_cv=cv(raw_steps), marker_error_p95=p95, max_step_px=max(map(abs,adjacent_changes),default=0), eligible_response_ms=None if first is None else first-(eligible-start)*1000/frequency, input_interval_p95_ms=cadence_p95)
         data.append(line)
         first_text = f'{first:.1f}' if first is not None else 'missing'
-        print(f'|{label}|{len(active)}|{losses}|{repeats}/{len(changes)}|{gaps}|{cv(changes):.1f}|{first_text}|{cv(raw_steps):.1f}|{p95:.2f}|')
+        onset=f'{line["eligible_response_ms"]:.1f}' if first is not None else 'missing'
+        print(f'|{label}|{len(active)}|{losses}|{repeats}/{len(changes)}|{gaps}|{cv(changes):.1f}|{first_text}|{cv(raw_steps):.1f}|{p95:.2f}|{line["max_step_px"]:.1f}|{onset}|{cadence_p95:.2f}|')
     (folder / 'display-summary.json').write_text(json.dumps(data, indent=2))
     print('CV includes intentional F-curve latching and reversal; it is not residual judder. First response is motion onset, not steady-state latency.')
     return data

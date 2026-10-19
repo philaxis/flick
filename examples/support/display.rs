@@ -45,13 +45,13 @@ impl Capture {
         }
     }
     unsafe fn frame(&self, save: bool) -> Result<Option<(DXGI_OUTDUPL_FRAME_INFO, [(i32,i32,i32,i32,u32); 4], [f64;4], f64)>> {
-        let start = Instant::now();
         let (mut info, mut resource) = (DXGI_OUTDUPL_FRAME_INFO::default(), None);
         match self.duplication.AcquireNextFrame(50, &mut info, &mut resource) {
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
             r => r?,
         }
         if info.LastPresentTime == 0 { self.duplication.ReleaseFrame()?; return Ok(None); }
+        let start = Instant::now();
         let source = resource.unwrap().cast::<ID3D11Texture2D>();
         if let Ok(source) = &source { self.context.CopyResource(&self.staging, source); }
         self.duplication.ReleaseFrame()?;
@@ -60,32 +60,9 @@ impl Capture {
         self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
         let mut boxes = [(i32::MAX, i32::MAX, -1, -1, 0); 4];
         let (mut mass,mut moment)=([0u64;4],[0u64;4]);
-        // Long horizontal runs isolate fixture interiors from desktop icons and text.
-        // Sampling every fourth row cuts CPU readback analysis without quantizing x.
         for y in (20..self.height.saturating_sub(60)).step_by(4) {
             let line = std::slice::from_raw_parts((mapped.pData as *const u8).add((y * mapped.RowPitch) as usize), self.width as usize * 4);
-            let classify = |x: u32| {
-                let p = &line[x as usize * 4..][..3];
-                let (b,g,r) = (p[0] as u32,p[1] as u32,p[2] as u32);
-                if r > 40 && b > 40 && g * 3 < r.min(b) { Some((0,r.min(b)-g)) }
-                else if b > 40 && g > 40 && r * 3 < b.min(g) { Some((1,b.min(g)-r)) }
-                else if r > 40 && g > 40 && b * 3 < r.min(g) { Some((2,r.min(g)-b)) }
-                else if y < 40 && g > 180 && r < 40 && b < 40 { Some((3,g-r.max(b))) } else { None }
-            };
-            let mut x=0;
-            while x < self.width {
-                let Some((c,_))=classify(x) else { x+=1; continue; };
-                let left=x;
-                let (mut m,mut mx)=(0u64,0u64);
-                while x < self.width {
-                    match classify(x) { Some((other,w)) if other==c => {m+=w as u64;mx+=w as u64*x as u64;x+=1;}, _=>break }
-                }
-                let width=x-left;
-                if width > boxes[c].4 && width >= if c==3 {2} else {32} {
-                    boxes[c]=(left as i32,y as i32,x as i32-1,y as i32,width);
-                    mass[c]=m;moment[c]=mx;
-                }
-            }
+            scan_line(line,y,&mut boxes,&mut mass,&mut moment);
         }
         if save && self.sample.borrow().is_none() {
             let mut raw=Vec::with_capacity((self.width*self.height*4+8) as usize);
@@ -97,6 +74,33 @@ impl Capture {
         let centers=std::array::from_fn(|i| if mass[i]>0 {moment[i] as f64/mass[i] as f64} else {f64::NAN});
         Ok(Some((info, boxes, centers, start.elapsed().as_secs_f64()*1000.0)))
     }
+}
+
+// Long runs isolate fixtures from desktop icons; y subsampling preserves x precision.
+fn scan_line(line: &[u8], y: u32, boxes: &mut [(i32,i32,i32,i32,u32);4], mass: &mut [u64;4], moment: &mut [u64;4]) {
+    let width=line.len() as u32/4;
+            let classify = |x: u32| {
+                let p = &line[x as usize * 4..][..3];
+                let (b,g,r) = (p[0] as u32,p[1] as u32,p[2] as u32);
+                if r > 40 && b > 40 && g * 3 < r.min(b) { Some((0,r.min(b)-g)) }
+                else if b > 40 && g > 40 && r * 3 < b.min(g) { Some((1,b.min(g)-r)) }
+                else if r > 40 && g > 40 && b * 3 < r.min(g) { Some((2,r.min(g)-b)) }
+                else if y < 40 && g > 180 && r < 40 && b < 40 { Some((3,g-r.max(b))) } else { None }
+            };
+            let mut x=0;
+            while x < width {
+                let Some((c,_))=classify(x) else { x+=1; continue; };
+                let left=x;
+                let (mut m,mut mx)=(0u64,0u64);
+                while x < width {
+                    match classify(x) { Some((other,w)) if other==c => {m+=w as u64;mx+=w as u64*x as u64;x+=1;}, _=>break }
+                }
+                let width=x-left;
+                if width > boxes[c].4 && width >= if c==3 {2} else {32} {
+                    boxes[c]=(left as i32,y as i32,x as i32-1,y as i32,width);
+                    mass[c]=m;moment[c]=mx;
+                }
+            }
 }
 
 // Smooth velocity ramps and deliberately stationary intervals; units are cells.
@@ -221,6 +225,14 @@ pub unsafe fn run(out: &Path, flick: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn patch_tracking_ignores_isolated_desktop_colors() {
+        let mut row=vec![0u8;400*4];
+        for x in (10..12).chain(100..300).chain(380..382) {row[x*4]=255;row[x*4+2]=255;}
+        let mut boxes=[(i32::MAX,i32::MAX,-1,-1,0);4];let(mut mass,mut moment)=([0;4],[0;4]);
+        scan_line(&row,200,&mut boxes,&mut mass,&mut moment);
+        assert_eq!((boxes[0].0,boxes[0].2,boxes[0].4),(100,299,200));
+        assert_eq!(moment[0] as f64/mass[0] as f64,199.5);
+    }
     #[test] fn trajectory_is_continuous_and_has_a_real_pause() {
         for t in [1.2,1.6,2.4,3.8,4.2,5.3] { assert!((hand("mixed",t-1e-5)-hand("mixed",t+1e-5)).abs()<1e-6); }
         assert_eq!(hand("mixed",1.3),hand("mixed",1.5));
