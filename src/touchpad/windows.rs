@@ -538,7 +538,7 @@ impl Device {
         Ok(logical.clamp(axis.min, axis.max) as f64 * axis.scale)
     }
 
-    fn report(&mut self, report: &[u8]) -> Option<Vec<Contact>> {
+    fn report(&mut self, report: &[u8]) -> Option<(u32, Vec<Contact>)> {
         #[cfg(test)]
         {
             self.samples += 1;
@@ -585,7 +585,7 @@ impl Device {
                 self.seen.reports, self.handle
             ));
         }
-        frame
+        frame.map(|contacts| (scan, contacts))
     }
 
     fn parse(&self, report: &[u8]) -> Result<(u32, usize, Vec<(u32, Option<Contact>)>), String> {
@@ -636,6 +636,7 @@ pub struct Reader {
     pub devices: Vec<Device>,
     owner: Option<isize>,
     gesture: Gesture,
+    clock: super::ScanClock,
     /// Contact counts already written to the log, one bit each, and whether a hold began.
     logged: u32,
     #[cfg(test)]
@@ -648,6 +649,7 @@ impl Default for Reader {
             devices: Vec::new(),
             owner: None,
             gesture: Gesture::default(),
+            clock: super::ScanClock::default(),
             logged: 0,
             #[cfg(test)]
             last_count: 0,
@@ -674,14 +676,16 @@ impl Reader {
             }
             return None;
         };
-        let contacts = self.devices[index].report(report)?;
+        let (scan, contacts) = self.devices[index].report(report)?;
         if self.owner.is_some_and(|owner| owner != device) {
             return None;
         }
         if !contacts.is_empty() {
             self.owner = Some(device);
         }
-        let event = self.gesture.update(&contacts, ms);
+        let mut event = self.gesture.update(&contacts, ms);
+        event.sampled_at = Some(self.clock.stamp(scan, std::time::Instant::now()));
+        event.scan_time = Some(scan);
         // Each finger count once, so a log shows how many fingers this pad reports at most.
         let bit = 1 << contacts.len().min(10);
         if self.logged & bit == 0 && !contacts.is_empty() {
@@ -705,6 +709,7 @@ impl Reader {
         }
         if contacts.is_empty() {
             self.owner = None;
+            self.clock = super::ScanClock::default();
         }
         Some(event)
     }

@@ -911,6 +911,9 @@ pub struct Board {
     /// being drawn; whether it is moving, with the cells beside the
     /// selection laid out and their live previews registered.
     strip: Strip,
+    strip_frame: Option<Strip>,
+    strip_input: Option<(crate::input::Hand, bool)>,
+    strip_samples: Vec<(f64,f64,f64,usize)>,
     strip_epoch: Instant,
     strip_at: f32,
     strip_on: bool,
@@ -1082,6 +1085,9 @@ impl Board {
                 clock: FrameClock::default(),
                 vblank_frame: None,
                 strip: Strip::default(),
+                strip_frame: None,
+                strip_input: None,
+                strip_samples: Vec::new(),
                 strip_epoch: Instant::now(),
                 strip_at: 0.0,
                 strip_on: false,
@@ -1312,6 +1318,7 @@ impl Board {
         self.relayout();
         self.motion.moved(&before, &self.marks(), now);
         let t = self.strip_time(now);
+        self.strip_frame = None;
         self.strip.moved(&strip_before, &self.strip_marks, t);
         self.strip_at = t;
         self.strip_on |= self.strip.active(t);
@@ -1351,6 +1358,9 @@ impl Board {
     /// and its clock starts again from `now`.
     fn settle_strip(&mut self, now: Instant) {
         self.strip = Strip::default();
+        self.strip_frame = None;
+        self.strip_input = None;
+        self.strip_samples.clear();
         self.strip_epoch = now;
         self.strip_at = 0.0;
         self.strip_on = false;
@@ -1361,6 +1371,8 @@ impl Board {
     }
 
     /// How far the hand pulls the selection, in cells and rows.
+    fn drawn_strip(&self) -> &Strip { self.strip_frame.as_ref().unwrap_or(&self.strip) }
+
     fn strip_pull(&self, hand: (f32, f32)) -> (f32, f32) {
         let Some(at) = self.grid.find(&self.selected).filter(|_| hand != (0.0, 0.0)) else { return (0.0, 0.0) };
         hand_pull(&self.grid, at, hand)
@@ -1446,13 +1458,35 @@ impl Board {
     /// never from how many frames there were. Stops once all is in place
     /// and no hold goes on.
     fn tick_motion(&mut self, now: Instant, by_vblank: bool) {
-        let hand = crate::input::hand();
-        let holding = crate::input::holding();
+        let (hand, holding, axis, samples) = crate::input::board_frame();
+        let now = samples.last().map_or(now, |s| now.max(s.at));
         let dragging = self.press.as_ref().is_some_and(|press| press.dragging);
         let t = self.strip_time(now);
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
-        self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+        let changed_origin = self.strip_input.is_none_or(|(last, _)| last.counted_from != hand.counted_from);
+        if changed_origin { self.strip_samples.clear(); }
+        for sample in &samples {
+            let at = self.strip_time(sample.at);
+            let h = sample.hand;
+            self.strip.follow(self.strip_pull((h.along, h.across)), row, h.counted_from, sample.followed.holding, at);
+            if self.strip_samples.len() == 3 { self.strip_samples.remove(0); }
+            self.strip_samples.push((at as f64,h.along as f64,h.across as f64,sample.axis));
+        }
+        if samples.is_empty() && self.strip_input != Some((hand, holding)) {
+            self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+        }
+        self.strip_input = Some((hand, holding));
+        let mut frame = self.strip.clone();
+        if holding && !changed_origin {
+            if let Some(((x,y),at)) = crate::follow::resample(&self.strip_samples,t as f64) {
+                // Keep prediction inside this cell; only real input may cross a commit.
+                if x.floor() == (hand.along as f64).floor() && y.floor() == (hand.across as f64).floor() {
+                    frame.follow(self.strip_pull((x as f32,y as f32)),row,hand.counted_from,true,at as f32);
+                }
+            }
+        }
+        self.strip_frame = Some(frame);
 
         self.strip_at = t;
         let strip_moving = self.strip.active(t);
@@ -1462,7 +1496,7 @@ impl Board {
             self.register_thumbnails();
         }
         let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now) || strip_moving;
-        if holding { if let Some(axis) = crate::input::axis() { self.motion.lock_axis(axis); } }
+        if holding { if let Some(axis) = axis { self.motion.lock_axis(axis); } }
         {
             // Also submit the final frame after a drag or hold stops.
             let started = Instant::now();
@@ -1496,7 +1530,7 @@ impl Board {
                     by_vblank,
                     hand: (hand.along, hand.across),
                     drawn,
-                    depth: self.strip.depth(t),
+                    depth: self.drawn_strip().depth(t),
                     draw: took - dwm,
                     dwm,
                     submit: took - prepared,
@@ -1511,7 +1545,7 @@ impl Board {
             debug_log!("board: motion frame {} drawn in {:.2} ms, {} parts easing, at most {:.1} px left, hand {:.3},{:.3} {:?}, strip {:.3} back",
                 self.motion.frames, took.as_secs_f32() * 1000.0, self.motion.rest.len(),
                 self.motion.rest.values().flatten().map(|spring| spring.offset.abs()).fold(0.0, f32::max), hand.along, hand.across,
-                self.motion.hand.values().next(), self.strip.depth(t));
+                self.motion.hand.values().next(), self.drawn_strip().depth(t));
         }
         if !moving && !holding && !dragging {
             debug_log!("board: motion settled after {} frames, drawing {:.2} ms a frame on average and {:.2} at most",
@@ -1717,14 +1751,14 @@ impl Board {
     fn picture_place(&self, pos: Pos, m: usize) -> Place {
         let (Some(plate), Some(mark), true) = (self.plates.get(m), self.strip_marks.get(pos.row), self.strip_on) else { return Place::SAME };
         let t = self.strip_at;
-        let (x, y) = self.strip.offset(pos.row, t);
-        let size = strip::scale(self.strip.depth(t));
+        let (x, y) = self.drawn_strip().offset(pos.row, t);
+        let size = strip::scale(self.drawn_strip().depth(t));
         strip::place(plate, (mark.0 + pos.col as f32 + x, mark.1 + y), size, size)
     }
 
     fn picture_shade(&self, pos: Pos) -> f32 {
         let Some(mark) = self.strip_marks.get(pos.row) else { return 1.0 };
-        let (x, y) = self.strip.offset(pos.row, self.strip_at);
+        let (x, y) = self.drawn_strip().offset(pos.row, self.strip_at);
         strip::shade((mark.0 + pos.col as f32 + x).hypot(mark.1 + y))
     }
 
@@ -1735,8 +1769,8 @@ impl Board {
         let Some(at) = self.grid.find(&self.selected) else { return Place::SAME };
         let (Some(plate), Some(mark), true) = (self.plates.get(m), self.strip_marks.get(at.row), self.strip_on) else { return Place::SAME };
         let t = self.strip_at;
-        let spacing = strip::scale(self.strip.depth(t));
-        strip::place(plate, (0.0, mark.1 + self.strip.offset(at.row, t).1), strip::scale(self.strip.row_depth(t)), spacing)
+        let spacing = strip::scale(self.drawn_strip().depth(t));
+        strip::place(plate, (0.0, mark.1 + self.drawn_strip().offset(at.row, t).1), strip::scale(self.drawn_strip().row_depth(t)), spacing)
     }
 
     /// How a tile of the cell at `pos` that moves as `carried` is drawn,
@@ -2845,7 +2879,7 @@ impl Board {
     /// in the middle outlined, all moving as `tile_place` has it.
     fn draw_tiles(&self, p: &Painter, fonts: &Fonts) {
         let s = self.scale;
-        let depth = if self.strip_on { self.strip.depth(self.strip_at) } else { 0.0 };
+        let depth = if self.strip_on { self.drawn_strip().depth(self.strip_at) } else { 0.0 };
         let at = self.grid.find(&self.selected);
         if depth > 0.001 {
             for plate in &self.plates {
@@ -3320,6 +3354,9 @@ impl Board {
             }
             // The strip `ms` into the move, with the cells beside both.
             self.strip = Strip::default();
+        self.strip_frame = None;
+        self.strip_input = None;
+        self.strip_samples.clear();
             self.strip.moved(&strip_before, &self.strip_marks, 0.0);
             self.strip_at = ms as f32 / 1000.0;
             self.strip_on = self.strip.active(self.strip_at);

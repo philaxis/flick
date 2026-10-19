@@ -22,7 +22,7 @@ def read(path):
 
 
 def position(row, color):
-    if int(row[color + '_n']) < 100 or int(row[color + '_l']) <= 1:
+    if int(row[color + '_n']) < (2 if color=='marker' else 32) or int(row[color + '_l']) <= 1 or int(row[color + '_r']) >= 1918:
         return None
     return float(row.get(color + '_x', (float(row[color + '_l']) + float(row[color + '_r'])) / 2))
 
@@ -78,7 +78,7 @@ def report(folder):
                 first = (int(changed['qpc'])-start)*1000/frequency
         p95 = sorted(marker_errors)[int(len(marker_errors)*.95)] if marker_errors else math.nan
         line = dict(scenario=label, updates=len(active), capture_losses=losses, repeat_pairs=repeats, pairs=len(changes), no_update_refreshes=gaps,
-                    step_cv=cv(changes), first_response_ms=first, input_step_cv=cv(raw_steps), marker_error_p95=p95)
+                    step_cv=cv(changes), first_response_ms=first, input_step_cv=cv(raw_steps), marker_error_p95=p95, max_step_px=max(map(abs,changes),default=0))
         data.append(line)
         first_text = f'{first:.1f}' if first is not None else 'missing'
         print(f'|{label}|{len(active)}|{losses}|{repeats}/{len(changes)}|{gaps}|{cv(changes):.1f}|{first_text}|{cv(raw_steps):.1f}|{p95:.2f}|')

@@ -599,6 +599,7 @@ struct Session {
     names: Vec<String>,
     label: Label,
     last_frame: Option<Instant>,
+    input_samples: Vec<(f64, f64, f64, usize)>,
     visible: bool,
     stats: Stats,
     trace: Option<Trace>,
@@ -893,7 +894,7 @@ impl View {
             leftover,
             phase,
             hide_after: None,
-            began: Instant::now(),
+            began: if phase == Phase::Following { crate::input::follow_hold(scene.hold).and_then(|s| s.started).unwrap_or_else(Instant::now) } else { Instant::now() },
             hand: (0.0, 0.0),
             shown: None,
             farthest_y: 0.0,
@@ -901,6 +902,7 @@ impl View {
             names: scene.names,
             label: Label::new(0),
             last_frame: None,
+            input_samples: Vec::new(),
             visible,
             stats,
             trace,
@@ -991,7 +993,7 @@ impl View {
         let (cpu, work) = (thread_cpu(), Instant::now());
         let app = self.app;
         let Some(session) = &mut self.session else { return };
-        let now = session.began.elapsed().as_secs_f64();
+        let mut now = session.began.elapsed().as_secs_f64();
         let mut done = false;
         let tell = |message: u32, to: (i32, i32), hold: u32| unsafe {
             let _ = PostMessageW(app, message, WPARAM(pack(to)), LPARAM(hold as isize));
@@ -999,28 +1001,45 @@ impl View {
 
         // Where the strip is, how far receded, and whether the rows go as
         // in a single step (`follow::step_along`).
+        let mut following_frame = None;
         let ((x, y), receded, stepping) = match session.phase {
             Phase::Following => {
-                let saved = crate::input::follow_hold(session.hold);
+                let saved = crate::input::follow_frame(session.hold);
                 let hand = saved.as_ref().map_or_else(crate::input::followed, |s| s.hand);
-                if hand.hold == session.hold {
-                    session.hand = (hand.x, hand.y);
-                }
+                if hand.hold == session.hold { session.hand = (hand.x, hand.y); }
+                let mut release_time = now;
                 if let Some(saved) = &saved {
-                    session.follow.track_path(now, &saved.path);
+                    if saved.overflowed {
+                        // A blocked renderer keeps every semantic turn via the compact path.
+                        session.follow.track_path(now, &saved.path);
+                        session.input_samples.clear();
+                    } else {
+                        for sample in &saved.samples {
+                            let t = sample.at.saturating_duration_since(session.began).as_secs_f64();
+                            now = now.max(t);
+                            session.follow.track_locked(t, (sample.followed.x, sample.followed.y), sample.axis);
+                            if session.input_samples.len() == 3 { session.input_samples.remove(0); }
+                            session.input_samples.push((t,sample.followed.x,sample.followed.y,sample.axis));
+                            if !sample.followed.holding { release_time = t; }
+                        }
+                        session.follow.consumed_path(&saved.path);
+                    }
                 }
                 if hand.hold == session.hold && hand.holding {
-                    let at = session.follow.track_locked(now, session.hand, saved.as_ref().map_or(0, |s| s.axis));
-                    (at, session.follow.depth(), false)
+                    let prediction = follow::resample(&session.input_samples, now);
+                    let frame = session.follow.sampled(now, prediction);
+                    let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
+                    following_frame = Some(frame);
+                    result
                 } else {
-                    let to = session.follow.let_go(now, session.hand);
+                    let to = session.follow.let_go(release_time, session.hand);
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
-                    debug_log!("glide {}: let go of at {:?}, settling on {to:?}", session.hold, session.hand);
                     tell(WM_GLIDE_TARGET, to, session.hold);
                     session.phase = Phase::Settling(to, now);
                     (session.follow.settle(now).0, session.follow.depth(), false)
                 }
             }
+
             Phase::Settling(to, _) => {
                 let (at, settled) = session.follow.settle(now);
                 let receded = session.follow.depth();
@@ -1061,7 +1080,7 @@ impl View {
                 let rows = session.follow.rows;
                 let along = (rows.0..=rows.1)
                     .map(|row| {
-                        let along = if stepping { follow::step_along(x, y, row) } else { session.follow.offset(row) };
+                        let along = if stepping { follow::step_along(x, y, row) } else { following_frame.as_ref().unwrap_or(&session.follow).offset(row) };
                         along
                     })
                     .collect();
@@ -1118,7 +1137,7 @@ impl View {
                 }
             }
         }
-        if session.stats.frames == 0 {
+        if session.stats.frames == 0 && session.phase != Phase::Following {
             // Thumbnail/font setup is not animation time: the next visible frame starts from zero.
             session.began = Instant::now();
             self.frame = session.began;

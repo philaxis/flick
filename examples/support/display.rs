@@ -60,18 +60,31 @@ impl Capture {
         self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
         let mut boxes = [(i32::MAX, i32::MAX, -1, -1, 0); 4];
         let (mut mass,mut moment)=([0u64;4],[0u64;4]);
-        for y in 0..self.height {
+        // Long horizontal runs isolate fixture interiors from desktop icons and text.
+        // Sampling every fourth row cuts CPU readback analysis without quantizing x.
+        for y in (20..self.height.saturating_sub(60)).step_by(4) {
             let line = std::slice::from_raw_parts((mapped.pData as *const u8).add((y * mapped.RowPitch) as usize), self.width as usize * 4);
-            for x in 0..self.width {
+            let classify = |x: u32| {
                 let p = &line[x as usize * 4..][..3];
-                // Chroma ratios also find shaded thumbnails; green is the D2D marker.
                 let (b,g,r) = (p[0] as u32,p[1] as u32,p[2] as u32);
-                let c = if r > 40 && b > 40 && g * 3 < r.min(b) { Some(0) }
-                    else if b > 40 && g > 40 && r * 3 < b.min(g) { Some(1) }
-                    else if r > 40 && g > 40 && b * 3 < r.min(g) { Some(2) }
-                    else if y < 40 && g > 180 && r < 40 && b < 40 { Some(3) } else { None };
-                if let Some(c) = c { let weight = match c {0=>r.min(b)-g,1=>b.min(g)-r,2=>r.min(g)-b,_=>g-r.max(b)} as u64;
-                    mass[c]+=weight;moment[c]+=weight*x as u64;let v = &mut boxes[c]; v.0=v.0.min(x as i32); v.1=v.1.min(y as i32); v.2=v.2.max(x as i32); v.3=v.3.max(y as i32); v.4+=1; }
+                if r > 40 && b > 40 && g * 3 < r.min(b) { Some((0,r.min(b)-g)) }
+                else if b > 40 && g > 40 && r * 3 < b.min(g) { Some((1,b.min(g)-r)) }
+                else if r > 40 && g > 40 && b * 3 < r.min(g) { Some((2,r.min(g)-b)) }
+                else if y < 40 && g > 180 && r < 40 && b < 40 { Some((3,g-r.max(b))) } else { None }
+            };
+            let mut x=0;
+            while x < self.width {
+                let Some((c,_))=classify(x) else { x+=1; continue; };
+                let left=x;
+                let (mut m,mut mx)=(0u64,0u64);
+                while x < self.width {
+                    match classify(x) { Some((other,w)) if other==c => {m+=w as u64;mx+=w as u64*x as u64;x+=1;}, _=>break }
+                }
+                let width=x-left;
+                if width > boxes[c].4 && width >= if c==3 {2} else {32} {
+                    boxes[c]=(left as i32,y as i32,x as i32-1,y as i32,width);
+                    mass[c]=m;moment[c]=mx;
+                }
             }
         }
         if save && self.sample.borrow().is_none() {
@@ -150,7 +163,7 @@ pub unsafe fn run(out: &Path, flick: &str) {
     let mut windows=Vec::new();
     for (i,rgb) in [["255","0","255"],["0","255","255"],["255","255","0"]].iter().enumerate() {
         let title=format!("F motion {i}");
-        windows.push(Command::new(&me).args(["hold",rgb[0],rgb[1],rgb[2],&title,"200","200","600","400","240"])
+        windows.push(Command::new(&me).args(["hold",rgb[0],rgb[1],rgb[2],&title,"200","200","600","400","1200"])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
         wait(400);
         let hwnd=FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title)); assert!(hwnd.0!=0);
@@ -160,8 +173,9 @@ pub unsafe fn run(out: &Path, flick: &str) {
     let mut timing=windows::Win32::Graphics::Dwm::DWM_TIMING_INFO {cbSize:std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_TIMING_INFO>() as u32,..Default::default()};
     windows::Win32::Graphics::Dwm::DwmGetCompositionTimingInfo(HWND(0),&mut timing).unwrap();
     let refresh_ticks = timing.qpcRefreshPeriod;
-    std::fs::write(out.join("display-meta.json"),serde_json::json!({"frequency":frequency,"refresh_ticks":refresh_ticks,"composition":std::env::var_os("FLICK_COMPOSITION").is_some(),"capture":"desktop duplication, not panel scanout"}).to_string()).unwrap();
+    std::fs::write(out.join("display-meta.json"),serde_json::json!({"frequency":frequency,"refresh_ticks":refresh_ticks,"composition":std::env::var_os("FLICK_COMPOSITION").is_some(),"capture":"desktop duplication, not panel scanout","width":1920}).to_string()).unwrap();
     for mode in ["follow","board"] { for kind in ["mouse","ptp"] { for scenario in ["slow","normal","fast","mixed"] {
+        if std::env::var_os("FLICK_SHORT_PROBE").is_some() && scenario != "fast" && scenario != "mixed" { continue; }
         super::vdapi::switch_desktop(home).unwrap(); wait(500);
         let label=format!("{mode}-{kind}-{scenario}");
         let mut child=Command::new(flick).arg("--portable").env("FLICK_INPUT_TRACE",out.join(format!("{label}-received.csv"))).env("FLICK_TRACE",out.join(format!("{label}-app.csv")))

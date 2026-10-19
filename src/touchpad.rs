@@ -12,6 +12,9 @@ pub struct Contact {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Event {
+    /// Device scan time mapped to the receiver clock; absent for synthetic/unit input.
+    pub sampled_at: Option<std::time::Instant>,
+    pub scan_time: Option<u32>,
     pub began: bool,
     pub delta: (f64, f64),
     pub ended: Option<bool>, // whether the release is a tap
@@ -92,6 +95,25 @@ impl Gesture {
         }
         self.previous = contacts.to_vec();
         event
+    }
+}
+
+/// PTP scan time is a wrapping 16-bit counter in 100us units (HID 0D/56).
+#[derive(Default)]
+pub struct ScanClock { last: Option<(u16, std::time::Instant)> }
+impl ScanClock {
+    pub fn stamp(&mut self, scan: u32, received: std::time::Instant) -> std::time::Instant {
+        use std::time::Duration;
+        let mapped = self.last.and_then(|(before, at)| {
+            if scan > u16::MAX as u32 {return None;}
+            let ticks = (scan as u16).wrapping_sub(before) as u64;
+            if ticks > 500 {return None;}
+            let candidate = at + Duration::from_micros(ticks * 100);
+            (candidate <= received + Duration::from_millis(2)
+                && received.saturating_duration_since(candidate) <= Duration::from_millis(50)).then_some(candidate.min(received))
+        }).unwrap_or(received);
+        self.last = Some((scan as u16, mapped));
+        mapped
     }
 }
 
@@ -500,4 +522,16 @@ mod tests {
         assert_eq!(f.push(5, 3, &[(0, Some(c[0]))]), None);
         assert_eq!(f.push(6, 1, &[(1, Some(c[1]))]), Some(vec![c[1]]));
     }
+    #[test]
+    fn scan_clock_handles_wrap_idle_reset_and_future_reports() {
+        use std::time::{Instant,Duration};
+        let start=Instant::now();
+        let mut clock=ScanClock::default();
+        assert_eq!(clock.stamp(65500,start),start);
+        assert_eq!(clock.stamp(44,start+Duration::from_millis(10)),start+Duration::from_millis(8));
+        let idle=start+Duration::from_secs(1);
+        assert_eq!(clock.stamp(0,idle),idle);
+        assert_eq!(clock.stamp(400,idle+Duration::from_millis(8)),idle+Duration::from_millis(8));
+    }
+
 }

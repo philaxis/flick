@@ -184,7 +184,7 @@ fn still(glide: &Glide, t: f32) -> bool {
 
 /// Where the strip is: what is left of each move, as `transition_curve`
 /// has it, and the hand.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Strip {
     /// How far back the cells are.
     recede: Recede,
@@ -201,6 +201,7 @@ pub struct Strip {
     hand_row: usize,
     counted_from: Option<u64>,
     holding: bool,
+    last_input: f32,
 }
 
 impl Strip {
@@ -215,6 +216,8 @@ impl Strip {
     /// still drawn where it was and goes on from there. Unless the hand
     /// holds the strip, the move recedes and comes forward again.
     pub fn moved(&mut self, before: &[(f32, f32)], after: &[(f32, f32)], now: f32) {
+        let now = now.max(self.last_input);
+        self.last_input = now;
         let slide = curve::SLIDE_END - curve::SLIDE_START;
         let mut end: Option<f32> = None;
         for (row, (was, is)) in before.iter().zip(after).enumerate() {
@@ -246,6 +249,8 @@ impl Strip {
     /// (cells), counted from `counted_from`. A hold recedes the strip; let
     /// go, it settles on the committed cell without predicting a fling.
     pub fn follow(&mut self, hand: (f32, f32), row: usize, counted_from: u64, holding: bool, now: f32) {
+        let now = now.max(self.last_input);
+        self.last_input = now;
         let hand = if holding { hand } else { (0.0, 0.0) };
         if holding && hand != (0.0, 0.0) && self.recede.settled(now) { self.recede.hold(now); }
         if holding && hand.1.abs() > 0.02 {

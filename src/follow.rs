@@ -169,6 +169,7 @@ impl Follow {
     pub fn cols_of(&self, row: i32) -> (i32, i32) {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
     }
+    pub fn sampled_vertical(&self) -> f64 { self.vertical.p }
     pub fn offset(&self, row: i32) -> f64 { self.along.get((row - self.rows.0) as usize).map_or(0.0, |s| s.p) }
     pub fn selected(&self) -> (i32, i32) { (self.columns[(self.row - self.rows.0) as usize].cell, self.row) }
     pub fn depth(&self) -> f64 { self.depth.p.clamp(0.0, 1.0) }
@@ -193,6 +194,7 @@ impl Follow {
         self.vertical = Spring { p: at.1, v: speed.1 }; self.depth = Spring { p: depth, v: depth_speed };
     }
     fn advance(&mut self, now: f64) -> ((f64, f64), bool) {
+        let now = now.max(self.last.unwrap_or(now));
         let dt = self.last.replace(now).map_or(0.0, |last| (now - last).max(0.0));
         let current = (self.row - self.rows.0) as usize;
         let mut moving = !self.released;
@@ -233,6 +235,7 @@ impl Follow {
         // The last straight leg keeps growing until the next turn.
         self.path_cursor = path.len().saturating_sub(1);
     }
+    pub fn consumed_path(&mut self, path: &[(f64, f64, usize)]) { self.path_cursor = path.len().saturating_sub(1); }
     pub fn finish_path(&mut self, path: &[(f64, f64, usize)]) -> (i32, i32) {
         self.track_path(0.0, path);
         self.let_go(0.0, self.hand)
@@ -242,6 +245,32 @@ impl Follow {
         (self.columns[(self.row - self.rows.0) as usize].cell, self.row)
     }
     pub fn settle(&mut self, now: f64) -> ((f64, f64), bool) { self.advance(now) }
+
+    /// Evaluate a frame without moving the real input timeline into the future.
+    pub fn sampled(&self, now: f64, prediction: Option<((f64, f64), f64)>) -> Self {
+        let mut frame = self.clone();
+        if let Some((at, at_time)) = prediction {
+            frame.track_locked(at_time, at, self.axis);
+            // Prediction is visual only and cannot cross a real latch/row boundary.
+            if frame.selected() != self.selected() || frame.row != self.row { frame = self.clone(); }
+        }
+        frame.advance(now);
+        frame
+    }
+
+}
+
+/// A short visual prediction; stale, stationary, reversed, or changed-axis input is not predicted.
+pub fn resample(samples: &[(f64, f64, f64, usize)], now: f64) -> Option<((f64,f64),f64)> {
+    let [a,b,c] = samples.get(samples.len().checked_sub(3)?..)? else {return None};
+    let dt = c.0-b.0;
+    let age = now-c.0;
+    if a.3 != b.3 || b.3 != c.3 || !(0.002..=0.020).contains(&dt) || age < 0.0 || age > 0.020 {return None;}
+    let d=(c.1-b.1,c.2-b.2);
+    if d.0*(b.1-a.1)+d.1*(b.2-a.2) <= 0.0 {return None;}
+    let horizon=age.min(dt*0.5).min(0.008);
+    // Retarget halfway through the prediction interval, then integrate to the frame.
+    Some(((c.1+d.0/dt*horizon*0.5,c.2+d.1/dt*horizon*0.5),c.0+horizon*0.5))
 }
 
 /// Keep reversals and axis turns even when thumbnail setup misses input frames.
@@ -329,4 +358,38 @@ mod tests {
         f.track_locked(0.01, (8.0, 0.0), 0);
         assert_eq!(f.let_go(0.02, (8.0, 0.0)), (-1, 0));
     }
+    #[test]
+    fn timestamped_input_is_independent_of_render_batching() {
+        let run = |hz: u32| {
+            let mut f = Follow::new((0, 0), vec![(0, 4)]);
+            let mut event = 0;
+            for frame in 0..=hz {
+                let now = frame as f64 / hz as f64;
+                while event <= 125 && event as f64 / 125.0 <= now {
+                    let at = event as f64 / 125.0;
+                    f.track_locked(at, (at * 2.4, 0.0), 0);
+                    event += 1;
+                }
+                let _ = f.sampled(now, None);
+            }
+            (f.selected(),f.sampled(1.0,None).offset(0))
+        };
+        assert_eq!(run(60),run(144));
+        let mut f=Follow::new((0,0),vec![(0,2)]);
+        f.track_locked(0.0,(0.999,0.0),0);
+        let preview=f.sampled(0.02,Some(((1.001,0.0),0.01)));
+        assert_eq!(preview.selected(),(0,0));
+        assert_eq!(f.let_go(0.02,(0.999,0.0)),(0,0));
+    }
+    #[test]
+    fn visual_resampling_stops_at_zero_time_pause_reversal_and_stale_input() {
+        let steady=[(0.0,0.0,0.0,0),(0.008,0.008,0.0,0),(0.016,0.016,0.0,0)];
+        let predicted=resample(&steady,0.02).unwrap();
+        assert!((predicted.0.0-0.018).abs()<1e-9);
+        assert!(resample(&steady,0.1).is_none());
+        for last in [(0.008,0.016,0.0,0),(0.016,0.008,0.0,0),(0.016,0.004,0.0,0),(0.016,0.016,0.0,1)] {
+            assert!(resample(&[steady[0],steady[1],last],0.02).is_none());
+        }
+    }
+
 }
