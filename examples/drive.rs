@@ -656,11 +656,14 @@ fn hold(args: &[String]) {
     use windows::core::{w, HSTRING};
     use windows::Win32::{Foundation::COLORREF, Graphics::Gdi::CreateSolidBrush, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*};
     let n = |i: usize| args[i].parse::<i32>().unwrap();
+    unsafe extern "system" fn plain(hwnd: windows::Win32::Foundation::HWND, message: u32, w: windows::Win32::Foundation::WPARAM, l: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
+        DefWindowProcW(hwnd, message, w, l)
+    }
     unsafe {
         let instance = GetModuleHandleW(None).unwrap();
         let class = w!("flick.test.hold");
         RegisterClassW(&WNDCLASSW {
-            lpfnWndProc: Some(DefWindowProcW),
+            lpfnWndProc: Some(plain),
             hInstance: instance.into(),
             lpszClassName: class,
             hbrBackground: CreateSolidBrush(COLORREF((n(0) | n(1) << 8 | n(2) << 16) as u32)),
