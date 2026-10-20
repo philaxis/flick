@@ -102,6 +102,70 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             print!("{report}");
             assert_eq!(failures, 0, "cube probe failed; see report.txt");
         },
+        // Down a shelf and along it in one hold arrives where the hand let go,
+        // at mixed speeds; the shelf stays turned there for the next hold.
+        "rowmove" => unsafe {
+            let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();
+            let ids: Vec<_> = ids.lines().collect();
+            let all = vdapi::get_desktops().unwrap();
+            let current = || vdapi::get_current_desktop().unwrap().id();
+            let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg.join("state.json")).unwrap()).unwrap();
+            let rows = state["rows"].as_array_mut().unwrap();
+            rows[0] = serde_json::json!({"name": "Row 1", "cells": [ids[0]], "last": ids[0]});
+            rows[1] = serde_json::json!({"name": "Row 2", "cells": [ids[1], ids[2], ids[3]], "last": ids[1]});
+            rows[2] = serde_json::json!({"name": "Row 3", "cells": [ids[4], ids[5]], "last": ids[4]});
+            std::fs::write(cfg.join("state.json"), state.to_string()).unwrap();
+            std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = true\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = true\nfollow_y = true\nreverse = false\n").unwrap();
+            let goto = |i: usize| {
+                let desktop = *all.iter().find(|d| d.id() == ids[i]).unwrap();
+                for _ in 0..3 {
+                    vdapi::switch_desktop(desktop).unwrap(); wait(900);
+                    if current() == ids[i] { return; }
+                }
+                panic!("probe could not establish starting desktop {i}");
+            };
+            let mouse = |flags, dx, dy| {
+                let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: 2, dwFlags: flags, ..Default::default() } } };
+                assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
+            };
+            let stroke = |dx: i32, dy: i32, ms: u64| {
+                let n = (ms / 10).max(1) as i32;
+                for i in 1..=n { mouse(MOUSEEVENTF_MOVE, dx * i / n - dx * (i - 1) / n, dy * i / n - dy * (i - 1) / n); wait(ms / n as u64); }
+            };
+            goto(0);
+            let mut child = Command::new(flick.unwrap()).arg("--portable").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            wait(3000);
+            assert!(FindWindowW(w!("flick.main"), None).0 != 0, "Flick did not start");
+            let mut report = String::new();
+            let mut failures = 0;
+            // Row 2's turned cell as the probe expects it (`Row::last`).
+            let mut anchor: i32 = 0;
+            let along: [i32; 20] = [0, 1, 2, -1, 1, -2, 2, 0, -1, 1, 1, -2, 2, -1, 0, 1, -1, 2, -2, 1];
+            let pace: [(u64, u64, u64); 4] = [(120, 120, 0), (300, 300, 40), (700, 600, 250), (150, 400, 120)];
+            for (trial, &k) in along.iter().enumerate() {
+                let (down, side, rest) = pace[trial % pace.len()];
+                goto(0);
+                mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
+                stroke(4, 300, down);
+                if k != 0 { wait(60); stroke(k * 220 + k.signum() * 80, 3, side); }
+                wait(rest);
+                mouse(MOUSEEVENTF_XUP, 0, 0); wait(2000);
+                let expected = (anchor + k).clamp(0, 2);
+                let got = current();
+                let at = [ids[1], ids[2], ids[3]].iter().position(|id| *id == got).map(|i| i as i32);
+                let ok = at == Some(expected);
+                let actual = match at { Some(i) => format!("row2[{i}]"), None if got == ids[0] => "start".into(), None => format!("other {}", &got[..8.min(got.len())]) };
+                report += &format!("trial {trial:2} along {k:+} pace {down}/{side}/{rest}ms from row2[{anchor}]: expected row2[{expected}] actual {actual} {}\n", if ok { "ok" } else { "FAIL" });
+                if !ok { failures += 1; }
+                if let Some(i) = at { anchor = i; } else { anchor = expected; }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            report += &format!("navigation failures: {failures} of {}\n", along.len());
+            std::fs::write(out.join("report.txt"), &report).unwrap();
+            print!("{report}");
+            assert_eq!(failures, 0, "rowmove probe failed; see report.txt");
+        },
         // A quick, sure move goes to the next desktop without the screen
         // receding; a slow one recedes as before. Both switch on letting go.
         "quick" => unsafe {
