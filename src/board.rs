@@ -479,15 +479,15 @@ fn centre(r: &Rect) -> (f32, f32) {
     ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0)
 }
 
-/// The colour of what is pinned to all rows, on its pin and its place:
-/// warm amber.
+/// The colour of what is pinned to all rows, on its pin and its place
+/// (`paint::PIN_ALL`).
 fn everywhere(a: f32) -> D2D1_COLOR_F {
-    rgba(1.0, 0.74, 0.34, a)
+    paint::pinned(true, a)
 }
 
-/// The colour of what is pinned to its row: cool teal.
+/// The colour of what is pinned to its row (`paint::PIN_ROW`).
 fn on_row(a: f32) -> D2D1_COLOR_F {
-    rgba(0.32, 0.86, 0.82, a)
+    paint::pinned(false, a)
 }
 
 /// The shadows and the glows the board is drawn with, made for its target.
@@ -3214,10 +3214,11 @@ impl Board {
         let (spine, names, selection) = (at(Part::Spine(map.monitor)), at(Part::Names(map.monitor)), at(Part::Selection(map.monitor)));
         let selected = layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected);
 
-        // Windows on every desktop: a thin line of their colour over the map.
+        // Windows on every desktop: a thin white line over the map, under
+        // the previews.
         if !self.model.pinned.is_empty() {
             let y = layout.top - 6.0 * s;
-            p.fading_line((layout.bounds.left, y), (layout.bounds.right, y), 1.2 * s, everywhere(0.65));
+            p.fading_line((layout.bounds.left, y), (layout.bounds.right, y), 1.2 * s, white(0.65));
         }
         // The column vertical moves travel along.
         self.shifted(p, base, spine, || {
@@ -3258,7 +3259,7 @@ impl Board {
     }
 
     /// A row's name, on a faint surface as wide as its text while hovered or
-    /// edited; a teal dot after it when windows are pinned to the row.
+    /// edited; a dot of their colour after it when windows are pinned to the row.
     fn draw_row_name(&self, p: &Painter, fonts: &Fonts, r: usize, row: &RowLayout, name: &str, in_selected_row: bool) {
         let s = self.scale;
         let editing = self.editing.as_ref().filter(|(row, _)| *row == r);

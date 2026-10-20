@@ -345,8 +345,8 @@ struct Veil {
 }
 
 /// One opaque source bitmap of four squares: black, white, and the lights
-/// of what is pinned to every shelf and to its shelf (the board's amber
-/// and teal). The white keeps the off-screen surface from being entirely
+/// of what is pinned to every shelf and to its shelf (`paint::PIN_ALL`
+/// and `PIN_ROW`). The white keeps the off-screen surface from being entirely
 /// black, which DWM would drop as empty.
 struct Paints { hwnd: HWND }
 
@@ -355,7 +355,7 @@ const BLACK: RECT = RECT { left: 0, top: 0, right: 16, bottom: 16 };
 const AMBER: RECT = RECT { left: 32, top: 0, right: 48, bottom: 16 };
 const TEAL: RECT = RECT { left: 48, top: 0, right: 64, bottom: 16 };
 /// Blue, green, red of each square, in order.
-const PAINTS: [[u8; 3]; 4] = [[0, 0, 0], [255, 255, 255], [87, 189, 255], [209, 219, 82]];
+const PAINTS: [[u8; 3]; 4] = [[0, 0, 0], [255, 255, 255], paint::bgr(paint::PIN_ALL), paint::bgr(paint::PIN_ROW)];
 
 impl Paints {
     fn new() -> Option<Paints> {
@@ -522,7 +522,8 @@ impl Ink {
 /// A pinned window put by at the edge as the screen recedes (`dock`).
 struct Docked {
     spot: Spot,
-    /// Its light beneath it: amber pinned to every shelf, teal to its own.
+    /// Its light beneath it: `paint::PIN_ALL` pinned to every shelf,
+    /// `PIN_ROW` to its own.
     halos: Vec<Thumb>,
 }
 
@@ -557,7 +558,7 @@ impl Ink {
         if let Ok(p) = Painter::new(target) {
             for (at, shown, what, all) in marks {
                 let area = paint::rect(at[0] as f32, at[1] as f32, (at[2] - at[0]) as f32, (at[3] - at[1]) as f32);
-                let light = |a: f32| if *all { rgba(1.0, 0.74, 0.34, a * shown) } else { rgba(0.32, 0.86, 0.82, a * shown) };
+                let light = |a: f32| paint::pinned(*all, a * shown);
                 // A light about it, no box.
                 for (out, a) in [(2.0, 0.22), (6.0, 0.10), (12.0, 0.05)] {
                     let out = out * scale;

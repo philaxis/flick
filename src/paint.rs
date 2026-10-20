@@ -55,6 +55,27 @@ pub fn accent(a: f32) -> D2D1_COLOR_F {
     rgba(0.34, 0.62, 1.0, a)
 }
 
+/// The colours of what is pinned, wherever they show (the board, the
+/// pinned windows docked as the screen recedes): to every shelf, warm
+/// amber; to its own shelf, cool teal. Changed here, changed everywhere.
+pub const PIN_ALL: [f32; 3] = [1.0, 0.74, 0.34];
+pub const PIN_ROW: [f32; 3] = [0.32, 0.86, 0.82];
+
+/// `PIN_ALL` or `PIN_ROW` (`all`) at `a`.
+pub fn pinned(all: bool, a: f32) -> D2D1_COLOR_F {
+    let [r, g, b] = if all { PIN_ALL } else { PIN_ROW };
+    rgba(r, g, b, a)
+}
+
+/// A colour's blue, green and red as bytes.
+pub const fn bgr([r, g, b]: [f32; 3]) -> [u8; 3] {
+    [byte(b), byte(g), byte(r)]
+}
+
+const fn byte(c: f32) -> u8 {
+    (c * 255.0 + 0.5) as u8
+}
+
 /// The colour of a cell the user marked to stand out. Warm, so that it is
 /// taken for neither the current cell nor the selection.
 pub fn warm(a: f32) -> D2D1_COLOR_F {
