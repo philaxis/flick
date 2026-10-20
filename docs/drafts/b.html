@@ -19,96 +19,92 @@
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="theme-color" content="#edeff1" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#06090c" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#e7e9e3" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#090c0b" media="(prefers-color-scheme: dark)">
 <link rel="icon" type="image/png" href="../icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
 <style>
-/* Draft B — Flight deck: hairlines on a measured grid, monospaced labels, a stage framed like an instrument. */
+/* Draft B — Flight deck: graph paper, monospaced type, the demo bolted into an instrument panel. */
 :root{
-  --bg:#edeff1; --ink:#101318; --mute:#5b626e; --line:rgba(16,19,24,.16); --hair:rgba(16,19,24,.38);
-  --grid:rgba(16,19,24,.045); --grid2:rgba(16,19,24,.075);
-  --accent:#579eff; --accent-ink:#1f66db; --on-accent:#05101f;
+  --bg:#e7e9e3; --ink:#141a17; --mute:#56615a; --line:rgba(20,26,23,.18); --grid:rgba(20,26,23,.06);
+  --accent:#ffb000; --accent-ink:#a86a00; --green:#2a8c58;
+  --mono:"IBM Plex Mono","IBM Plex Sans KR","Malgun Gothic",ui-monospace,monospace;
   --font:"IBM Plex Sans KR","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif;
-  --mono:"JetBrains Mono","IBM Plex Mono",ui-monospace,monospace;
-  --gut:20px;
-  color-scheme:light;
+  --gut:20px; color-scheme:light;
 }
 @media (prefers-color-scheme:dark){
-  :root{
-    --bg:#06090c; --ink:#e7ecf2; --mute:#7f8996; --line:rgba(150,200,255,.14); --hair:rgba(150,200,255,.42);
-    --grid:rgba(120,190,255,.035); --grid2:rgba(120,190,255,.065);
-    --accent-ink:#6fb0ff;
-    color-scheme:dark;
-  }
+  :root{--bg:#090c0b; --ink:#dfe9e3; --mute:#7c8a82; --line:rgba(120,255,190,.16); --grid:rgba(120,255,190,.045); --accent-ink:#ffb000; --green:#5cf2a0; color-scheme:dark}
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;color:var(--ink);font:400 16px/1.4 var(--font);padding-inline:var(--gut);-webkit-font-smoothing:antialiased;overflow-x:hidden;
-  background-color:var(--bg);
-  background-image:linear-gradient(var(--grid2) 1px,transparent 1px),linear-gradient(90deg,var(--grid2) 1px,transparent 1px),linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
-  background-size:120px 120px,120px 120px,24px 24px,24px 24px;background-position:center top}
+body{margin:0;background-color:var(--bg);background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:24px 24px;background-position:-1px -1px;color:var(--ink);font:400 15px/1.5 var(--font);padding-inline:var(--gut);-webkit-font-smoothing:antialiased;overflow-x:hidden}
 a{color:inherit;text-decoration:none}
-:focus-visible{outline:1px solid var(--accent-ink);outline-offset:4px}
-.col{width:min(1200px,100%,max(600px,(100svh - 260px)*16/9));margin-inline:auto}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.col{width:min(1360px,100%);margin-inline:auto}
 
-.top{display:flex;align-items:center;justify-content:space-between;height:64px;border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:18px;letter-spacing:-.01em}
+.top{display:flex;align-items:center;justify-content:space-between;height:56px;border-bottom:1px solid var(--line);font-family:var(--mono)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:600;font-size:16px;letter-spacing:.14em;text-transform:uppercase}
 .brand img{width:24px;height:24px;display:block}
-.top nav{display:flex;align-items:center;gap:8px;font:500 11.5px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--mute)}
-.top nav a,.top nav button{padding:8px 10px;border:1px solid var(--line);border-radius:2px;transition:color .2s ease,border-color .2s ease}
-.top nav a:hover,.top nav button:hover{color:var(--ink);border-color:var(--hair)}
-.top nav button{font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;background:none;cursor:pointer}
+.top nav{display:flex;align-items:center;font-size:12px;font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--mute)}
+.top nav a,.top nav button{padding:6px 14px;border-left:1px solid var(--line)}
+.top nav a:hover,.top nav button:hover{color:var(--ink)}
+.top nav button{font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit;background:none;border-block:0;border-right:0;cursor:pointer}
 
-.say{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-block:52px 34px}
-h1{margin:0;font-weight:600;letter-spacing:-.035em;line-height:1.04;font-size:clamp(34px,5.4vw,72px);text-wrap:balance}
-:lang(en) h1{font-size:clamp(34px,4.6vw,62px);letter-spacing:-.04em}
-h1 span{transition:color .5s ease}
+/* Wide screens: the line stacked in a narrow column at left, the panel at right. */
+.hero{display:grid;grid-template-columns:minmax(240px,27%) 1fr;gap:36px;align-items:end;padding-top:34px}
+.say{display:flex;flex-direction:column;align-items:flex-start;gap:30px;padding-bottom:30px}
+.say::before{content:"";display:block;width:120px;height:9px;background:linear-gradient(90deg,var(--green) 1px,transparent 1px) 0 0/10px 5px repeat-x,linear-gradient(90deg,var(--green) 1px,transparent 1px) 0 0/50px 9px repeat-x;opacity:.8}
+h1{margin:0;font-family:var(--mono);font-weight:600;letter-spacing:-.03em;line-height:1.08;font-size:clamp(34px,3.7vw,56px)}
+h1 span{display:block;transition:color .5s ease}
+h1 span::before{content:"";display:inline-block;width:.28em;height:.28em;margin:0 .3em .18em 0;border:1.5px solid var(--line);vertical-align:middle;transition:background .5s ease,border-color .5s ease}
 h1 span.on{color:var(--accent-ink);transition-duration:.08s}
-.say .dl{flex:none;margin-bottom:8px}
-.dl{display:inline-flex;align-items:center;gap:12px;height:48px;padding:0 20px 0 16px;border-radius:2px;background:var(--accent);color:var(--on-accent);font:600 13px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;white-space:nowrap;box-shadow:0 0 0 3px var(--bg),0 0 0 4px var(--hair);transition:background .15s ease,box-shadow .15s ease}
-:lang(ko) .dl{font-family:var(--font);font-size:15px;letter-spacing:.04em}
-.dl:hover{background:#6aa9ff;box-shadow:0 0 0 3px var(--bg),0 0 0 4px var(--accent)}
-.dl svg{width:16px;height:16px;flex:none}
+h1 span.on::before{background:var(--accent);border-color:var(--accent);transition-duration:.08s}
+.dl{display:inline-flex;align-items:center;gap:10px;height:50px;padding:0 22px 0 18px;border-radius:3px;background:var(--accent);color:#1b1200;font-family:var(--mono);font-weight:600;font-size:15px;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;box-shadow:inset 0 -2px 0 rgba(0,0,0,.18);transition:filter .15s ease}
+.dl:hover{filter:brightness(1.08)}
+.dl svg{width:18px;height:18px;flex:none}
 
-/* The frame: corner brackets and a ruler of ticks along the top and the left, drawn with gradients only. */
-.frame{position:relative;padding:16px 0 0 16px}
-.frame::before{content:"";position:absolute;left:16px;right:0;top:0;height:9px;pointer-events:none;
-  background:linear-gradient(90deg,var(--hair) 1px,transparent 1px) 0 0/48px 9px repeat-x,linear-gradient(90deg,var(--line) 1px,transparent 1px) 0 4px/12px 5px repeat-x}
-.frame::after{content:"";position:absolute;top:16px;bottom:0;left:0;width:9px;pointer-events:none;
-  background:linear-gradient(var(--hair) 1px,transparent 1px) 0 0/9px 48px repeat-y,linear-gradient(var(--line) 1px,transparent 1px) 4px 0/5px 12px repeat-y}
-.stage{position:relative;aspect-ratio:16/9;border-radius:3px;overflow:hidden;background:#17212e;box-shadow:0 0 0 1px var(--hair),0 30px 60px -40px rgba(0,0,0,.55)}
+/* The panel: gunmetal, four screws, rulers on two edges, three lamps that follow the line. */
+.panel{position:relative;padding:24px;border-radius:8px;background:linear-gradient(160deg,#30363a,#1b1f21 60%,#15181a);box-shadow:inset 0 1px 0 rgba(255,255,255,.1),inset 0 0 0 1px rgba(0,0,0,.6),0 30px 60px -32px rgba(0,0,0,.7)}
+.screw{position:absolute;width:9px;height:9px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#8a9196,#2b3033 70%);box-shadow:0 1px 0 rgba(255,255,255,.08)}
+.screw::after{content:"";position:absolute;left:1px;right:1px;top:4px;height:1px;background:rgba(0,0,0,.55);transform:rotate(-30deg)}
+.screw:nth-of-type(1){left:8px;top:8px}.screw:nth-of-type(2){right:8px;top:8px}.screw:nth-of-type(3){left:8px;bottom:8px}.screw:nth-of-type(4){right:8px;bottom:8px}
+.ruler{position:absolute;opacity:.7}
+.ruler.x{left:34px;right:34px;top:8px;height:9px;background:linear-gradient(90deg,#5cf2a0 1px,transparent 1px) 0 100%/10px 4px repeat-x,linear-gradient(90deg,#5cf2a0 1px,transparent 1px) 0 100%/50px 9px repeat-x}
+.ruler.y{top:34px;bottom:34px;left:8px;width:9px;background:linear-gradient(#5cf2a0 1px,transparent 1px) 100% 0/4px 10px repeat-y,linear-gradient(#5cf2a0 1px,transparent 1px) 100% 0/9px 50px repeat-y}
+.lamps{position:absolute;right:34px;bottom:8px;display:flex;gap:10px}
+.lamps i{width:7px;height:7px;border-radius:50%;background:#3b2c08;box-shadow:inset 0 0 0 1px rgba(0,0,0,.5);transition:background .4s ease,box-shadow .4s ease}
+.lamps i.on{background:#ffb000;box-shadow:0 0 10px #ffb000;transition-duration:.06s}
+.stage{position:relative;aspect-ratio:16/9;border-radius:3px;overflow:hidden;background:#030806;box-shadow:0 0 0 1px rgba(92,242,160,.28),0 0 0 4px #0b0e0d,0 0 30px rgba(92,242,160,.1)}
 .stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
-.frame .stage::after{content:"";position:absolute;inset:8px;pointer-events:none;
-  background:
-   linear-gradient(var(--accent),var(--accent)) 0 0/14px 1px no-repeat,linear-gradient(var(--accent),var(--accent)) 0 0/1px 14px no-repeat,
-   linear-gradient(var(--accent),var(--accent)) 100% 0/14px 1px no-repeat,linear-gradient(var(--accent),var(--accent)) 100% 0/1px 14px no-repeat,
-   linear-gradient(var(--accent),var(--accent)) 0 100%/14px 1px no-repeat,linear-gradient(var(--accent),var(--accent)) 0 100%/1px 14px no-repeat,
-   linear-gradient(var(--accent),var(--accent)) 100% 100%/14px 1px no-repeat,linear-gradient(var(--accent),var(--accent)) 100% 100%/1px 14px no-repeat;opacity:.55}
 
-.end{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-top:clamp(80px,12vw,160px);padding-top:30px;border-top:1px solid var(--hair);position:relative}
-.end::before{content:"";position:absolute;left:0;right:0;top:0;height:7px;background:linear-gradient(90deg,var(--line) 1px,transparent 1px) 0 0/24px 7px repeat-x}
-.end .brand{font-size:clamp(34px,5vw,60px);gap:18px;letter-spacing:-.035em}
-.end .brand img{width:clamp(44px,5.2vw,64px);height:auto}
-footer{display:flex;gap:8px;padding-block:40px 20px;font:400 12px/1.4 var(--mono);color:var(--mute)}
-.inspiration{margin:0;padding-bottom:40px;max-width:68ch;font-size:12px;line-height:1.7;color:var(--mute);opacity:.72}
-.inspiration b{display:block;margin-bottom:4px;font:500 10.5px/1.4 var(--mono);letter-spacing:.16em;text-transform:uppercase}
+.end{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-top:clamp(80px,12vw,160px);padding-top:28px;border-top:1px dashed var(--line);font-family:var(--mono)}
+.end .brand{font-size:clamp(30px,4.4vw,56px);gap:18px;letter-spacing:.12em}
+.end .brand img{width:clamp(40px,4.8vw,62px);height:auto}
+footer{display:flex;gap:8px;padding-block:40px 22px;font-family:var(--mono);font-size:12px;color:var(--mute)}
+.inspiration{margin:0;padding-bottom:40px;max-width:68ch;font-size:12px;line-height:1.7;color:var(--mute);opacity:.7}
+.inspiration b{display:block;margin-bottom:3px;font-family:var(--mono);font-weight:500;font-size:11px;letter-spacing:.12em;text-transform:uppercase}
 footer a{text-decoration:underline;text-decoration-color:var(--line);text-underline-offset:3px}
 footer a:hover{color:var(--ink)}
 
-@media (max-width:820px){
-  .say{flex-direction:column;align-items:flex-start;gap:24px;padding-block:38px 26px}
-  h1,:lang(en) h1{font-size:clamp(34px,10.4vw,60px)}
+@media (max-width:980px){
+  .hero{grid-template-columns:1fr;gap:0;padding-top:26px}
+  .say{flex-direction:row;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:20px 24px;padding-bottom:24px}
+  .say::before{flex-basis:100%}
+  h1{font-size:clamp(30px,7vw,52px)}
 }
 @media (max-width:640px){
-  :root{--gut:16px}
-  .col{width:100%}
-  .top{height:56px}
-  .top nav{letter-spacing:.1em}
-  .frame{padding:12px 0 0 12px}
-  .frame::before{left:12px}.frame::after{top:12px}
+  :root{--gut:14px}
+  .top{height:52px}
+  .top nav a,.top nav button{padding:6px 10px}
+  .say{flex-direction:column;align-items:flex-start}
+  h1{font-size:clamp(30px,9.4vw,46px)}
+  .panel{padding:16px 14px 20px 16px}
+  .screw{width:7px;height:7px}
+  .ruler.x{left:24px;right:24px;top:4px}
+  .ruler.y{top:24px;bottom:24px;left:3px}
+  .lamps{right:24px;bottom:6px}
   .stage{aspect-ratio:5/4}
   .end{flex-direction:column;align-items:flex-start}
 }
@@ -135,14 +131,14 @@ footer a:hover{color:var(--ink)}
         </a>
       </div>
 
-      <div class="frame">
+      <div class="panel"><b class="screw"></b><b class="screw"></b><b class="screw"></b><b class="screw"></b><span class="ruler x"></span><span class="ruler y"></span>
       <div class="stage" id="stage" role="img"
            data-ko-label="Flick 사용 화면: 마우스 옆 버튼을 누른 채 밀면 옆 데스크톱으로 넘어가고, 한 번 누르면 모든 창이 보입니다."
            data-en-label="Flick in use: hold the mouse side button and flick to land on the next desktop; tap it to see every window."
            aria-label="Flick 사용 화면">
         <canvas id="hero"></canvas>
       </div>
-      </div>
+      <div class="lamps" aria-hidden="true"><i></i><i></i><i></i></div></div>
     </section>
 
     <section class="end">
@@ -161,8 +157,6 @@ footer a:hover{color:var(--ink)}
 <script>
 (() => {
 'use strict';
-const ACCENT = '#579eff';
-const FONT = '"IBM Plex Sans KR","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif';
 const qs = new URLSearchParams(location.search);
 const FREEZE = qs.has('t') ? parseFloat(qs.get('t')) : null;   // ?t=3.6 holds one frame of the loop
 // The loop is the page's content, like an embedded video, so it plays even
@@ -173,8 +167,9 @@ const STILL = FREEZE !== null;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const inOut = t => (t = clamp(t, 0, 1), t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
 const follow = (cur, to, dt, tau) => to + (cur - to) * Math.exp(-dt / tau);
+const rgba = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${n >> 8 & 255},${n & 255},${a})`; };
 const white = a => `rgba(255,255,255,${a})`;
-const accent = a => `rgba(87,158,255,${a})`;
+const black = a => `rgba(0,0,0,${a})`;
 
 /* ---------- language ---------- */
 let lang = 'ko';
@@ -189,6 +184,7 @@ function applyLang() {
 }
 
 /* ---------- drawing helpers ---------- */
+let FONT = 'system-ui,sans-serif';
 function rr(g, x, y, w, h, r) {
   r = Math.max(0, Math.min(r, w / 2, h / 2));
   g.beginPath(); g.moveTo(x + r, y);
@@ -196,19 +192,21 @@ function rr(g, x, y, w, h, r) {
   g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
 }
 function bar(g, x, y, w, h, c, r) { g.fillStyle = c; if (r) { rr(g, x, y, w, h, r); g.fill(); } else g.fillRect(x, y, w, h); }
+function ring(g, x, y, w, h, c, lw, r) { g.strokeStyle = c; g.lineWidth = lw; rr(g, x, y, w, h, r || 0); g.stroke(); }
+function dot(g, x, y, r, c) { g.fillStyle = c; g.beginPath(); g.arc(x, y, r, 0, 7); g.fill(); }
+function line(g, x0, y0, x1, y1, c, lw) { g.strokeStyle = c; g.lineWidth = lw; g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); }
 function txt(g, s, x, y, px, c, weight, align) {
   g.font = `${weight || 400} ${px}px ${FONT}`; g.fillStyle = c; g.textAlign = align || 'left'; g.textBaseline = 'middle'; g.fillText(s, x, y);
 }
+/* A repeatable scatter, so a wallpaper looks the same every time it is painted. */
+function seeded(seed) { let s = 0; for (const ch of String(seed)) s = (s * 31 + ch.charCodeAt(0)) >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+/* Blurs what is already on the canvas behind a shape, for glass panels. */
+function frost(g, hero, blur) {
+  g.save(); g.clip(); g.filter = `blur(${blur}px)`;
+  g.drawImage(hero.cv, 0, 0, hero.cv.width, hero.cv.height, 0, 0, hero.W, hero.H);
+  g.restore();
+}
 
-/* ---------- the demo desktops: one tint each, one or two plain windows ---------- */
-const TINTS = {            // wallpaper from, wallpaper to, the colour of the blocks inside its windows
-  teal:   ['#0d2a2e', '#216168', '#35a89f'],
-  amber:  ['#33230d', '#80591f', '#e3a640'],
-  violet: ['#1e1638', '#55439a', '#8f76e3'],
-  rose:   ['#351420', '#863552', '#e27397'],
-  green:  ['#11281a', '#2f6d46', '#56b47a'],
-  slate:  ['#151c28', '#3c4f6a', '#8195b3'],
-};
 /* Soft blocks inside a window, as fractions of its content box: x, y, w, h, strength. */
 const BLOCKS = {
   side: [[0, 0, .22, 1, .28], [.25, 0, .75, .58, .9], [.25, .63, .36, .37, .28], [.64, .63, .36, .37, .28]],
@@ -217,17 +215,104 @@ const BLOCKS = {
   cols: [[0, 0, .48, 1, .9], [.52, 0, .48, .47, .28], [.52, .53, .48, .47, .28]],
   one:  [[0, 0, 1, .62, .9], [0, .69, .6, .31, .28]],
 };
-function paintWindow(g, win, w, h, u) {
-  const c = TINTS[win.tint][2], top = 26 * u, p = 16 * u;
-  g.save(); rr(g, 0, 0, w, h, 10 * u); g.clip();
-  bar(g, 0, 0, w, h, '#f5f6f9'); bar(g, 0, 0, w, top, '#e6e8ee');
-  bar(g, 12 * u, top / 2 - 4 * u, 8 * u, 8 * u, c, 4 * u);
-  txt(g, tr(win.label), 27 * u, top / 2 + .5 * u, 10.5 * u, '#565c6b', 500);
-  for (let i = 0; i < 3; i++) bar(g, w - (20 + i * 13) * u, top / 2 - 3 * u, 6 * u, 6 * u, '#c3c8d2', 3 * u);
-  const cw = w - 2 * p, ch = h - top - 2 * p;
-  BLOCKS[win.kind].forEach(b => { g.globalAlpha = b[4]; bar(g, p + b[0] * cw, top + p + b[1] * ch, b[2] * cw, b[3] * ch, c, 8 * u); });
-  g.restore();
+/* The switcher's geometry, shared by every look: one cell per desktop, rows shifted onto one column. */
+function miniGeom(grid, cx, cy, s, o) {
+  o = o || {};
+  const CW = (o.cw || 46) * s, CH = (o.ch || 30) * s, GAP = (o.gap || 7) * s, PAD = (o.pad || 20) * s, TITLE = (o.title ?? 26) * s, rows = grid.m.rows;
+  const pw = PAD * 2 + grid.colsE * (CW + GAP) - GAP, ph = PAD * 2 + rows.length * (CH + GAP) - GAP + TITLE;
+  const x0 = cx - pw / 2, y0 = cy - ph / 2;
+  return { CW, CH, GAP, PAD, TITLE, pw, ph, x0, y0, rows, X: c => x0 + PAD + c * (CW + GAP), Y: r => y0 + PAD + r * (CH + GAP) };
 }
+
+/* ---------- Draft B — Flight deck: a phosphor display, line-drawn windows, the switcher as a gauge ---------- */
+const PH = '#5cf2a0';   // phosphor green; amber is the accent
+const T = {
+  accent: '#ffb000', top: 16, bottom: 22, round: .22,
+  font: '"IBM Plex Mono","IBM Plex Sans KR","Malgun Gothic",ui-monospace,monospace',
+  fontFaces: [[500, '"IBM Plex Mono"'], [600, '"IBM Plex Mono"'], [500, '"IBM Plex Sans KR"'], [600, '"IBM Plex Sans KR"']],
+  tints: {
+    teal:   ['#030d0b', '#06201a', '#5cf2c8'],
+    amber:  ['#030d07', '#08241a', '#5cf2a0'],
+    violet: ['#08060f', '#151028', '#a99bff'],
+    rose:   ['#0e0507', '#260d13', '#ff7d93'],
+    green:  ['#040d05', '#0a220d', '#86ff8f'],
+    slate:  ['#05080c', '#0f1824', '#9fb7d0'],
+  },
+  /* A display, not a photo: fine graticule, a horizon line, darker towards the edges. */
+  wall(g, w, h, t, u) {
+    bar(g, 0, 0, w, h, t[0]);
+    let gr = g.createRadialGradient(w / 2, h * .48, 0, w / 2, h * .48, Math.max(w, h) * .6); gr.addColorStop(0, t[1]); gr.addColorStop(1, rgba(t[1], 0)); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    const step = 20 * u;
+    for (let x = w / 2 % step, i = 0; x < w; x += step, i++) line(g, x, 0, x, h, rgba(t[2], Math.round((x - w / 2) / step) % 5 ? .045 : .1), 1);
+    for (let y = h / 2 % step; y < h; y += step) line(g, 0, y, w, y, rgba(t[2], Math.round((y - h / 2) / step) % 5 ? .045 : .1), 1);
+    line(g, w * .08, h / 2, w * .92, h / 2, rgba(t[2], .18), 1);
+    [-2, -1, 1, 2].forEach(k => line(g, w / 2 - (k % 2 ? 18 : 30) * u, h / 2 + k * 26 * u, w / 2 + (k % 2 ? 18 : 30) * u, h / 2 + k * 26 * u, rgba(t[2], .14), 1));
+    gr = g.createRadialGradient(w / 2, h / 2, Math.min(w, h) * .35, w / 2, h / 2, Math.max(w, h) * .75); gr.addColorStop(0, black(0)); gr.addColorStop(1, black(.55)); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  },
+  window(g, win, w, h, u, t) {
+    const top = 22 * u, p = 12 * u, c = t[2];
+    bar(g, 0, 0, w, h, 'rgba(2,8,6,.94)', 3 * u);
+    bar(g, 1, 1, w - 2, top, rgba(c, .1));
+    line(g, 0, top, w, top, rgba(c, .4), 1);
+    txt(g, tr(win.label).toUpperCase(), 10 * u, top / 2 + .5 * u, 10 * u, c, 600);
+    for (let i = 0; i < 3; i++) ring(g, w - (18 + i * 12) * u, top / 2 - 3 * u, 6 * u, 6 * u, rgba(c, .55), 1);
+    ring(g, .5, .5, w - 1, h - 1, rgba(c, .5), 1, 3 * u);
+    const k = 9 * u; g.lineCap = 'square';
+    [[0, 0, 1, 1], [w, 0, -1, 1], [0, h, 1, -1], [w, h, -1, -1]].forEach(([x, y, dx, dy]) => { g.strokeStyle = c; g.lineWidth = 2 * u; g.beginPath(); g.moveTo(x + dx * k, y + dy * u); g.lineTo(x + dx * u, y + dy * u); g.lineTo(x + dx * u, y + dy * k); g.stroke(); });
+    const cw = w - 2 * p, ch = h - top - 2 * p;
+    BLOCKS[win.kind].forEach(b => {
+      const bx = p + b[0] * cw, by = top + p + b[1] * ch, bw = b[2] * cw, bh = b[3] * ch;
+      if (b[4] > .5) { bar(g, bx, by, bw, bh, rgba(c, .12), 1.5 * u); ring(g, bx + .5, by + .5, bw - 1, bh - 1, rgba(c, .7), 1, 1.5 * u); line(g, bx, by + bh, bx + bw, by, rgba(c, .25), 1); }
+      else { ring(g, bx + .5, by + .5, bw - 1, bh - 1, rgba(c, .32), 1, 1.5 * u); for (let y = by + 8 * u; y < by + bh - 5 * u; y += 8 * u) bar(g, bx + 6 * u, y, Math.max(0, bw * .62 - 6 * u), 2 * u, rgba(c, .18)); }
+    });
+  },
+  shadow(g, u, dpr, t) { g.shadowColor = rgba(t[2], .2); g.shadowBlur = 18 * u * dpr; },
+  shadowFill: '#020806',
+  /* A ruler along the top, a status line along the bottom that shows the row and the column. */
+  chrome(g, hero) {
+    const { W, H, u } = hero, top = 16 * u, bt = 22 * u, cur = hero.grid.cur;
+    bar(g, 0, 0, W, top, black(.6)); line(g, 0, top, W, top, rgba(PH, .3), 1);
+    for (let x = 0, i = 0; x < W; x += 10 * u, i++) line(g, x, top, x, top - (i % 5 ? 3 : 7) * u, rgba(PH, i % 5 ? .3 : .55), 1);
+    bar(g, 0, H - bt, W, bt, black(.65)); line(g, 0, H - bt, W, H - bt, rgba(PH, .3), 1);
+    const seg = (x, n, on) => { for (let i = 0; i < n; i++) bar(g, x + i * 13 * u, H - bt / 2 - 3 * u, 10 * u, 6 * u, i === on ? ACCENT : rgba(PH, .22)); };
+    seg(14 * u, 3, cur.r); seg(64 * u, 3, cur.c);
+    line(g, 56 * u, H - bt + 6 * u, 56 * u, H - 6 * u, rgba(PH, .3), 1);
+    for (let i = 0; i < 3; i++) dot(g, W / 2 + (i - 1) * 14 * u, H - bt / 2, 2.5 * u, rgba(PH, .5));
+  },
+  /* The switcher as an instrument: hairline cells, ticks over the columns, crosshairs on the highlight. */
+  mini(g, grid, cx, cy, s, alpha, hero) {
+    const m = miniGeom(grid, cx, cy, s, { pad: 22, title: 28 }), { X, Y, CW, CH, GAP, PAD, pw, ph, x0, y0 } = m;
+    g.save(); g.globalAlpha *= alpha;
+    bar(g, x0, y0, pw, ph, 'rgba(2,6,4,.92)', 3 * s); ring(g, x0 + .5, y0 + .5, pw - 1, ph - 1, accent(.45), 1, 3 * s);
+    const k = 10 * s; g.lineCap = 'square';
+    [[x0, y0, 1, 1], [x0 + pw, y0, -1, 1], [x0, y0 + ph, 1, -1], [x0 + pw, y0 + ph, -1, -1]].forEach(([x, y, dx, dy]) => { g.strokeStyle = ACCENT; g.lineWidth = 2 * s; g.beginPath(); g.moveTo(x + dx * k, y); g.lineTo(x, y); g.lineTo(x, y + dy * k); g.stroke(); });
+    g.save(); rr(g, x0, y0, pw, ph, 3 * s); g.clip();
+    for (let c = 0; c < Math.ceil(grid.colsE); c++) line(g, X(c) + CW / 2, y0 + 7 * s, X(c) + CW / 2, y0 + 13 * s, rgba(PH, .5), 1);
+    const hx = X(grid.hl.x), hy = Y(grid.hl.y);
+    g.setLineDash([3 * s, 3 * s]); line(g, x0 + 6 * s, hy + CH / 2, x0 + pw - 6 * s, hy + CH / 2, accent(.35), 1); line(g, hx + CW / 2, y0 + 15 * s, hx + CW / 2, Y(m.rows.length) - GAP / 2, accent(.35), 1); g.setLineDash([]);
+    m.rows.forEach((row, r) => row.cells.forEach((_, c) => { const x = X(c + grid.shifts[r]), y = Y(r), on = r === grid.cur.r; bar(g, x, y, CW, CH, rgba(PH, on ? .1 : .04)); ring(g, x + .5, y + .5, CW - 1, CH - 1, rgba(PH, on ? .6 : .28), 1); }));
+    line(g, x0 + PAD, y0 + ph - m.TITLE - PAD * .35, x0 + pw - PAD, y0 + ph - m.TITLE - PAD * .35, rgba(PH, .2), 1);
+    txt(g, grid.name(grid.cur.r).toUpperCase(), x0 + pw / 2, y0 + ph - (PAD * .55 + m.TITLE / 2), 12 * s, ACCENT, 600, 'center');
+    g.restore();
+    g.save(); g.shadowColor = accent(.7); g.shadowBlur = 12 * s * hero.dpr; bar(g, hx, hy, CW, CH, accent(.88)); g.restore();
+    ring(g, hx + 3 * s, hy + 3 * s, CW - 6 * s, CH - 6 * s, 'rgba(20,12,0,.6)', 1);
+    g.restore();
+  },
+  board: {
+    bg(g, hero) { bar(g, 0, 0, hero.W, hero.H, 'rgba(2,6,4,.93)'); const u = hero.u; for (let y = 0; y < hero.H; y += 4 * u) bar(g, 0, y, hero.W, 1, rgba(PH, .025)); },
+    tile: 'rgba(3,10,7,.96)', tileLine: rgba(PH, .35), label: PH, caps: true, labelPx: 11.5,
+    spine: rgba(PH, .05), cell: rgba(PH, .05), cellRow: rgba(PH, .12), cellSel: '#0b1a12', name: rgba(PH, .4), nameCur: PH,
+  },
+  mouse: { body: 'rgba(2,10,6,.92)', line: PH, btn: rgba(PH, .3), gripHex: '#ffb000', glow: rgba(PH, .35), round: .45, dash: true },
+  cursor: { fill: '#04140c', line: PH, ringHex: PH },
+  /* The panel's three lamps follow the line: hold, flick, next desktop. */
+  onBeat(i) { document.querySelectorAll('.lamps i').forEach((el, j) => el.classList.toggle('on', j === i)); },
+};
+
+FONT = T.font;
+const ACCENT = T.accent;
+const accent = a => rgba(ACCENT, a);
+const TINT = name => T.tints[name];
 
 /* ---------- the grid, with the real navigation rules ---------- */
 let WIN_ID = 0;
@@ -286,26 +371,6 @@ class Grid {
   }
 }
 
-/* Flick's switcher: the panel the real overlay draws (same proportions and opacities), the workspace's name under the grid. */
-const MINI_TITLE = 26;
-function drawMini(g, grid, cx, cy, s, alpha) {
-  const CW = 46 * s, CH = 30 * s, GAP = 7 * s, PAD = 20 * s, rows = grid.m.rows;
-  const pw = PAD * 2 + grid.colsE * (CW + GAP) - GAP, ph = PAD * 2 + rows.length * (CH + GAP) - GAP + MINI_TITLE * s;
-  const x0 = cx - pw / 2, y0 = cy - ph / 2;
-  const X = c => x0 + PAD + c * (CW + GAP), Y = r => y0 + PAD + r * (CH + GAP);
-  g.save(); g.globalAlpha *= alpha;
-  rr(g, x0, y0, pw, ph, 16 * s); g.fillStyle = 'rgba(19,20,24,.86)'; g.fill(); g.strokeStyle = white(.10); g.lineWidth = 1; g.stroke();
-  g.save(); rr(g, x0 + 3 * s, y0, pw - 6 * s, ph, 14 * s); g.clip();
-  bar(g, X(grid.leadE) - GAP / 2, y0 + PAD - GAP / 2, CW + GAP, rows.length * (CH + GAP), white(.045), 10 * s);
-  rows.forEach((row, r) => row.cells.forEach((_, c) => bar(g, X(c + grid.shifts[r]), Y(r), CW, CH, white(r === grid.cur.r ? .17 : .08), 7 * s)));
-  txt(g, grid.name(grid.cur.r), x0 + pw / 2, y0 + ph - (PAD * .55 + MINI_TITLE * s / 2), 13 * s, white(.88), 600, 'center');
-  g.restore();
-  const hx = X(grid.hl.x), hy = Y(grid.hl.y);
-  [[5, .07], [3, .12], [1.5, .20]].forEach(([k, a]) => bar(g, hx - k * s, hy - k * s, CW + 2 * k * s, CH + 2 * k * s, accent(a), (7 + k) * s));
-  bar(g, hx, hy, CW, CH, ACCENT, 7 * s);
-  g.restore();
-}
-
 function fit(cv) {
   const r = cv.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 2), w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
   if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
@@ -346,9 +411,11 @@ class Hero {
   }
   resize() {
     const f = fit(this.cv); this.W = f.w; this.H = f.h; this.dpr = f.dpr;
-    this.narrow = this.W < 560; this.u = this.H / (this.narrow ? 400 : 562); this.TB = 22 * this.u;
+    this.narrow = this.W < 560; this.u = this.H / (this.narrow ? 400 : 562);
+    this.TT = (T.top || 0) * this.u; this.TB = (T.bottom ?? 22) * this.u;
     this.sprites.clear(); this.walls.clear();
   }
+  get DH() { return this.H - this.TT - this.TB; }
   cell(pos) { return this.grid.m.rows[pos.r].cells[pos.c]; }
   beat(i) { if (!this.quiet) this.onBeat(i); }
   press() { this.held = true; this.beat(0); }
@@ -364,8 +431,8 @@ class Hero {
     this.tapUntil = this.t + .2; const b = this.board;
     if (b.open) { b.open = false; b.drag = null; return; }
     b.open = true; b.cell = { ...this.grid.cur }; b.rects.clear(); b.drag = null; b.drop = null; this.hideAt = 0;
-    const DH = this.H - this.TB, th = this.boardLayout().th;
-    this.cell(b.cell).wins.forEach(win => b.rects.set(win.id, { x: win.r[0] * this.W, y: win.r[1] * DH - th, w: win.r[2] * this.W, h: win.r[3] * DH + th, a: 1, dying: false }));
+    const DH = this.DH, th = this.boardLayout().th;
+    this.cell(b.cell).wins.forEach(win => b.rects.set(win.id, { x: win.r[0] * this.W, y: this.TT + win.r[1] * DH - th, w: win.r[2] * this.W, h: win.r[3] * DH + th, a: 1, dying: false }));
   }
   cursorTo(p, d) { this.tween = { x0: this.cur.x, y0: this.cur.y, x1: p.x, y1: p.y, t0: this.t, d }; }
   grab() { const wins = this.cell(this.board.cell).wins; this.board.drag = { id: wins[wins.length - 1].id, k: 0 }; }
@@ -390,7 +457,7 @@ class Hero {
     const spine = { x: spineX - gap / 2, y: mapTop - gap / 2, w: pitch, h: n * rp };
     const wins = this.cell(cell).wins, tm = (narrow ? 16 : 70) * s, top = (narrow ? 20 : 34) * s, th = (narrow ? 28 : 34) * s, tg = (narrow ? 10 : 28) * s;
     const area = { x: tm, y: top, w: w - 2 * tm, h: mapTop - (narrow ? 20 : 28) * s - top };
-    const asp = wins.map(win => (win.r[2] * w) / (win.r[3] * (H - this.TB))), sum = asp.reduce((a, b) => a + b, 0) || 1;
+    const asp = wins.map(win => (win.r[2] * w) / (win.r[3] * this.DH)), sum = asp.reduce((a, b) => a + b, 0) || 1;
     const ph = Math.max(10, Math.min(area.h - th, (area.w - tg * (wins.length - 1)) / sum));
     let tx = area.x + (area.w - (sum * ph + tg * (wins.length - 1))) / 2; const ty = area.y + (area.h - (ph + th)) / 2;
     const tiles = wins.map((win, i) => { const t = { win, x: tx, y: ty, w: asp[i] * ph, h: ph + th }; tx += t.w + tg; return t; });
@@ -419,88 +486,85 @@ class Hero {
   seek(t) { this.quiet = true; this.reset(); for (let i = 0, n = Math.round(t * 60); i < n; i++) this.step(1 / 60); this.quiet = false; }
 
   sprite(win) {
-    const DH = this.H - this.TB, w = Math.round(win.r[2] * this.W), h = Math.round(win.r[3] * DH);
+    const w = Math.round(win.r[2] * this.W), h = Math.round(win.r[3] * this.DH);
     let s = this.sprites.get(win.id);
     if (!s) {
       const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * this.dpr)); c.height = Math.max(1, Math.round(h * this.dpr));
-      const g = c.getContext('2d'); g.scale(this.dpr, this.dpr); paintWindow(g, win, w, h, this.u);
+      const g = c.getContext('2d'); g.scale(this.dpr, this.dpr); T.window(g, win, w, h, this.u, TINT(win.tint));
       s = { c, w, h }; this.sprites.set(win.id, s);
     }
     return s;
   }
   wallpaper(tint) {
     let c = this.walls.get(tint); if (c) return c;
-    const { W: w, H: h, dpr } = this, T = TINTS[tint]; c = document.createElement('canvas'); c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
-    const g = c.getContext('2d'); g.scale(dpr, dpr);
-    let gr = g.createLinearGradient(0, 0, w, h); gr.addColorStop(0, T[0]); gr.addColorStop(1, T[1]); g.fillStyle = gr; g.fillRect(0, 0, w, h);
-    gr = g.createRadialGradient(w * .78, h * .9, 0, w * .78, h * .9, Math.max(w, h) * .6); gr.addColorStop(0, white(.14)); gr.addColorStop(1, white(0)); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    const { W: w, H: h, dpr } = this; c = document.createElement('canvas'); c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    const g = c.getContext('2d'); g.scale(dpr, dpr); T.wall(g, w, h, TINT(tint), this.u, tint);
     this.walls.set(tint, c); return c;
   }
   drawDesktop() {
-    const g = this.g, { W, H, u, TB } = this, DH = H - TB;
+    const g = this.g, { W, u, TT } = this, DH = this.DH;
     this.cell(this.grid.cur).wins.forEach(win => {
-      const s = this.sprite(win), x = Math.round(win.r[0] * W), y = Math.round(win.r[1] * DH);
-      g.save(); g.shadowColor = 'rgba(0,0,0,.4)'; g.shadowBlur = 30 * u * this.dpr; g.shadowOffsetY = 12 * u * this.dpr; bar(g, x + 2, y + 2, s.w - 4, s.h - 4, '#000', 10 * u); g.restore();
+      const s = this.sprite(win), x = Math.round(win.r[0] * W), y = Math.round(TT + win.r[1] * DH);
+      g.save(); T.shadow(g, u, this.dpr, TINT(win.tint)); bar(g, x + 2, y + 2, s.w - 4, s.h - 4, T.shadowFill || '#000', (T.round ?? 1) * 10 * u); g.restore();
       g.drawImage(s.c, x, y, s.w, s.h);
     });
-    bar(g, 0, H - TB, W, TB, 'rgba(12,14,19,.5)');
-    for (let i = -1; i < 2; i++) bar(g, W / 2 + i * 14 * u - 3 * u, H - TB / 2 - 3 * u, 6 * u, 6 * u, white(.4), 3 * u);
+    T.chrome(g, this);
   }
   drawBoard() {
-    const g = this.g, { W, H, u: s } = this, b = this.board, L = this.boardLayout(), px = this.cur.x * W, py = this.cur.y * H, th = L.th;
-    g.save(); g.globalAlpha = b.a; bar(g, 0, 0, W, H, '#0d0e11');
+    const g = this.g, { W, H, u: s } = this, b = this.board, L = this.boardLayout(), px = this.cur.x * W, py = this.cur.y * H, th = L.th, B = T.board, R = k => k * s * (T.round ?? 1);
+    g.save(); g.globalAlpha = b.a; B.bg(g, this);
     /* previews */
     b.rects.forEach((r, id) => {
       if (!r.win) return;
       const dim = (b.drag && b.drag.id === id ? 1 - .7 * b.drag.k : 1) * r.a, sp = this.sprite(r.win);
       const hot = !b.drag && !r.dying && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
       g.save(); g.globalAlpha = b.a * dim;
-      rr(g, r.x, r.y, r.w, r.h, 10 * s); g.clip(); bar(g, r.x, r.y, r.w, r.h, 'rgb(32,34,42)'); g.drawImage(sp.c, r.x, r.y + th, r.w, r.h - th);
-      txt(g, tr(r.win.label), r.x + 14 * s, r.y + th / 2 + .5 * s, 12.5 * s, white(.88), 600);
+      rr(g, r.x, r.y, r.w, r.h, R(10)); g.clip(); bar(g, r.x, r.y, r.w, r.h, B.tile); g.drawImage(sp.c, r.x, r.y + th, r.w, r.h - th);
+      txt(g, B.caps ? tr(r.win.label).toUpperCase() : tr(r.win.label), r.x + 14 * s, r.y + th / 2 + .5 * s, (B.labelPx || 12.5) * s, B.label, 600);
       g.restore();
-      g.save(); g.globalAlpha = b.a * dim; g.strokeStyle = hot ? ACCENT : white(.10); g.lineWidth = hot ? 2.5 * s : 1; rr(g, r.x - s, r.y - s, r.w + 2 * s, r.h + 2 * s, 11 * s); g.stroke(); g.restore();
+      g.save(); g.globalAlpha = b.a * dim; ring(g, r.x - s, r.y - s, r.w + 2 * s, r.h + 2 * s, hot ? ACCENT : B.tileLine, hot ? 2.5 * s : 1, R(11)); g.restore();
     });
     /* the map: one square per desktop, one dot per window in it */
-    bar(g, L.spine.x, L.spine.y, L.spine.w, L.spine.h, white(.035), 10 * s);
-    const dot = L.ch * .28;
-    L.rows.forEach((row, r) => txt(g, this.grid.name(r), L.x0, row[0].y + L.ch / 2 + .5 * s, (this.narrow ? 11 : 12.5) * s, white(r === L.cell.r ? .92 : .45), r === L.cell.r ? 600 : 500));
+    bar(g, L.spine.x, L.spine.y, L.spine.w, L.spine.h, B.spine, R(10));
+    const pip = L.ch * .28;
+    L.rows.forEach((row, r) => txt(g, this.grid.name(r), L.x0, row[0].y + L.ch / 2 + .5 * s, (this.narrow ? 11 : 12.5) * s, r === L.cell.r ? B.nameCur : B.name, r === L.cell.r ? 600 : 500));
     L.rows.forEach(row => row.forEach(c => {
       const sel = c.r === L.cell.r && c.c === L.cell.c, drop = b.drop && b.drop.r === c.r && b.drop.c === c.c;
-      if (sel) [[5, .08], [3, .14]].forEach(([k, a]) => bar(g, c.x - k * s, c.y - k * s, c.w + 2 * k * s, c.h + 2 * k * s, accent(a), (8 + k) * s));
-      bar(g, c.x, c.y, c.w, c.h, sel ? '#22252d' : white(c.r === L.cell.r ? .14 : .07), 8 * s);
-      if (drop || sel) { g.strokeStyle = ACCENT; g.lineWidth = (drop ? 2.5 : 2) * s; rr(g, c.x, c.y, c.w, c.h, 8 * s); g.stroke(); }
-      const n = c.wins.length, x0 = c.x + (c.w - (n * dot + (n - 1) * dot * .4)) / 2;
-      c.wins.forEach((win, i) => bar(g, x0 + i * dot * 1.4, c.y + (c.h - dot) / 2, dot, dot, TINTS[win.tint][2], dot * .3));
+      if (sel) [[5, .08], [3, .14]].forEach(([k, a]) => bar(g, c.x - k * s, c.y - k * s, c.w + 2 * k * s, c.h + 2 * k * s, accent(a), R(8 + k)));
+      bar(g, c.x, c.y, c.w, c.h, sel ? B.cellSel : c.r === L.cell.r ? B.cellRow : B.cell, R(8));
+      if (drop || sel) ring(g, c.x, c.y, c.w, c.h, ACCENT, (drop ? 2.5 : 2) * s, R(8));
+      const n = c.wins.length, x0 = c.x + (c.w - (n * pip + (n - 1) * pip * .4)) / 2;
+      c.wins.forEach((win, i) => bar(g, x0 + i * pip * 1.4, c.y + (c.h - pip) / 2, pip, pip, TINT(win.tint)[2], pip * .3 * (T.round ?? 1)));
     }));
     /* the preview riding on the cursor */
     if (b.drag) {
       const r = b.rects.get(b.drag.id), sp = this.sprite(r.win), k = 1 - (1 - 70 * s / (r.h - th)) * b.drag.k, gw = r.w * k, gh = (r.h - th) * k, gx = px - gw / 2, gy = py - gh - 8 * s;
       g.globalAlpha = b.a * .96;
-      g.save(); g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 22 * s * this.dpr; g.shadowOffsetY = 8 * s * this.dpr; bar(g, gx, gy, gw, gh, '#111', 6 * s); g.restore();
-      g.drawImage(sp.c, gx, gy, gw, gh); g.strokeStyle = accent(.9); g.lineWidth = 1.5 * s; rr(g, gx, gy, gw, gh, 6 * s); g.stroke();
+      g.save(); g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 22 * s * this.dpr; g.shadowOffsetY = 8 * s * this.dpr; bar(g, gx, gy, gw, gh, '#111', R(6)); g.restore();
+      g.drawImage(sp.c, gx, gy, gw, gh); ring(g, gx, gy, gw, gh, accent(.9), 1.5 * s, R(6));
     }
     g.restore();
   }
-  /* The hand: a small mouse whose side button is blue while held. Each flick throws it one way; it drifts back. */
+  /* The hand: a small mouse whose side button lights while held. Each flick throws it one way; it drifts back. */
   drawMouse() {
-    const g = this.g, U = this.u, u = U * (this.narrow ? .9 : 1), hd = this.hand, w = 34 * u, h = 52 * u, k = jolt(this.t - hd.t0), far = 40 * u;
+    const g = this.g, U = this.u, u = U * (this.narrow ? .9 : 1), hd = this.hand, w = 34 * u, h = 52 * u, k = jolt(this.t - hd.t0), far = 40 * u, M = T.mouse;
     const rx = this.W - w - 64 * U, ry = this.H - this.TB - h - 56 * U, x = rx + hd.vx * far * k, y = ry + hd.vy * far * k, lit = hd.side > .5;
-    if (k > .02) { g.strokeStyle = accent(.42 * k); g.lineWidth = w * .7; g.lineCap = 'round'; g.beginPath(); g.moveTo(rx + w / 2, ry + h / 2); g.lineTo(x + w / 2, y + h / 2); g.stroke(); }
-    g.save(); g.shadowColor = lit ? accent(.9) : 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; bar(g, x - 6 * u, y + 17 * u, 12 * u, 17 * u, lit ? ACCENT : '#aeb4c0', 4 * u); g.restore();
-    g.save(); g.shadowColor = 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; g.shadowOffsetY = 3 * u * this.dpr; bar(g, x, y, w, h, '#14161c', 17 * u); g.restore();
-    if (this.grip > .05) { g.save(); rr(g, x, y, w, h, 17 * u); g.clip(); bar(g, x, y, w / 2, 21 * u, white(.85 * this.grip)); g.restore(); }
-    g.strokeStyle = white(.92); g.lineWidth = 1.6 * u; rr(g, x, y, w, h, 17 * u); g.stroke();
+    if (k > .02) { g.strokeStyle = accent(.42 * k); g.lineWidth = w * .7; g.lineCap = 'round'; if (M.dash) g.setLineDash([3 * u, 5 * u]); g.beginPath(); g.moveTo(rx + w / 2, ry + h / 2); g.lineTo(x + w / 2, y + h / 2); g.stroke(); g.setLineDash([]); }
+    g.save(); g.shadowColor = lit ? accent(.9) : 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; bar(g, x - 6 * u, y + 17 * u, 12 * u, 17 * u, lit ? ACCENT : M.btn, 4 * u * (M.round ?? 1)); g.restore();
+    g.save(); g.shadowColor = M.glow || 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; g.shadowOffsetY = (M.glow ? 0 : 3) * u * this.dpr; bar(g, x, y, w, h, M.body, 17 * u * (M.round ?? 1)); g.restore();
+    if (this.grip > .05) { g.save(); rr(g, x, y, w, h, 17 * u * (M.round ?? 1)); g.clip(); bar(g, x, y, w / 2, 21 * u, rgba(M.gripHex || '#ffffff', .85 * this.grip)); g.restore(); }
+    ring(g, x, y, w, h, M.line, 1.6 * u, 17 * u * (M.round ?? 1));
     g.lineCap = 'round'; g.lineWidth = 2 * u; g.beginPath(); g.moveTo(x + w / 2, y + 9 * u); g.lineTo(x + w / 2, y + 16 * u); g.stroke();
   }
   /* The cursor exists only on the board, where it picks a window up and carries it. */
   drawCursor() {
-    const g = this.g, u = this.u, x = this.cur.x * this.W, y = this.cur.y * this.H, k = (this.narrow ? 1.25 : 1.12) * u;
+    const g = this.g, u = this.u, x = this.cur.x * this.W, y = this.cur.y * this.H, k = (this.narrow ? 1.25 : 1.12) * u, C = T.cursor || { fill: '#fff', line: '#111' };
     g.save(); g.globalAlpha = this.board.a;
-    if (this.grip > .05) { g.strokeStyle = white(.55 * this.grip); g.lineWidth = 1.5 * u; g.beginPath(); g.arc(x, y, 9 * u, 0, 7); g.stroke(); }
+    if (this.grip > .05) { g.strokeStyle = rgba(C.ringHex || '#ffffff', .55 * this.grip); g.lineWidth = 1.5 * u; g.beginPath(); g.arc(x, y, 9 * u, 0, 7); g.stroke(); }
     g.save(); g.translate(x, y); g.scale(k, k); g.beginPath();
     [[0, 0], [0, 16.5], [4.3, 12.7], [7.1, 19], [9.7, 17.8], [6.9, 11.7], [12.2, 11.7]].forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1])); g.closePath();
-    g.shadowColor = 'rgba(0,0,0,.45)'; g.shadowBlur = 5 * this.dpr; g.shadowOffsetY = 1.5 * this.dpr; g.fillStyle = '#fff'; g.fill(); g.shadowColor = 'transparent';
-    g.strokeStyle = '#111'; g.lineWidth = 1.1; g.lineJoin = 'round'; g.stroke(); g.restore(); g.restore();
+    g.shadowColor = 'rgba(0,0,0,.45)'; g.shadowBlur = 5 * this.dpr; g.shadowOffsetY = 1.5 * this.dpr; g.fillStyle = C.fill; g.fill(); g.shadowColor = 'transparent';
+    g.strokeStyle = C.line; g.lineWidth = 1.1; g.lineJoin = 'round'; g.stroke(); g.restore(); g.restore();
   }
   draw() {
     const g = this.g, { W, H, dpr } = this;
@@ -508,7 +572,7 @@ class Hero {
     g.drawImage(this.wallpaper(this.cell(this.grid.cur).tint), 0, 0, W, H);
     if (this.board.a < .995) {
       this.drawDesktop();
-      if (this.grid.alpha > .01) drawMini(g, this.grid, W / 2, H / 2, this.u * (this.narrow ? .95 : 1.3), this.grid.alpha);
+      if (this.grid.alpha > .01) T.mini(g, this.grid, W / 2, H / 2, this.u * (this.narrow ? .95 : 1.3), this.grid.alpha, this);
     }
     if (this.board.a > .005) { this.drawBoard(); this.drawCursor(); }
     this.drawMouse();
@@ -520,7 +584,7 @@ applyLang();
 const hero = new Hero(document.getElementById('hero'));
 const words = [...document.querySelectorAll('#line span')];
 let beatTimer = 0;
-hero.onBeat = i => { words.forEach((w, j) => w.classList.toggle('on', j === i)); clearTimeout(beatTimer); beatTimer = setTimeout(() => words.forEach(w => w.classList.remove('on')), 650); };
+hero.onBeat = i => { words.forEach((w, j) => w.classList.toggle('on', j === i)); if (T.onBeat) T.onBeat(i); clearTimeout(beatTimer); beatTimer = setTimeout(() => { words.forEach(w => w.classList.remove('on')); if (T.onBeat) T.onBeat(-1); }, 650); };
 
 function redrawStill() { hero.seek(FREEZE); hero.draw(); }
 /* Text on the canvases changes with the language and once the web font arrives. */
@@ -529,7 +593,7 @@ function repaint() { hero.sprites.clear(); if (STILL) redrawStill(); }
 document.getElementById('lang').addEventListener('click', () => { lang = lang === 'ko' ? 'en' : 'ko'; try { localStorage.setItem('flick-lang', lang); } catch (e) {} applyLang(); repaint(); });
 if (document.fonts) {
   const all = '워크스페이스편집기브라우저메모디자인채팅WorkspaceEditorBrowserNotesDesignChat123';
-  Promise.all([500, 600].map(w => document.fonts.load(`${w} 12px "IBM Plex Sans KR"`, all))).then(repaint, () => {});
+  Promise.all(T.fontFaces.map(([w, f]) => document.fonts.load(`${w} 12px ${f}`, all))).then(repaint, () => {});
 }
 new ResizeObserver(() => { hero.resize(); if (STILL) redrawStill(); else hero.draw(); }).observe(hero.cv);
 

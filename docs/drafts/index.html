@@ -14,31 +14,32 @@
 @media (prefers-color-scheme:dark){:root{--bg:#08090b;--card:#121419;--ink:#eef0f4;--mute:#8b919d;--line:rgba(255,255,255,.12);--accent:#579eff;color-scheme:dark}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.5 "IBM Plex Sans KR","Malgun Gothic",system-ui,sans-serif;padding:0 16px;-webkit-font-smoothing:antialiased}
-main{max-width:760px;margin:0 auto;padding:56px 0 64px}
+main{max-width:1080px;margin:0 auto;padding:56px 0 64px}
 h1{margin:0 0 6px;font-size:28px;letter-spacing:-.02em;display:flex;align-items:center;gap:10px}
 h1 img{width:28px;height:28px}
 p.lead{margin:0 0 32px;color:var(--mute)}
-ol{list-style:none;margin:0;padding:0;display:grid;gap:12px}
-a.card{display:grid;grid-template-columns:44px 1fr auto;align-items:center;gap:16px;padding:18px 20px;border-radius:14px;background:var(--card);border:1px solid var(--line);color:inherit;text-decoration:none;transition:border-color .15s ease,transform .15s ease}
-a.card:hover{border-color:var(--accent);transform:translateY(-1px)}
-.k{font-weight:700;font-size:22px;color:var(--accent);text-align:center}
+ol{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+@media (max-width:700px){ol{grid-template-columns:1fr}}
+a.card{display:block;border-radius:16px;background:var(--card);border:1px solid var(--line);color:inherit;text-decoration:none;overflow:hidden;transition:border-color .15s ease,transform .15s ease}
+a.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+a.card img{display:block;width:100%;height:auto;aspect-ratio:16/10;object-fit:cover;object-position:top;border-bottom:1px solid var(--line)}
+.meta{display:grid;grid-template-columns:32px 1fr;gap:12px;padding:14px 18px 16px}
+.k{font-weight:700;font-size:22px;color:var(--accent)}
 .n{font-weight:600;font-size:17px}
 .c{color:var(--mute);font-size:14px}
-.go{color:var(--mute);font-size:20px}
 footer{margin-top:28px;font-size:13px;color:var(--mute)}
 footer a{color:inherit}
-@media (max-width:480px){a.card{grid-template-columns:32px 1fr;gap:12px}.go{display:none}}
 </style>
 </head>
 <body>
 <main>
   <h1><img src="../icon.png" alt="">Flick 랜딩 시안</h1>
-  <p class="lead">내용·문구·동작은 지금 페이지와 같고, 생김새만 다릅니다. 라이트/다크는 시스템 설정을 따릅니다.</p>
+  <p class="lead">문구·링크·데모 동작은 지금 페이지와 같고, 데모 화면(바탕·창·격자 팝업·테두리)과 배치를 시안마다 새로 그렸습니다. 라이트/다크는 시스템 설정을 따릅니다(C는 둘 다 밤).</p>
   <ol>
-    <li><a class="card" href="a.html"><span class="k">A</span><span><span class="n">Vibrancy</span><br><span class="c">macOS Sonoma 풍 — 은은한 색 번짐 위에 반투명 유리(헤더·화면 테두리·끝 카드), 캡슐 버튼.</span></span><span class="go">→</span></a></li>
-    <li><a class="card" href="b.html"><span class="k">B</span><span><span class="n">Flight deck</span><br><span class="c">항공 계기판 — 정밀한 격자 바탕, 헤어라인, 고정폭 글꼴, 눈금자와 모서리 표식으로 감싼 화면.</span></span><span class="go">→</span></a></li>
-    <li><a class="card" href="c.html"><span class="k">C</span><span><span class="n">Deep orbit</span><br><span class="c">깊은 우주 — 별빛 수준의 미세한 점, 화면 뒤를 지나는 궤도선 하나, 가는 제목과 은은한 광륜.</span></span><span class="go">→</span></a></li>
-    <li><a class="card" href="d.html"><span class="k">D</span><span><span class="n">Hardware</span><br><span class="c">애플 제품 페이지 — 흰(다크는 검정) 바탕, 가운데 정렬, 큰 여백과 큰 제목, 제품 사진처럼 놓인 화면.</span></span><span class="go">→</span></a></li>
+    <li><a class="card" href="a.html"><img src="shots/a.png" alt="시안 A 첫 화면" width="720" height="450" loading="lazy"><span class="meta"><span class="k">A</span><span><span class="n">Aqua</span><br><span class="c">밝은 macOS — 파스텔 배경 위 진짜 창(신호등 버튼·제목줄) 안에 메뉴 막대·Dock 있는 데스크톱, 유리 HUD 격자.</span></span></span></a></li>
+    <li><a class="card" href="b.html"><img src="shots/b.png" alt="시안 B 첫 화면" width="720" height="450" loading="lazy"><span class="meta"><span class="k">B</span><span><span class="n">Flight deck</span><br><span class="c">항공 계기판 — 모눈종이 위 나사·눈금자 달린 금속 패널, 형광 녹색 선으로 그린 창, 호박색 계기형 격자와 문구를 따라 켜지는 램프.</span></span></span></a></li>
+    <li><a class="card" href="c.html"><img src="shots/c.png" alt="시안 C 첫 화면" width="720" height="450" loading="lazy"><span class="meta"><span class="k">C</span><span><span class="n">Deep orbit</span><br><span class="c">깊은 우주(라이트·다크 모두 밤) — 별과 성운, 행성 가장자리가 보이는 둥근 창, 어두운 유리 창, 궤도 위 점으로 그린 격자.</span></span></span></a></li>
+    <li><a class="card" href="d.html"><img src="shots/d.png" alt="시안 D 첫 화면" width="720" height="450" loading="lazy"><span class="meta"><span class="k">D</span><span><span class="n">Hardware</span><br><span class="c">애플 제품 페이지 — 흰(다크는 검정) 바탕 가운데 큰 제목, 노치 있는 노트북 화면 속 선명한 다크 macOS 데스크톱.</span></span></span></a></li>
   </ol>
   <footer><a href="../">지금 페이지 보기</a></footer>
 </main>
