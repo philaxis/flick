@@ -307,10 +307,10 @@ fn recede_stats(raw: &[u8], width: u32, height: u32) -> (f64, f64) {
 }
 
 /// The normal view receding over maximized windows, recorded as composed:
-/// `recede-frames.csv` (each frame's time from the trigger, the middle
-/// desktop's width and how much is neither dark nor a window), and frames
-/// as BMPs: the real desktops before, the first ones of each hold, then
-/// every fifth.
+/// `recede-frames.csv` (each frame's time from the trigger and from letting
+/// go, the middle desktop's width and how much is neither dark nor a
+/// window), and frames as BMPs: the real desktops before, the first ones of
+/// each hold, every fifth, and all in the half second after letting go.
 pub unsafe fn recede(out: &Path, flick: &str) {
     use std::sync::{atomic::{AtomicBool, AtomicI64, Ordering}, Arc, Mutex};
     let wait = |ms| std::thread::sleep(Duration::from_millis(ms));
@@ -339,12 +339,13 @@ pub unsafe fn recede(out: &Path, flick: &str) {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let since = Arc::new(AtomicI64::new(0));
+    let released = Arc::new(AtomicI64::new(0));
     let snap: Arc<Mutex<Option<String>>> = Arc::default();
-    let (o, s1, s2, s3) = (out.to_owned(), stop.clone(), since.clone(), snap.clone());
+    let (o, s1, s2, s3, s4) = (out.to_owned(), stop.clone(), since.clone(), snap.clone(), released.clone());
     let recorder = std::thread::spawn(move || {
         let capture = Capture::new().unwrap();
         let mut frequency = 0; QueryPerformanceFrequency(&mut frequency).unwrap();
-        let mut csv = String::from("hold,ms,middle_width,other\n");
+        let mut csv = String::from("hold,ms,after_release_ms,middle_width,other\n");
         let (mut latest, mut hold, mut nth, mut was) = (Vec::new(), 0, 0, 0i64);
         while !s1.load(Ordering::SeqCst) {
             if let Some((present, raw)) = capture.grab().unwrap() {
@@ -353,8 +354,10 @@ pub unsafe fn recede(out: &Path, flick: &str) {
                 if from != 0 {
                     let (middle, other) = recede_stats(&raw, capture.width, capture.height);
                     let ms = (present - from) as f64 * 1000.0 / frequency as f64;
-                    writeln!(csv, "{hold},{ms:.1},{middle:.4},{other:.4}").unwrap();
-                    if nth < 14 || nth % 5 == 0 { save_bmp(&o.join(format!("h{hold}-{nth:03}-{ms:.0}ms.bmp")), &raw, capture.width, capture.height); }
+                    let let_go = s4.load(Ordering::SeqCst);
+                    let after = if let_go > from { (present - let_go) as f64 * 1000.0 / frequency as f64 } else { f64::NAN };
+                    writeln!(csv, "{hold},{ms:.1},{after:.1},{middle:.4},{other:.4}").unwrap();
+                    if nth < 14 || nth % 5 == 0 || (0.0..500.0).contains(&after) { save_bmp(&o.join(format!("h{hold}-{nth:03}-{ms:.0}ms.bmp")), &raw, capture.width, capture.height); }
                     nth += 1;
                 }
                 latest = raw;
@@ -383,13 +386,14 @@ pub unsafe fn recede(out: &Path, flick: &str) {
         for i in 1..=n { mouse(MOUSEEVENTF_MOVE, dx * i / n - dx * (i - 1) / n, dy * i / n - dy * (i - 1) / n); wait(ms / n as u64); }
     };
     let begin = || { since.store(qpc(), Ordering::SeqCst); mouse(MOUSEEVENTF_XDOWN, 0, 0); };
-    let rest = || { wait(1500); since.store(0, Ordering::SeqCst); wait(300); };
-    // 1: a short pull that commits nothing, held still: the recede and the return, timed.
-    begin(); wait(80); stroke(60, 0, 80); wait(700); mouse(MOUSEEVENTF_XUP, 0, 0); rest();
-    // 2: across to the right desktop, slowly, and let go there.
-    begin(); wait(80); stroke(330, 4, 700); wait(400); mouse(MOUSEEVENTF_XUP, 0, 0); rest();
-    // 3: from there down to the row below.
-    begin(); wait(80); stroke(4, 330, 700); wait(400); mouse(MOUSEEVENTF_XUP, 0, 0); rest();
+    let end = || { released.store(qpc(), Ordering::SeqCst); mouse(MOUSEEVENTF_XUP, 0, 0); wait(1500); since.store(0, Ordering::SeqCst); wait(300); };
+    // Each hold goes on to the next desktop: one that does not is a click, and opens the board.
+    // 1: across to the right desktop, slowly, and let go there: the recede, timed.
+    begin(); wait(80); stroke(330, 4, 700); wait(400); end();
+    // 2: back to the middle one: it comes forward to the whole screen, timed.
+    begin(); wait(80); stroke(-330, 4, 700); wait(400); end();
+    // 3: down to the row below.
+    begin(); wait(80); stroke(4, 330, 700); wait(400); end();
     stop.store(true, Ordering::SeqCst);
     recorder.join().unwrap();
     let _ = child.kill(); let _ = child.wait();
