@@ -189,91 +189,71 @@ function surface(g, x, y, w, h, r, face, alpha, lift, s) {
   if (w > 2 * inset) { g.fillStyle = white(.07 * alpha); g.fillRect(x + inset, y + .25 * s, w - 2 * inset, s); }
 }
 
-/* ---------- apps: each a plain window and its icon's colour ---------- */
-const APPS = {
-  editor:   { tone: '#3d8bfd', kind: 'side' },
-  browser:  { tone: '#f08a3c', kind: 'page' },
-  terminal: { tone: '#8d96a8', kind: 'lines' },
-  notes:    { tone: '#e6c34a', kind: 'lines' },
-  chat:     { tone: '#8f7cf0', kind: 'list' },
-  mail:     { tone: '#3fb6d9', kind: 'list' },
-  photos:   { tone: '#e46a9a', kind: 'grid' },
-  sheet:    { tone: '#3fae6a', kind: 'grid' },
-  music:    { tone: '#e5534b', kind: 'page' },
+/* ---------- the desktops: real Windows 11 screens (scripts/landing-cells.ps1), one shelf per piece of work ---------- */
+const CELLS = {"sw":1920,"sh":1080,"shelves":[[{"img":"d00.webp","wins":[{"app":"notepad","r":[134,61,1152,877]},{"app":"terminal","r":[960,428,864,530]}]},{"img":"d01.webp","wins":[{"app":"edge","r":[192,51,1536,918]}]},{"img":"d02.webp","wins":[{"app":"explorer","r":[96,82,998,796]},{"app":"terminal","r":[922,204,902,632]}]}],[{"img":"d10.webp","wins":[{"app":"edge","r":[77,61,1056,898],"img":"w-d10-0.webp"},{"app":"notepad","r":[960,204,864,755],"img":"w-d10-1.webp"},{"app":"explorer","r":[1190,41,672,428],"img":"w-d10-2.webp"}]},{"img":"d11.webp","wins":[{"app":"paint","r":[384,61,1190,877]}]}],[{"img":"d20.webp","wins":[{"app":"edge","r":[230,71,1382,857]}]},{"img":"d21.webp","wins":[{"app":"edge","r":[96,71,1152,857]},{"app":"notepad","r":[1152,143,672,673]}]}]],"pinAll":{"app":"calc","r":[1498,306,402,632],"img":"w-pins-0.webp"},"pinRow":{"row":1,"app":"notepad","r":[58,571,499,408],"img":"w-pins-1.webp"}};
+const SHELF_NAMES = {
+  ko: ['개발 · tidepool', '글쓰기 · 도시 숲 보고서', '소통 · 이번 주'],
+  en: ['Build · tidepool', 'Writing · urban forest report', 'Talk · this week'],
 };
-/* An app's icon: a rounded square of its colour with a light mark. */
-function icon(g, app, x, y, k) {
-  fill(g, x, y, k, k, k * .24, APPS[app].tone);
-  fill(g, x + k * .28, y + k * .28, k * .44, k * .44, k * .12, 'rgba(255,255,255,.82)');
-}
-/* What a window shows, as faint blocks in its body. */
-const BODY = {
-  side:  [[0, 0, .2, 1], [.24, 0, .76, .08], [.24, .14, .6, .06], [.24, .26, .7, .06], [.24, .38, .5, .06], [.24, .5, .66, .06]],
-  page:  [[0, 0, 1, .46], [0, .54, .62, .07], [0, .66, .8, .07], [0, .78, .5, .07]],
-  lines: [[0, 0, .7, .07], [0, .13, .9, .07], [0, .26, .55, .07], [0, .39, .8, .07], [0, .52, .62, .07]],
-  list:  [[0, 0, .3, 1], [.34, 0, .66, .2], [.34, .26, .66, .2], [.34, .52, .66, .2]],
-  grid:  [[0, 0, .31, .46], [.345, 0, .31, .46], [.69, 0, .31, .46], [0, .54, .31, .46], [.345, .54, .31, .46], [.69, .54, .31, .46]],
-};
-/* A window as it is on a desktop: 8px corners, a title bar with its icon, dark faces as dark-mode apps have. */
-function paintWindow(g, win, X, Y, w, h, s) {
-  const bar = 30 * s, r = 8 * s, a = APPS[win.app];
-  surface(g, X, Y, w, h, r, .165, 1, win.top ? 1 : .3, s);
-  icon(g, win.app, X + 12 * s, Y + bar / 2 - 7 * s, 14 * s);
-  g.fillStyle = white(.5); [0, 1, 2].forEach(i => g.fillRect(X + w - (18 + 26 * i) * s, Y + bar / 2, 9 * s, Math.max(1, 1.2 * s)));
-  const p = 14 * s, cw = w - 2 * p, ch = h - bar - p;
-  g.save(); rr(g, X, Y, w, h, r); g.clip();
-  BODY[a.kind].forEach((b, i) => fill(g, X + p + b[0] * cw, Y + bar + b[1] * ch, b[2] * cw, b[3] * ch, 4 * s, white(i === 0 && a.kind !== 'lines' && a.kind !== 'grid' ? .06 : .045)));
-  g.restore();
-}
+const SHELF_SHORT = { ko: ['개발', '글쓰기', '소통'], en: ['Build', 'Writing', 'Talk'] };
+const shelfName = r => SHELF_NAMES[lang][r];
+const SHELVES = CELLS.shelves;
+const PINNED_ALL = CELLS.pinAll, PINNED_ROW = CELLS.pinRow;
+/* An app's colour, for its icon until the picture of it has come. */
+const TONE = { notepad: '#3d8bfd', terminal: '#8d96a8', edge: '#2fa8d8', explorer: '#e6c34a', paint: '#e46a9a', calc: '#8f7cf0' };
 
-/* ---------- the grid of desktops: shelves (rows) of desktops ---------- */
-const Wn = (app, x, y, w, h, top) => ({ app, r: [x, y, w, h], top: !!top });
-const SHELVES = [
-  [ [Wn('editor', .1, .09, .62, .78), Wn('terminal', .58, .5, .34, .38)],
-    [Wn('browser', .16, .08, .68, .8)],
-    [Wn('mail', .08, .12, .5, .72), Wn('chat', .62, .2, .3, .6)] ],
-  [ [Wn('photos', .06, .1, .58, .76), Wn('sheet', .5, .3, .4, .55), Wn('notes', .76, .07, .19, .3, true)],
-    [Wn('editor', .2, .1, .6, .78)] ],
-  [ [Wn('music', .24, .14, .52, .7)],
-    [Wn('browser', .1, .1, .5, .76), Wn('notes', .64, .1, .27, .5)] ],
-];
-/* Windows pinned: one on every desktop, one on every desktop of the second shelf. */
-const PINNED_ALL = Wn('music', .74, .66, .21, .26);
-const PINNED_ROW = { row: 1, win: Wn('chat', .05, .62, .22, .3) };
-const shelfName = r => `Shelf ${r + 1}`;   // grid::row_title for a shelf not yet named
+const IMG = {};
+let onImage = () => {};
+function image(path) {
+  let im = IMG[path];
+  if (!im) { im = IMG[path] = new Image(); im.decoding = 'async'; im.onload = () => onImage(); im.src = 'cells/' + path; }
+  return im.complete && im.naturalWidth ? im : null;
+}
+/* An app's icon: its own picture, or a rounded square of its colour while that loads. */
+function icon(g, app, x, y, k) {
+  const im = image(`icons/${app}.png`);
+  if (im) { g.imageSmoothingQuality = 'high'; g.drawImage(im, x, y, k, k); return; }
+  fill(g, x, y, k, k, k * .24, TONE[app]);
+}
 
 /* ---------- the loop: hold, flick right, right, down, let go; tap for the board; back again ---------- */
 const SCRIPT = [
-  [.7, h => h.press()],
-  [1.2, h => h.drag(1, 0)],
-  [2.0, h => h.drag(1, 0)],
-  [2.9, h => h.drag(0, 1)],
-  [3.8, h => h.release()],
-  [5.0, h => h.tap()],
-  [8.4, h => h.tap()],
-  [9.2, h => h.press()],
-  [9.7, h => h.drag(0, -1)],
-  [10.5, h => h.drag(-1, 0)],
-  [11.2, h => h.drag(-1, 0)],
-  [11.9, h => h.release()],
+  [.15, h => h.press()],
+  [.45, h => h.drag(1, 0)],
+  [.85, h => h.drag(1, 0)],
+  [1.4, h => h.drag(0, 1)],
+  [2.0, h => h.release()],
+  [2.75, h => h.tap()],
+  [5.2, h => h.tap()],
+  [5.75, h => h.press()],
+  [6.05, h => h.drag(0, -1)],
+  [6.6, h => h.drag(-1, 0)],
+  [7.0, h => h.drag(-1, 0)],
+  [7.5, h => h.release()],
 ];
-const LOOP = 13.4;
-const DRAG = .5;   // how long one push of the hand takes
+const LOOP = 8.6;
+/* Springs, a little under-damped: quick to go, a few per cent past, quick to settle. */
+const MOVE = { w: 24, z: .74 }, DEPTH = { w: 22, z: .7 }, BOARD = { w: 20, z: .72 };
+function spring(s, to, dt, { w, z }) {
+  for (let n = Math.ceil(dt / (1 / 240)), h = dt / n; n > 0; n--) { s.v += (-w * w * (s.p - to) - 2 * z * w * s.v) * h; s.p += s.v * h; }
+}
 
 class Hero {
   constructor(cv) {
-    this.cv = cv; this.g = cv.getContext('2d'); this.sprites = new Map(); this.visible = true; this.quiet = false;
+    this.cv = cv; this.g = cv.getContext('2d'); this.visible = true; this.quiet = false;
     this.onBeat = () => {};
     this.reset(); this.resize();
   }
   reset() {
     this.t = 0; this.si = 0;
     this.row = 0; this.col = 0; this.last = SHELVES.map(() => 0);
-    this.x = 0; this.y = 0;           // where the strip is: column on the current shelf, and shelf
-    this.hand = null;                 // a push under way
-    this.held = false; this.receded = 0;
-    this.board = { open: false, a: 0 };
+    this.sx = { p: 0, v: 0 }; this.sy = { p: 0, v: 0 }; this.tx = 0; this.ty = 0;   // where the strip is: column on the current shelf, and shelf
+    this.held = false; this.depth = { p: 0, v: 0 };
+    this.board = { open: false, s: { p: 0, v: 0 } };
   }
+  get x() { return this.sx.p; }
+  get y() { return this.sy.p; }
+  get receded() { return this.depth.p; }
   resize() {
     const r = this.cv.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.W = Math.max(1, Math.round(r.width)); this.H = Math.max(1, Math.round(r.height)); this.dpr = dpr;
@@ -281,54 +261,58 @@ class Hero {
     this.u = this.H / 620;                       // one of the app's pixels on this stage
     this.tu = Math.max(this.u, .62);             // the same for text, kept legible on a phone
     this.narrow = this.W < 560;
-    this.sprites.clear();
+    /* The screen fills the stage, cut at its sides if the stage is narrower. */
+    this.sc = Math.max(this.W / CELLS.sw, this.H / CELLS.sh);
+    this.ox = (this.W - CELLS.sw * this.sc) / 2; this.oy = (this.H - CELLS.sh * this.sc) / 2;
   }
   beat(i) { if (!this.quiet) this.onBeat(i); }
   press() { this.held = true; this.beat(0); }
   release() { this.held = false; this.beat(2); }
-  drag(dx, dy) { this.hand = { dx, dy, t0: this.t, x0: this.x, y0: this.y }; this.beat(1); }
+  drag(dx, dy) {
+    this.tx = clamp(this.col + dx, 0, SHELVES[this.row].length - 1);
+    this.ty = clamp(this.row + dy, 0, SHELVES.length - 1);
+    this.beat(1);
+  }
   tap() { this.board.open = !this.board.open; }
 
   step(dt) {
     this.t += dt;
     while (this.si < SCRIPT.length && SCRIPT[this.si][0] <= this.t) SCRIPT[this.si++][1](this);
     if (this.t >= LOOP) this.reset();
-    /* The hand pushes; the strip follows it, and the desktop it is nearest is the one chosen. */
-    const h = this.hand;
-    if (h) {
-      const k = ease((this.t - h.t0) / DRAG);
-      if (h.dx) this.x = h.x0 + h.dx * k;
-      if (h.dy) {
-        this.y = h.y0 + h.dy * k;
-        const row = clamp(Math.round(this.y), 0, SHELVES.length - 1);
-        if (row !== this.row) { this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.x = this.col; }
-      }
-      this.col = clamp(Math.round(this.x), 0, SHELVES[this.row].length - 1);
-      if (k >= 1) this.hand = null;
-    }
-    if (!this.held && !this.hand) { this.x = follow(this.x, this.col, dt, .06); this.y = follow(this.y, this.row, dt, .06); }
+    /* The strip springs to where the hand sent it; the desktop it is nearest is the one chosen. */
+    spring(this.sy, this.ty, dt, MOVE);
+    const row = clamp(Math.round(this.y), 0, SHELVES.length - 1);
+    if (row !== this.row) { this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
+    spring(this.sx, this.tx, dt, MOVE);
+    this.col = clamp(Math.round(this.x), 0, SHELVES[this.row].length - 1);
     /* Held, the screen recedes; let go, the chosen desktop comes forward. */
-    this.receded = follow(this.receded, this.held ? 1 : 0, dt, this.held ? .07 : .09);
-    this.board.a = follow(this.board.a, this.board.open ? 1 : 0, dt, .05);
+    spring(this.depth, this.held ? 1 : 0, dt, DEPTH);
+    spring(this.board.s, this.board.open ? 1 : 0, dt, BOARD);
   }
   seek(t) { this.quiet = true; this.reset(); for (let i = 0, n = Math.round(t * 60); i < n; i++) this.step(1 / 60); this.quiet = false; }
 
-  /* One desktop, full size, drawn once: the same dark under every desktop, its windows. */
-  desktop(r, c) {
-    const key = r + ':' + c; let cv = this.sprites.get(key);
-    if (cv) return cv;
-    const { W, H, dpr } = this; cv = document.createElement('canvas'); cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-    const g = cv.getContext('2d'); g.scale(dpr, dpr);
-    g.fillStyle = '#1e2127'; g.fillRect(0, 0, W, H);
-    SHELVES[r][c].forEach(win => paintWindow(g, win, win.r[0] * W, win.r[1] * H, win.r[2] * W, win.r[3] * H, this.u));
-    this.sprites.set(key, cv); return cv;
+  /* A rectangle of the real screen, in the stage's pixels. */
+  onStage(r) { const { sc, ox, oy } = this; return [ox + r[0] * sc, oy + r[1] * sc, r[2] * sc, r[3] * sc]; }
+  /* A window by itself: its shadow, then its picture with Windows 11's 8px corners. Before the picture comes, its desktop's. */
+  paintShot(g, win, desk, x, y, w, h, lift) {
+    const s = w / win.r[2], r = 8 * s;   // one of the screen's pixels, here
+    glow(g, x, y + (6 + 8 * lift) * s, w, h, r, (20 + 16 * lift) * s, `rgba(0,0,0,${.32 + .2 * lift})`);
+    glow(g, x, y + s, w, h, r, 4 * s, 'rgba(0,0,0,.4)');
+    const own = win.img && image(win.img), from = own || image(desk.img);
+    g.save(); rr(g, x, y, w, h, r); g.clip();
+    if (from) {
+      const k = from.naturalWidth / (own ? win.r[2] : CELLS.sw);
+      if (own) g.drawImage(own, x, y, w, h);
+      else g.drawImage(from, win.r[0] * k, win.r[1] * k, win.r[2] * k, win.r[3] * k, x, y, w, h);
+    } else { g.fillStyle = '#202328'; g.fillRect(x, y, w, h); }
+    g.restore();
   }
   /* follow::placed: where a thing `apart` desktops from the strip is drawn, and how dark. */
   place(ax, ay) {
     const { W, H } = this, sc = scaleAt(this.receded), emphasis = clamp(1 - Math.hypot(ax, ay), 0, 1);
     const [lift, dark] = standingOut(emphasis, this.receded), k = sc * lift;
     const cx = W / 2 + ax * W * (1 + GAP) * sc, cy = H / 2 + ay * H * (1 + GAP) * sc;
-    return { x: cx - W * k / 2, y: cy - H * k / 2, k, dark: this.receded > .001 ? dark : 0 };
+    return { x: cx - W * k / 2, y: cy - H * k / 2, k, dark: this.receded > .001 ? clamp(dark, 0, 1) : 0 };
   }
   /* Where shelf `r` stands sideways: the shelf the hand is on goes with the strip, the others wait on the desktop they were left on (follow::step_along). */
   rowX(r) {
@@ -336,23 +320,27 @@ class Hero {
     return (r === this.row ? this.col : this.last[r]) + off * clamp(1 - Math.abs(r - this.y), 0, 1);
   }
   drawGlide() {
-    const g = this.g, { W, H } = this;
+    const g = this.g, { W, H, sc, ox, oy } = this;
     g.fillStyle = BACKDROP; g.fillRect(0, 0, W, H);
-    SHELVES.forEach((row, r) => row.forEach((_, c) => {
-      const p = this.place(c - this.rowX(r), r - this.y);
-      if (p.x > W || p.y > H || p.x + W * p.k < 0 || p.y + H * p.k < 0) return;
-      g.drawImage(this.desktop(r, c), p.x, p.y, W * p.k, H * p.k);
-      if (p.dark > 0) { g.fillStyle = `rgba(0,0,0,${p.dark})`; g.fillRect(p.x, p.y, W * p.k, H * p.k); }
+    SHELVES.forEach((row, r) => row.forEach((desk, c) => {
+      const p = this.place(c - this.rowX(r), r - this.y), w = W * p.k, h = H * p.k;
+      if (p.x > W || p.y > H || p.x + w < 0 || p.y + h < 0) return;
+      const im = image(desk.img);
+      if (im) {
+        const k = im.naturalWidth / CELLS.sw;
+        g.drawImage(im, -ox / sc * k, -oy / sc * k, W / sc * k, H / sc * k, p.x, p.y, w, h);
+      } else { g.fillStyle = '#1e2127'; g.fillRect(p.x, p.y, w, h); }
+      if (p.dark > 0) { g.fillStyle = `rgba(0,0,0,${p.dark})`; g.fillRect(p.x, p.y, w, h); }
     }));
     /* Pinned windows stay where they are sideways; those of a shelf go up and down with it. */
     const pinned = (win, ay) => {
-      const p = this.place(0, ay);
+      const p = this.place(0, ay), [x, y, w, h] = this.onStage(win.r);
       g.save(); g.translate(p.x, p.y); g.scale(p.k, p.k);
-      paintWindow(g, win, win.r[0] * W, win.r[1] * H, win.r[2] * W, win.r[3] * H, this.u);
-      if (p.dark > 0) fill(g, win.r[0] * W, win.r[1] * H, win.r[2] * W, win.r[3] * H, 8 * this.u, `rgba(0,0,0,${p.dark})`);
+      this.paintShot(g, win, win, x, y, w, h, 1);
+      if (p.dark > 0) fill(g, x, y, w, h, 8 * sc, `rgba(0,0,0,${p.dark})`);
       g.restore();
     };
-    if (Math.abs(PINNED_ROW.row - this.y) < 1.5) pinned(PINNED_ROW.win, PINNED_ROW.row - this.y);
+    if (Math.abs(PINNED_ROW.row - this.y) < 1.5) pinned(PINNED_ROW, PINNED_ROW.row - this.y);
     pinned(PINNED_ALL, 0);
     if (this.receded > .01) this.drawBanner();
   }
@@ -380,41 +368,39 @@ class Hero {
     const lead = Math.max(...SHELVES.map((_, r) => anchor(r))), tail = Math.max(...SHELVES.map((row, r) => row.length - anchor(r)));
     const nameW = (narrow ? 70 : 84) * s, mapW = nameW + (lead + tail) * pitch - gap, mapTop = H - n * rp - 30 * s;
     const x0 = (W - mapW) / 2, spineX = x0 + nameW + lead * pitch;
-    const cells = SHELVES.map((row, r) => row.map((wins, c) => ({ x: spineX + (c - anchor(r)) * pitch, y: mapTop + r * rp, w: cw, h: ch, wins, r, c })));
+    const cells = SHELVES.map((row, r) => row.map((desk, c) => ({ x: spineX + (c - anchor(r)) * pitch, y: mapTop + r * rp, w: cw, h: ch, wins: desk.wins, r, c })));
     /* Pinned windows at the left, all shelves above this shelf; the chosen desktop's windows as large previews beside them. */
     const top = 58 * s, bottom = mapTop - 34 * s, colW = W * .19, left = 30 * s;
     const pinH = (bottom - top - 24 * s) / 2;
     const pins = [
       { win: PINNED_ALL, kind: 'all', ...this.fitTile(PINNED_ALL, left, top, colW, pinH) },
-      ...(this.row === PINNED_ROW.row ? [{ win: PINNED_ROW.win, kind: 'row', ...this.fitTile(PINNED_ROW.win, left, top + pinH + 24 * s, colW, pinH) }] : []),
+      ...(this.row === PINNED_ROW.row ? [{ win: PINNED_ROW, kind: 'row', ...this.fitTile(PINNED_ROW, left, top + pinH + 24 * s, colW, pinH) }] : []),
     ];
-    const wins = SHELVES[this.row][this.col], ax = left + colW + 40 * s, aw = W - ax - 40 * s, tg = 26 * s;
-    const asp = wins.map(w => (w.r[2] * W) / (w.r[3] * H)), sum = asp.reduce((a, b) => a + b, 0);
+    const desk = SHELVES[this.row][this.col], wins = desk.wins, ax = left + colW + 40 * s, aw = W - ax - 40 * s, tg = 26 * s;
+    const asp = wins.map(w => w.r[2] / w.r[3]), sum = asp.reduce((a, b) => a + b, 0);
     const ph = Math.min(bottom - top - 30 * s, (aw - tg * (wins.length - 1)) / sum);
     let tx = ax + (aw - (sum * ph + tg * (wins.length - 1))) / 2; const ty = top + (bottom - top - ph - 30 * s) / 2;
-    const tiles = wins.map((win, i) => { const t = { win, x: tx, y: ty, w: asp[i] * ph, h: ph }; tx += t.w + tg; return t; });
+    const tiles = wins.map((win, i) => { const t = { win, desk, x: tx, y: ty, w: asp[i] * ph, h: ph }; tx += t.w + tg; return t; });
     return { cells, tiles, pins, ch, gap, x0, right: x0 + mapW, spine: { x: spineX - gap / 2, y: mapTop - gap / 2, w: pitch, h: n * rp } };
   }
   fitTile(win, x, y, w, h) {
-    const asp = (win.r[2] * this.W) / (win.r[3] * this.H), th = Math.min(h - 30 * this.u, w / asp), tw = th * asp;
+    const asp = win.r[2] / win.r[3], th = Math.min(h - 30 * this.u, w / asp), tw = th * asp;
     return { x: x + (w - tw) / 2, y: y + (h - 30 * this.u - th) / 2, w: tw, h: th };
   }
-  /* A preview: its shadow (deep for one kept on top), the glow of its pin under it, a shrunken picture of the window, its app's icon over its lower left corner. */
+  /* A preview: the glow of its pin under it, a shrunken picture of the window, its app's icon over its lower left corner. */
   drawTile(t, pin) {
-    const g = this.g, s = this.u, { W, H } = this, win = t.win, k = t.w / (win.r[2] * W);
+    const g = this.g, s = this.u, win = t.win;
     if (pin) glow(g, t.x + t.w * .08, t.y + t.h * .65, t.w * .84, t.h * .35 + 6 * s, 14 * s, 40 * s, (pin === 'all' ? everywhere : onRow)(.5));
-    g.save(); g.translate(t.x, t.y); g.scale(k, k);
-    paintWindow(g, win, 0, 0, win.r[2] * W, win.r[3] * H, s);
-    g.restore();
+    this.paintShot(g, win, t.desk || win, t.x, t.y, t.w, t.h, .5);
     const side = 32 * s; icon(g, win.app, t.x - 6 * s, t.y + t.h - side + 10 * s, side);
   }
   drawBoard() {
-    const g = this.g, { W, H, u: s, tu, dpr } = this, L = this.boardLayout(), a = this.board.a;
+    const g = this.g, { W, H, u: s, tu, dpr } = this, L = this.boardLayout(), a = clamp(this.board.s.p, 0, 1);
     g.save(); g.globalAlpha = a;
     g.fillStyle = BACKDROP; g.fillRect(0, 0, W, H);
     /* Where pinned windows go: a pool of their colour on the floor of each place. */
     L.pins.forEach(p => glow(g, p.x + p.w * .12, p.y + p.h + 14 * s, p.w * .76, 6 * s, 3 * s, 70 * s * .5, (p.kind === 'all' ? everywhere : onRow)(.13)));
-    const z = .96 + .04 * a;
+    const z = .96 + .04 * this.board.s.p;
     g.translate(W / 2, H / 2); g.scale(z, z); g.translate(-W / 2, -H / 2);
     L.pins.forEach(p => this.drawTile(p, p.kind));
     L.tiles.forEach(t => this.drawTile(t, null));
@@ -427,7 +413,7 @@ class Hero {
     const ly = L.spine.y - 6 * s, gr = g.createLinearGradient(L.x0, 0, L.right, 0);
     gr.addColorStop(0, everywhere(0)); gr.addColorStop(.5, everywhere(.65)); gr.addColorStop(1, everywhere(0));
     g.fillStyle = gr; g.fillRect(L.x0, ly, L.right - L.x0, 1.2 * s);
-    L.cells.forEach((row, r) => txt(g, shelfName(r), L.x0, row[0].y + L.ch / 2, 12 * tu, white(r === this.row ? .86 : .5), r === this.row ? 600 : 400));
+    L.cells.forEach((row, r) => txt(g, SHELF_SHORT[lang][r], L.x0, row[0].y + L.ch / 2, 12 * tu, white(r === this.row ? .86 : .5), r === this.row ? 600 : 400));
     L.cells.forEach(row => row.forEach(c => {
       const chosen = c.r === this.row && c.c === this.col;
       if (chosen) {
@@ -442,16 +428,20 @@ class Hero {
   }
 
   draw() {
-    const g = this.g;
+    const g = this.g, a = this.board.s.p;
     g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); g.globalAlpha = 1;
-    if (this.board.a < .995) this.drawGlide();
-    if (this.board.a > .005) this.drawBoard();
+    if (a < .995) this.drawGlide();
+    if (a > .005) this.drawBoard();
   }
 }
 
 /* ---------- wiring ---------- */
 applyLang();
 const hero = new Hero(document.getElementById('hero'));
+/* The pictures come in their own time; a held frame is drawn again as each arrives. */
+onImage = () => { if (STILL) redrawStill(); };
+SHELVES.forEach(row => row.forEach(d => { image(d.img); d.wins.forEach(w => { image(`icons/${w.app}.png`); if (w.img) image(w.img); }); }));
+[PINNED_ALL, PINNED_ROW].forEach(w => { image(w.img); image(`icons/${w.app}.png`); });
 const words = [...document.querySelectorAll('#line span')];
 let beatTimer = 0;
 hero.onBeat = i => { words.forEach((w, j) => w.classList.toggle('on', j === i)); clearTimeout(beatTimer); beatTimer = setTimeout(() => words.forEach(w => w.classList.remove('on')), 650); };
