@@ -536,21 +536,29 @@ pub unsafe fn dock(out: &Path, flick: &str) {
 
 /// Of a frame, what tells the size and place of the picture: the first and
 /// last white grid line (`hold` "grid") across the middle line and down the
-/// middle column, how many there are across, and the box of the small green window.
-fn settle_marks(raw: &[u8], width: u32, height: u32) -> [i64; 9] {
+/// middle column, how many there are across, the boxes of the small green
+/// and red windows, and of the desktops beneath them (teal, ochre).
+fn settle_marks(raw: &[u8], width: u32, height: u32) -> [i64; 21] {
     let px = |x: u32, y: u32| { let i = ((y * width + x) * 4) as usize; (raw[i + 2], raw[i + 1], raw[i]) };
     let white = |(r, g, b): (u8, u8, u8)| r > 200 && g > 200 && b > 200;
     let (mut left, mut right, mut lines, mut was) = (-1i64, -1i64, 0, false);
     for x in 0..width { let w = white(px(x, height / 2)); if w { if left < 0 { left = x as i64; } right = x as i64; if !was { lines += 1; } } was = w; }
     let (mut top, mut bottom) = (-1i64, -1i64);
     for y in 0..height { if white(px(width / 2, y)) { if top < 0 { top = y as i64; } bottom = y as i64; } }
-    let mut green = [i64::MAX, i64::MAX, -1, -1];
+    // The green and red windows, and the desktops under them, darkened or not.
+    let mut boxes = [[i64::MAX, i64::MAX, -1, -1]; 4];
     for y in 0..height { for x in 0..width {
         let (r, g, b) = px(x, y);
-        if g > 150 && r < 60 && b < 60 { green = [green[0].min(x as i64), green[1].min(y as i64), green[2].max(x as i64), green[3].max(y as i64)]; }
+        let (r16, g16, b16) = (r as u16, g as u16, b as u16);
+        let which = if g > 150 && r < 60 && b < 60 { 0 } else if r > 150 && g < 60 && b < 60 { 1 }
+            else if r < 12 && b > 25 && b16 * 10 > g16 * 11 && b16 * 10 < g16 * 15 { 2 }
+            else if b < 12 && r > 25 && r16 * 10 > g16 * 10 && r16 * 10 < g16 * 13 { 3 } else { continue };
+        let at = &mut boxes[which];
+        *at = [at[0].min(x as i64), at[1].min(y as i64), at[2].max(x as i64), at[3].max(y as i64)];
     }}
-    if green[2] < 0 { green = [-1; 4]; }
-    [left, right, lines, top, bottom, green[0], green[1], green[2], green[3]]
+    for at in &mut boxes { if at[2] < 0 { *at = [-1; 4]; } }
+    let [green, red, teal, ochre] = boxes;
+    [left, right, lines, top, bottom, green[0], green[1], green[2], green[3], red[0], red[1], red[2], red[3], teal[0], teal[1], teal[2], teal[3], ochre[0], ochre[1], ochre[2], ochre[3]]
 }
 
 /// How unlike `real` a frame is: the mean difference of every 2nd pixel's
@@ -568,11 +576,11 @@ fn unlike(raw: &[u8], real: &[u8], width: u32, height: u32) -> (f64, f64) {
 }
 
 /// The normal view coming forward to the real desktop on letting go, over
-/// maximized windows with a grid on them and a small green one: a fast, a
-/// slow (receded, then forward) and a middling move. `settle.csv`: each
-/// composed frame after letting go, its grid's extent and the green box
-/// (`settle_marks`), and how unlike the real desktop it lands on it is,
-/// taken before Flick ran (`unlike`); the last frames of each hold as BMPs.
+/// maximized windows with a grid on them and a small window on two: a fast,
+/// a slow (receded, then forward) and a middling move. `settle.csv`: each
+/// composed frame of a hold, its grid's extent and boxes (`settle_marks`),
+/// and how unlike the real desktop it lands on it is, taken before Flick
+/// ran (`unlike`); as BMPs, the frames either side of the real one coming.
 pub unsafe fn settle(out: &Path, flick: &str) {
     use std::sync::{atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering}, Arc, Mutex};
     let wait = |ms| std::thread::sleep(Duration::from_millis(ms));
@@ -588,7 +596,7 @@ pub unsafe fn settle(out: &Path, flick: &str) {
     let me = std::env::current_exe().unwrap();
     let mut windows = Vec::new();
     for (i, rgb, title, rect) in [(0, "90 0 90", "F grid 0", "0 0 0 0"), (1, "0 70 90", "F grid 1", "0 0 0 0"), (2, "90 80 0", "F grid 2", "0 0 0 0"),
-                                  (1, "0 200 0", "F green 1", "201 151 300 200"), (2, "0 200 0", "F green 2", "1301 707 333 177")] {
+                                  (1, "0 200 0", "F green 1", "201 151 300 200"), (2, "200 0 0", "F red 2", "1301 707 333 177")] {
         let mut args = vec!["hold".to_string()];
         args.extend(rgb.split(' ').map(str::to_owned));
         args.push(title.into());
@@ -600,47 +608,51 @@ pub unsafe fn settle(out: &Path, flick: &str) {
         super::vdapi::move_window_to_desktop(desk(i), hwnd).unwrap();
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let released = Arc::new(AtomicI64::new(0));
+    let (pressed, released) = (Arc::new(AtomicI64::new(0)), Arc::new(AtomicI64::new(0)));
     // The desktop being landed on, and a real one to keep as it is.
     let landing = Arc::new(AtomicUsize::new(usize::MAX));
     let keep: Arc<Mutex<Option<usize>>> = Arc::default();
-    let (o, s1, s2, s3, s4) = (out.to_owned(), stop.clone(), released.clone(), landing.clone(), keep.clone());
+    let (o, s1, s2, s3, s4, s5) = (out.to_owned(), stop.clone(), released.clone(), landing.clone(), keep.clone(), pressed.clone());
     let recorder = std::thread::spawn(move || {
         let capture = Capture::new().unwrap();
         let (width, height) = (capture.width, capture.height);
         let mut frequency = 0; QueryPerformanceFrequency(&mut frequency).unwrap();
-        let mut csv = String::from("hold,after_release_ms,grid_left,grid_right,grid_lines,grid_top,grid_bottom,green_l,green_t,green_r,green_b,mean_diff,share_off\n");
+        let mut csv = String::from("hold,ms,after_release_ms,grid_left,grid_right,grid_lines,grid_top,grid_bottom,green_l,green_t,green_r,green_b,red_l,red_t,red_r,red_b,teal_l,teal_t,teal_r,teal_b,ochre_l,ochre_t,ochre_r,ochre_b,mean_diff,share_off\n");
+        let row = |m: [i64; 21]| m.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let mut reals: Vec<Option<Vec<u8>>> = vec![None; 3];
-        let (mut latest, mut hold, mut was, mut ring): (Vec<u8>, usize, i64, Vec<(f64, Vec<u8>)>) = (Vec::new(), 0, 0, Vec::new());
-        let save = |hold: usize, ring: &mut Vec<(f64, Vec<u8>)>| {
-            let n = ring.len();
-            for (k, (ms, raw)) in ring.drain(..).enumerate() { save_bmp(&o.join(format!("s{hold}-last{}-{ms:.0}ms.bmp", n - 1 - k)), &raw, width, height); }
-        };
+        let (mut latest, mut hold, mut was, mut real_seen): (Vec<u8>, usize, i64, bool) = (Vec::new(), 0, 0, false);
+        let mut before: Option<(f64, Vec<u8>)> = None;
         while !s1.load(Ordering::SeqCst) {
             if let Some((present, raw)) = capture.grab().unwrap() {
-                let let_go = s2.load(Ordering::SeqCst);
-                if let_go != was { if was != 0 { save(hold, &mut ring); } was = let_go; if let_go != 0 { hold += 1; } }
+                let press = s5.load(Ordering::SeqCst);
+                if press != was { was = press; if press != 0 { hold += 1; real_seen = false; before = None; } }
                 let on = s3.load(Ordering::SeqCst);
-                if let_go != 0 {
-                    let ms = (present - let_go) as f64 * 1000.0 / frequency as f64;
+                if press != 0 {
+                    let ms = (present - press) as f64 * 1000.0 / frequency as f64;
+                    let let_go = s2.load(Ordering::SeqCst);
+                    let after = if let_go > press { (present - let_go) as f64 * 1000.0 / frequency as f64 } else { f64::NAN };
                     let m = settle_marks(&raw, width, height);
                     let (mean, off) = reals.get(on).and_then(Option::as_ref).map_or((f64::NAN, f64::NAN), |real| unlike(&raw, real, width, height));
-                    writeln!(csv, "{hold},{ms:.1},{},{},{},{},{},{},{},{},{},{mean:.3},{off:.5}", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]).unwrap();
-                    ring.push((ms, raw.clone()));
-                    if ring.len() > 4 { ring.remove(0); }
+                    writeln!(csv, "{hold},{ms:.1},{after:.1},{},{mean:.3},{off:.5}", row(m)).unwrap();
+                    // The last frame of the picture and the first of the real desktop.
+                    if after >= 0.0 && !real_seen {
+                        if off < 0.02 {
+                            real_seen = true;
+                            if let Some((at, last)) = before.take() { save_bmp(&o.join(format!("s{hold}-picture-{at:.0}ms.bmp")), &last, width, height); }
+                            save_bmp(&o.join(format!("s{hold}-real-{after:.0}ms.bmp")), &raw, width, height);
+                        } else { before = Some((after, raw.clone())); }
+                    }
                 }
                 latest = raw;
             }
             if let Some(i) = s4.lock().unwrap().take() {
                 if !latest.is_empty() {
-                    let m = settle_marks(&latest, width, height);
-                    writeln!(csv, "real-{i},0,{},{},{},{},{},{},{},{},{},0,0", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]).unwrap();
+                    writeln!(csv, "real-{i},0,0,{},0,0", row(settle_marks(&latest, width, height))).unwrap();
                     save_bmp(&o.join(format!("real-{i}.bmp")), &latest, width, height);
                     reals[i] = Some(latest.clone());
                 }
             }
         }
-        if was != 0 { save(hold, &mut ring); }
         std::fs::write(o.join("settle.csv"), csv).unwrap();
     });
     wait(600);
@@ -665,11 +677,12 @@ pub unsafe fn settle(out: &Path, flick: &str) {
     let mut report = String::new();
     for (label, dx, ms, rest, to) in [("fast", 330, 100, 40, 2), ("slow", -330, 1500, 400, 1), ("middling", 330, 750, 30, 2), ("fast-back", -330, 100, 40, 1)] {
         landing.store(to, Ordering::SeqCst);
+        pressed.store(qpc(), Ordering::SeqCst);
         mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
         stroke(dx, ms); wait(rest);
         released.store(qpc(), Ordering::SeqCst);
         mouse(MOUSEEVENTF_XUP, 0, 0); wait(1800);
-        released.store(0, Ordering::SeqCst); wait(400);
+        pressed.store(0, Ordering::SeqCst); released.store(0, Ordering::SeqCst); wait(400);
         report += &format!("{label}: landed on the expected desktop: {}\n", super::vdapi::get_current_desktop().unwrap().id() == ids[to]);
     }
     stop.store(true, Ordering::SeqCst);
