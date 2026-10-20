@@ -2544,26 +2544,28 @@ impl Board {
             let _ = ReleaseCapture();
         }
         let Some(press) = self.press.take() else { return Action::None };
+        // Where a drag ends is judged by the board as it was dragged over,
+        // before the cell released on is peeked at and its windows shown.
+        let dropped = press.dragging.then(|| match &press.hit {
+            Hit::Window { cell, hwnd } => self.drop_window(cell, *hwnd, x, y),
+            Hit::Cell(id) => match self.slot_at(id, x, y) {
+                Some(Slot::Row { row, index, .. }) => Action::MoveCell { id: id.clone(), row, index },
+                Some(Slot::NewRow { at, .. }) => Action::MoveCellToNewRow { id: id.clone(), at },
+                None => Action::None,
+            },
+            Hit::RowName(from) => match self.row_slot_at(*from, y) {
+                Some((at, _)) if at != *from => Action::MoveRow { from: *from, at },
+                _ => Action::None,
+            },
+            _ => Action::None,
+        });
         self.hover = self.hit_test(x, y);
         // Released on the cell pointed at, it is gone to as it is shown.
         if !matches!(&press, Press { hit: Hit::Cell(id), dragging: false, .. } if *id == self.hover_cell()) {
             self.update_peek(Instant::now());
         }
         self.invalidate();
-        if press.dragging {
-            let action = match &press.hit {
-                Hit::Window { cell, hwnd } => self.drop_window(cell, *hwnd, x, y),
-                Hit::Cell(id) => match self.slot_at(id, x, y) {
-                    Some(Slot::Row { row, index, .. }) => Action::MoveCell { id: id.clone(), row, index },
-                    Some(Slot::NewRow { at, .. }) => Action::MoveCellToNewRow { id: id.clone(), at },
-                    None => Action::None,
-                },
-                Hit::RowName(from) => match self.row_slot_at(*from, y) {
-                    Some((at, _)) if at != *from => Action::MoveRow { from: *from, at },
-                    _ => Action::None,
-                },
-                _ => Action::None,
-            };
+        if let Some(action) = dropped {
             // Put the thumbnail back; a successful move replaces the model anyway.
             self.update_thumbnails();
             return action;
@@ -2601,43 +2603,36 @@ impl Board {
         })
     }
 
-    /// A window of cell `from` was dragged to a point. Dropped in a place
-    /// of the pinned windows it is pinned so; dropped on a map cell it goes
-    /// to that cell, on the monitor whose map that was; dropped elsewhere
-    /// among the previews it is no longer pinned, or only changes monitor.
+    /// A window of cell `from` was dragged to a point (`window_drop`).
     fn drop_window(&self, from: &str, hwnd: isize, x: f32, y: f32) -> Action {
         let windows = self.tile_windows();
         let Some(&(window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
-        let pin = Pin::of(window, everywhere);
-        let set = |to: Pin| {
-            let (row, all) = to.flags();
-            if to == pin { Action::None } else { Action::SetPin { window: HWND(hwnd), row, all } }
-        };
-        if let Some(to) = self.zone_at(x, y) {
-            return set(to);
-        }
         let on_map = self.cell_at(x, y).is_some() || {
             let (map, mx, my) = self.map_at(x, y);
             contains(&map.layout.bounds, mx, my)
         };
-        // On every desktop it has no cell to go to.
-        if pin == Pin::Everywhere {
-            return if on_map { Action::None } else { set(Pin::Off) };
-        }
-        if pin == Pin::Row && !on_map && self.plates.iter().any(|plate| contains(plate, x, y)) {
-            return set(Pin::Off);
-        }
-        let from_monitor = Some(self.monitor_of(window));
         let (to_cell, to_monitor) = match self.cell_at(x, y) {
-            Some((target, m)) => (Some(target.id.clone()), m),
+            Some((target, m)) => (Some(target.id.as_str()), m),
             None => (None, self.map_at(x, y).0.monitor),
         };
-        let cell = to_cell.filter(|id| id != from);
-        let monitor = if Some(to_monitor) != from_monitor { self.monitor_on_screen(to_monitor) } else { None };
-        if cell.is_none() && monitor.is_none() {
-            Action::None
-        } else {
-            Action::MoveWindow { window: HWND(hwnd), cell, monitor }
+        let spot = DropSpot {
+            zone: self.zone_at(x, y),
+            on_map,
+            on_plate: self.plates.iter().any(|plate| contains(plate, x, y)),
+            cell: to_cell,
+            other_monitor: to_monitor != self.monitor_of(window),
+        };
+        match window_drop(from, Pin::of(window, everywhere), &spot) {
+            WindowDrop::Nothing => Action::None,
+            WindowDrop::Pin(to) => {
+                let (row, all) = to.flags();
+                Action::SetPin { window: HWND(hwnd), row, all }
+            }
+            WindowDrop::Move { cell, monitor } => Action::MoveWindow {
+                window: HWND(hwnd),
+                cell,
+                monitor: if monitor { self.monitor_on_screen(to_monitor) } else { None },
+            },
         }
     }
 
@@ -3964,6 +3959,52 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     layout
 }
 
+/// Where a dragged window was released, as `window_drop` judges it.
+struct DropSpot<'a> {
+    /// The place of the pinned windows it is in.
+    zone: Option<Pin>,
+    /// Over a map (on a cell or not).
+    on_map: bool,
+    /// Among the previews.
+    on_plate: bool,
+    /// The map cell under it.
+    cell: Option<&'a str>,
+    /// On another monitor than the window's.
+    other_monitor: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum WindowDrop {
+    Nothing,
+    Pin(Pin),
+    /// To another cell, and to the monitor it was dropped on.
+    Move { cell: Option<CellId>, monitor: bool },
+}
+
+/// What becomes of a window of cell `from`, pinned `pin`, released at
+/// `spot`: in a place of the pinned windows it is pinned so; on a map cell
+/// it goes to that cell, on the monitor whose map that was; elsewhere
+/// among the previews it is no longer pinned, or only changes monitor.
+fn window_drop(from: &str, pin: Pin, spot: &DropSpot) -> WindowDrop {
+    let set = |to: Pin| if to == pin { WindowDrop::Nothing } else { WindowDrop::Pin(to) };
+    if let Some(to) = spot.zone {
+        return set(to);
+    }
+    // On every desktop it has no cell to go to.
+    if pin == Pin::Everywhere {
+        return if spot.on_map { WindowDrop::Nothing } else { set(Pin::Off) };
+    }
+    if pin == Pin::Row && !spot.on_map && spot.on_plate {
+        return set(Pin::Off);
+    }
+    let cell = spot.cell.filter(|id| *id != from).map(CellId::from);
+    if cell.is_none() && !spot.other_monitor {
+        WindowDrop::Nothing
+    } else {
+        WindowDrop::Move { cell, monitor: spot.other_monitor }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4372,5 +4413,27 @@ mod tests {
         assert_eq!((none.0, none.1, none.2), (two.0, two.1, two.2));
         assert_eq!((one.0, one.1, one.2), (two.0, two.1, two.2));
         assert_eq!((none.3, one.3, two.3), (0, 1, 2));
+    }
+
+    #[test]
+    fn a_dropped_window_goes_to_the_cell_or_the_pin_it_was_released_on() {
+        let at = |zone, on_map, on_plate, cell| DropSpot { zone, on_map, on_plate, cell, other_monitor: false };
+        let moved = |cell: &str| WindowDrop::Move { cell: Some(cell.to_string()), monitor: false };
+        // On another cell of the map it goes there; on its own, nowhere.
+        assert_eq!(window_drop("a", Pin::Off, &at(None, true, false, Some("b"))), moved("b"));
+        assert_eq!(window_drop("a", Pin::Row, &at(None, true, false, Some("b"))), moved("b"));
+        assert_eq!(window_drop("a", Pin::Off, &at(None, true, false, Some("a"))), WindowDrop::Nothing);
+        // In a place of the pinned windows it is pinned so.
+        assert_eq!(window_drop("a", Pin::Off, &at(Some(Pin::Everywhere), false, false, None)), WindowDrop::Pin(Pin::Everywhere));
+        assert_eq!(window_drop("a", Pin::Off, &at(Some(Pin::Row), false, false, None)), WindowDrop::Pin(Pin::Row));
+        assert_eq!(window_drop("a", Pin::Row, &at(Some(Pin::Row), false, false, None)), WindowDrop::Nothing);
+        // Anywhere else nothing happens, but a pinned one is let go among the previews.
+        assert_eq!(window_drop("a", Pin::Off, &at(None, false, true, None)), WindowDrop::Nothing);
+        assert_eq!(window_drop("a", Pin::Off, &at(None, false, false, None)), WindowDrop::Nothing);
+        assert_eq!(window_drop("a", Pin::Row, &at(None, false, true, None)), WindowDrop::Pin(Pin::Off));
+        assert_eq!(window_drop("a", Pin::Everywhere, &at(None, true, false, Some("b"))), WindowDrop::Nothing);
+        // Over another monitor's map, it only changes monitor.
+        let other = DropSpot { other_monitor: true, ..at(None, true, false, None) };
+        assert_eq!(window_drop("a", Pin::Off, &other), WindowDrop::Move { cell: None, monitor: true });
     }
 }
