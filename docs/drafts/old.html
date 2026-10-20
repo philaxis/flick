@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flick — 윈도우 11 가상 데스크톱을 2D 격자로</title>
+<meta name="description" content="버튼을 누른 채 마우스를 밀면 옆 데스크톱으로 넘어갑니다. 윈도우 11 가상 데스크톱을 2D 격자로 쓰는 무료 오픈 소스 프로그램. Hold a button, flick the mouse, land on the next desktop. Free and open source for Windows 11.">
+<link rel="canonical" href="https://philaxis.github.io/flick/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Flick">
+<meta property="og:title" content="Flick — 누르고, 밀면, 옆 데스크톱.">
+<meta property="og:description" content="윈도우 11 가상 데스크톱을 2D 격자로. 무료, 오픈 소스. / Hold. Flick. Next desktop. Windows 11 virtual desktops as a 2D grid.">
+<meta property="og:url" content="https://philaxis.github.io/flick/">
+<meta property="og:locale" content="ko_KR">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:image" content="https://philaxis.github.io/flick/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#f3f4f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#08090b" media="(prefers-color-scheme: dark)">
+<link rel="icon" type="image/png" href="icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: one column as wide as the screen-shaped stage; the line and the download sit on its top edge. */
+:root{
+  --bg:#f3f4f7; --ink:#12141a; --mute:#646a78; --line:rgba(18,20,26,.14);
+  --accent:#579eff; --accent-ink:#2a6fe6; --on-accent:#06101f;
+  --stage-shadow:0 44px 90px -38px rgba(22,34,66,.55), 0 0 0 1px rgba(18,20,26,.22);
+  --font:"IBM Plex Sans KR","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif;
+  --gut:20px;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#08090b; --ink:#eef0f4; --mute:#8b919d; --line:rgba(255,255,255,.14);
+    --accent-ink:#579eff;
+    --stage-shadow:0 0 0 1px rgba(255,255,255,.12);
+    color-scheme:dark;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.4 var(--font);padding-inline:var(--gut);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:inherit;text-decoration:none}
+:focus-visible{outline:2px solid var(--accent-ink);outline-offset:3px;border-radius:6px}
+.col{width:min(1240px,100%,max(600px,(100svh - 236px)*16/9));margin-inline:auto}
+
+.top{display:flex;align-items:center;justify-content:space-between;height:68px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:20px;letter-spacing:-.01em}
+.brand img{width:28px;height:28px;display:block}
+.top nav{display:flex;align-items:center;gap:22px;font-size:14px;font-weight:500;color:var(--mute)}
+.top nav a:hover,.top nav button:hover{color:var(--ink)}
+.top nav button{font:inherit;color:inherit;background:none;border:0;padding:6px 0;cursor:pointer}
+
+.say{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding-block:10px 30px}
+h1{margin:0;font-weight:700;letter-spacing:-.035em;line-height:1.04;font-size:clamp(34px,5.6vw,76px);text-wrap:balance}
+:lang(en) h1{font-size:clamp(34px,4.7vw,64px);letter-spacing:-.04em}
+h1 span{transition:color .5s ease}
+h1 span.on{color:var(--accent-ink);transition-duration:.08s}
+.say .dl{flex:none;margin-bottom:6px}
+.dl{display:inline-flex;align-items:center;gap:10px;height:52px;padding:0 22px 0 18px;border-radius:12px;background:var(--accent);color:var(--on-accent);font-weight:600;font-size:17px;white-space:nowrap;transition:transform .15s ease,filter .15s ease}
+.dl:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.dl:active{transform:translateY(0)}
+.dl svg{width:18px;height:18px;flex:none}
+
+.stage{position:relative;aspect-ratio:16/9;border-radius:14px;overflow:hidden;background:#17212e;box-shadow:var(--stage-shadow)}
+.stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+
+.end{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-top:clamp(80px,12vw,170px);padding-top:34px;border-top:1px solid var(--line)}
+.end .brand{font-size:clamp(34px,5vw,64px);gap:18px;letter-spacing:-.035em}
+.end .brand img{width:clamp(44px,5.4vw,70px);height:auto}
+footer{display:flex;gap:8px;padding-block:44px 22px;font-size:13px;color:var(--mute)}
+/* A note for the curious, kept out of the way. */
+.inspiration{margin:0;padding-bottom:40px;max-width:68ch;font-size:12px;line-height:1.65;color:var(--mute);opacity:.62}
+.inspiration b{display:block;margin-bottom:3px;font-weight:500;font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+footer a{text-decoration:underline;text-decoration-color:var(--line);text-underline-offset:3px}
+footer a:hover{color:var(--ink)}
+
+@media (max-width:820px){
+  .say{flex-direction:column;align-items:flex-start;gap:22px;padding-bottom:26px}
+  h1,:lang(en) h1{font-size:clamp(34px,10.4vw,60px)}
+}
+@media (max-width:640px){
+  :root{--gut:16px}
+  .col{width:100%}
+  .top{height:58px}
+  .stage{aspect-ratio:5/4;border-radius:12px}
+  .end{flex-direction:column;align-items:flex-start}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="col">
+  <header class="top">
+    <a class="brand" href="https://philaxis.github.io/flick/"><img src="icon.png" alt="" width="28" height="28">Flick</a>
+    <nav>
+      <button type="button" id="lang" data-ko="English" data-en="한국어" data-ko-label="Switch to English" data-en-label="한국어로 보기">English</button>
+      <a href="https://github.com/philaxis/flick">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="say">
+        <h1 id="line"><span data-ko="누르고," data-en="Hold.">누르고,</span> <span data-ko="밀면," data-en="Flick.">밀면,</span> <span data-ko="옆 데스크톱." data-en="Next desktop.">옆 데스크톱.</span></h1>
+        <a class="dl" href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2.5v9M5 8l4 4 4-4M3 15.5h12"/></svg>
+          <span data-ko="다운로드" data-en="Download">다운로드</span>
+        </a>
+      </div>
+
+      <div class="stage" id="stage" role="img"
+           data-ko-label="Flick 사용 화면: 마우스 옆 버튼을 누른 채 밀면 옆 데스크톱으로 넘어가고, 한 번 누르면 모든 창이 보입니다."
+           data-en-label="Flick in use: hold the mouse side button and flick to land on the next desktop; tap it to see every window."
+           aria-label="Flick 사용 화면">
+        <canvas id="hero"></canvas>
+      </div>
+    </section>
+
+    <section class="end">
+      <div class="brand"><img src="icon.png" alt="" width="70" height="70">Flick</div>
+    </section>
+  </main>
+
+  <footer>
+    <span>MIT</span><span>·</span>
+    <a href="https://github.com/philaxis/flick" data-ko="소스" data-en="source">소스</a><span>·</span>
+    <span>made by <a href="https://philaxis.github.io">philaxis</a></span>
+  </footer>
+  <p class="inspiration"><b>Design inspiration</b><span data-ko="Flick의 아이디어는 단백질 접힘 현상에서 일부 영감을 받았습니다. 일렬로 연결된 아미노산들이 접히면서 복잡한 공간 구조를 형성한다는 점이 흥미로웠습니다. 그렇다면 가상 데스크톱도 꼭 일렬로 배치해야 할까요? 우리가 작업을 구분하고 연결하는 방식에 따라 공간적으로 배치할 수는 없을까요?" data-en="The idea for Flick was partly inspired by protein folding — how a linear chain of amino acids can fold into a complex spatial structure. It made me wonder: why should virtual desktops be confined to a single line? What if we could arrange them in a space that better reflects how we organize our work?">Flick의 아이디어는 단백질 접힘 현상에서 일부 영감을 받았습니다. 일렬로 연결된 아미노산들이 접히면서 복잡한 공간 구조를 형성한다는 점이 흥미로웠습니다. 그렇다면 가상 데스크톱도 꼭 일렬로 배치해야 할까요? 우리가 작업을 구분하고 연결하는 방식에 따라 공간적으로 배치할 수는 없을까요?</span></p>
+</div>
+
+<script>
+(() => {
+'use strict';
+const ACCENT = '#579eff';
+const FONT = '"IBM Plex Sans KR","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif';
+const qs = new URLSearchParams(location.search);
+const FREEZE = qs.has('t') ? parseFloat(qs.get('t')) : null;   // ?t=3.6 holds one frame of the loop
+// The loop is the page's content, like an embedded video, so it plays even
+// where the system asks for reduced motion (Windows reports that whenever
+// its animation effects are off, which left desktop visitors a still image).
+const STILL = FREEZE !== null;
+
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const inOut = t => (t = clamp(t, 0, 1), t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const follow = (cur, to, dt, tau) => to + (cur - to) * Math.exp(-dt / tau);
+const white = a => `rgba(255,255,255,${a})`;
+const accent = a => `rgba(87,158,255,${a})`;
+
+/* ---------- language ---------- */
+let lang = 'ko';
+try { lang = localStorage.getItem('flick-lang') || ''; } catch (e) { lang = ''; }
+if (qs.get('lang')) lang = qs.get('lang');
+if (lang !== 'ko' && lang !== 'en') lang = (navigator.languages || [navigator.language || 'ko']).some(l => /^ko/i.test(l)) ? 'ko' : 'en';
+const tr = v => (v && typeof v === 'object') ? v[lang] : v;
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-ko]').forEach(el => { el.textContent = el.dataset[lang]; });
+  document.querySelectorAll('[data-ko-label]').forEach(el => { el.setAttribute('aria-label', el.dataset[lang + 'Label']); });
+}
+
+/* ---------- drawing helpers ---------- */
+function rr(g, x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  g.beginPath(); g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function bar(g, x, y, w, h, c, r) { g.fillStyle = c; if (r) { rr(g, x, y, w, h, r); g.fill(); } else g.fillRect(x, y, w, h); }
+function txt(g, s, x, y, px, c, weight, align) {
+  g.font = `${weight || 400} ${px}px ${FONT}`; g.fillStyle = c; g.textAlign = align || 'left'; g.textBaseline = 'middle'; g.fillText(s, x, y);
+}
+
+/* ---------- the demo desktops: one tint each, one or two plain windows ---------- */
+const TINTS = {            // wallpaper from, wallpaper to, the colour of the blocks inside its windows
+  teal:   ['#0d2a2e', '#216168', '#35a89f'],
+  amber:  ['#33230d', '#80591f', '#e3a640'],
+  violet: ['#1e1638', '#55439a', '#8f76e3'],
+  rose:   ['#351420', '#863552', '#e27397'],
+  green:  ['#11281a', '#2f6d46', '#56b47a'],
+  slate:  ['#151c28', '#3c4f6a', '#8195b3'],
+};
+/* Soft blocks inside a window, as fractions of its content box: x, y, w, h, strength. */
+const BLOCKS = {
+  side: [[0, 0, .22, 1, .28], [.25, 0, .75, .58, .9], [.25, .63, .36, .37, .28], [.64, .63, .36, .37, .28]],
+  hero: [[0, 0, 1, .5, .9], [0, .56, .31, .44, .28], [.345, .56, .31, .44, .28], [.69, .56, .31, .44, .28]],
+  list: [[0, 0, 1, .29, .9], [0, .355, 1, .29, .28], [0, .71, 1, .29, .28]],
+  cols: [[0, 0, .48, 1, .9], [.52, 0, .48, .47, .28], [.52, .53, .48, .47, .28]],
+  one:  [[0, 0, 1, .62, .9], [0, .69, .6, .31, .28]],
+};
+function paintWindow(g, win, w, h, u) {
+  const c = TINTS[win.tint][2], top = 26 * u, p = 16 * u;
+  g.save(); rr(g, 0, 0, w, h, 10 * u); g.clip();
+  bar(g, 0, 0, w, h, '#f5f6f9'); bar(g, 0, 0, w, top, '#e6e8ee');
+  bar(g, 12 * u, top / 2 - 4 * u, 8 * u, 8 * u, c, 4 * u);
+  txt(g, tr(win.label), 27 * u, top / 2 + .5 * u, 10.5 * u, '#565c6b', 500);
+  for (let i = 0; i < 3; i++) bar(g, w - (20 + i * 13) * u, top / 2 - 3 * u, 6 * u, 6 * u, '#c3c8d2', 3 * u);
+  const cw = w - 2 * p, ch = h - top - 2 * p;
+  BLOCKS[win.kind].forEach(b => { g.globalAlpha = b[4]; bar(g, p + b[0] * cw, top + p + b[1] * ch, b[2] * cw, b[3] * ch, c, 8 * u); });
+  g.restore();
+}
+
+/* ---------- the grid, with the real navigation rules ---------- */
+let WIN_ID = 0;
+const W = (label, kind, x, y, w, h) => ({ id: ++WIN_ID, label, kind, r: [x, y, w, h] });
+const D = (tint, ...wins) => ({ tint, wins: wins.map(w => Object.assign(w, { tint })) });
+function heroModel() {
+  WIN_ID = 0;
+  const solo = (tint, ko, en) => D(tint, W({ ko, en }, 'one', .2, .14, .6, .68));
+  return { cur: { r: 0, c: 0 }, rows: [
+    { name: '', last: null, cells: [
+      D('teal', W({ ko: '편집기', en: 'Editor' }, 'side', .14, .1, .72, .76)),
+      D('amber', W({ ko: '브라우저', en: 'Browser' }, 'hero', .05, .1, .41, .76), W({ ko: '메모', en: 'Notes' }, 'list', .49, .1, .41, .76)),
+      solo('slate', '터미널', 'Terminal') ] },
+    { name: '', last: null, cells: [
+      D('violet', W({ ko: '디자인', en: 'Design' }, 'cols', .06, .09, .54, .78), W({ ko: '채팅', en: 'Chat' }, 'list', .62, .3, .29, .57)),
+      solo('rose', '사진', 'Photos'),
+      solo('green', '표', 'Sheet') ] },
+    { name: '', last: null, cells: [
+      solo('green', '음악', 'Music'),
+      solo('rose', '메일', 'Mail') ] },
+  ] };
+}
+
+class Grid {
+  constructor(model) {
+    this.m = model; this.cur = { ...model.cur }; this.show = false; this.alpha = 0;
+    this.shifts = model.rows.map((_, r) => this.shift(r)); this.hl = { x: this.lead(), y: this.cur.r }; this.colsE = this.columns(); this.leadE = this.lead();
+  }
+  anchor(r) { return r === this.cur.r ? this.cur.c : (this.m.rows[r].last ?? 0); }
+  lead() { return Math.max(...this.m.rows.map((_, r) => this.anchor(r))); }
+  shift(r) { return this.lead() - this.anchor(r); }
+  columns() { return this.lead() + Math.max(1, ...this.m.rows.map((row, r) => row.cells.length - this.anchor(r))); }
+  /* The app names an unnamed shelf by its number. */
+  name(r) { return tr(this.m.rows[r].name) || tr({ ko: `선반 ${r + 1}`, en: `Shelf ${r + 1}` }); }
+  /* Left/right stay in the row and stop at its ends; up/down land on the cell that row was last left on (its first if never visited). */
+  target(dir) {
+    const { r, c } = this.cur, rows = this.m.rows;
+    if (dir === 'left') return c > 0 ? { r, c: c - 1 } : null;
+    if (dir === 'right') return c + 1 < rows[r].cells.length ? { r, c: c + 1 } : null;
+    const nr = dir === 'up' ? r - 1 : r + 1;
+    if (nr < 0 || nr >= rows.length) return null;
+    return { r: nr, c: Math.min(rows[nr].last ?? 0, rows[nr].cells.length - 1) };
+  }
+  move(dir) {
+    const to = this.target(dir);
+    if (!to) return false;
+    this.m.rows[this.cur.r].last = this.cur.c; this.cur = to;
+    return true;
+  }
+  step(dt) {
+    const tau = .085;
+    this.m.rows.forEach((_, r) => { this.shifts[r] = follow(this.shifts[r], this.shift(r), dt, tau); });
+    this.hl.x = follow(this.hl.x, this.lead(), dt, tau); this.hl.y = follow(this.hl.y, this.cur.r, dt, tau);
+    this.colsE = follow(this.colsE, this.columns(), dt, tau); this.leadE = follow(this.leadE, this.lead(), dt, tau);
+    this.alpha = follow(this.alpha, this.show ? 1 : 0, dt, this.show ? .05 : .11);
+  }
+}
+
+/* Flick's switcher: the panel the real overlay draws (same proportions and opacities), the shelf's name under the grid. */
+const MINI_TITLE = 26;
+function drawMini(g, grid, cx, cy, s, alpha) {
+  const CW = 46 * s, CH = 30 * s, GAP = 7 * s, PAD = 20 * s, rows = grid.m.rows;
+  const pw = PAD * 2 + grid.colsE * (CW + GAP) - GAP, ph = PAD * 2 + rows.length * (CH + GAP) - GAP + MINI_TITLE * s;
+  const x0 = cx - pw / 2, y0 = cy - ph / 2;
+  const X = c => x0 + PAD + c * (CW + GAP), Y = r => y0 + PAD + r * (CH + GAP);
+  g.save(); g.globalAlpha *= alpha;
+  rr(g, x0, y0, pw, ph, 16 * s); g.fillStyle = 'rgba(19,20,24,.86)'; g.fill(); g.strokeStyle = white(.10); g.lineWidth = 1; g.stroke();
+  g.save(); rr(g, x0 + 3 * s, y0, pw - 6 * s, ph, 14 * s); g.clip();
+  bar(g, X(grid.leadE) - GAP / 2, y0 + PAD - GAP / 2, CW + GAP, rows.length * (CH + GAP), white(.045), 10 * s);
+  rows.forEach((row, r) => row.cells.forEach((_, c) => bar(g, X(c + grid.shifts[r]), Y(r), CW, CH, white(r === grid.cur.r ? .17 : .08), 7 * s)));
+  txt(g, grid.name(grid.cur.r), x0 + pw / 2, y0 + ph - (PAD * .55 + MINI_TITLE * s / 2), 13 * s, white(.88), 600, 'center');
+  g.restore();
+  const hx = X(grid.hl.x), hy = Y(grid.hl.y);
+  [[5, .07], [3, .12], [1.5, .20]].forEach(([k, a]) => bar(g, hx - k * s, hy - k * s, CW + 2 * k * s, CH + 2 * k * s, accent(a), (7 + k) * s));
+  bar(g, hx, hy, CW, CH, ACCENT, 7 * s);
+  g.restore();
+}
+
+function fit(cv) {
+  const r = cv.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 2), w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  return { w, h, dpr };
+}
+
+/* ---------- hero: a desktop, Flick's switcher and the board, played on a loop ---------- */
+const SCRIPT = [
+  [.5, h => h.press()],
+  [1.1, h => h.flick('right')],
+  [2.3, h => h.flick('down')],
+  [3.4, h => h.release()],
+  [3.9, h => h.tap()],
+  [4.4, h => h.cursorTo(h.tilePoint(), .6)],
+  [5.1, h => h.grab()],
+  [5.25, h => h.cursorTo(h.cellPoint(1, 2), 1.0)],
+  [6.45, h => h.drop()],
+  [7.2, h => h.tap()],
+  [7.9, h => h.press()],
+  [8.4, h => h.flick('up')],
+  [9.5, h => h.flick('left')],
+  [10.3, h => h.release()],
+];
+const LOOP = 11;   // the loop ends on the desktop it starts on
+/* A flick of the hand: out at once, held a moment, then a slow drift back to rest. */
+const jolt = t => t < 0 ? 0 : t < .07 ? 1 - Math.pow(1 - t / .07, 3) : t < .2 ? 1 : 1 - inOut((t - .2) / .75);
+
+class Hero {
+  constructor(cv) {
+    this.cv = cv; this.g = cv.getContext('2d'); this.sprites = new Map(); this.walls = new Map(); this.visible = true; this.quiet = false;
+    this.onBeat = () => {};
+    this.reset(); this.resize();
+  }
+  reset() {
+    this.grid = new Grid(heroModel()); this.t = 0; this.si = 0; this.held = false; this.hideAt = 0;
+    this.cur = { x: .5, y: .56 }; this.tween = null; this.tapUntil = 0; this.grip = 0; this.beatAt = null; this.hand = { vx: 0, vy: 0, t0: -9, side: 0 };
+    this.board = { open: false, a: 0, cell: null, rects: new Map(), drag: null, drop: null };
+  }
+  resize() {
+    const f = fit(this.cv); this.W = f.w; this.H = f.h; this.dpr = f.dpr;
+    this.narrow = this.W < 560; this.u = this.H / (this.narrow ? 400 : 562); this.TB = 22 * this.u;
+    this.sprites.clear(); this.walls.clear();
+  }
+  cell(pos) { return this.grid.m.rows[pos.r].cells[pos.c]; }
+  beat(i) { if (!this.quiet) this.onBeat(i); }
+  press() { this.held = true; this.beat(0); }
+  release() { this.held = false; this.hideAt = this.t + .3; }
+  /* The screen changes at once and the cursor is frozen, as in the app: only the hand moves and the switcher's highlight glides. */
+  flick(dir) {
+    const v = { left: [-1, 0], right: [1, 0], up: [0, -1], down: [0, 1] }[dir];
+    Object.assign(this.hand, { vx: v[0], vy: v[1], t0: this.t });
+    this.beat(1);
+    if (this.grid.move(dir)) this.beatAt = this.t + .28;
+  }
+  tap() {
+    this.tapUntil = this.t + .2; const b = this.board;
+    if (b.open) { b.open = false; b.drag = null; return; }
+    b.open = true; b.cell = { ...this.grid.cur }; b.rects.clear(); b.drag = null; b.drop = null; this.hideAt = 0;
+    const DH = this.H - this.TB, th = this.boardLayout().th;
+    this.cell(b.cell).wins.forEach(win => b.rects.set(win.id, { x: win.r[0] * this.W, y: win.r[1] * DH - th, w: win.r[2] * this.W, h: win.r[3] * DH + th, a: 1, dying: false }));
+  }
+  cursorTo(p, d) { this.tween = { x0: this.cur.x, y0: this.cur.y, x1: p.x, y1: p.y, t0: this.t, d }; }
+  grab() { const wins = this.cell(this.board.cell).wins; this.board.drag = { id: wins[wins.length - 1].id, k: 0 }; }
+  drop() {
+    const b = this.board, d = b.drag; b.drag = null;
+    if (!d || !b.drop) return;
+    const from = this.cell(b.cell).wins, i = from.findIndex(w => w.id === d.id);
+    this.cell(b.drop).wins.push(from.splice(i, 1)[0]);
+    b.rects.get(d.id).dying = true; b.drop = null;
+  }
+  tilePoint() { const L = this.boardLayout(), t = L.tiles[L.tiles.length - 1]; return { x: (t.x + t.w * .46) / this.W, y: (t.y + L.th + (t.h - L.th) * .4) / this.H }; }
+  cellPoint(r, c) { const b = this.boardLayout().rows[r][c]; return { x: (b.x + b.w / 2) / this.W, y: (b.y + b.h * .6) / this.H }; }
+
+  /* The board, following the app: large previews on top, the map of squares below with its rows shifted onto one column. */
+  boardLayout() {
+    const { W: w, H, u: s, narrow } = this, m = this.grid.m, cell = this.board.cell || this.grid.cur, n = m.rows.length;
+    const gap = (narrow ? 7 : 9) * s, ch = (narrow ? 30 : 40) * s, cw = ch / .62, pitch = cw + gap, rp = ch + gap;
+    const anchor = r => r === cell.r ? cell.c : (m.rows[r].last ?? 0);
+    const lead = Math.max(...m.rows.map((_, r) => anchor(r))), columns = lead + Math.max(1, ...m.rows.map((row, r) => row.cells.length - anchor(r)));
+    const nameW = (narrow ? 80 : 108) * s, mapTop = H - (n * rp - gap) - (narrow ? 26 : 34) * s, x0 = (w - (nameW + columns * pitch - gap)) / 2, spineX = x0 + nameW + lead * pitch;
+    const rows = m.rows.map((row, r) => row.cells.map((d, c) => ({ x: spineX + (c - anchor(r)) * pitch, y: mapTop + r * rp, w: cw, h: ch, wins: d.wins, r, c })));
+    const spine = { x: spineX - gap / 2, y: mapTop - gap / 2, w: pitch, h: n * rp };
+    const wins = this.cell(cell).wins, tm = (narrow ? 16 : 70) * s, top = (narrow ? 20 : 34) * s, th = (narrow ? 28 : 34) * s, tg = (narrow ? 10 : 28) * s;
+    const area = { x: tm, y: top, w: w - 2 * tm, h: mapTop - (narrow ? 20 : 28) * s - top };
+    const asp = wins.map(win => (win.r[2] * w) / (win.r[3] * (H - this.TB))), sum = asp.reduce((a, b) => a + b, 0) || 1;
+    const ph = Math.max(10, Math.min(area.h - th, (area.w - tg * (wins.length - 1)) / sum));
+    let tx = area.x + (area.w - (sum * ph + tg * (wins.length - 1))) / 2; const ty = area.y + (area.h - (ph + th)) / 2;
+    const tiles = wins.map((win, i) => { const t = { win, x: tx, y: ty, w: asp[i] * ph, h: ph + th }; tx += t.w + tg; return t; });
+    return { rows, spine, tiles, cell, ch, th, x0 };
+  }
+
+  step(dt) {
+    this.t += dt; const g = this.grid, b = this.board;
+    while (this.si < SCRIPT.length && SCRIPT[this.si][0] <= this.t) SCRIPT[this.si++][1](this);
+    if (this.t >= LOOP) this.reset();
+    if (this.tween) { const k = (this.t - this.tween.t0) / this.tween.d, e = inOut(k); this.cur.x = this.tween.x0 + (this.tween.x1 - this.tween.x0) * e; this.cur.y = this.tween.y0 + (this.tween.y1 - this.tween.y0) * e; if (k >= 1) this.tween = null; }
+    if (this.beatAt !== null && this.t >= this.beatAt) { this.beatAt = null; this.beat(2); }
+    this.grip = follow(this.grip, b.drag ? 1 : 0, dt, .05);
+    this.hand.side = follow(this.hand.side, this.held || this.t < this.tapUntil ? 1 : 0, dt, .04);
+    g.show = !b.open && (this.held || this.t < this.hideAt);
+    g.step(dt);
+    b.a = follow(b.a, b.open ? 1 : 0, dt, b.open ? .06 : .05);
+    if (b.open || b.a > .01) {
+      const L = this.boardLayout();
+      L.tiles.forEach(tl => { let r = b.rects.get(tl.win.id); if (!r) { r = { x: tl.x, y: tl.y, w: tl.w, h: tl.h, a: 0, dying: false }; b.rects.set(tl.win.id, r); } for (const k of ['x', 'y', 'w', 'h']) r[k] = follow(r[k], tl[k], dt, .1); r.a = follow(r.a, 1, dt, .08); r.win = tl.win; });
+      b.rects.forEach((r, id) => { if (r.dying) { r.a = follow(r.a, 0, dt, .06); if (r.a < .02) b.rects.delete(id); } });
+      b.drop = null;
+      if (b.drag) { b.drag.k = follow(b.drag.k, 1, dt, .07); const px = this.cur.x * this.W, py = this.cur.y * this.H; L.rows.forEach(row => row.forEach(c => { if (px >= c.x && px <= c.x + c.w && py >= c.y && py <= c.y + c.h) b.drop = { r: c.r, c: c.c }; })); }
+    }
+  }
+  seek(t) { this.quiet = true; this.reset(); for (let i = 0, n = Math.round(t * 60); i < n; i++) this.step(1 / 60); this.quiet = false; }
+
+  sprite(win) {
+    const DH = this.H - this.TB, w = Math.round(win.r[2] * this.W), h = Math.round(win.r[3] * DH);
+    let s = this.sprites.get(win.id);
+    if (!s) {
+      const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * this.dpr)); c.height = Math.max(1, Math.round(h * this.dpr));
+      const g = c.getContext('2d'); g.scale(this.dpr, this.dpr); paintWindow(g, win, w, h, this.u);
+      s = { c, w, h }; this.sprites.set(win.id, s);
+    }
+    return s;
+  }
+  wallpaper(tint) {
+    let c = this.walls.get(tint); if (c) return c;
+    const { W: w, H: h, dpr } = this, T = TINTS[tint]; c = document.createElement('canvas'); c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    const g = c.getContext('2d'); g.scale(dpr, dpr);
+    let gr = g.createLinearGradient(0, 0, w, h); gr.addColorStop(0, T[0]); gr.addColorStop(1, T[1]); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    gr = g.createRadialGradient(w * .78, h * .9, 0, w * .78, h * .9, Math.max(w, h) * .6); gr.addColorStop(0, white(.14)); gr.addColorStop(1, white(0)); g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    this.walls.set(tint, c); return c;
+  }
+  drawDesktop() {
+    const g = this.g, { W, H, u, TB } = this, DH = H - TB;
+    this.cell(this.grid.cur).wins.forEach(win => {
+      const s = this.sprite(win), x = Math.round(win.r[0] * W), y = Math.round(win.r[1] * DH);
+      g.save(); g.shadowColor = 'rgba(0,0,0,.4)'; g.shadowBlur = 30 * u * this.dpr; g.shadowOffsetY = 12 * u * this.dpr; bar(g, x + 2, y + 2, s.w - 4, s.h - 4, '#000', 10 * u); g.restore();
+      g.drawImage(s.c, x, y, s.w, s.h);
+    });
+    bar(g, 0, H - TB, W, TB, 'rgba(12,14,19,.5)');
+    for (let i = -1; i < 2; i++) bar(g, W / 2 + i * 14 * u - 3 * u, H - TB / 2 - 3 * u, 6 * u, 6 * u, white(.4), 3 * u);
+  }
+  drawBoard() {
+    const g = this.g, { W, H, u: s } = this, b = this.board, L = this.boardLayout(), px = this.cur.x * W, py = this.cur.y * H, th = L.th;
+    g.save(); g.globalAlpha = b.a; bar(g, 0, 0, W, H, '#0d0e11');
+    /* previews */
+    b.rects.forEach((r, id) => {
+      if (!r.win) return;
+      const dim = (b.drag && b.drag.id === id ? 1 - .7 * b.drag.k : 1) * r.a, sp = this.sprite(r.win);
+      const hot = !b.drag && !r.dying && px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+      g.save(); g.globalAlpha = b.a * dim;
+      rr(g, r.x, r.y, r.w, r.h, 10 * s); g.clip(); bar(g, r.x, r.y, r.w, r.h, 'rgb(32,34,42)'); g.drawImage(sp.c, r.x, r.y + th, r.w, r.h - th);
+      txt(g, tr(r.win.label), r.x + 14 * s, r.y + th / 2 + .5 * s, 12.5 * s, white(.88), 600);
+      g.restore();
+      g.save(); g.globalAlpha = b.a * dim; g.strokeStyle = hot ? ACCENT : white(.10); g.lineWidth = hot ? 2.5 * s : 1; rr(g, r.x - s, r.y - s, r.w + 2 * s, r.h + 2 * s, 11 * s); g.stroke(); g.restore();
+    });
+    /* the map: one square per desktop, one dot per window in it */
+    bar(g, L.spine.x, L.spine.y, L.spine.w, L.spine.h, white(.035), 10 * s);
+    const dot = L.ch * .28;
+    L.rows.forEach((row, r) => txt(g, this.grid.name(r), L.x0, row[0].y + L.ch / 2 + .5 * s, (this.narrow ? 11 : 12.5) * s, white(r === L.cell.r ? .92 : .45), r === L.cell.r ? 600 : 500));
+    L.rows.forEach(row => row.forEach(c => {
+      const sel = c.r === L.cell.r && c.c === L.cell.c, drop = b.drop && b.drop.r === c.r && b.drop.c === c.c;
+      if (sel) [[5, .08], [3, .14]].forEach(([k, a]) => bar(g, c.x - k * s, c.y - k * s, c.w + 2 * k * s, c.h + 2 * k * s, accent(a), (8 + k) * s));
+      bar(g, c.x, c.y, c.w, c.h, sel ? '#22252d' : white(c.r === L.cell.r ? .14 : .07), 8 * s);
+      if (drop || sel) { g.strokeStyle = ACCENT; g.lineWidth = (drop ? 2.5 : 2) * s; rr(g, c.x, c.y, c.w, c.h, 8 * s); g.stroke(); }
+      const n = c.wins.length, x0 = c.x + (c.w - (n * dot + (n - 1) * dot * .4)) / 2;
+      c.wins.forEach((win, i) => bar(g, x0 + i * dot * 1.4, c.y + (c.h - dot) / 2, dot, dot, TINTS[win.tint][2], dot * .3));
+    }));
+    /* the preview riding on the cursor */
+    if (b.drag) {
+      const r = b.rects.get(b.drag.id), sp = this.sprite(r.win), k = 1 - (1 - 70 * s / (r.h - th)) * b.drag.k, gw = r.w * k, gh = (r.h - th) * k, gx = px - gw / 2, gy = py - gh - 8 * s;
+      g.globalAlpha = b.a * .96;
+      g.save(); g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 22 * s * this.dpr; g.shadowOffsetY = 8 * s * this.dpr; bar(g, gx, gy, gw, gh, '#111', 6 * s); g.restore();
+      g.drawImage(sp.c, gx, gy, gw, gh); g.strokeStyle = accent(.9); g.lineWidth = 1.5 * s; rr(g, gx, gy, gw, gh, 6 * s); g.stroke();
+    }
+    g.restore();
+  }
+  /* The hand: a small mouse whose side button is blue while held. Each flick throws it one way; it drifts back. */
+  drawMouse() {
+    const g = this.g, U = this.u, u = U * (this.narrow ? .9 : 1), hd = this.hand, w = 34 * u, h = 52 * u, k = jolt(this.t - hd.t0), far = 40 * u;
+    const rx = this.W - w - 64 * U, ry = this.H - this.TB - h - 56 * U, x = rx + hd.vx * far * k, y = ry + hd.vy * far * k, lit = hd.side > .5;
+    if (k > .02) { g.strokeStyle = accent(.42 * k); g.lineWidth = w * .7; g.lineCap = 'round'; g.beginPath(); g.moveTo(rx + w / 2, ry + h / 2); g.lineTo(x + w / 2, y + h / 2); g.stroke(); }
+    g.save(); g.shadowColor = lit ? accent(.9) : 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; bar(g, x - 6 * u, y + 17 * u, 12 * u, 17 * u, lit ? ACCENT : '#aeb4c0', 4 * u); g.restore();
+    g.save(); g.shadowColor = 'rgba(0,0,0,.4)'; g.shadowBlur = 10 * u * this.dpr; g.shadowOffsetY = 3 * u * this.dpr; bar(g, x, y, w, h, '#14161c', 17 * u); g.restore();
+    if (this.grip > .05) { g.save(); rr(g, x, y, w, h, 17 * u); g.clip(); bar(g, x, y, w / 2, 21 * u, white(.85 * this.grip)); g.restore(); }
+    g.strokeStyle = white(.92); g.lineWidth = 1.6 * u; rr(g, x, y, w, h, 17 * u); g.stroke();
+    g.lineCap = 'round'; g.lineWidth = 2 * u; g.beginPath(); g.moveTo(x + w / 2, y + 9 * u); g.lineTo(x + w / 2, y + 16 * u); g.stroke();
+  }
+  /* The cursor exists only on the board, where it picks a window up and carries it. */
+  drawCursor() {
+    const g = this.g, u = this.u, x = this.cur.x * this.W, y = this.cur.y * this.H, k = (this.narrow ? 1.25 : 1.12) * u;
+    g.save(); g.globalAlpha = this.board.a;
+    if (this.grip > .05) { g.strokeStyle = white(.55 * this.grip); g.lineWidth = 1.5 * u; g.beginPath(); g.arc(x, y, 9 * u, 0, 7); g.stroke(); }
+    g.save(); g.translate(x, y); g.scale(k, k); g.beginPath();
+    [[0, 0], [0, 16.5], [4.3, 12.7], [7.1, 19], [9.7, 17.8], [6.9, 11.7], [12.2, 11.7]].forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1])); g.closePath();
+    g.shadowColor = 'rgba(0,0,0,.45)'; g.shadowBlur = 5 * this.dpr; g.shadowOffsetY = 1.5 * this.dpr; g.fillStyle = '#fff'; g.fill(); g.shadowColor = 'transparent';
+    g.strokeStyle = '#111'; g.lineWidth = 1.1; g.lineJoin = 'round'; g.stroke(); g.restore(); g.restore();
+  }
+  draw() {
+    const g = this.g, { W, H, dpr } = this;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.globalAlpha = 1;
+    g.drawImage(this.wallpaper(this.cell(this.grid.cur).tint), 0, 0, W, H);
+    if (this.board.a < .995) {
+      this.drawDesktop();
+      if (this.grid.alpha > .01) drawMini(g, this.grid, W / 2, H / 2, this.u * (this.narrow ? .95 : 1.3), this.grid.alpha);
+    }
+    if (this.board.a > .005) { this.drawBoard(); this.drawCursor(); }
+    this.drawMouse();
+  }
+}
+
+/* ---------- wiring ---------- */
+applyLang();
+const hero = new Hero(document.getElementById('hero'));
+const words = [...document.querySelectorAll('#line span')];
+let beatTimer = 0;
+hero.onBeat = i => { words.forEach((w, j) => w.classList.toggle('on', j === i)); clearTimeout(beatTimer); beatTimer = setTimeout(() => words.forEach(w => w.classList.remove('on')), 650); };
+
+function redrawStill() { hero.seek(FREEZE); hero.draw(); }
+/* Text on the canvases changes with the language and once the web font arrives. */
+function repaint() { hero.sprites.clear(); if (STILL) redrawStill(); }
+
+document.getElementById('lang').addEventListener('click', () => { lang = lang === 'ko' ? 'en' : 'ko'; try { localStorage.setItem('flick-lang', lang); } catch (e) {} applyLang(); repaint(); });
+if (document.fonts) {
+  const all = '선반편집기브라우저메모디자인채팅ShelfEditorBrowserNotesDesignChat123';
+  Promise.all([500, 600].map(w => document.fonts.load(`${w} 12px "IBM Plex Sans KR"`, all))).then(repaint, () => {});
+}
+new ResizeObserver(() => { hero.resize(); if (STILL) redrawStill(); else hero.draw(); }).observe(hero.cv);
+
+/* Plays by itself, and only while it is on screen. */
+if ('IntersectionObserver' in window) { hero.visible = false; new IntersectionObserver(es => { hero.visible = es[es.length - 1].isIntersecting; kick(); }, { threshold: .05 }).observe(hero.cv); }
+
+let raf = 0, last = 0;
+function frame(now) {
+  raf = 0;
+  const dt = Math.min(.05, (now - last) / 1000 || 0); last = now;
+  if (!hero.visible || document.hidden) return;
+  hero.step(dt); hero.draw(); raf = requestAnimationFrame(frame);
+}
+function kick() { if (STILL || raf || document.hidden || !hero.visible) return; last = performance.now(); raf = requestAnimationFrame(frame); }
+document.addEventListener('visibilitychange', kick);
+if (STILL) redrawStill(); else kick();
+})();
+</script>
+</body>
+</html>
