@@ -101,6 +101,72 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
             print!("{report}");
             assert_eq!(failures, 0, "cube probe failed; see report.txt");
         },
+        // A quick, sure move goes to the next desktop without the screen
+        // receding; a slow one recedes as before. Both switch on letting go.
+        "quick" => unsafe {
+            let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();
+            let ids: Vec<_> = ids.lines().collect();
+            let all = vdapi::get_desktops().unwrap();
+            let current = || vdapi::get_current_desktop().unwrap().id();
+            let goto = |i: usize| {
+                let desktop = *all.iter().find(|d| d.id() == ids[i]).unwrap();
+                for _ in 0..3 {
+                    vdapi::switch_desktop(desktop).unwrap(); wait(900);
+                    if current() == ids[i] { return; }
+                }
+                panic!("probe could not establish starting desktop {i}");
+            };
+            let mouse = |flags, dx, dy| {
+                let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: 2, dwFlags: flags, ..Default::default() } } };
+                assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
+            };
+            let stroke = |dx: i32, ms: u64| {
+                let n = (ms / 10).max(1) as i32;
+                for i in 1..=n { mouse(MOUSEEVENTF_MOVE, dx * i / n - dx * (i - 1) / n, 0); wait(ms / n as u64); }
+            };
+            std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2, f8\"\nminimap = true\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = true\nfollow_y = true\nreverse = false\n[experimental]\nquick_flick = \"slide\"\n").unwrap();
+            goto(0);
+            let trace = out.join("trace-quick.csv");
+            let _ = std::fs::remove_file(&trace);
+            let mut child = Command::new(flick.unwrap()).arg("--portable").env("FLICK_TRACE", &trace)
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            wait(3000);
+            assert!(FindWindowW(w!("flick.main"), None).0 != 0, "Flick did not start");
+            let mut report = String::new();
+            let mut arrived = Vec::new();
+            // 1.5 cells in 100 ms and let go; then 1.5 cells in 900 ms, held a moment.
+            for (label, ms, rest) in [("fast", 100, 40), ("slow", 900, 250)] {
+                goto(0);
+                mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
+                stroke(340, ms); wait(rest);
+                mouse(MOUSEEVENTF_XUP, 0, 0); wait(2400);
+                let ok = current() == ids[1];
+                report += &format!("{label}-arrives: {ok}\n");
+                arrived.push(ok);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            // The smallest the screen got in each hold (trace column `scale`).
+            let text = std::fs::read_to_string(&trace).unwrap_or_default();
+            let mut smallest: Vec<(String, f64)> = Vec::new();
+            for line in text.lines().skip(1) {
+                let cols: Vec<_> = line.split(',').collect();
+                let (Some(hold), Some(scale)) = (cols.first(), cols.get(11).and_then(|s| s.parse::<f64>().ok())) else { continue };
+                match smallest.iter_mut().find(|(h, _)| h == hold) {
+                    Some((_, least)) => *least = least.min(scale),
+                    None => smallest.push((hold.to_string(), scale)),
+                }
+            }
+            report += &format!("smallest scale per hold: {smallest:?}\n");
+            let fast_whole = smallest.first().is_some_and(|(_, s)| *s > 0.999);
+            let slow_receded = smallest.last().is_some_and(|(_, s)| *s < 0.9) && smallest.len() >= 2;
+            report += &format!("fast-never-recedes: {fast_whole}\nslow-recedes: {slow_receded}\n");
+            let failures = arrived.iter().chain([&fast_whole, &slow_receded]).filter(|ok| !**ok).count();
+            report += &format!("navigation failures: {failures}\n");
+            std::fs::write(out.join("report.txt"), &report).unwrap();
+            print!("{report}");
+            assert_eq!(failures, 0, "quick probe failed; see report.txt");
+        },
         "pacing" => unsafe { super::drive_pacing::run(out, flick.unwrap()); },
         "run" | "motion" | "geometry" => unsafe {
             let geometry = mode == "geometry";

@@ -39,6 +39,8 @@ mod install;
 mod overlay;
 #[cfg(windows)]
 mod paint;
+#[cfg(any(windows, test))]
+mod quick;
 #[cfg(windows)]
 mod settings;
 #[cfg(any(windows, test))]

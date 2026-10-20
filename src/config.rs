@@ -84,6 +84,9 @@ reverse = true
 commit_speed = "default"
 # Prototype: two faint DWM trails, costs three thumbnails per source; reopen the board.
 motion_blur = false
+# A quick, sure move skips the zoomed-out picture until the hand hesitates:
+# "slide" (the next desktop slides in), "instant" (comes at once), or "off".
+quick_flick = "slide"
 "#;
 
 /// Keys of earlier versions, before each device had its own settings: the
@@ -124,7 +127,15 @@ pub enum Compositor { #[default] Auto, Off, All }
 /// Opt-in visual experiments never change the distance or commit rules.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct Experimental { pub commit_speed: CommitSpeed, pub motion_blur: bool }
+pub struct Experimental { pub commit_speed: CommitSpeed, pub motion_blur: bool, pub quick_flick: QuickFlick }
+/// How a quick, sure move is shown (`quick`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuickFlick { Off, #[default] Slide, Instant }
+impl QuickFlick {
+    /// As written in config.toml.
+    pub fn name(self) -> &'static str { match self { Self::Off=>"off", Self::Slide=>"slide", Self::Instant=>"instant" } }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommitSpeed { #[default] Default, Gentle, Slow }
@@ -413,6 +424,8 @@ mod tests {
         let opt: Config=toml::from_str("[experimental]\ncommit_speed='gentle'\nmotion_blur=true").unwrap();
         assert_eq!(opt.experimental.commit_speed.omega(true),25.0);assert!(opt.experimental.motion_blur);
         assert!(toml::from_str::<Config>("[experimental]\ncommit_speed='unknown'").is_err());
+        assert_eq!(default.experimental.quick_flick,QuickFlick::Slide);
+        assert_eq!(toml::from_str::<Config>("[experimental]\nquick_flick='instant'").unwrap().experimental.quick_flick,QuickFlick::Instant);
         assert_eq!(default.compositor,Compositor::Auto);
         assert_eq!(toml::from_str::<Config>("compositor='off'").unwrap().compositor,Compositor::Off);
     }

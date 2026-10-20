@@ -7,7 +7,7 @@
 //! the app, which answers with a new `View`.
 
 use crate::{
-    config::{CommitSpeed, Mouse, Touchpad},
+    config::{CommitSpeed, Mouse, QuickFlick, Touchpad},
     paint::{self, accent, rect, white, Canvas, Painter, Rect},
     vd,
     i18n::text as tr,
@@ -57,11 +57,13 @@ const EDGES: (f32, f32) = (28.0, 628.0);
 /// The tab's rows, the first with the tabs themselves above it, and the
 /// link to the file below them.
 const TAB_ROWS: (f32, f32) = (5.0, 13.0);
-const FILE_ROW: f32 = 18.0;
-/// The experiments' heading; their switch and choice follow, then a note.
+const FILE_ROW: f32 = 20.0;
+/// The experiments' heading; their switch and choices follow, then a note.
 const EXPERIMENT_ROW: f32 = 14.0;
 /// The commit springs offered, as `config::CommitSpeed` names them.
 const SPEEDS: [CommitSpeed; 3] = [CommitSpeed::Default, CommitSpeed::Gentle, CommitSpeed::Slow];
+/// The quick flicks offered, as `config::QuickFlick` names them.
+const QUICKS: [QuickFlick; 3] = [QuickFlick::Off, QuickFlick::Slide, QuickFlick::Instant];
 /// How far the tab's controls stand in from its edges, and the room
 /// between its two ways.
 const INSET: f32 = 16.0;
@@ -91,6 +93,7 @@ pub struct View {
     /// See `config::Experimental`.
     pub motion_blur: bool,
     pub commit_speed: CommitSpeed,
+    pub quick_flick: QuickFlick,
 }
 
 /// What the user asked for; carried out by the app.
@@ -139,6 +142,7 @@ enum Hit {
     TouchpadSettings,
     Blur,
     Speed(usize),
+    Quick(usize),
     File,
 }
 
@@ -160,6 +164,7 @@ struct Layout {
     touchpad_settings: Rect,
     blur: Rect,
     speeds: [Rect; 3],
+    quicks: [Rect; 3],
     file: Rect,
 }
 
@@ -196,6 +201,7 @@ impl Layout {
             touchpad_settings: rect(inner.0 * s, (row(TAB_ROWS.0 + 7.0) + 6.0) * s, 260.0 * s, 30.0 * s),
             blur: right(EXPERIMENT_ROW + 1.0, 44.0, 24.0),
             speeds: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 2.0, 90.0, 30.0)),
+            quicks: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 3.0, 90.0, 30.0)),
             file: rect(EDGES.0 * s, (row(FILE_ROW) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
@@ -215,6 +221,7 @@ impl Layout {
         }
         controls.push((self.blur, Hit::Blur));
         controls.extend(self.speeds.iter().enumerate().map(|(i, r)| (*r, Hit::Speed(i))));
+        controls.extend(self.quicks.iter().enumerate().map(|(i, r)| (*r, Hit::Quick(i))));
         controls.push((self.file, Hit::File));
         controls
     }
@@ -289,6 +296,7 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
         Hit::Minimap => "minimap",
         Hit::Blur => "experimental.motion_blur",
         Hit::Speed(_) => "experimental.commit_speed",
+        Hit::Quick(_) => "experimental.quick_flick",
         _ => return None,
     })
 }
@@ -677,6 +685,7 @@ impl Settings {
             Hit::Tab(tab) => self.show(tab),
             Hit::Follow(_) | Hit::Reverse | Hit::Touchpad | Hit::Minimap | Hit::Blur => self.toggle(hit),
             Hit::Speed(i) => Action::Set("experimental.commit_speed", format!("\"{}\"", SPEEDS[i].name())),
+            Hit::Quick(i) => Action::Set("experimental.quick_flick", format!("\"{}\"", QUICKS[i].name())),
             Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
             Hit::File => Action::OpenFile,
             _ => Action::None,
@@ -857,10 +866,17 @@ impl Settings {
             else { self.draw_button(&p, fonts, area, names[i], Hit::Speed(i)); continue; }
             p.text(names[i], &fonts.button, area, white(1.0));
         }
-        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle.",
-            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다.",
-            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。"),
-            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 3.0).top + ROWS.1 * s, ..row(EXPERIMENT_ROW + 3.0) }, white(0.62));
+        label(EXPERIMENT_ROW + 3.0, tr("Quick flick", "빠른 넘김", "快速翻页"));
+        let names = [tr("Off", "끔", "关闭"), tr("Slide", "슬라이드", "滑动"), tr("Instant", "즉시", "即时")];
+        for (i, area) in layout.quicks.iter().enumerate() {
+            if view.quick_flick == QUICKS[i] { p.fill(area, 7.0 * s, accent(0.95)); }
+            else { self.draw_button(&p, fonts, area, names[i], Hit::Quick(i)); continue; }
+            p.text(names[i], &fonts.button, area, white(1.0));
+        }
+        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle. A quick, sure move goes straight to the next desktop without zooming out; slow down or pause and the zoomed-out view comes in.",
+            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다. 빠르고 확실하게 움직이면 축소 없이 바로 옆 데스크톱으로 넘어가고, 느려지거나 멈추면 축소 화면이 나타납니다.",
+            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。快速而果断地移动会直接切到相邻桌面而不缩小；放慢或停顿时会出现缩小视图。"),
+            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 4.0).top + 2.0 * ROWS.1 * s, ..row(EXPERIMENT_ROW + 4.0) }, white(0.62));
 
         let hot = self.hover == Hit::File;
         p.text(tr("More settings: config.toml", "추가 설정: config.toml", "更多设置：config.toml"), &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));

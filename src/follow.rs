@@ -201,6 +201,15 @@ impl Follow {
             for (column, &(left, right)) in self.columns.iter_mut().zip(&self.cols) { column.cell = column.cell.clamp(left, right); }
         }
     }
+    /// Where the strip is headed for the hand as it is (`quick`): the
+    /// row's cell and the hand's lean, sideways and up and down.
+    pub fn aim(&self) -> (f64, f64) {
+        let i = (self.row - self.rows.0) as usize;
+        let x = if !self.released && self.axis == 0 { self.columns[i].target(self.cols[i]) } else { self.columns[i].cell as f64 };
+        let y = if !self.released && self.axis == 1 { self.rows_hand.target(self.rows) } else { self.row as f64 };
+        (x, y)
+    }
+    pub fn axis(&self) -> usize { self.axis }
     pub fn velocity(&self) -> ((f64, f64), f64) {
         ((self.along[(self.row - self.rows.0) as usize].v, self.vertical.v), self.depth.v)
     }
