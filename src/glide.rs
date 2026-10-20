@@ -1298,8 +1298,8 @@ impl View {
                     let prediction = follow::resample(&session.input_samples, now);
                     let frame = session.follow.sampled(now, prediction);
                     let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
-                    // Whole, the screen is where the hand is, resampled to the frame's time;
-                    // sure, no more than a cell from where it set off.
+                    // Whole, the screen stays on the cell it set off from (`quick`), the hand
+                    // resampled to the frame's time; sure, no more than a cell from there.
                     let (held, past) = (frame.held(), frame.past());
                     let sure = session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure);
                     let held = if sure { frame.within_a_cell(held) } else { held };
