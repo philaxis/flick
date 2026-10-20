@@ -1166,14 +1166,19 @@ impl View {
                     result
                 } else {
                     // Let go of a flick still moving, it goes on a little (`Judge::coast`);
-                    // sure, to the cell nearest, unsure, to the latches'.
-                    let coast = session.quick.as_mut().map_or((0.0, 0.0), |quick| { quick.release(release_time); quick.judge.coast(release_time) });
+                    // sure, to the cell nearest, unsure, to the latches'; tapped, either
+                    // way, at least to the next cell (`Judge::tap`).
+                    let (coast, tap) = session.quick.as_mut().map_or(((0.0, 0.0), (0.0, 0.0)), |quick| {
+                        quick.release(release_time);
+                        (quick.judge.coast(release_time), quick.judge.tap(release_time))
+                    });
                     let held = session.follow.held();
-                    let to = if session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure) {
-                        session.follow.let_go_near(release_time, session.hand, coast)
+                    if session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure) {
+                        session.follow.let_go_near(release_time, session.hand, coast);
                     } else {
-                        session.follow.let_go(release_time, (session.hand.0 + coast.0, session.hand.1 + coast.1))
-                    };
+                        session.follow.let_go(release_time, (session.hand.0 + coast.0, session.hand.1 + coast.1));
+                    }
+                    let to = session.follow.tapped(session.hand, tap);
                     if let Some(quick) = &mut session.quick {
                         look = Some(quick.look(now, session.follow.aim(), Some(held), to, session.follow.axis()));
                     }

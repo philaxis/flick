@@ -229,9 +229,9 @@ pub struct Follow {
     along: Vec<Spring>, columns: Vec<Latch>, vertical: Spring, rows_hand: Latch,
     committing: Vec<bool>, row_committing: bool,
     depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool, path_cursor: usize,
-    /// The cell a sure hand is taken to be on (`passed`), and the axis and
-    /// row it is counted along.
-    passed: Option<(usize, i32, i32)>,
+    /// The cell a sure hand is taken to be on (`passed`), the axis and row
+    /// it is counted along, and the cell it set off from along them.
+    passed: Option<(usize, i32, i32, i32)>,
 }
 impl Follow {
     pub fn new(rows: (i32, i32), cols: Vec<(i32, i32)>) -> Self {
@@ -335,8 +335,9 @@ impl Follow {
         if commits != 0 { self.depth.v = kicked(self.depth, 5.0 * commits.abs() as f64); }
         let held = if axis == 0 { self.held().0 } else { self.held().1 };
         let along = if axis == 0 { self.row } else { 0 };
-        let from = self.passed.filter(|&(a, r, _)| a == axis && r == along).map_or(held.round() as i32, |(.., cell)| cell);
-        self.passed = Some((axis, along, passed(from, held)));
+        let (start, from) = self.passed.filter(|&(a, r, ..)| a == axis && r == along)
+            .map_or((held.round() as i32, held.round() as i32), |(.., start, cell)| (start, cell));
+        self.passed = Some((axis, along, start, passed(from, held)));
         (self.offset(self.row), self.vertical.p)
     }
     pub fn track_path(&mut self, now: f64, path: &[(f64, f64, usize)]) {
@@ -373,6 +374,27 @@ impl Follow {
             }
         }
         self.released = true;
+        self.selected()
+    }
+    /// Let go of (`let_go`, `let_go_near`) as a tapped hand is
+    /// (`quick::Judge::tap`): still on the cell it set off from, to the
+    /// next one its way; past it, where it was let go to.
+    pub fn tapped(&mut self, at: (f64, f64), tap: (f64, f64)) -> (i32, i32) {
+        let Some((axis, along, start, _)) = self.passed else { return self.selected() };
+        let way = if axis == 0 { tap.0 } else { tap.1 };
+        if way == 0.0 || axis != self.axis || (axis == 0 && along != self.row) { return self.selected(); }
+        let next = start + way.signum() as i32;
+        let i = (self.row - self.rows.0) as usize;
+        if axis == 0 {
+            let (left, right) = self.cols[i];
+            if self.columns[i].cell == start { self.columns[i].cell = next.clamp(left, right); }
+        } else if self.row == start {
+            let row = next.clamp(self.rows.0, self.rows.1);
+            if row != self.row {
+                (self.rows_hand.cell, self.row) = (row, row);
+                self.columns[(row - self.rows.0) as usize].rebase(at.0);
+            }
+        }
         self.selected()
     }
     pub fn settle(&mut self, now: f64) -> ((f64, f64), bool) { self.advance(now) }

@@ -21,6 +21,8 @@
 //! go of sure it lands on the cell nearest where it was going, coast and
 //! all (`Follow::let_go_near`); unsure, the cells gone to are the hand's
 //! latches (`follow::Follow`), switched to once, on letting go.
+//! Either way, a hand let go of tapped (sharp just before, however short,
+//! `Judge::tap`) still on the cell it set off from goes to the next one.
 use crate::{config::QuickFlick, transition_curve::Spring};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -42,6 +44,13 @@ pub const PAUSE: f64 = 0.25;
 /// fast as `FLING` (cells a second) does it go on `COAST_MOST` more, a cell.
 pub const FLING: f64 = 12.0;
 pub const COAST_MOST: f64 = 1.0;
+/// A tap: let go of having gone its way as fast as `TAP` (cells a second)
+/// within `TAP_LATE` (s), and come back no more than `TAP_BACK` (cells)
+/// from the farthest it went, the hand goes at least to the next cell,
+/// however short it went, sure or not (`Follow::tapped`).
+pub const TAP: f64 = 4.0;
+pub const TAP_LATE: f64 = 0.06;
+pub const TAP_BACK: f64 = 0.05;
 /// Turning back this far (cells) from the farthest it went is unsure.
 pub const BACK: f64 = 0.15;
 /// The hand's speed is taken over this long (s).
@@ -107,6 +116,8 @@ pub struct Judge {
     slow_since: Option<f64>,
     /// Its way so far over the last `WINDOW`, and one more.
     recent: Vec<(f64, f64)>,
+    /// When it last went its way as fast as `TAP`.
+    sharp: Option<f64>,
     /// Let go of, and how far it wanted the screen to recede then.
     released: Option<f64>,
 }
@@ -119,7 +130,7 @@ impl Judge {
     /// it, and it is unsure (for good, this hold).
     fn anchor(&mut self, t: f64, axis: usize, sign: f64, gone: f64) {
         self.onset = Some((self.onset.map_or(t, |(onset, ..)| onset), axis, sign));
-        (self.far, self.recent) = (gone, vec![(t, gone)]);
+        (self.far, self.recent, self.sharp) = (gone, vec![(t, gone)], None);
         (self.mind, self.slow_since) = (Mind::Unsure, None);
     }
 
@@ -145,6 +156,7 @@ impl Judge {
         self.recent.push((t, gone));
         let keep = self.recent.iter().rposition(|(when, _)| *when <= t - WINDOW).unwrap_or(0);
         self.recent.drain(..keep);
+        if self.speed(t) >= TAP { self.sharp = Some(t); }
         self.check(t);
     }
 
@@ -205,6 +217,17 @@ impl Judge {
     pub fn coast(&self, now: f64) -> (f64, f64) {
         let Some((_, axis, sign)) = self.onset.filter(|_| self.mind == Mind::Sure) else { return (0.0, 0.0) };
         let on = if self.speed(now) >= FLING { sign * COAST_MOST } else { 0.0 };
+        if axis == 0 { (on, 0.0) } else { (0.0, on) }
+    }
+
+    /// Which way (cells along and down, 1 or -1) a hold let go of at `now`
+    /// was tapped, sure or not: gone its way as fast as `TAP` just before,
+    /// not come back, and still on its side of where it set off.
+    pub fn tap(&self, now: f64) -> (f64, f64) {
+        let Some((_, axis, sign)) = self.onset else { return (0.0, 0.0) };
+        let gone = self.recent.last().map_or(0.0, |&(_, gone)| gone);
+        let tapped = self.sharp.is_some_and(|sharp| now - sharp <= TAP_LATE) && gone > 0.0 && self.far - gone <= TAP_BACK;
+        let on = if tapped { sign } else { 0.0 };
         if axis == 0 { (on, 0.0) } else { (0.0, on) }
     }
 }
@@ -446,6 +469,44 @@ mod tests {
         assert_eq!(hand.clone().let_go_near(0.02, (0.5, 0.0), (0.0, 0.0)), (1, 0));
         hand.track_locked(0.02, (0.35, 0.0), 0);
         assert_eq!(hand.let_go_near(0.03, (0.35, 0.0), (0.0, 0.0)), (0, 0));
+    }
+
+    #[test]
+    fn a_tap_goes_to_the_next_cell_however_short_sure_or_not() {
+        // The hand at `x(t)` until `end`, let go of as `glide` lets go.
+        let let_go = |x: &dyn Fn(f64) -> f64, end: f64| {
+            let mut quick = fresh();
+            let mut hand = crate::follow::Follow::new((0, 0), vec![(-3, 3)]);
+            let mut t = 0.0;
+            while t <= end + 1e-9 {
+                hand.track_locked(t, (x(t), 0.0), 0);
+                quick.judge.feed(t, (x(t), 0.0), 0);
+                t += 0.001;
+            }
+            quick.release(t);
+            let (coast, tap) = (quick.judge.coast(t), quick.judge.tap(t));
+            if quick.judge.mind == Mind::Sure { hand.let_go_near(t, (x(t), 0.0), coast); } else { hand.let_go(t, (x(t), 0.0)); }
+            (hand.tapped((x(t), 0.0), tap), quick.judge.mind)
+        };
+        let go = |from: f64, to: f64, speed: f64| move |t: f64| from + (to - from).signum() * (speed * (t - 0.05).max(0.0)).min((to - from).abs());
+        // A tap, 0.15 of a cell at eight a second: the next cell, either way.
+        assert_eq!(let_go(&go(0.0, 0.15, 8.0), 0.07), ((1, 0), Mind::Sure));
+        assert_eq!(let_go(&go(0.0, -0.15, 8.0), 0.07), ((-1, 0), Mind::Sure));
+        // Still a moment (40 ms) before let go of: a tap still.
+        assert_eq!(let_go(&go(0.0, 0.15, 8.0), 0.11), ((1, 0), Mind::Sure));
+        // Receded (still at first), the same.
+        let late = |t: f64| go(0.0, 0.15, 8.0)(t - 0.3);
+        assert_eq!(let_go(&late, 0.37), ((1, 0), Mind::Unsure));
+        // Pushed slowly, 0.3 of a cell at a cell a second: back where it was.
+        assert_eq!(let_go(&go(0.0, 0.3, 1.0), 0.35).0, (0, 0));
+        // Still a while before let go of: no tap.
+        assert_eq!(let_go(&go(0.0, 0.15, 8.0), 0.2).0, (0, 0));
+        // 1.3 cells at eight a second: a cell, no more.
+        assert_eq!(let_go(&go(0.0, 1.3, 8.0), 0.22).0, (1, 0));
+        // Turned back as it was let go of, a little or far: where it was.
+        let back = |to: f64| move |t: f64| if t < 0.1 { go(0.0, 0.3, 8.0)(t) } else { go(0.3, to, 8.0)(t - 0.05) };
+        assert_eq!(let_go(&back(0.22), 0.11), ((0, 0), Mind::Sure));
+        assert_eq!(let_go(&back(0.1), 0.125).0, (0, 0));
     }
 
     #[test]
