@@ -723,7 +723,8 @@ pub unsafe fn onset(out: &Path, flick: &str) {
     let all = super::vdapi::get_desktops().unwrap();
     let desk = |i: usize| *all.iter().find(|d| d.id() == ids[i]).unwrap();
     let other: Vec<_> = all.iter().map(|d| d.id()).filter(|id| !ids.contains(&id.as_str())).collect();
-    std::fs::write(cfg.join("state.json"), serde_json::json!({"rows":[{"name":"Onset","cells":&ids[0..3],"last":ids[1]},{"name":"Existing","cells":other}],"guide_seen":true}).to_string()).unwrap();
+    // Windows of `onset-row.exe` go along their row (`lights`).
+    std::fs::write(cfg.join("state.json"), serde_json::json!({"rows":[{"name":"Onset","cells":&ids[0..3],"last":ids[1]},{"name":"Existing","cells":other}],"follow_apps":["onset-row.exe"],"guide_seen":true}).to_string()).unwrap();
     super::vdapi::switch_desktop(desk(1)).unwrap(); wait(800);
     let me = std::env::current_exe().unwrap();
     let mut windows = Vec::new();
@@ -738,14 +739,18 @@ pub unsafe fn onset(out: &Path, flick: &str) {
     let ms = move |qpc: i64| qpc as f64 * 1000.0 / frequency as f64;
     let stop = Arc::new(AtomicBool::new(false));
     let frames: Arc<Mutex<Vec<(f64, [(i32, i32, i32, i32, u32); 4])>>> = Arc::default();
-    let (s1, f1) = (stop.clone(), frames.clone());
-    let width = Arc::new(Mutex::new(0u32));
+    // While the lights are looked at, every frame whole, the last one kept.
+    let (whole, latest) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::<u8>::new())));
+    let (s1, f1, wh1, l1) = (stop.clone(), frames.clone(), whole.clone(), latest.clone());
+    let width = Arc::new(Mutex::new((0u32, 0u32)));
     let w1 = width.clone();
     let recorder = std::thread::spawn(move || {
         let capture = Capture::new().unwrap();
-        *w1.lock().unwrap() = capture.width;
+        *w1.lock().unwrap() = (capture.width, capture.height);
         while !s1.load(Ordering::SeqCst) {
-            if let Some((info, boxes, ..)) = capture.frame(false).unwrap() { f1.lock().unwrap().push((ms(info.LastPresentTime), boxes)); }
+            if wh1.load(Ordering::SeqCst) {
+                if let Some((_, raw)) = capture.grab().unwrap() { *l1.lock().unwrap() = raw; }
+            } else if let Some((info, boxes, ..)) = capture.frame(false).unwrap() { f1.lock().unwrap().push((ms(info.LastPresentTime), boxes)); }
         }
     });
     let trace = out.join("onset-trace.csv");
@@ -797,13 +802,49 @@ pub unsafe fn onset(out: &Path, flick: &str) {
         let now = super::vdapi::get_current_desktop().unwrap().id();
         holds.push(Hold { label, press: ms(press), moves, release: ms(release), landed: ids.iter().position(|id| *id == now) });
     }}
+    // The light about pinned windows, one to every desktop and one going
+    // along its row: whole as a sure hand goes, receded as a still one
+    // holds, and on the board, a capture of each.
+    super::vdapi::switch_desktop(desk(1)).unwrap(); wait(900);
+    let row_exe = out.join("onset-row.exe");
+    std::fs::copy(&me, &row_exe).unwrap();
+    for (exe, title, rect) in [(&me, "F pin all", ["1150", "160", "520", "300"]), (&row_exe, "F pin row", ["1150", "620", "520", "300"])] {
+        windows.push(Command::new(exe).args(["hold", "235", "235", "235", title, rect[0], rect[1], rect[2], rect[3], "600"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        wait(500);
+        let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title)); assert!(hwnd.0 != 0, "{title}");
+        if title == "F pin all" { super::vdapi::pin_window(hwnd).unwrap(); }
+    }
+    wait(500);
+    whole.store(true, Ordering::SeqCst);
+    let (screen_w, screen_h) = *width.lock().unwrap();
+    let snap = |name: &str| { let raw = latest.lock().unwrap().clone(); if !raw.is_empty() { save_bmp(&out.join(name), &raw, screen_w, screen_h); } };
+    // Sure: set off sharply and kept going, caught going.
+    mouse(MOUSEEVENTF_XDOWN, 0); wait(40);
+    for i in 0..30 { mouse(MOUSEEVENTF_MOVE, if i < 8 { 12 } else { 3 }); wait(5); }
+    snap("light-whole.bmp");
+    mouse(MOUSEEVENTF_XUP, 0); wait(1200);
+    super::vdapi::switch_desktop(desk(1)).unwrap(); wait(900);
+    // Unsure: held still a while, all the way back.
+    mouse(MOUSEEVENTF_XDOWN, 0); wait(40);
+    mouse(MOUSEEVENTF_MOVE, 30); wait(600);
+    snap("light-receded.bmp");
+    mouse(MOUSEEVENTF_MOVE, -30); wait(30);
+    mouse(MOUSEEVENTF_XUP, 0); wait(1200);
+    super::vdapi::switch_desktop(desk(1)).unwrap(); wait(900);
+    let app = FindWindowW(w!("flick.main"), None);
+    PostMessageW(app, WM_APP + 2, WPARAM(0), LPARAM(0)).unwrap(); wait(1200);
+    // Something to draw, so the last frame is the board as it is.
+    SetCursorPos(400, 500).unwrap(); wait(300); SetCursorPos(402, 500).unwrap(); wait(300);
+    snap("light-board.bmp");
+    PostMessageW(FindWindowW(w!("flick.board"), None), WM_KEYDOWN, WPARAM(0x1b), LPARAM(0)).unwrap(); wait(400);
+    whole.store(false, Ordering::SeqCst);
     wait(300);
     stop.store(true, Ordering::SeqCst);
     recorder.join().unwrap();
     let _ = child.kill(); let _ = child.wait();
     CloseHandle(timer).unwrap();
     for window in &mut windows { let _ = window.kill(); let _ = window.wait(); }
-    let width = *width.lock().unwrap() as f64;
+    let width = width.lock().unwrap().0 as f64;
     let frames = frames.lock().unwrap().clone();
     // Flick's own frames: when each was shown and how small the picture was.
     let flick_frames: Vec<(f64, f64)> = std::fs::read_to_string(&trace).unwrap_or_default().lines().skip(1)
@@ -812,10 +853,12 @@ pub unsafe fn onset(out: &Path, flick: &str) {
     let mut report = format!("width {width}, frames {}\n", frames.len());
     let (mut sums, mut counts): (std::collections::BTreeMap<&str, [f64; 7]>, std::collections::BTreeMap<&str, f64>) = Default::default();
     for (i, hold) in holds.iter().enumerate() {
-        let before: Vec<_> = frames.iter().filter(|f| f.0 < hold.press && f.0 > hold.press - 500.0 && f.1[1].4 >= 32).collect();
+        // At rest on the middle desktop: its cyan, none of the yellow beside it.
+        let before: Vec<_> = frames.iter().filter(|f| f.0 < hold.press && f.1[1].4 >= 32 && f.1[2].4 < 32).collect();
         let Some(rest) = before.last() else { report += &format!("{i} {}: no resting frame\n", hold.label); continue };
         let x0 = (rest.1[1].0 as f64, rest.1[1].2 as f64);
-        let end = holds.get(i + 1).map_or(f64::INFINITY, |next| next.press - 300.0);
+        // Before the desktop is switched back for the next.
+        let end = hold.release + 1200.0;
         let mine: Vec<(f64, Option<f64>)> = frames.iter().filter(|f| f.0 >= hold.press && f.0 < end).map(|f| (f.0, onset_at(&f.1, x0, width))).collect();
         let hand = |t: f64| hold.moves.iter().take_while(|m| m.0 <= t).last().map_or(0.0, |m| m.1);
         for f in frames.iter().filter(|f| f.0 >= hold.press && f.0 < end) {

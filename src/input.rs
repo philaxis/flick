@@ -79,6 +79,9 @@ pub const WM_SLIDE: u32 = WM_APP + 6;
 /// the one the hold began on (`row_of`); lparam: which hold. To be answered
 /// with `rows_shown`.
 pub const WM_ROWS: u32 = WM_APP + 7;
+/// A hold the screen follows began: the app gets its picture ready before
+/// the hand sets off (`App::glide_prepare`). lparam: which hold.
+pub const WM_PRESSED: u32 = WM_APP + 8;
 
 /// Thread message telling the hook thread to pick up new settings.
 const WM_RELOAD: u32 = WM_APP + 20;
@@ -910,6 +913,9 @@ fn press(source: Source) {
         listen_raw(true);
         WATCH_TIMER.set(unsafe { SetTimer(None, 0, WATCH_MS, Some(watch)) });
         remember_follow();
+        if follow.is_some() {
+            SETTINGS.with(|slot| if let Some(s) = slot.try_borrow().ok().as_ref().and_then(|s| s.as_ref()) { post(s, WM_PRESSED, 0); });
+        }
     }
 }
 

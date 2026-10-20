@@ -9,7 +9,7 @@ use crate::{
     glide::{self, Glide, Place, Scene, Shot, WM_GLIDE_SETTLED, WM_GLIDE_TARGET},
     guide::{self, Guide},
     grid::{self, Dir, Grid, Pos, Row},
-    input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
+    input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_PRESSED, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     settings::{self, Settings},
     stack::{self, Kind},
@@ -185,6 +185,9 @@ struct App {
     /// hold it follows.
     glide: Glide,
     gliding: Option<Gliding>,
+    /// The picture of a hold just begun, made as it began, for when the
+    /// hand sets off (`glide_prepare`): the hold, where it began, its scene.
+    prepared: Option<(u32, String, Scene)>,
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
     following: vd::WindowPins,
@@ -397,6 +400,7 @@ impl App {
             rowing: None,
             glide: Glide::spawn(hwnd),
             gliding: None,
+            prepared: None,
             following: vd::WindowPins::default(),
             pending_menu: None,
             pending_row_menu: None,
@@ -1140,13 +1144,38 @@ impl App {
         }
         if let Some(old) = self.gliding.take() {
             self.glide_finish(old);
+            self.prepared = None;
         }
-        let Some(desktops) = self.sync() else { return };
-        let origin = self.heading(&desktops);
-        let Some(scene) = self.glide_scene(&desktops, &origin, hold, hand.ways) else { return };
+        let (origin, scene) = match self.prepared.take().filter(|prepared| prepared.0 == hold) {
+            Some((_, origin, scene)) => (origin, scene),
+            None => {
+                let Some(desktops) = self.sync() else { return };
+                let origin = self.heading(&desktops);
+                let Some(scene) = self.glide_scene(&desktops, &origin, hold, hand.ways) else { return };
+                (origin, scene)
+            }
+        };
         let fallback = follow::Follow::new(scene.rows, scene.cols.clone());
         self.glide.begin(scene);
         self.gliding = Some(Gliding { hold, fallback: Some(fallback), origin, landing: None, step: None, carry: false, turns: Vec::new() });
+    }
+
+    /// As a hold the screen follows begins, its picture made then, not when
+    /// the hand sets off: finding the desktops and their windows takes tens
+    /// of milliseconds, which a flick would otherwise wait for. Not while
+    /// another is still settling, which may change the desktop it begins on.
+    fn glide_prepare(&mut self, hold: u32) {
+        self.prepared = None;
+        let Some(saved) = input::follow_hold(hold) else { return };
+        let ways = saved.hand.ways;
+        if saved.hand.hold != hold || ways & (input::FOLLOW_X | input::FOLLOW_Y) == 0 || self.board.is_open() || self.gliding.is_some() {
+            return;
+        }
+        let Some(desktops) = self.sync() else { return };
+        let origin = self.heading(&desktops);
+        if let Some(scene) = self.glide_scene(&desktops, &origin, hold, ways) {
+            self.prepared = Some((hold, origin, scene));
+        }
     }
 
     /// A glide still settling, or a step still under way, as a new one
@@ -2040,6 +2069,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 debug_log!("app: {dir:?} {} in {:?}", if taken.is_some() { "done" } else { "dropped, the app being busy" }, started.elapsed());
                 let _ = taken;
             }
+        }
+        WM_PRESSED => {
+            let _ = with_app(|app| app.glide_prepare(lparam.0 as u32));
         }
         WM_SLIDE | WM_DRAG => {
             let hold = lparam.0 as u32;
