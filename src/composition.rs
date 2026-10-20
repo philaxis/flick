@@ -171,7 +171,11 @@ pub unsafe fn unregister(id: isize) -> Result<()> {
 }
 
 /// Precise edges reach the compositor; public thumbnails keep their rounded RECT.
-pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4]) -> Result<()> {
+pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4]) -> Result<()> { update_clipped(id,props,dest,None) }
+
+/// As `update`, only what of `dest` is within `clip` (on the host) shown: a composed
+/// thumbnail clipped exactly, a public one with its rectangles cut down and rounded.
+pub unsafe fn update_clipped(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4], clip: Option<[f32;4]>) -> Result<()> {
     TRAILS.with(|trails| -> Result<()> {
         let mut trails=trails.borrow_mut();
         if let Some(trails)=trails.get_mut(&id) {
@@ -199,15 +203,29 @@ pub unsafe fn update(id: isize, props: &DWM_THUMBNAIL_PROPERTIES, dest: [f32;4])
         let Some(thumb)=scenes.thumbs.get(&id) else {return Ok(false)};
         let source=if props.dwFlags&DWM_TNP_RECTSOURCE!=0 {props.rcSource} else {let s=thumb.size;RECT {left:0,top:0,right:s.cx,bottom:s.cy}};
         let visible=props.fVisible.as_bool() && source.right>source.left && source.bottom>source.top && dest[2]>dest[0] && dest[3]>dest[1];
-        thumb.opacity.SetOpacity2(if visible {props.opacity as f32/255.0} else {0.0})?;
-        if visible {
+        let whole=[source.left as f32,source.top as f32,source.right as f32,source.bottom as f32];
+        let shown=if visible {clip.map_or(Some(whole),|clip| crop(whole,dest,clip).map(|(from,_)| from))} else {None};
+        thumb.opacity.SetOpacity2(if shown.is_some() {props.opacity as f32/255.0} else {0.0})?;
+        if let Some([left,top,right,bottom])=shown {
+            // The matrix of the whole picture: the clip only cuts it down.
             let matrix = transform(source, dest);
-            thumb.visual.SetClip2(&D2D_RECT_F {left:source.left as f32,top:source.top as f32,right:source.right as f32,bottom:source.bottom as f32})?;
+            thumb.visual.SetClip2(&D2D_RECT_F {left,top,right,bottom})?;
             thumb.visual.SetTransform2(&matrix)?;
         }
         Ok(true)
     })?;
-    if updated {Ok(())} else {DwmUpdateThumbnailProperties(id,props)}
+    if updated {return Ok(());}
+    let Some(clip)=clip else {return DwmUpdateThumbnailProperties(id,props)};
+    let mut cut=*props;
+    let d=props.rcDestination;
+    let source=if props.dwFlags&DWM_TNP_RECTSOURCE!=0 {props.rcSource} else {RECT {left:0,top:0,right:d.right-d.left,bottom:d.bottom-d.top}};
+    let f=|r: RECT| [r.left as f32,r.top as f32,r.right as f32,r.bottom as f32];
+    let round=|r: [f32;4]| RECT {left:r[0].round() as i32,top:r[1].round() as i32,right:r[2].round() as i32,bottom:r[3].round() as i32};
+    match crop(f(source),f(d),clip) {
+        Some((from,to)) => {cut.rcSource=round(from);cut.rcDestination=round(to);cut.dwFlags|=DWM_TNP_RECTSOURCE;}
+        None => {cut.dwFlags|=DWM_TNP_VISIBLE;cut.fVisible=false.into();}
+    }
+    DwmUpdateThumbnailProperties(id,&cut)
 }
 
 pub fn commit(hwnd: HWND) -> Result<()> {
@@ -250,6 +268,17 @@ pub unsafe fn back(hwnd: HWND, size: (i32,i32)) -> Result<()> {
     surface.EndDraw()
 }
 
+/// What of a picture's `source` drawn at `dest` is within `clip`: that part of the source
+/// and where it is drawn, each edge where the whole picture puts it; `None` for nothing.
+fn crop(source: [f32;4], dest: [f32;4], clip: [f32;4]) -> Option<([f32;4],[f32;4])> {
+    let to=[dest[0].max(clip[0]),dest[1].max(clip[1]),dest[2].min(clip[2]),dest[3].min(clip[3])];
+    if !(to[2]>to[0] && to[3]>to[1]) || !(source[2]>source[0] && source[3]>source[1]) {return None;}
+    let (sx,sy)=((source[2]-source[0])/(dest[2]-dest[0]),(source[3]-source[1])/(dest[3]-dest[1]));
+    let x=|v: f32| source[0]+(v-dest[0])*sx;
+    let y=|v: f32| source[1]+(v-dest[1])*sy;
+    Some(([x(to[0]),y(to[1]),x(to[2]),y(to[3])],to))
+}
+
 fn transform(source: RECT, dest: [f32;4]) -> Matrix3x2 {
     let sx=(dest[2]-dest[0])/(source.right-source.left) as f32;
     let sy=(dest[3]-dest[1])/(source.bottom-source.top) as f32;
@@ -269,6 +298,16 @@ mod tests {
         let t=trail(a,[1000.0,0.0,1100.0,100.0],0.016);assert!(t.0.hypot(t.1)<=32.0);
         // A slow drag (3 px a frame) and a settled frame leave no trail.
         assert_eq!(trail(a,[3.0,0.0,103.0,100.0],0.016),(0.0,0.0));
+    }
+    #[test]
+    fn a_clip_cuts_the_picture_where_the_whole_one_lies() {
+        // Twice as large on the host, its left half and a strip above out of the clip.
+        let (from,to)=crop([0.0,0.0,100.0,50.0],[-100.0,-20.0,100.0,80.0],[0.0,0.0,500.0,500.0]).unwrap();
+        assert_eq!(to,[0.0,0.0,100.0,80.0]);
+        assert_eq!(from,[50.0,10.0,100.0,50.0]);
+        // Within the clip: as it is. Out of it: nothing.
+        assert_eq!(crop([5.0,5.0,15.0,15.0],[1.0,1.0,11.0,11.0],[0.0,0.0,20.0,20.0]),Some(([5.0,5.0,15.0,15.0],[1.0,1.0,11.0,11.0])));
+        assert_eq!(crop([0.0,0.0,10.0,10.0],[30.0,0.0,40.0,10.0],[0.0,0.0,20.0,20.0]),None);
     }
     #[test]
     fn cropped_sources_keep_fractional_destination_edges() {

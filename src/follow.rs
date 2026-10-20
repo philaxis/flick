@@ -126,6 +126,16 @@ pub fn step_along(x: f64, y: f64, row: i32) -> f64 {
     x * (1.0 - (row as f64 - y).abs()).clamp(0.0, 1.0)
 }
 
+/// `rect` moved and sized as `from` is to `to`: the edges of the screen a
+/// window at `from` is on, with the window drawn at `to`.
+pub fn carried(rect: [f64; 4], from: [f64; 4], to: [f64; 4]) -> [f64; 4] {
+    let axis = |a: usize, b: usize, v: f64| {
+        let span = from[b] - from[a];
+        if span.abs() < f64::EPSILON { to[a] } else { to[a] + (v - from[a]) * (to[b] - to[a]) / span }
+    };
+    [axis(0, 2, rect[0]), axis(1, 3, rect[1]), axis(0, 2, rect[2]), axis(1, 3, rect[3])]
+}
+
 /// `a` going to `b` by `t` (0 to 1).
 pub fn between(a: [f64; 4], b: [f64; 4], t: f64) -> [f64; 4] {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
@@ -403,6 +413,19 @@ pub fn remember(path: &mut Vec<(f64, f64, usize)>, point: (f64, f64, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_desktops_windows_end_at_the_edges_of_its_cell() {
+        let size = (1920.0, 1080.0);
+        let screen = [0.0, 0.0, 1920.0, 1080.0];
+        // A window half off the right of the screen, the screen receded and a cell along.
+        let window = [1500.0, 100.0, 2300.0, 700.0];
+        let (scale, apart, lift) = (0.6, (1.0, 0.0), 1.1);
+        let clip = carried(screen, window, placed(window, size, scale, apart, lift));
+        let cell = placed(screen, size, scale, apart, lift);
+        for i in 0..4 { assert!((clip[i] - cell[i]).abs() < 1e-9); }
+        // Left where it is: the screen's own edges.
+        assert_eq!(carried(screen, window, window), screen);
+    }
     #[test]
     fn shelf_windows_stay_with_their_row_and_return_from_offscreen() {
         let rect = [100.0, 100.0, 400.0, 300.0];

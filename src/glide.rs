@@ -110,6 +110,29 @@ pub enum Place {
     Pinned,
 }
 
+/// Which picture of a window a thumbnail is. A window pinned to every
+/// shelf or its own, not always on top, has two: one where it is among the
+/// windows of the screen, as it is while the screen slides whole, and one in
+/// front of them all, as opaque as the screen has receded, so that it rises
+/// from where it was as the screen recedes and settles back as it comes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Layer {
+    Whole,
+    Under,
+    Over,
+}
+
+/// How opaque a window `shown` as opaque is drawn as its `layer`, and its
+/// light, with the screen `lift` (0 to 1) receded.
+fn layered(layer: Layer, shown: f64, lift: f64) -> (f64, f64) {
+    let lift = lift.clamp(0.0, 1.0);
+    match layer {
+        Layer::Whole => (shown, shown),
+        Layer::Under => (shown, 0.0),
+        Layer::Over => (shown * lift, shown * lift),
+    }
+}
+
 pub struct Shot {
     pub hwnd: HWND,
     /// Its visible frame on the screen (`DWMWA_EXTENDED_FRAME_BOUNDS`).
@@ -248,8 +271,8 @@ struct Thumb {
     /// Where it is drawn on its screen with the picture where the hold began.
     dest: RECT,
     source: Option<RECT>,
-    /// Where it was last drawn and how opaque; `None` while not drawn.
-    drawn: Option<(RECT, u8)>,
+    /// Where it was last drawn, how opaque and within what; `None` while not drawn.
+    drawn: Option<(RECT, u8, Option<[i32; 4]>)>,
 }
 
 impl Thumb {
@@ -282,12 +305,24 @@ impl Thumb {
     /// its rounded edges, which would make it a pixel larger or smaller
     /// from frame to frame as it slides: the picture in it would shimmer.
     fn draw(&mut self, at: Option<[f64; 4]>, size: (i32, i32), opacity: u8) -> bool {
+        self.draw_within(at, None, size, opacity)
+    }
+
+    /// As `draw`, only what of it is within `clip` shown.
+    fn draw_within(&mut self, at: Option<[f64; 4]>, clip: Option<[f64; 4]>, size: (i32, i32), opacity: u8) -> bool {
         let rect = at.map(|[l, t, r, b]| {
             let (left, top) = (l.round() as i32, t.round() as i32);
             RECT { left, top, right: left + (r - l).round() as i32, bottom: top + (b - t).round() as i32 }
         });
         let rect = rect.filter(|r| r.right > 0 && r.bottom > 0 && r.left < size.0 && r.top < size.1 && r.right > r.left && r.bottom > r.top);
-        let drawn = rect.map(|rect| (rect, opacity)).filter(|_| opacity > 0);
+        // Within the screen, the clip is no more than the screen's edges.
+        let clip = clip.map(|[l, t, r, b]| [l.max(0.0), t.max(0.0), r.min(size.0 as f64), b.min(size.1 as f64)]);
+        let rect = rect.filter(|_| match (at, clip) {
+            (Some(a), Some(c)) => a[0].max(c[0]) < a[2].min(c[2]) && a[1].max(c[1]) < a[3].min(c[3]),
+            _ => true,
+        });
+        let cut = clip.map(|c| c.map(|v| v.round() as i32));
+        let drawn = rect.map(|rect| (rect, opacity, cut)).filter(|_| opacity > 0);
         if drawn == self.drawn && !crate::composition::needs_update(self.id) {
             return false;
         }
@@ -306,7 +341,7 @@ impl Thumb {
         }
         unsafe {
             let precise = at.unwrap_or([0.0; 4]).map(|v| v as f32);
-            let _ = crate::composition::update(self.id, &props, precise);
+            let _ = crate::composition::update_clipped(self.id, &props, precise, clip.map(|c| c.map(|v| v as f32)));
         }
         true
     }
@@ -596,8 +631,9 @@ struct Session {
     anchors: Vec<usize>,
     follow: Follow,
     screens: Vec<Screen>,
-    /// The windows' thumbnails, bottom first, and where each is drawn.
-    shots: Vec<(Thumb, usize, Place)>,
+    /// The windows' thumbnails, bottom first, where each is drawn and which
+    /// picture of its window it is.
+    shots: Vec<(Thumb, usize, Place, Layer)>,
     /// As `shots`: each pinned one's light beneath it, `paint::PIN_ALL`
     /// pinned to every shelf, `PIN_ROW` to its own (`LIGHT`).
     halos: Vec<Vec<Thumb>>,
@@ -902,8 +938,18 @@ impl View {
             Place::Row(_) => 1,
             Place::Fixed | Place::Pinned => 2,
         };
-        let mut order: Vec<&Shot> = scene.shots.iter().collect();
-        order.sort_by_key(|shot| rank(&shot.place));
+        // A pinned window's picture where it is among the others, and the one
+        // in front of them (`Layer`).
+        let mut order: Vec<(&Shot, Layer)> = Vec::new();
+        for shot in &scene.shots {
+            let rises = matches!(shot.place, Place::Pinned | Place::Row(_)) && !crate::vd::is_topmost(shot.hwnd);
+            if rises {
+                order.push((shot, Layer::Under));
+            }
+            order.push((shot, if rises { Layer::Over } else { Layer::Whole }));
+        }
+        let ranked = |(shot, layer): &(&Shot, Layer)| if *layer == Layer::Under { 0 } else { rank(&shot.place) };
+        order.sort_by_key(ranked);
         let mut shots = Vec::new();
         let mut halos: Vec<Vec<Thumb>> = Vec::new();
         let mut bare = Vec::new();
@@ -911,15 +957,15 @@ impl View {
         if self.paints.is_none() {
             self.paints = Paints::new();
         }
-        for shot in order {
-            if rank(&shot.place) > 0 && veils.is_empty() {
+        for (shot, layer) in order {
+            if ranked(&(shot, layer)) > 0 && veils.is_empty() {
                 veils = self.veils(&screens);
             }
             let (cx, cy) = ((shot.rect.left + shot.rect.right) / 2, (shot.rect.top + shot.rect.bottom) / 2);
             let inside = |a: &RECT| cx >= a.left && cx < a.right && cy >= a.top && cy < a.bottom;
             let on = monitors.iter().position(|m| inside(&m.bounds)).unwrap_or(0).min(screens.len() - 1);
             // A pinned window's light beneath it.
-            let colour = match shot.place { Place::Pinned => Some(ALL_LIGHT), Place::Row(_) => Some(ROW_LIGHT), _ => None };
+            let colour = match shot.place { _ if layer == Layer::Under => None, Place::Pinned => Some(ALL_LIGHT), Place::Row(_) => Some(ROW_LIGHT), _ => None };
             let lit: Vec<Thumb> = colour
                 .zip(self.paints.as_ref())
                 .map(|(colour, paints)| (0..LIGHT.len()).filter_map(|_| Thumb::new(&screens[on], paints.hwnd, (screens[on].area.left, screens[on].area.top), Some(colour))).collect())
@@ -949,7 +995,7 @@ impl View {
                         thumb.source = Some(within(thumb.dest, area, window));
                     }
                 }
-                shots.push((thumb, on, shot.place));
+                shots.push((thumb, on, shot.place, layer));
                 halos.push(lit);
             }
         }
@@ -1476,7 +1522,7 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
     // as the screen recedes, and smaller about their middles only if they
     // would hide much of it (`follow::tucked`).
     let share = strip.receded.clamp(0.0, 1.0);
-    for (index, (thumb, on, place)) in session.shots.iter_mut().enumerate() {
+    for (index, (thumb, on, place, layer)) in session.shots.iter_mut().enumerate() {
         let screen = &session.screens[*on];
         let area = screen.area;
         let size = (area.right - area.left, area.bottom - area.top);
@@ -1495,15 +1541,20 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
             Place::Pinned => (follow::tucked(edges, whole, share), 1.0, Some(true)),
             Place::Fixed => (edges, 1.0, None),
         };
+        // A pinned one rises from among the others as the screen recedes (`Layer`).
+        let (shown, light) = layered(*layer, shown, share);
         if let Some(all) = lit {
             let (strength, reach) = paint::pin_light(all);
             for (halo, (side, above, below, alpha)) in session.halos[index].iter_mut().zip(LIGHT) {
                 let k = reach as f64 * screen.scale as f64;
                 let out = [at[0] - side * k, at[1] - above * k, at[2] + side * k, at[3] + below * k];
-                moved += halo.draw(Some(out), size, opacity(alpha * strength as f64 * shown * strip.lit)) as u32;
+                moved += halo.draw(Some(out), size, opacity(alpha * strength as f64 * light * strip.lit)) as u32;
             }
         }
-        moved += thumb.draw(Some(at), size, opacity(shown)) as u32;
+        // What of it is off its screen stays out of sight, the screen's edges
+        // carried along with it: a desktop's windows end at the edges of its cell.
+        let clip = follow::carried([0.0, 0.0, whole.0, whole.1], edges, at);
+        moved += thumb.draw_within(Some(at), Some(clip), size, opacity(shown)) as u32;
     }
     moved
 }
@@ -1511,6 +1562,19 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinned_window_rises_from_its_place_as_the_screen_recedes() {
+        // The screen whole: only where it is among the others, unlit.
+        assert_eq!(layered(Layer::Under, 1.0, 0.0), (1.0, 0.0));
+        assert_eq!(layered(Layer::Over, 1.0, 0.0), (0.0, 0.0));
+        // Halfway: the one in front half opaque over it, its light half on.
+        assert_eq!(layered(Layer::Over, 1.0, 0.5), (0.5, 0.5));
+        assert_eq!(layered(Layer::Under, 0.8, 0.5), (0.8, 0.0));
+        // Receded all the way, wholly in front; always on top, always so.
+        assert_eq!(layered(Layer::Over, 0.8, 1.0), (0.8, 0.8));
+        assert_eq!(layered(Layer::Whole, 1.0, 0.0), (1.0, 1.0));
+    }
 
     #[test]
     fn windows_over_the_whole_work_area_cover_it() {
