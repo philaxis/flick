@@ -44,7 +44,8 @@ mod imp {
                     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
                 },
                 WindowsAndMessaging::{
-                    CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW, ShowWindow,
+                    CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW, SetWindowPos, ShowWindow,
+                    HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
                     SystemParametersInfoW, TranslateMessage, CW_USEDEFAULT, MSG, PM_REMOVE, SPI_GETWORKAREA, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
                     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP,
                 },
@@ -172,6 +173,8 @@ mod imp {
                 CreateWindowExW(WS_EX_APPWINDOW, w!("glide.e2e"), &title, WS_POPUP, n(1), n(2), n(3), n(4), None, None, instance, None)
             };
             ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOWNOACTIVATE });
+            // Above whatever else is open, in the order they are made.
+            let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             pump(300);
             if args[5] == "pin" {
                 println!("pin {:?}", vdapi::pin_window(hwnd));
@@ -385,19 +388,21 @@ mod imp {
         // Pinned, then a window of A over its lower right; and one of A half off the right.
         children.push(spawn(GREEN, (x(0.40), y(0.10), w / 5, h / 5), "pin"));
         std::thread::sleep(Duration::from_millis(1500));
-        children.push(spawn(YELLOW, (x(0.50), y(0.20), w * 4 / 10, h * 3 / 10), &a));
+        // Wide, so that it is over the pinned one still with A half gone.
+        children.push(spawn(YELLOW, (x(0.05), y(0.20), w * 9 / 10, h * 3 / 10), &a));
         children.push(spawn(MAGENTA, (x(0.75), y(0.60), w / 2, h / 4), &a));
         std::thread::sleep(Duration::from_millis(2500));
         let start = r.shot("c0-start");
         r.colour(&start, "start: yellow over the pinned window", (0.55, 0.25), "yellow");
         r.colour(&start, "start: pinned window", (0.45, 0.15), "green");
 
-        // A flick: shot while the hand is still going, the screen whole.
+        // A flick, shot before a pause would make the hand unsure, the screen whole.
         hold(true);
         std::thread::sleep(Duration::from_millis(40));
-        travel(140, 0, 50);
+        travel(110, 0, 40);
+        std::thread::sleep(Duration::from_millis(120));
         let quick = r.shot("c1-quick");
-        travel(40, 0, 20);
+        r.colour(&quick, "quick: yellow still over the pinned window", (0.42, 0.25), "yellow");
         hold(false);
         r.line(format!("quick: A ends at {:?} across (row 0.35)", edge(&quick, true, 0.35, "red")));
         r.line(format!("quick: along y 0.72 {:?}", (0..20).map(|i| name(quick.at(i as f64 / 20.0, 0.72))).collect::<Vec<_>>()));
@@ -412,7 +417,7 @@ mod imp {
         travel(160, 0, 200);
         std::thread::sleep(Duration::from_millis(300));
         let receded = r.shot("c2-receded");
-        r.colour(&receded, "receded: pinned window in front of yellow", (0.55, 0.25), "green");
+        r.colour(&receded, "receded: pinned window in front of yellow", (0.5, 0.25), "green");
         r.line(format!("receded: along y 0.6 {:?}", (0..20).map(|i| name(receded.at(i as f64 / 20.0, 0.6))).collect::<Vec<_>>()));
         travel(-160, 0, 200);
         std::thread::sleep(Duration::from_millis(300));
