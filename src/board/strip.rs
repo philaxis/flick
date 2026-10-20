@@ -474,8 +474,9 @@ mod tests {
         strip.follow((0.0, 0.0), 0, 1, true, 1.0);
         strip.follow((0.1, 0.0), 0, 1, true, 2.0);
         assert_eq!(strip.depth(2.0), 0.0);
+        // From the front, a third of the way back by the next frame: not lingering near whole.
         strip.follow((0.1, 0.0), 0, 1, true, 2.016);
-        assert!(strip.depth(2.016) > 0.0 && strip.depth(2.016) < 0.1);
+        assert!(strip.depth(2.016) > 0.25 && strip.depth(2.016) < 0.4);
     }
 
     #[test]

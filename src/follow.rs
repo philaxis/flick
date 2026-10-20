@@ -1,22 +1,9 @@
 //! Variant F on the desktop grid; the same springs drive the board and minimap.
-use crate::transition_curve::{Latch, Spring};
+use crate::transition_curve::{deepen, kicked, Latch, Spring};
 pub const GAP: f64 = 0.07;
 pub const DIM: f64 = 0.55;
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
 pub fn scale(depth: f64) -> f64 { 1.0 - 0.5 * depth.clamp(0.0, 1.0) }
-/// How fast the screen recedes as a hold moves, and comes forward again.
-const RECEDE_RATE: f64 = 24.0;
-const RETURN_RATE: f64 = 22.0;
-
-/// The depth going toward receded (`moving`) or whole, fastest at first:
-/// never slower than an exponential approach (95% in 0.125 s receding),
-/// rather than a spring setting off from rest, which lingers near whole.
-pub fn deepen(depth: &mut Spring, moving: bool, dt: f64) {
-    let (target, rate) = if moving { (1.0, RECEDE_RATE) } else { (0.0, RETURN_RATE) };
-    let least = rate * (target - depth.p);
-    if (least > 0.0 && depth.v < least) || (least < 0.0 && depth.v > least) { depth.v = least; }
-    depth.advance(target, dt, rate, 1.0);
-}
 /// Where `rect` (left, top, right, bottom on a screen `size` across and
 /// down) of a desktop `apart` desktops from where the strip is (sideways,
 /// up and down) is drawn, the screen at `scale`: the strip's desktops side
@@ -102,7 +89,7 @@ pub struct Step {
 }
 impl Step {
     pub fn new(now: f64, to: (i32, i32)) -> Self {
-        Self { from: (0.0, 0.0), to, began: now, receded: 0.0, speed: (0.0, 0.0), depth_speed: 6.0 }
+        Self { from: (0.0, 0.0), to, began: now, receded: 0.0, speed: (0.0, 0.0), depth_speed: kicked(Spring::default(), 6.0) }
     }
     pub fn advance(&mut self, now: f64) {
         let dt = (now - self.began).max(0.0);
@@ -116,7 +103,7 @@ impl Step {
     }
     pub fn then(&self, now: f64, to: (i32, i32)) -> Self {
         let mut next = *self;
-        next.advance(now); next.to = to; next.depth_speed += 6.0; next
+        next.advance(now); next.to = to; next.depth_speed = kicked(Spring { p: next.receded, v: next.depth_speed }, 6.0); next
     }
     pub fn at(&self) -> ((f64, f64), f64) { (self.from, self.receded.clamp(0.0, 1.0)) }
     pub fn done(&self) -> bool {
@@ -264,7 +251,7 @@ impl Follow {
         if commits != 0 {
             if axis == 1 { self.row_committing=true; } else { self.committing[(self.row-self.rows.0) as usize]=true; }
         }
-        self.depth.v += 5.0 * commits.abs() as f64;
+        if commits != 0 { self.depth.v = kicked(self.depth, 5.0 * commits.abs() as f64); }
         (self.offset(self.row), self.vertical.p)
     }
     pub fn track_path(&mut self, now: f64, path: &[(f64, f64, usize)]) {

@@ -51,6 +51,34 @@ impl Spring {
     }
 }
 
+/// How fast a picture recedes as it moves, and comes forward again.
+pub const RECEDE_RATE: f64 = 24.0;
+pub const RETURN_RATE: f64 = 22.0;
+
+/// The depth (0 whole, 1 receded) going toward receded (`deep`) or whole
+/// for `dt`. A spring setting off from rest lingers near where it was; this
+/// one leaves at least as fast as an exponential approach (95% receded in
+/// 0.125 s, whole again in 0.136 s) and is exact from there, so a late
+/// frame keeps the same curve.
+pub fn deepen(depth: &mut Spring, deep: bool, dt: f64) {
+    launch(depth, deep);
+    let (target, rate) = if deep { (1.0, RECEDE_RATE) } else { (0.0, RETURN_RATE) };
+    depth.advance(target, dt, rate, 1.0);
+}
+
+/// At least an exponential approach's speed; one already faster keeps it,
+/// and stays faster as it goes, so this changes nothing a second time.
+fn launch(depth: &mut Spring, deep: bool) {
+    depth.v = if deep { depth.v.max(RECEDE_RATE * (1.0 - depth.p)) } else { depth.v.min(-RETURN_RATE * depth.p) };
+}
+
+/// The speed of `depth` kicked `by` deeper, on top of how it leaves (`deepen`).
+pub fn kicked(depth: Spring, by: f64) -> f64 {
+    let mut depth = depth;
+    launch(&mut depth, true);
+    depth.v + by
+}
+
 /// Distances are normalized by the configured Distance: one full unit commits.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Latch { pub cell: i32, pub hand: f64, last: f64, held: bool, hold_origin: f64 }
@@ -124,19 +152,19 @@ impl Recede {
     fn sample(&self, t: f32) -> Spring {
         let mut state = self.state;
         let rising = t.min(self.fall).max(self.start) - self.start;
-        if rising > 0.0 { state.advance(1.0, rising as f64, 22.0, 1.0); }
-        if t > self.fall { state.advance(0.0, (t - self.fall.max(self.start)) as f64, 14.0, 1.0); }
+        if rising > 0.0 { deepen(&mut state, true, rising as f64); }
+        if t > self.fall { deepen(&mut state, false, (t - self.fall.max(self.start)) as f64); }
         state
     }
     pub fn depth(&self, t: f32) -> f32 { self.sample(t).p.clamp(0.0, 1.0) as f32 }
     pub fn settled(&self, t: f32) -> bool { t >= self.fall && self.sample(t).settled(0.0) }
     pub fn kick(&mut self, now: f32, velocity: f64) {
         let now=now.max(self.start);
-        self.state = self.sample(now); self.start = now; self.state.v += velocity;
+        self.state = self.sample(now); self.start = now; self.state.v = kicked(self.state, velocity);
     }
     pub fn moving(&mut self, now: f32, moving: bool) {
         let now=now.max(self.start);
-        self.state.advance(if moving { 1.0 } else { 0.0 }, (now - self.start).max(0.0) as f64, if moving { 22.0 } else { 14.0 }, 1.0);
+        deepen(&mut self.state, moving, (now - self.start).max(0.0) as f64);
         self.start = now;
         self.fall = if moving { f32::INFINITY } else { now };
     }

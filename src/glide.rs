@@ -769,7 +769,7 @@ impl View {
             Request::Step(scene, to) => {
                 let (carry, speed, receded, depth_speed) = self.carried();
                 let (screens, leftover) = self.session.take().map(|s| s.retire(self.trace.as_deref())).unwrap_or_default();
-                let step = Step { from: carry, speed, receded, depth_speed: depth_speed + 6.0, ..Step::new(0.0, to) };
+                let step = Step { from: carry, speed, receded, depth_speed: crate::transition_curve::kicked(crate::transition_curve::Spring { p: receded, v: depth_speed }, 6.0), ..Step::new(0.0, to) };
                 self.begin(scene, screens, leftover, Phase::Stepping(step));
             }
             Request::Retarget(hold, to) => {
