@@ -26,12 +26,14 @@ pub fn placed(rect: [f64; 4], size: (f64, f64), scale: f64, apart: (f64, f64), l
 // Vertical travel before the starting shelf's windows fully join its motion.
 const ROW_WINDOWS_JOIN: f64 = 0.15;
 
-/// Shelf followers stay in front only on the starting row; other rows enter with the strip.
+/// Shelf followers stay in front on their own row, however the strip came
+/// to it, and go with the strip as far as it is off their row: one size on
+/// their row for a depth, never shrunk with the strip as well there.
 pub fn row_window(rect: [f64; 4], size: (f64, f64), row: i32, y: f64, depth: f64, farthest_y: f64) -> ([f64; 4], f64) {
     let join = row_join(row, farthest_y);
     let apart = row as f64 - y;
-    let at = between(rect, on_strip(rect, size, scale(depth), (0.0, apart)), join);
     let near = (1.0 - apart.abs()).clamp(0.0, 1.0);
+    let at = between(rect, on_strip(rect, size, scale(depth), (0.0, apart)), (1.0 - near) * join);
     (at, 1.0 - DIM * (1.0 - near) * depth * join)
 }
 
@@ -565,6 +567,16 @@ mod tests {
             let returning = row_window(rect, size, 1, 1.0 - t, 1.0, 1.0 - t);
             for (a, b) in leaving.0.into_iter().zip(returning.0) { assert!((a - b).abs() < 1e-9); }
             assert!((leaving.1 - returning.1).abs() < 1e-9);
+        }
+        // On its row it is as large as it is going along it, the strip
+        // having come from another row or not, and leaves it from there.
+        for depth in [0.3, 0.7, 1.0] {
+            let along = row_window(rect, size, 0, 0.0, depth, 0.0).0;
+            for (row, farthest_y) in [(0, 1.0), (1, 1.0), (-1, 2.0), (2, 2.0)] {
+                assert_eq!(row_window(rect, size, row, row as f64, depth, farthest_y).0, along);
+            }
+            let leaving = row_window(rect, size, 1, 0.999, depth, 1.0).0;
+            for (a, b) in leaving.into_iter().zip(along) { assert!((a - b).abs() < 1.0); }
         }
     }
     #[test]
