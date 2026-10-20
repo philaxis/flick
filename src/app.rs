@@ -1755,6 +1755,7 @@ impl App {
             touchpad_status: crate::touchpad::status(),
             motion_blur: self.config.experimental.motion_blur,
             commit_speed: self.config.experimental.commit_speed,
+            quick_flick: self.config.experimental.quick_flick,
         }
     }
 
@@ -1911,6 +1912,7 @@ impl App {
         }
         crate::transition_curve::configure(config.experimental.commit_speed);
         crate::composition::configure_blur(config.experimental.motion_blur);
+        crate::quick::configure(config.experimental.quick_flick);
         crate::composition::configure(config.compositor);
         self.glide.warm();
         crate::touchpad::poll(config.touchpad.three_finger);
@@ -2776,6 +2778,7 @@ pub fn render_settings(path: &str, touchpad: bool) {
         touchpad_status: if touchpad { crate::touchpad::Status::Conflict } else { crate::touchpad::Status::Absent },
         motion_blur: config.experimental.motion_blur,
         commit_speed: config.experimental.commit_speed,
+        quick_flick: config.experimental.quick_flick,
     };
     let tab = if touchpad { settings::Tab::Touchpad } else { settings::Tab::Mouse };
     if let Some((size, pixels)) = window.render_to_pixels(view, tab, 1.5) {

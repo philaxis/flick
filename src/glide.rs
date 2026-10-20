@@ -531,6 +531,10 @@ struct Strip {
     y: f64,
     along: Vec<f64>,
     receded: f64,
+    /// How much of the others' darkening a quick flick takes away, and how
+    /// dark every desktop is as one comes in at once (`quick::Look`).
+    calm: f64,
+    flash: f64,
 }
 
 impl Strip {
@@ -600,6 +604,8 @@ struct Session {
     label: Label,
     last_frame: Option<Instant>,
     input_samples: Vec<(f64, f64, f64, usize)>,
+    /// A hold followed while it may be a quick flick (`quick`).
+    quick: Option<crate::quick::Quick>,
     visible: bool,
     stats: Stats,
     trace: Option<Trace>,
@@ -912,6 +918,7 @@ impl View {
             label: Label::new(0),
             last_frame: None,
             input_samples: Vec::new(),
+            quick: if phase == Phase::Following { crate::quick::Quick::new() } else { None },
             visible,
             stats,
             trace,
@@ -1010,6 +1017,7 @@ impl View {
         // Where the strip is, how far receded, and whether the rows go as
         // in a single step (`follow::step_along`).
         let mut following_frame = None;
+        let mut look = None;
         let ((x, y), receded, stepping) = match session.phase {
             Phase::Following => {
                 let saved = crate::input::follow_frame(session.hold);
@@ -1021,11 +1029,13 @@ impl View {
                         // A blocked renderer keeps every semantic turn via the compact path.
                         session.follow.track_path(now, &saved.path);
                         session.input_samples.clear();
+                        if let (Some(quick), Some(&(x, y, axis))) = (&mut session.quick, saved.path.last()) { quick.judge.feed(now, (x, y), axis); }
                     } else {
                         for sample in &saved.samples {
                             let t = sample.at.saturating_duration_since(session.began).as_secs_f64();
                             now = now.max(t);
                             session.follow.track_locked(t, (sample.followed.x, sample.followed.y), sample.axis);
+                            if let Some(quick) = &mut session.quick { quick.judge.feed(t, (sample.followed.x, sample.followed.y), sample.axis); }
                             if session.input_samples.len() == 3 { session.input_samples.remove(0); }
                             session.input_samples.push((t,sample.followed.x,sample.followed.y,sample.axis));
                             if !sample.followed.holding { release_time = t; }
@@ -1039,9 +1049,14 @@ impl View {
                     let frame = session.follow.sampled(now, prediction);
                     let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
                     following_frame = Some(frame);
+                    look = session.quick.as_mut().map(|quick| quick.look(now, session.follow.aim(), session.follow.selected(), session.follow.axis()));
                     result
                 } else {
                     let to = session.follow.let_go(release_time, session.hand);
+                    if let Some(quick) = &mut session.quick {
+                        quick.judge.release(release_time);
+                        look = Some(quick.look(now, session.follow.aim(), to, session.follow.axis()));
+                    }
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
                     tell(WM_GLIDE_TARGET, to, session.hold);
                     session.phase = Phase::Settling(to, now);
@@ -1050,7 +1065,13 @@ impl View {
             }
 
             Phase::Settling(to, _) => {
-                let (at, settled) = session.follow.settle(now);
+                let (at, mut settled) = session.follow.settle(now);
+                if let Some(quick) = &mut session.quick {
+                    // Until the receded picture is all there is, the quick one settles.
+                    let seen = quick.look(now, session.follow.aim(), to, session.follow.axis());
+                    if !quick.gone(now) { settled = seen.mix == 0.0 && seen.settled; }
+                    look = Some(seen);
+                }
                 let receded = session.follow.depth();
                 if settled {
                     // A subthreshold release must also retire the app's hold.
@@ -1083,7 +1104,7 @@ impl View {
             return self.finish();
         }
         let Some(session) = &mut self.session else { return };
-        let strip = match session.phase {
+        let mut strip = match session.phase {
             Phase::Arriving(..) => session.shown.clone().unwrap_or_default(),
             _ => {
                 let rows = session.follow.rows;
@@ -1093,9 +1114,19 @@ impl View {
                         along
                     })
                     .collect();
-                Strip { y, along, receded }
+                Strip { y, along, receded, calm: 0.0, flash: 0.0 }
             }
         };
+        // A quick flick: the moving axis as it slides, whole, as bright as
+        // it is; blending into the receded picture once the hand hesitates.
+        if let Some(look) = look.filter(|_| !matches!(session.phase, Phase::Arriving(..))) {
+            let keep = 1.0 - look.mix;
+            let current = (session.follow.row - session.follow.rows.0) as usize;
+            let moving = if look.axis == 0 { strip.along.get_mut(current) } else { Some(&mut strip.y) };
+            if let Some(moving) = moving { *moving += (look.at - *moving) * keep; }
+            strip.receded *= look.mix;
+            (strip.calm, strip.flash) = (keep, look.flash * keep);
+        }
         // The row whose name is shown: the one the hand is on, or the one
         // the picture goes to.
         let row = match session.phase {
@@ -1290,6 +1321,7 @@ fn in_sight(follow: &Follow, strip: &Strip, focus: &follow::Focus) -> Vec<Desk> 
             if exists(row, col) {
                 let apart = (col as f64 - along, row as f64 - strip.y);
                 let (lift, dark) = follow::standing_out(focus.at(col, row), strip.receded);
+                let dark = (dark * (1.0 - strip.calm)).max(strip.flash);
                 sight.push(Desk { cell: (row, col), apart, lift, dark });
             }
         }
