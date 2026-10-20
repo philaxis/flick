@@ -1,4 +1,5 @@
 //! The same exclusive window/app pin choices in the board and tray.
+use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pin { Off, Row, Everywhere }
 impl Pin {
@@ -38,6 +39,44 @@ impl PinState {
         (!self.inherited()).then_some(requested)
     }
 }
+/// Windows Flick put on top as they were pinned (`by_pin`), taken down again
+/// as they are unpinned, and pinned ones the user took down since
+/// (`declined`), left down. Kept with the grid, so after a restart too.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinTop {
+    #[serde(default)]
+    pub by_pin: Vec<isize>,
+    #[serde(default)]
+    pub declined: Vec<isize>,
+}
+impl PinTop {
+    /// `window`'s pin went from `was` to `now`, it being on top or not: to
+    /// be put on top (`Some(true)`), taken down (`Some(false)`) or left.
+    /// Pinned, or pinned another way, it goes on top unless it is already or
+    /// the user took it down; unpinned, it comes down if pinning put it up.
+    pub fn pin_changed(&mut self, window: isize, was: Pin, now: Pin, topmost: bool) -> Option<bool> {
+        if now == Pin::Off {
+            self.declined.retain(|w| *w != window);
+            let put = self.by_pin.contains(&window);
+            self.by_pin.retain(|w| *w != window);
+            return (put && topmost).then_some(false);
+        }
+        (now != was && !topmost && !self.declined.contains(&window)).then_some(true)
+    }
+    /// Pinning put `window` on top.
+    pub fn put_up(&mut self, window: isize) {
+        self.by_pin.retain(|w| *w != window);
+        self.by_pin.push(window);
+    }
+    /// The user put `window` on top or took it down: theirs from now on.
+    pub fn set_by_user(&mut self, window: isize, on: bool, pinned: bool) {
+        self.by_pin.retain(|w| *w != window);
+        self.declined.retain(|w| *w != window);
+        if !on && pinned {
+            self.declined.push(window);
+        }
+    }
+}
 /// A window property is destroyed with the window, even if its HWND is reused.
 pub fn same_window(saved: isize, property: isize) -> bool { saved != 0 && saved == property }
 #[cfg(test)]
@@ -68,6 +107,31 @@ mod tests {
         let override_pin = PinState { row_app: true, all_window: true, ..Default::default() };
         assert_eq!(override_pin.window_change(Pin::Off), Some(Pin::Off));
         assert!(override_pin.row_app); // Removing the window override leaves the app's shelf pin alone.
+    }
+    #[test]
+    fn pinning_puts_on_top_and_unpinning_takes_down_only_its_own() {
+        let mut top = PinTop::default();
+        assert_eq!(top.pin_changed(1, Pin::Off, Pin::Row, false), Some(true));
+        top.put_up(1);
+        assert_eq!(top.pin_changed(1, Pin::Row, Pin::Everywhere, true), None);
+        assert_eq!(top.pin_changed(1, Pin::Everywhere, Pin::Off, true), Some(false));
+        assert_eq!(top.pin_changed(1, Pin::Off, Pin::Off, false), None);
+        // On top before it was pinned: left so as it is unpinned.
+        assert_eq!(top.pin_changed(2, Pin::Off, Pin::Everywhere, true), None);
+        assert_eq!(top.pin_changed(2, Pin::Everywhere, Pin::Off, true), None);
+        // Taken down by the user while pinned: stays down, also pinned another way.
+        assert_eq!(top.pin_changed(3, Pin::Off, Pin::Row, false), Some(true));
+        top.put_up(3);
+        top.set_by_user(3, false, true);
+        assert_eq!(top.pin_changed(3, Pin::Row, Pin::Everywhere, false), None);
+        assert_eq!(top.pin_changed(3, Pin::Everywhere, Pin::Off, false), None);
+        assert_eq!(top.pin_changed(3, Pin::Off, Pin::Row, false), Some(true));
+        // Put back up by the user while pinned: theirs, left up as it is unpinned.
+        top.put_up(3);
+        top.set_by_user(3, false, true);
+        top.set_by_user(3, true, true);
+        assert_eq!(top.pin_changed(3, Pin::Row, Pin::Off, true), None);
+        assert_eq!(top, PinTop::default());
     }
     #[test]
     fn reused_handles_do_not_inherit_the_old_window() {

@@ -736,9 +736,15 @@ impl App {
     }
 
     /// `window`'s pin went from `was` to `now`. Pinned, or pinned another
-    /// way, it is raised and put in front of the windows where it is;
-    /// unpinned, that is forgotten.
+    /// way, it is raised and put in front of the windows where it is, and
+    /// put on top; unpinned, that is forgotten and taken back
+    /// (`pin::PinTop`).
     fn pin_changed(&mut self, window: HWND, was: crate::pin::Pin, now: crate::pin::Pin) {
+        match self.grid.pin_top.pin_changed(window.0, was, now, vd::is_topmost(window)) {
+            Some(true) => if self.put_top(window, true) { self.grid.pin_top.put_up(window.0) },
+            Some(false) => { self.put_top(window, false); }
+            None => {}
+        }
         if now == crate::pin::Pin::Off {
             self.raised.unpinned(window);
         } else if now != was {
@@ -796,18 +802,30 @@ impl App {
         }
     }
 
-    /// Puts a window above the others or takes it down again, and keeps
-    /// note of the ones put up here.
+    /// The user puts a window above the others or takes it down again: it
+    /// is theirs from then on, pinned or not (`pin::PinTop`).
     fn set_top(&mut self, window: HWND, on: bool) {
+        if self.put_top(window, on) {
+            let pinned = self.pin_state(window);
+            let pinned = pinned.row_window || pinned.row_app || pinned.all_window || pinned.all_app;
+            self.grid.pin_top.set_by_user(window.0, on, pinned);
+        }
+    }
+
+    /// Puts a window above the others or takes it down again, and keeps
+    /// note of the ones put up here. False when Windows would not have it.
+    fn put_top(&mut self, window: HWND, on: bool) -> bool {
         if !vd::set_topmost(window, on) {
             log("a window could not be put above the others or taken down");
-            return self.board.close_refused(window);
+            self.board.close_refused(window);
+            return false;
         }
         self.grid.kept_on_top.retain(|(hwnd, _)| *hwnd != window.0);
         if on {
             self.grid.kept_on_top.push((window.0, vd::exe_of_window(window).unwrap_or_default()));
         }
         self.restack();
+        true
     }
 
     /// Forgets the windows put above the others that are gone (a handle may
@@ -818,6 +836,9 @@ impl App {
         self.grid.kept_on_top.retain(|(hwnd, exe)| {
             unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && vd::exe_of_window(HWND(*hwnd)).unwrap_or_default() == *exe
         });
+        let kept: Vec<isize> = self.grid.kept_on_top.iter().map(|(hwnd, _)| *hwnd).collect();
+        self.grid.pin_top.by_pin.retain(|hwnd| kept.contains(hwnd));
+        self.grid.pin_top.declined.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
     }
 
     // ---- sleeping rows --------------------------------------------------------

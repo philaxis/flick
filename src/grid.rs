@@ -90,6 +90,10 @@ pub struct Grid {
     /// so that it takes back only what it did itself, also after a restart.
     #[serde(default)]
     pub kept_on_top: Vec<(isize, String)>,
+    /// Of those, the ones put up as they were pinned, and pinned ones the
+    /// user took down (`pin::PinTop`).
+    #[serde(default)]
+    pub pin_top: crate::pin::PinTop,
     /// The window showing how Flick is used was closed once: it is not
     /// shown by itself again.
     #[serde(default)]
