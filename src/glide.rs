@@ -981,11 +981,28 @@ impl View {
                 .map(|(colour, paints)| (0..LIGHT.len()).filter_map(|_| Thumb::new(&screens[on], paints.hwnd, (screens[on].area.left, screens[on].area.top), Some(colour))).collect())
                 .unwrap_or_default();
             if let Some(mut thumb) = Thumb::new(&screens[on], shot.hwnd, (shot.rect.left, shot.rect.top), None) {
+                let mut covered = false;
                 if let Place::Cell(row, col) = shot.place {
                     let area = screens[on].area;
                     if let Some(frame) = covering(shot.rect, area, unsafe { IsZoomed(shot.hwnd) }.as_bool()) {
                         thumb.dest = RECT { left: frame.left - area.left, top: frame.top - area.top, right: frame.right - area.left, bottom: frame.bottom - area.top };
                         bare.push((on, (row, col)));
+                        covered = true;
+                    }
+                }
+                // A composed thumbnail's picture begins at the corner of the
+                // window, invisible borders and all, not of its frame: drawn
+                // from the frame's corner it would be the borders off, a
+                // jump when the real window takes its place.
+                if crate::composition::follow_enabled() {
+                    let mut window = RECT::default();
+                    if unsafe { GetWindowRect(shot.hwnd, &mut window) }.is_ok() {
+                        // Its frame's own size, not the source's.
+                        let area = screens[on].area;
+                        if !covered {
+                            thumb.dest = RECT { left: shot.rect.left - area.left, top: shot.rect.top - area.top, right: shot.rect.right - area.left, bottom: shot.rect.bottom - area.top };
+                        }
+                        thumb.source = Some(within(thumb.dest, area, window));
                     }
                 }
                 shots.push((thumb, on, shot.place));
@@ -1527,6 +1544,13 @@ fn covering(frame: RECT, area: RECT, zoomed: bool) -> Option<RECT> {
     }
 }
 
+/// `dest` (on the screen whose work area is `area`) as a part of the
+/// picture of a window at `window`, which begins at its corner.
+fn within(dest: RECT, area: RECT, window: RECT) -> RECT {
+    let (dx, dy) = (area.left - window.left, area.top - window.top);
+    RECT { left: dest.left + dx, top: dest.top + dy, right: dest.right + dx, bottom: dest.bottom + dy }
+}
+
 fn opacity(share: f64) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -1672,5 +1696,19 @@ mod tests {
         let short = RECT { right: 1919, ..area };
         assert_eq!(covering(short, area, true), Some(area));
         assert_eq!(covering(short, area, false), None);
+    }
+
+    #[test]
+    fn a_window_is_drawn_from_its_frame_not_its_invisible_borders() {
+        // Maximized on a screen whose work area begins below a top bar, its
+        // borders 9 px past the work area: the picture from 9 in.
+        let area = RECT { left: 1920, top: 40, right: 3840, bottom: 1080 };
+        let window = RECT { left: 1911, top: 31, right: 3849, bottom: 1089 };
+        let dest = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(within(dest, area, window), RECT { left: 9, top: 9, right: 1929, bottom: 1049 });
+        // A window with 8 px borders either side and below, none above.
+        let window = RECT { left: 2200, top: 140, right: 2533, bottom: 317 };
+        let frame = RECT { left: 2208 - 1920, top: 100, right: 2525 - 1920, bottom: 269 };
+        assert_eq!(within(frame, area, window), RECT { left: 8, top: 0, right: 325, bottom: 169 });
     }
 }

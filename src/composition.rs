@@ -128,8 +128,11 @@ unsafe fn register_inner(destination: HWND, source: HWND, composed: bool) -> Res
         let library=GetModuleHandleW(w!("dwmapi.dll"))?;
         let proc=GetProcAddress(library,PCSTR(147usize as *const u8)).ok_or_else(||Error::from(E_FAIL))?;
         let create: SharedThumbnail=std::mem::transmute(proc);
+        // Its picture begins at the window's corner, invisible borders and all: the whole of it, or
+        // the frame's right and bottom edges are cut off by the borders' width.
+        let whole=window.map_or(size,|w| SIZE {cx:w.cx.max(size.cx),cy:w.cy.max(size.cy)});
         let props=DWM_THUMBNAIL_PROPERTIES {dwFlags:DWM_TNP_RECTDESTINATION|DWM_TNP_RECTSOURCE|DWM_TNP_VISIBLE|DWM_TNP_OPACITY|DWM_TNP_SOURCECLIENTAREAONLY|0x04000000,
-            rcDestination:RECT {left:0,top:0,right:size.cx,bottom:size.cy},rcSource:RECT {left:0,top:0,right:size.cx,bottom:size.cy},opacity:255,fVisible:true.into(),fSourceClientAreaOnly:false.into()};
+            rcDestination:RECT {left:0,top:0,right:whole.cx,bottom:whole.cy},rcSource:RECT {left:0,top:0,right:whole.cx,bottom:whole.cy},opacity:255,fVisible:true.into(),fSourceClientAreaOnly:false.into()};
         let(mut raw,mut id)=(std::ptr::null_mut(),0);
         create(destination,source,2,&props,scene.device.as_raw(),&mut raw,&mut id).ok()?;
         if raw.is_null() {return Err(Error::from(E_FAIL));}

@@ -678,13 +678,30 @@ fn boardstress(cycles: usize, millis: u64, mode: &str, cursor: &str) {
 /// A plain window of one colour, kept up for a while: something whose live
 /// preview can be found on the screen by its colour.
 #[cfg(windows)]
+static GRID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
 fn hold(args: &[String]) {
     use windows::core::{w, HSTRING};
     use windows::Win32::{Foundation::COLORREF, Graphics::Gdi::CreateSolidBrush, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*};
     let n = |i: usize| args[i].parse::<i32>().unwrap();
     unsafe extern "system" fn plain(hwnd: windows::Win32::Foundation::HWND, message: u32, w: windows::Win32::Foundation::WPARAM, l: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::{Foundation::RECT, Graphics::Gdi::{BeginPaint, EndPaint, FillRect, GetStockObject, HBRUSH, PAINTSTRUCT, WHITE_BRUSH}};
+        // A title with "grid" in it: white lines every 64 px over the colour, to tell its size by.
+        if message == WM_PAINT && GRID.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut paint = PAINTSTRUCT::default();
+            let dc = BeginPaint(hwnd, &mut paint);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let white = HBRUSH(GetStockObject(WHITE_BRUSH).0);
+            for x in (0..client.right).step_by(64) { FillRect(dc, &RECT { left: x, top: 0, right: x + 2, bottom: client.bottom }, white); }
+            for y in (0..client.bottom).step_by(64) { FillRect(dc, &RECT { left: 0, top: y, right: client.right, bottom: y + 2 }, white); }
+            let _ = EndPaint(hwnd, &paint);
+            return windows::Win32::Foundation::LRESULT(0);
+        }
         DefWindowProcW(hwnd, message, w, l)
     }
+    GRID.store(args[3].contains("grid"), std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let instance = GetModuleHandleW(None).unwrap();
         let class = w!("flick.test.hold");
