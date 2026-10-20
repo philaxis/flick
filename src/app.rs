@@ -1398,14 +1398,11 @@ impl App {
 
     /// Hold `hold` was let go of and settles on `to`: the minimap goes there
     /// along with the picture.
+    /// Let go of, the picture lands on `to`: Windows goes there at once,
+    /// under the picture as it lands, not once it has (`glide_settled`), so
+    /// the switch's own time is not added after the landing.
     fn glide_target(&mut self, hold: u32, to: (i32, i32)) {
-        // The turns are kept once it lands (`glide_go`): kept now, `to`
-        // would be counted from them a second time there.
-        let Some(origin) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|g| g.origin.clone()) else { return };
-        if let Some(id) = self.glide_cell(&origin, to) {
-            let view = self.view(&id);
-            self.minimap.update(view);
-        }
+        self.glide_settled(hold, to);
     }
 
     /// The rows a hold turned stay turned (`Row::last`), whichever it goes
@@ -1442,9 +1439,10 @@ impl App {
     }
 
     /// The picture of hold `hold` settled on `to`: Windows goes there, and
-    /// the picture goes once it is.
+    /// the picture goes once it is. Gone there already as it was let go of
+    /// (`glide_target`), nothing more.
     fn glide_settled(&mut self, hold: u32, to: (i32, i32)) {
-        let Some((origin, carry, turns)) = self.gliding.as_mut().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.carry, g.turns())) else {
+        let Some((origin, carry, turns)) = self.gliding.as_mut().filter(|gliding| gliding.hold == hold && gliding.landing.is_none()).map(|g| (g.origin.clone(), g.carry, g.turns())) else {
             input::forget_hold(hold);
             return;
         };
