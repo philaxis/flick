@@ -1,10 +1,10 @@
 //! End-to-end check of the screen following the hand (src/glide.rs) on a
 //! real Windows session, with Flick running `--portable`:
 //!   glide_e2e prepare <dir>    desktops A, B (a row) and C (below A); state.json and config.toml
-//!   glide_e2e window <rrggbb> <x> <y> <w> <h> <desktop id|pin> <secs>
+//!   glide_e2e window <rrggbb> <x> <y> <w> <h> <desktop id|pin> <secs>   (w and h 0: maximized)
 //!   glide_e2e run <dir> <exe for the row window>
 //!   glide_e2e cleanup <dir>
-//! A full-screen window of its own colour on each desktop, one pinned to all
+//! A full-screen window of its own colour on each desktop (B's maximized), one pinned to all
 //! desktops and one of an app that goes along its row; the trigger is held
 //! and the mouse moved with SendInput, and the screen read back in between.
 #[allow(dead_code)]
@@ -43,8 +43,8 @@ mod imp {
                 },
                 WindowsAndMessaging::{
                     CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW, ShowWindow,
-                    SystemParametersInfoW, TranslateMessage, MSG, PM_REMOVE, SPI_GETWORKAREA, SW_SHOWNOACTIVATE,
-                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WNDCLASSW, WS_EX_APPWINDOW, WS_POPUP,
+                    SystemParametersInfoW, TranslateMessage, CW_USEDEFAULT, MSG, PM_REMOVE, SPI_GETWORKAREA, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
+                    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, WS_POPUP,
                 },
             },
         },
@@ -160,8 +160,15 @@ mod imp {
                 hbrBackground: CreateSolidBrush(COLORREF(b << 16 | g << 8 | r)),
                 ..Default::default()
             });
-            let hwnd = CreateWindowExW(WS_EX_APPWINDOW, w!("glide.e2e"), &windows::core::HSTRING::from(format!("glide {}", args[0])), WS_POPUP, n(1), n(2), n(3), n(4), None, None, instance, None);
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let title = windows::core::HSTRING::from(format!("glide {}", args[0]));
+            let maximized = n(3) == 0 && n(4) == 0;
+            let hwnd = if maximized {
+                let d = CW_USEDEFAULT;
+                CreateWindowExW(WS_EX_APPWINDOW, w!("glide.e2e"), &title, WS_OVERLAPPEDWINDOW, d, d, d, d, None, None, instance, None)
+            } else {
+                CreateWindowExW(WS_EX_APPWINDOW, w!("glide.e2e"), &title, WS_POPUP, n(1), n(2), n(3), n(4), None, None, instance, None)
+            };
+            ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOWNOACTIVATE });
             pump(300);
             if args[5] == "pin" {
                 println!("pin {:?}", vdapi::pin_window(hwnd));
@@ -319,6 +326,33 @@ mod imp {
         })
     }
 
+    /// The pixels just outside each run of `color` along a line across the
+    /// screen that are neither black nor `color` darkened toward it: what is
+    /// beneath the window showing at its edges.
+    fn fringe(shot: &Shot, horizontal: bool, at: f64, color: u32) -> Vec<u32> {
+        let n = if horizontal { shot.w } else { shot.h };
+        let pixel = |i: i32| {
+            let f = (i as f64 + 0.5) / n as f64;
+            if horizontal { shot.at(f, at) } else { shot.at(at, f) }
+        };
+        let channels = |c: u32| [(c >> 16 & 0xFF) as f64, (c >> 8 & 0xFF) as f64, (c & 0xFF) as f64];
+        let want = channels(color);
+        let darkened = |c: u32| {
+            let got = channels(c);
+            let k = got[2] / want[2];
+            (0..3).map(|i| (got[i] - want[i] * k).abs()).sum::<f64>() < 30.0
+        };
+        let inside: Vec<bool> = (0..n).map(|i| name(pixel(i)) == name(color)).collect();
+        let mut found = Vec::new();
+        for i in 0..n {
+            let edge = (1..=3).any(|d| [i - d, i + d].into_iter().any(|j| (0..n).contains(&j) && inside[j as usize]));
+            if !inside[i as usize] && edge && !darkened(pixel(i)) {
+                found.push(pixel(i));
+            }
+        }
+        found
+    }
+
     fn run(dir: &str, row_exe: &str) {
         let mut r = Report { text: String::new(), failed: 0, dir: dir.to_owned() };
         let ids: Vec<String> = std::fs::read_to_string(format!("{dir}/ids.txt")).unwrap().lines().map(str::to_owned).collect();
@@ -345,7 +379,7 @@ mod imp {
         let row = (area.left + w * 75 / 100, area.top + h * 70 / 100, w * 15 / 100, h * 15 / 100);
         let mut children = vec![
             spawn(&me, RED, whole, &a),
-            spawn(&me, BLUE, whole, &b),
+            spawn(&me, BLUE, (0, 0, 0, 0), &b),
             spawn(&me, YELLOW, whole, &c),
         ];
         std::thread::sleep(Duration::from_millis(1500));
@@ -377,6 +411,9 @@ mod imp {
         // notches: A ends at about 34% across, then a dark gap, then B.
         r.check("held: A ends about 34% across", boundary.is_some_and(|b| (0.29..0.40).contains(&b)), format!("{boundary:?}"));
         r.colour(&mid, "held: receded, dark above A", (0.15, 0.02), "black");
+        // B's window is maximized: nothing beneath it shows at its left and bottom edges.
+        let seen = [fringe(&mid, true, 0.5, BLUE), fringe(&mid, false, 0.8, BLUE)].concat();
+        r.check("held: no wallpaper at B's maximized window's edges", seen.is_empty(), format!("{:06x?}", &seen[..seen.len().min(12)]));
         hold(false);
         let released = Instant::now();
         let mut settling = Vec::new();

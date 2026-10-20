@@ -59,7 +59,7 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW,
-            GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, PeekMessageW, PostMessageW, RegisterClassW,
+            GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId, IsZoomed, PeekMessageW, PostMessageW, RegisterClassW,
             SetLayeredWindowAttributes, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, LWA_ALPHA, MSG,
             PM_REMOVE, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
             SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WNDCLASSW, WS_EX_LAYERED,
@@ -577,6 +577,9 @@ struct Session {
     screens: Vec<Screen>,
     /// The windows' thumbnails, bottom first, and where each is drawn.
     shots: Vec<(Thumb, usize, Place)>,
+    /// The desktops (screen, row and cell) a window covers the whole of
+    /// (`covering`): their wallpaper is not drawn, to show at its edges.
+    bare: Vec<(usize, (i32, i32))>,
     /// Each screen's.
     veils: Vec<Veil>,
     /// The thumbnails of the hold before, while this one's are not drawn
@@ -858,6 +861,7 @@ impl View {
         let mut order: Vec<&Shot> = scene.shots.iter().collect();
         order.sort_by_key(|shot| rank(&shot.place));
         let mut shots = Vec::new();
+        let mut bare = Vec::new();
         let mut veils: Vec<Veil> = Vec::new();
         if self.paints.is_none() {
             self.paints = Paints::new();
@@ -869,7 +873,14 @@ impl View {
             let (cx, cy) = ((shot.rect.left + shot.rect.right) / 2, (shot.rect.top + shot.rect.bottom) / 2);
             let inside = |a: &RECT| cx >= a.left && cx < a.right && cy >= a.top && cy < a.bottom;
             let on = monitors.iter().position(|m| inside(&m.bounds)).unwrap_or(0).min(screens.len() - 1);
-            if let Some(thumb) = Thumb::new(&screens[on], shot.hwnd, (shot.rect.left, shot.rect.top), None) {
+            if let Some(mut thumb) = Thumb::new(&screens[on], shot.hwnd, (shot.rect.left, shot.rect.top), None) {
+                if let Place::Cell(row, col) = shot.place {
+                    let area = screens[on].area;
+                    if let Some(frame) = covering(shot.rect, area, unsafe { IsZoomed(shot.hwnd) }.as_bool()) {
+                        thumb.dest = RECT { left: frame.left - area.left, top: frame.top - area.top, right: frame.right - area.left, bottom: frame.bottom - area.top };
+                        bare.push((on, (row, col)));
+                    }
+                }
                 shots.push((thumb, on, shot.place));
             }
         }
@@ -887,6 +898,7 @@ impl View {
             follow,
             screens,
             shots,
+            bare,
             veils,
             leftover,
             phase,
@@ -1254,6 +1266,8 @@ fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
 /// One desktop in sight: how far from the middle of the screen (sideways,
 /// up and down), and how it stands out (`follow::standing_out`).
 struct Desk {
+    /// Its row and cell.
+    cell: (i32, i32),
     apart: (f64, f64),
     lift: f64,
     dark: f64,
@@ -1276,11 +1290,26 @@ fn in_sight(follow: &Follow, strip: &Strip, focus: &follow::Focus) -> Vec<Desk> 
             if exists(row, col) {
                 let apart = (col as f64 - along, row as f64 - strip.y);
                 let (lift, dark) = follow::standing_out(focus.at(col, row), strip.receded);
-                sight.push(Desk { apart, lift, dark });
+                sight.push(Desk { cell: (row, col), apart, lift, dark });
             }
         }
     }
     sight
+}
+
+/// Where a window over the whole work area `area` of its screen (`frame`
+/// covering it, or maximized) is drawn: over all of it, as the wallpaper
+/// beneath would be, not from its corner with its source's size, which can
+/// be a pixel short and show a line of wallpaper; or `None` for another.
+fn covering(frame: RECT, area: RECT, zoomed: bool) -> Option<RECT> {
+    let over = frame.left <= area.left && frame.top <= area.top && frame.right >= area.right && frame.bottom >= area.bottom;
+    if over {
+        Some(frame)
+    } else if zoomed {
+        Some(area)
+    } else {
+        None
+    }
 }
 
 fn opacity(share: f64) -> u8 {
@@ -1306,7 +1335,8 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
                 continue;
             }
             if let Some(wall) = walls.next() {
-                moved += wall.draw(Some(at), size, 255) as u32;
+                let bare = session.bare.contains(&(index, desk.cell));
+                moved += wall.draw((!bare).then_some(at), size, 255) as u32;
             }
             if desk.dark > 0.004 {
                 if let Some(shade) = shades.next() {
@@ -1335,4 +1365,21 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
         moved += thumb.draw(Some(at), size, opacity(shown)) as u32;
     }
     moved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_over_the_whole_work_area_cover_it() {
+        let area = RECT { left: 0, top: 0, right: 1920, bottom: 1032 };
+        assert_eq!(covering(area, area, true), Some(area));
+        let full = RECT { bottom: 1080, ..area };
+        assert_eq!(covering(full, area, false), Some(full));
+        // Maximized, its frame a pixel short: drawn over the whole of it still.
+        let short = RECT { right: 1919, ..area };
+        assert_eq!(covering(short, area, true), Some(area));
+        assert_eq!(covering(short, area, false), None);
+    }
 }
