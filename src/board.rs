@@ -3121,8 +3121,11 @@ impl Board {
                 // Most below it, spreading down as a lamp under it would; faint all round.
                 let reach = paint::pin_light(pin == Pin::Everywhere).1 * s;
                 let under = Rect { left: body.left + bw * 0.04, right: body.right - bw * 0.04, top: body.bottom - bh * 0.30, bottom: body.bottom + PIN_BELOW.1 * reach };
-                p.glow(glow, &under, PIN_BELOW.0 * reach, PIN_BELOW.2 * dim);
-                p.glow(glow, &body, PIN_ROUND.0 * reach, PIN_ROUND.1 * dim);
+                // None within it, which would show through a window seen through.
+                p.outside(&body, 8.0 * s, || {
+                    p.glow(glow, &under, PIN_BELOW.0 * reach, PIN_BELOW.2 * dim);
+                    p.glow(glow, &body, PIN_ROUND.0 * reach, PIN_ROUND.1 * dim);
+                });
             }
             if pointed && !dragged {
                 p.glow(&glows.light, &body, 30.0 * s, 0.16);
