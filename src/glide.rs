@@ -1299,9 +1299,9 @@ impl View {
                     let frame = session.follow.sampled(now, prediction);
                     let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
                     // Whole, the screen is where the hand is, resampled to the frame's time.
-                    let held = frame.held();
+                    let (held, past) = (frame.held(), frame.past());
                     following_frame = Some(frame);
-                    look = session.quick.as_mut().map(|quick| quick.look(now, session.follow.aim(), Some(held), session.follow.selected(), session.follow.axis()));
+                    look = session.quick.as_mut().map(|quick| { quick.past_end(past); quick.look(now, session.follow.aim(), Some(held), session.follow.selected(), session.follow.axis()) });
                     result
                 } else {
                     // Let go of a flick still moving, it goes on a little (`Judge::coast`);
@@ -1311,7 +1311,7 @@ impl View {
                         quick.release(release_time);
                         (quick.judge.coast(release_time), quick.judge.tap(release_time))
                     });
-                    let held = session.follow.held();
+                    let (held, past) = (session.follow.held(), session.follow.past());
                     if session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure) {
                         session.follow.let_go_near(release_time, session.hand, coast);
                     } else {
@@ -1319,6 +1319,7 @@ impl View {
                     }
                     let to = session.follow.tapped(session.hand, tap);
                     if let Some(quick) = &mut session.quick {
+                        quick.past_end(past);
                         look = Some(quick.look(now, session.follow.aim(), Some(held), to, session.follow.axis()));
                     }
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);

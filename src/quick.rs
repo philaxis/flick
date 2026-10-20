@@ -269,6 +269,12 @@ pub struct Quick {
     along: [Spring; 2],
     /// Let go of, and set off landing from where the hand was.
     landing: bool,
+    /// How far past the end the hand last showed (`Follow::past`), what
+    /// of it the picture still owes as the hand turns back (`Latch` drops
+    /// it at once), and whether it was let go of there.
+    past: [f64; 2],
+    back: [Spring; 2],
+    rebound: bool,
     depth: f64,
     last: Option<f64>,
     /// The cell last shown and when it came (`Instant`).
@@ -286,7 +292,7 @@ impl Quick {
         };
         let since = SURE_END.lock().ok().and_then(|end| end.map(|end| end.elapsed().as_secs_f64()));
         let judge = if carried(since) { Judge::sure() } else { Judge::default() };
-        Some(Quick { instant, judge, along: [Spring::default(); 2], landing: false, depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
+        Some(Quick { instant, judge, along: [Spring::default(); 2], landing: false, past: [0.0; 2], back: [Spring::default(); 2], rebound: false, depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
     }
 
     /// Let go of at `now`; let go of sure, the next hold soon after is sure
@@ -295,6 +301,16 @@ impl Quick {
         self.judge.release(now);
         if let Ok(mut end) = SURE_END.lock() {
             *end = (self.judge.mind == Mind::Sure).then(std::time::Instant::now);
+        }
+    }
+
+    /// How far past the end the hand shows (`Follow::past`) for the next
+    /// `look`: turned back from there the picture eases in as the latches
+    /// do (`Spring::position`) rather than jumping.
+    pub fn past_end(&mut self, past: (f64, f64)) {
+        for (way, past) in [past.0, past.1].into_iter().enumerate() {
+            if past.abs() < self.past[way].abs() { self.back[way].p += self.past[way] - past; }
+            self.past[way] = past;
         }
     }
 
@@ -310,16 +326,19 @@ impl Quick {
         let aim = [aim.0, aim.1];
         if let Some(held) = held {
             // Where the hand is, no later; let go of, off as fast as it went.
-            self.along = [Spring { p: held.0, v: 0.0 }, Spring { p: held.1, v: 0.0 }];
+            for (way, back) in self.back.iter_mut().enumerate() { back.position(0.0, dt, way == 1); }
+            self.along = [Spring { p: held.0 + self.back[0].p, v: self.back[0].v }, Spring { p: held.1 + self.back[1].p, v: self.back[1].v }];
             if self.judge.released.is_some() && !self.landing {
                 self.landing = true;
-                if let Some(way) = self.judge.axis() {
+                // Let go of past the end, it comes back as the latches do.
+                self.rebound = self.past.iter().chain(self.back.iter().map(|back| &back.p)).any(|&off| off.abs() > 1e-9);
+                if let (Some(way), false) = (self.judge.axis(), self.rebound) {
                     self.along[way].v = launch(self.along[way].p - aim[way], self.judge.way() * self.judge.speed(now));
                 }
             }
         } else {
-            for (spring, aim) in self.along.iter_mut().zip(aim) {
-                spring.advance(aim, dt, LAND, 1.0);
+            for (way, (spring, aim)) in self.along.iter_mut().zip(aim).enumerate() {
+                if self.rebound { spring.commit(aim, dt, way == 1); } else { spring.advance(aim, dt, LAND, 1.0); }
                 if spring.settled(aim) { *spring = Spring { p: aim, v: 0.0 }; }
             }
         }
@@ -339,9 +358,10 @@ impl Quick {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transition_curve::{give, EDGE};
 
     fn fresh() -> Quick {
-        Quick { instant: false, judge: Judge::default(), along: [Spring::default(); 2], landing: false, depth: 0.0, last: None, cell: (0, 0), came: 0.0 }
+        Quick { instant: false, judge: Judge::default(), along: [Spring::default(); 2], landing: false, past: [0.0; 2], back: [Spring::default(); 2], rebound: false, depth: 0.0, last: None, cell: (0, 0), came: 0.0 }
     }
 
     /// A hand along x at `x(t)` (cells), sampled every `dt` from `from`
@@ -630,9 +650,75 @@ mod tests {
         let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
         hand.track_locked(0.0, (0.9, 0.0), 0);
         assert_eq!(hand.let_go_near(0.01, (0.9, 0.0), (COAST_MOST, 0.0)), (1, 0));
-        // At the row's end, held there.
+        // At the row's end, held only as far as the latches give there.
         let mut hand = crate::follow::Follow::new((0, 0), vec![(-1, 0)]);
         hand.track_locked(0.0, (0.3, 0.0), 0);
-        assert_eq!(hand.held(), (0.0, 0.0));
+        assert_eq!(hand.held(), (give(0.3), 0.0));
+    }
+
+    #[test]
+    fn past_the_end_the_hand_gives_as_the_latches_do_and_lets_go_back_onto_the_last_cell() {
+        // Each row its own end, and the rows theirs, heavier the farther and never a cell's EDGE.
+        let mut hand = crate::follow::Follow::new((0, 1), vec![(0, 3), (0, 1)]);
+        hand.track_locked(0.0, (0.5, 0.0), 0);
+        assert_eq!(hand.held(), (0.5, 0.0));
+        hand.track_locked(0.01, (3.3, 0.0), 0);
+        assert!((hand.held().0 - 3.0 - give(0.3)).abs() < 1e-9 && (hand.past().0 - give(0.3)).abs() < 1e-9 && hand.past().1 == 0.0);
+        hand.track_locked(0.02, (90.0, 0.0), 0);
+        assert!(hand.held().0 > 3.14 && hand.held().0 < 3.0 + EDGE);
+        let mut hand = crate::follow::Follow::new((0, 1), vec![(0, 3), (0, 1)]);
+        hand.track_locked(0.0, (0.0, 1.0), 1);
+        hand.track_locked(0.01, (1.4, 1.0), 0);
+        assert!((hand.held().0 - 1.0 - give(0.4)).abs() < 1e-9, "{:?}", hand.held());
+        let mut hand = crate::follow::Follow::new((0, 1), vec![(0, 3), (0, 1)]);
+        hand.track_locked(0.0, (0.0, -0.2), 1);
+        assert!((hand.held().1 + give(0.2)).abs() < 1e-9);
+
+        // Turned back there, the picture eases in rather than jumping.
+        let mut quick = fresh();
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 1)]);
+        let x = |t: f64| if t < 0.1 { 1.5 * t / 0.1 } else { 1.5 - (t - 0.1) };
+        let (mut t, mut last) = (0.0, 0.0f64);
+        while t < 0.3 {
+            hand.track_locked(t, (x(t), 0.0), 0);
+            quick.past_end(hand.past());
+            let at = quick.look(t, hand.aim(), Some(hand.held()), hand.selected(), 0).at;
+            if t > 0.1 { assert!((at - last).abs() < 0.05, "{t}: {last} to {at}"); }
+            last = at;
+            t += 1.0 / 120.0;
+        }
+
+        // Let go past the end, flung or not, back onto it as a latch's commit
+        // comes back (`Spring::commit`), never past the end beyond.
+        for speed in [2.0, FLING * 1.5] {
+            let mut quick = fresh();
+            let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
+            let x = |t: f64| 2.9 + speed * t;
+            let mut t = 0.0;
+            while t < 0.1 {
+                hand.track_locked(t, (x(t), 0.0), 0);
+                quick.judge.feed(t, (x(t), 0.0), 0);
+                quick.past_end(hand.past());
+                quick.look(t, hand.aim(), Some(hand.held()), hand.selected(), 0);
+                t += 1.0 / 120.0;
+            }
+            quick.release(t);
+            let (held, past) = (hand.held(), hand.past());
+            let coast = quick.judge.coast(t);
+            let to = if quick.judge.mind == Mind::Sure { hand.let_go_near(t, (x(t), 0.0), coast) } else { hand.let_go(t, (x(t), 0.0)) };
+            assert_eq!(hand.tapped((x(t), 0.0), quick.judge.tap(t)), (3, 0));
+            assert_eq!(to, (3, 0));
+            quick.past_end(past);
+            let mut look = quick.look(t, hand.aim(), Some(held), to, 0);
+            let mut commit = Spring { p: look.at, v: 0.0 };
+            let mut most = look.at;
+            for frame in 1..=48 {
+                look = quick.look(t + frame as f64 / 120.0, hand.aim(), None, to, 0);
+                commit.commit(3.0, 1.0 / 120.0, false);
+                assert!((look.at - commit.p).abs() < 1e-6);
+                most = most.max(look.at);
+            }
+            assert!(most < 3.0 + EDGE && look.settled && look.at == 3.0, "{speed}: {most} {look:?}");
+        }
     }
 }

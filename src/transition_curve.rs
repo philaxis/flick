@@ -79,6 +79,10 @@ pub fn kicked(depth: Spring, by: f64) -> f64 {
     depth.v + by
 }
 
+/// How far past the last cell the picture goes for a hand `over` (cells)
+/// past it: heavier the farther, never `EDGE`.
+pub fn give(over: f64) -> f64 { over.signum() * EDGE * over.abs() / (over.abs() + EDGE) }
+
 /// Distances are normalized by the configured Distance: one full unit commits.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Latch { pub cell: i32, pub hand: f64, last: f64, held: bool, hold_origin: f64 }
@@ -106,7 +110,7 @@ impl Latch {
         let hand = self.hand - self.hold_origin;
         let hand = if self.held { hand.signum() * (hand.abs() - HOLD).max(0.0) / (1.0 - HOLD) } else { hand };
         let pull = if (self.cell == room.0 && hand < 0.0) || (self.cell == room.1 && hand > 0.0) {
-            hand.signum() * EDGE * hand.abs() / (hand.abs() + EDGE)
+            give(hand)
         } else { PULL * (hand / PULL).tanh() };
         self.cell as f64 + pull
     }
