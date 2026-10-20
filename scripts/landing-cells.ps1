@@ -24,6 +24,9 @@ public static class W {
   [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint f);
   [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string t);
   [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool SystemParametersInfo(uint a, uint p, string v, uint f);
@@ -45,6 +48,27 @@ public static class W {
     }, IntPtr.Zero);
     return list;
   }
+  // Whatever else is open and not minimized, owned dialogs too: hidden while the pictures are taken.
+  public static List<IntPtr> Strays() {
+    var list = new List<IntPtr>();
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h) || IsIconic(h) || Title(h).Length == 0) return true;
+      var c = new StringBuilder(256); GetClassName(h, c, 256);
+      string k = c.ToString(); if (k == "Shell_TrayWnd" || k == "Shell_SecondaryTrayWnd" || k == "Progman" || k == "WorkerW") return true;
+      int cloaked; if (DwmGetWindowAttribute(h, 14, out cloaked, 4) == 0 && cloaked != 0) return true;
+      RECT f = Frame(h); if (f.R - f.L < 100 || f.B - f.T < 60) return true;
+      list.Add(h); return true;
+    }, IntPtr.Zero);
+    return list;
+  }
+  // The desktop's icons: the list view in the shell's desktop window.
+  public static IntPtr DesktopIcons() {
+    IntPtr view = FindWindowEx(FindWindowEx(IntPtr.Zero, IntPtr.Zero, "Progman", null), IntPtr.Zero, "SHELLDLL_DefView", null);
+    IntPtr w = IntPtr.Zero;
+    while (view == IntPtr.Zero && (w = FindWindowEx(IntPtr.Zero, w, "WorkerW", null)) != IntPtr.Zero) view = FindWindowEx(w, IntPtr.Zero, "SHELLDLL_DefView", null);
+    return view == IntPtr.Zero ? IntPtr.Zero : FindWindowEx(view, IntPtr.Zero, "SysListView32", null);
+  }
+  public static void Show(IntPtr h, bool on) { ShowWindow(h, on ? 8 : 0); }
   public static string Title(IntPtr h) { var s = new StringBuilder(512); GetWindowText(h, s, 512); return s.ToString(); }
   public static RECT Frame(IntPtr h) { RECT r; if (DwmGetWindowAttribute(h, 9, out r, 16) != 0) GetWindowRect(h, out r); return r; }
   // Puts the window's visible frame at x,y,w,h: the outer rect has invisible borders round it.
@@ -99,20 +123,20 @@ $photos = @(Get-ChildItem 'C:\Windows\Web\Screen\*.jpg', 'C:\Windows\Web\Wallpap
 for ($i = 0; $i -lt $photos.Count; $i++) { Copy-Item $photos[$i].FullName (Join-Path $stuff ('현장사진_{0:00}.jpg' -f ($i + 1))) -Force }
 # The report's chart: shade against temperature at the three places.
 function Chart($path) {
-  $b = New-Object Drawing.Bitmap 1200, 760; $g = [Drawing.Graphics]::FromImage($b)
+  $b = New-Object Drawing.Bitmap 1000, 620; $g = [Drawing.Graphics]::FromImage($b)
   $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'ClearTypeGridFit'; $g.Clear([Drawing.Color]::White)
   $f = New-Object Drawing.Font 'Malgun Gothic', 22, ([Drawing.FontStyle]::Bold); $s = New-Object Drawing.Font 'Malgun Gothic', 15
   $ink = [Drawing.Brushes]::Black; $grey = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(110, 110, 110))
-  $g.DrawString('그림 1. 14시 기온 비교 (7일 평균)', $f, $ink, 60, 40)
+  $g.DrawString('그림 1. 14시 기온 비교 (7일 평균)', $f, $ink, 110, 30)
   $line = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(225, 225, 225)), 2
-  for ($k = 0; $k -le 4; $k++) { $y = 640 - $k * 120; $g.DrawLine($line, 140, $y, 1120, $y); $g.DrawString(('{0} ℃' -f (26 + $k * 2)), $s, $grey, 60, $y - 12) }
+  for ($k = 0; $k -le 4; $k++) { $y = 520 - $k * 100; $g.DrawLine($line, 190, $y, 960, $y); $g.DrawString(('{0} ℃' -f (26 + $k * 2)), $s, $grey, 110, $y - 12) }
   $bars = @(@('공원 둘레길', 29.2, '#3f9d5a'), @('주택가 골목', 31.6, '#c9a227'), @('대로변', 32.3, '#d1553f'))
   for ($k = 0; $k -lt 3; $k++) {
-    $v = $bars[$k][1]; $h = ($v - 26) * 60; $x = 230 + $k * 300
+    $v = $bars[$k][1]; $h = ($v - 26) * 50; $x = 250 + $k * 240
     $c = New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml($bars[$k][2]))
-    $g.FillRectangle($c, $x, 640 - $h, 160, $h)
-    $g.DrawString(('{0:0.0} ℃' -f $v), $f, $ink, $x + 22, 640 - $h - 44)
-    $g.DrawString($bars[$k][0], $s, $grey, $x + 20, 660)
+    $g.FillRectangle($c, $x, 520 - $h, 140, $h)
+    $g.DrawString(('{0:0.0} ℃' -f $v), $f, $ink, $x + 12, 520 - $h - 44)
+    $g.DrawString($bars[$k][0], $s, $grey, $x + 14, 540)
   }
   $b.Save($path, [Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()
 }
@@ -129,6 +153,9 @@ if (Test-Path $tabs) { Remove-Item $tabsBackup -Recurse -Force -ErrorAction Sile
 function ForgetTabs { if (Test-Path $tabs) { Get-ChildItem $tabs | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue } }
 $shell = New-Object -ComObject Shell.Application
 $shell.MinimizeAll(); Start-Sleep 2
+$strays = @([W]::Strays()); foreach ($h in $strays) { [W]::Show($h, $false) }
+$iconsView = [W]::DesktopIcons(); if ($iconsView -ne [IntPtr]::Zero) { [W]::Show($iconsView, $false) }
+Log "hidden: $($strays.Count) windows, desktop icons $($iconsView -ne [IntPtr]::Zero)"
 # Dark, as the page around the pictures.
 Set-ItemProperty $personalize AppsUseLightTheme 0 -Type DWord
 Set-ItemProperty $personalize SystemUsesLightTheme 0 -Type DWord
@@ -190,10 +217,11 @@ function Crop($bmp, $r, $path) {
 if ($edge) { $h = Launch 'edge' @('docs'); Start-Sleep 4; CloseAll @($h) }
 
 # One wallpaper per shelf: each piece of work has its own place.
-$walls = @(Get-ChildItem 'C:\Windows\Web\Wallpaper\*\*.jpg' -ErrorAction SilentlyContinue | Sort-Object FullName)
-Log "wallpapers: $($walls.Name -join ', ')"
-function Wall($i) { if ($walls.Count) { $walls[[Math]::Min($i, $walls.Count - 1)].FullName } }
-$shelfWall = @((Wall 0), (Wall ([Math]::Floor($walls.Count / 2))), (Wall ($walls.Count - 1)))
+# Windows' own wallpapers only, none of a maker's.
+$walls = @(Get-ChildItem 'C:\Windows\Web\Wallpaper\Theme*\*.jpg', 'C:\Windows\Web\Wallpaper\Windows\*.jpg' -ErrorAction SilentlyContinue | Sort-Object FullName)
+Log "wallpapers: $(($walls | ForEach-Object { $_.Directory.Name + '\' + $_.Name }) -join ', ')"
+function Wall($pattern) { ($walls | Where-Object { $_.FullName -like $pattern } | Select-Object -First 1).FullName }
+$shelfWall = @((@((Wall '*\ThemeD\*'), (Wall '*\ThemeA\*'), (Wall '*\ThemeC\*'), (Wall '*\img0.jpg')) | Where-Object { $_ } | Select-Object -First 1), (Wall '*\img27.jpg'), (Wall '*\img19.jpg'))
 
 # Each desktop: its windows bottom to top, as fractions of the work area.
 $scenes = @(
@@ -274,5 +302,7 @@ if ($wallpaper) { [W]::Wallpaper($wallpaper) }
 ForgetTabs
 if (Test-Path $tabsBackup) { Copy-Item "$tabsBackup\*" $tabs -Recurse -Force -ErrorAction SilentlyContinue }
 Remove-Item $proj, $report, $meeting, $serve, $edgeData -Recurse -Force -ErrorAction SilentlyContinue
+if ($iconsView -ne [IntPtr]::Zero) { [W]::Show($iconsView, $true) }
+foreach ($h in $strays) { [W]::Show($h, $true) }
 $shell.UndoMinimizeAll()
 Get-ChildItem $out -Recurse | Measure-Object | ForEach-Object { Log "files: $($_.Count)" }
