@@ -52,6 +52,7 @@ pub fn navigation(mode: &str, out: &Path, flick: Option<&str>) {
         "recede" => unsafe { super::drive_display::recede(out, flick.unwrap()); },
         "dock" => unsafe { super::drive_display::dock(out, flick.unwrap()); },
         "settle" => unsafe { super::drive_display::settle(out, flick.unwrap()); },
+        "onset" => unsafe { super::drive_display::onset(out, flick.unwrap()); },
         // A shelf turned in one hold stays turned: shown and arrived at there in the next.
         "cube" => unsafe {
             let ids = std::fs::read_to_string(out.join("made.txt")).unwrap();

@@ -12,7 +12,7 @@
 //!   drive desk | mkdesk | rmdesk <desktop id prefix>
 //!   drive hold <r> <g> <b> <title> <x> <y> <w> <h> <seconds>  (w and h 0: maximized)
 //!   drive holds <hold arguments>...  (several windows in one process)
-//!   drive navigation shelves|cube|rowmove|recede <out dir> <flick exe>
+//!   drive navigation shelves|cube|rowmove|recede|onset <out dir> <flick exe>
 //!   drive pinprobe <flick exe> <out dir>
 //!   drive boardshot <flick exe> <out dir>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`

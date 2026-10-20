@@ -693,6 +693,165 @@ pub unsafe fn settle(out: &Path, flick: &str) {
     print!("{report}");
 }
 
+/// Where the screen is along a row (cells, right positive) in a frame of
+/// `onset`: from the middle desktop's cyan window, or the yellow one of the
+/// desktop to its right, `x0` (left, right) where cyan is at rest.
+fn onset_at(boxes: &[(i32, i32, i32, i32, u32); 4], x0: (f64, f64), width: f64) -> Option<f64> {
+    let (cyan, yellow) = (boxes[1], boxes[2]);
+    let right = width as i32 - 1;
+    if cyan.4 >= 32 && cyan.0 > 0 { return Some((x0.0 - cyan.0 as f64) / width); }
+    if yellow.4 >= 32 && yellow.0 > 0 { return Some((x0.0 + width - yellow.0 as f64) / width); }
+    if cyan.4 >= 32 && cyan.2 < right && cyan.2 > 0 { return Some((x0.1 - cyan.2 as f64) / width); }
+    None
+}
+
+/// How soon the screen sets off, follows and lands for a hand that presses
+/// the trigger and flicks at once: Desktop Duplication frames against the
+/// injected input, a row of three (magenta, cyan, yellow) begun in the
+/// middle and flicked right. `onset.csv` every frame of every hold;
+/// `report.txt` per hold (a) press to Flick's first frame (`FLICK_TRACE`),
+/// (b) first move to the first frame the screen moved, (c) how far behind
+/// the hand it is while held (ms, mean and most) and (d) letting go to
+/// resting on the desktop landed on.
+pub unsafe fn onset(out: &Path, flick: &str) {
+    use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
+    let wait = |ms| std::thread::sleep(Duration::from_millis(ms));
+    let cfg = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("Flick");
+    std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2\"\nminimap = false\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = true\nfollow_y = true\nreverse = false\n[touchpad]\nthree_finger = true\nstep_x = 12\nstep_y = 12\nnotch_x = 0\nnotch_y = 0\nfollow_x = true\nfollow_y = true\nreverse = false\n[experimental]\nquick_flick = \"slide\"\n").unwrap();
+    let made = std::fs::read_to_string(out.join("made.txt")).unwrap();
+    let ids: Vec<_> = made.lines().collect();
+    let all = super::vdapi::get_desktops().unwrap();
+    let desk = |i: usize| *all.iter().find(|d| d.id() == ids[i]).unwrap();
+    let other: Vec<_> = all.iter().map(|d| d.id()).filter(|id| !ids.contains(&id.as_str())).collect();
+    std::fs::write(cfg.join("state.json"), serde_json::json!({"rows":[{"name":"Onset","cells":&ids[0..3],"last":ids[1]},{"name":"Existing","cells":other}],"guide_seen":true}).to_string()).unwrap();
+    super::vdapi::switch_desktop(desk(1)).unwrap(); wait(800);
+    let me = std::env::current_exe().unwrap();
+    let mut windows = Vec::new();
+    for (i, rgb) in [["255", "0", "255"], ["0", "255", "255"], ["255", "255", "0"]].iter().enumerate() {
+        let title = format!("F onset {i}");
+        windows.push(Command::new(&me).args(["hold", rgb[0], rgb[1], rgb[2], &title, "200", "300", "600", "400", "600"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        wait(500);
+        let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title)); assert!(hwnd.0 != 0);
+        super::vdapi::move_window_to_desktop(desk(i), hwnd).unwrap();
+    }
+    let mut frequency = 0; QueryPerformanceFrequency(&mut frequency).unwrap();
+    let ms = move |qpc: i64| qpc as f64 * 1000.0 / frequency as f64;
+    let stop = Arc::new(AtomicBool::new(false));
+    let frames: Arc<Mutex<Vec<(f64, [(i32, i32, i32, i32, u32); 4])>>> = Arc::default();
+    let (s1, f1) = (stop.clone(), frames.clone());
+    let width = Arc::new(Mutex::new(0u32));
+    let w1 = width.clone();
+    let recorder = std::thread::spawn(move || {
+        let capture = Capture::new().unwrap();
+        *w1.lock().unwrap() = capture.width;
+        while !s1.load(Ordering::SeqCst) {
+            if let Some((info, boxes, ..)) = capture.frame(false).unwrap() { f1.lock().unwrap().push((ms(info.LastPresentTime), boxes)); }
+        }
+    });
+    let trace = out.join("onset-trace.csv");
+    let _ = std::fs::remove_file(&trace);
+    let mut child = Command::new(flick).arg("--portable").env("FLICK_GLIDE_STATS", "1").env("FLICK_TRACE", &trace)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait(3000);
+    assert!(FindWindowW(w!("flick.main"), None).0 != 0, "Flick did not start");
+    let pad = FindWindowExW(HWND_MESSAGE, None, w!("flick.input"), None);
+    let mouse = |flags, dx| {
+        let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, mouseData: 2, dwFlags: flags, ..Default::default() } } };
+        assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
+    };
+    let touch = |x: f64, count: usize| {
+        let scan = ((qpc() as i128 * 10000 / frequency as i128) & 65535) as usize;
+        PostMessageW(pad, WM_APP + 62, WPARAM(count | scan << 8), LPARAM((x * 1200.0).round() as i32 as u32 as isize)).unwrap();
+    };
+    let timer = CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0).unwrap();
+    let sleep_until = |due: i64| {
+        let remaining = (due - qpc()) as f64 / frequency as f64;
+        if remaining > 0.0 { let ticks = -(remaining * 1e7).ceil() as i64; SetWaitableTimerEx(timer, &ticks, 0, None, None, None, 0).unwrap(); WaitForSingleObject(timer, 100); }
+    };
+    // A flick: `cells` in `stroke` ms, sharp at first and easing (as a hand
+    // does), let go at once; a mouse every ~1 ms, a touchpad every 8.
+    let cases = [("mouse-flick", "mouse", 1.0, 70.0), ("mouse-short", "mouse", 0.6, 55.0), ("ptp-flick", "ptp", 1.0, 80.0)];
+    struct Hold { label: &'static str, press: f64, moves: Vec<(f64, f64)>, release: f64, landed: Option<usize> }
+    let mut holds = Vec::new();
+    for round in 0..3 { for &(label, kind, cells, stroke) in &cases {
+        super::vdapi::switch_desktop(desk(1)).unwrap(); wait(900);
+        let _ = round;
+        let press = qpc();
+        if kind == "mouse" { mouse(MOUSEEVENTF_XDOWN, 0); } else { touch(0.0, 3); }
+        wait(40);
+        let (step, start) = (if kind == "mouse" { 1.0 } else { 8.0 }, qpc());
+        let (mut moves, mut sent, mut n) = (Vec::new(), 0i32, 1);
+        loop {
+            let t = (n as f64 * step).min(stroke);
+            let u = t / stroke;
+            let x = cells * (1.0 - (1.0 - u).powi(2));
+            if kind == "mouse" { let to = (x * 220.0).round() as i32; mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE, to - sent); sent = to; moves.push((ms(qpc()), to as f64 / 220.0)); }
+            else { touch(x, 3); moves.push((ms(qpc()), x)); }
+            if t >= stroke { break; }
+            n += 1;
+            sleep_until(start + (n as f64 * step / 1000.0 * frequency as f64) as i64);
+        }
+        let release = qpc();
+        if kind == "mouse" { mouse(MOUSEEVENTF_XUP, 0); } else { touch(cells, 0); }
+        wait(1500);
+        let now = super::vdapi::get_current_desktop().unwrap().id();
+        holds.push(Hold { label, press: ms(press), moves, release: ms(release), landed: ids.iter().position(|id| *id == now) });
+    }}
+    wait(300);
+    stop.store(true, Ordering::SeqCst);
+    recorder.join().unwrap();
+    let _ = child.kill(); let _ = child.wait();
+    CloseHandle(timer).unwrap();
+    for window in &mut windows { let _ = window.kill(); let _ = window.wait(); }
+    let width = *width.lock().unwrap() as f64;
+    let frames = frames.lock().unwrap().clone();
+    // Flick's own frames: when each was shown and how small the picture was.
+    let flick_frames: Vec<(f64, f64)> = std::fs::read_to_string(&trace).unwrap_or_default().lines().skip(1)
+        .filter_map(|line| { let c: Vec<_> = line.split(',').collect(); Some((c.get(1)?.parse().ok()?, c.get(11)?.parse().ok()?)) }).collect();
+    let mut csv = String::from("hold,label,ms_from_press,at_cells,hand_cells,cyan_l,cyan_r,yellow_l,yellow_r\n");
+    let mut report = format!("width {width}, frames {}\n", frames.len());
+    let (mut sums, mut counts): (std::collections::BTreeMap<&str, [f64; 7]>, std::collections::BTreeMap<&str, f64>) = Default::default();
+    for (i, hold) in holds.iter().enumerate() {
+        let before: Vec<_> = frames.iter().filter(|f| f.0 < hold.press && f.0 > hold.press - 500.0 && f.1[1].4 >= 32).collect();
+        let Some(rest) = before.last() else { report += &format!("{i} {}: no resting frame\n", hold.label); continue };
+        let x0 = (rest.1[1].0 as f64, rest.1[1].2 as f64);
+        let end = holds.get(i + 1).map_or(f64::INFINITY, |next| next.press - 300.0);
+        let mine: Vec<(f64, Option<f64>)> = frames.iter().filter(|f| f.0 >= hold.press && f.0 < end).map(|f| (f.0, onset_at(&f.1, x0, width))).collect();
+        let hand = |t: f64| hold.moves.iter().take_while(|m| m.0 <= t).last().map_or(0.0, |m| m.1);
+        for f in frames.iter().filter(|f| f.0 >= hold.press && f.0 < end) {
+            let b = f.1;
+            writeln!(csv, "{i},{},{:.2},{},{:.4},{},{},{},{}", hold.label, f.0 - hold.press, onset_at(&b, x0, width).map_or(String::new(), |s| format!("{s:.4}")), hand(f.0), b[1].0, b[1].2, b[2].0, b[2].2).unwrap();
+        }
+        let first_move = hold.moves.first().map_or(f64::NAN, |m| m.0);
+        let first_frame = flick_frames.iter().find(|f| f.0 >= hold.press && f.0 < end).map_or(f64::NAN, |f| f.0);
+        let least_scale = flick_frames.iter().filter(|f| f.0 >= hold.press && f.0 < end).map(|f| f.1).fold(1.0, f64::min);
+        let moved = mine.iter().find(|f| f.1.is_some_and(|s| s >= 0.005)).map_or(f64::NAN, |f| f.0);
+        let moved2 = mine.iter().find(|f| f.1.is_some_and(|s| s >= 0.02)).map_or(f64::NAN, |f| f.0);
+        // Behind the hand: how long ago the hand was where the screen is.
+        let lags: Vec<f64> = mine.iter().filter(|f| f.0 > first_move && f.0 <= hold.release)
+            .filter_map(|&(t, s)| { let s = s?; if !(0.02..0.98).contains(&s) { return None; } hold.moves.iter().find(|m| m.1 >= s).map(|m| t - m.0) }).collect();
+        let behind: Vec<f64> = mine.iter().filter(|f| f.0 > first_move && f.0 <= hold.release).filter_map(|&(t, s)| Some(hand(t) - s?)).collect();
+        let target = hold.landed.map_or(f64::NAN, |l| l as f64 - 1.0);
+        let last_off = mine.iter().rposition(|f| f.1.map_or(true, |s| (s - target).abs() >= 0.005));
+        let rested = last_off.and_then(|i| mine.get(i + 1)).map_or(f64::NAN, |f| f.0);
+        let most = mine.iter().filter_map(|f| f.1).fold(f64::NEG_INFINITY, f64::max);
+        let mean = |v: &[f64]| if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 };
+        let row = [first_frame - hold.press, moved - first_move, moved2 - first_move, mean(&lags), lags.iter().copied().fold(f64::NAN, f64::max), rested - hold.release, mean(&behind)];
+        report += &format!("{i} {}: landed {:?}; (a) press->first frame {:.1} ms (first move->first frame {:.1}); (b) first move->moved 0.5% {:.1} ms, 2% {:.1} ms; (c) behind the hand mean {:.1} most {:.1} ms over {} frames, {:.3} cells; (d) let go->rest {:.1} ms; farthest {most:.3}; least scale {least_scale:.3}; stroke {:.0} ms\n",
+            hold.label, hold.landed, row[0], first_frame - first_move, row[1], row[2], row[3], row[4], lags.len(), row[6], row[5], hold.release - first_move);
+        let sum = sums.entry(hold.label).or_default();
+        for (s, v) in sum.iter_mut().zip(row) { *s += v; }
+        *counts.entry(hold.label).or_default() += 1.0;
+    }
+    for (label, sum) in &sums {
+        let n = counts[label];
+        report += &format!("MEAN {label}: (a) {:.1} (b) {:.1}/{:.1} (c) mean {:.1} most {:.1} ms, {:.3} cells (d) {:.1} ms\n", sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n, sum[4] / n, sum[6] / n, sum[5] / n);
+    }
+    std::fs::write(out.join("onset.csv"), csv).unwrap();
+    std::fs::write(out.join("report.txt"), &report).unwrap();
+    print!("{report}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
