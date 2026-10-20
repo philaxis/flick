@@ -102,6 +102,7 @@ $proj = Join-Path $docs 'flick'
 $launch = Join-Path $docs 'Flick 0.6 출시'
 $serve = Join-Path $env:TEMP 'flick-cells-site'
 foreach ($d in $proj, $launch, "$serve\site") { New-Item -ItemType Directory -Force $d | Out-Null }
+$utf8 = New-Object System.Text.UTF8Encoding $false
 # Flick's own source, as this job was given it.
 foreach ($f in 'src', 'examples', 'scripts', 'assets', 'Cargo.toml', 'Cargo.lock', 'README.md', 'LICENSE', 'build.rs') { if (Test-Path $f) { Copy-Item $f $proj -Recurse -Force } }
 Copy-Item "$src\files\notice.txt" "$launch\출시 공지 초안.txt" -Force
@@ -135,7 +136,7 @@ ForgetTabs
 $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 $edgeData = Join-Path $env:TEMP 'flick-cells-edge'
 # A new profile nobody is signed in to; videos play by themselves, without sound.
-$edgeFlags = @('--no-first-run', '--no-default-browser-check', '--hide-crash-restore-bubble', '--autoplay-policy=no-user-gesture-required', '--mute-audio', "--user-data-dir=`"$edgeData`"")
+$edgeFlags = @('--no-first-run', '--no-default-browser-check', '--hide-crash-restore-bubble', '--autoplay-policy=no-user-gesture-required', '--mute-audio', '--disable-features=Translate,msTranslate', "--user-data-dir=`"$edgeData`"")
 $node = Get-Command node -ErrorAction SilentlyContinue
 $server = $null
 $base = 'http://localhost:5173'
@@ -188,7 +189,16 @@ function Crop($bmp, $r, $path) {
 }
 
 # Edge's first start in a new profile has its own pages; get it over with.
-if ($edge) { $h = Launch 'edge' @('https://github.com/philaxis/flick'); Start-Sleep 6; CloseAll @($h) }
+if ($edge) {
+  $h = Launch 'edge' @('https://github.com/philaxis/flick'); Start-Sleep 6; CloseAll @($h)
+  # No offer to translate the English pages over them.
+  $prefs = Join-Path $edgeData 'Default\Preferences'
+  if (Test-Path $prefs) {
+    $p = Get-Content $prefs -Raw -Encoding UTF8 | ConvertFrom-Json
+    $p | Add-Member -Force translate ([pscustomobject]@{ enabled = $false })
+    [IO.File]::WriteAllText($prefs, ($p | ConvertTo-Json -Depth 64 -Compress), $utf8)
+  }
+}
 
 # One wallpaper per shelf: each piece of work has its own place.
 # Windows' own wallpapers only, none of a maker's.
@@ -224,7 +234,7 @@ $scenes = @(
       @{ app = 'explorer'; arg = $launch; at = @(.6, .42, .37, .52) }) },
   # Pinned: the calculator on every shelf; the team's chat on the two shelves of work.
   @{ id = 'pins'; row = 0; wins = @(
-      @{ app = 'calc'; arg = ''; at = @(.8, .03, .18, .58) },
+      @{ app = 'calc'; arg = ''; at = @(.77, .03, .21, .58) },
       @{ app = 'app'; arg = 'chat'; at = @(.01, .4, .18, .58) }) }
 )
 
