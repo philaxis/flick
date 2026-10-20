@@ -1,7 +1,8 @@
 ﻿# Captures the desktops the landing page's demo shows (docs/index.html), on the
-# Windows test PC: real apps placed desktop by desktop, the whole screen taken,
-# each window cut out on its own. Three shelves, each one piece of work:
-# building tidepool, writing the urban forest report, the team's talk and week.
+# Windows test PC: real apps and real sites (signed out) placed desktop by
+# desktop, the whole screen taken, each window cut out on its own. The person
+# builds and markets Flick 0.6: a shelf for building it, one for its launch,
+# and one for a break between, a video kept playing there.
 # Puts the user's wallpaper, theme, Notepad tabs and windows back afterwards.
 # Results in cells-out\: d<row><col>.png, w-<scene>-<i>.png, icons\, layout.json.
 $ErrorActionPreference = 'Continue'
@@ -25,6 +26,7 @@ public static class W {
   [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
   [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string t);
   [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
@@ -96,52 +98,20 @@ function Log($s) { Add-Content "$out\log.txt" $s; Write-Host $s }
 
 # ---------- the work the desktops show, as files on disk ----------
 $docs = Join-Path $env:PUBLIC 'Documents'
-$proj = Join-Path $docs 'tidepool'
-$report = Join-Path $docs '도시숲 보고서'
-$stuff = Join-Path $report '자료'
+$proj = Join-Path $docs 'flick'
+$launch = Join-Path $docs 'Flick 0.6 출시'
 $serve = Join-Path $env:TEMP 'flick-cells-site'
-foreach ($d in $proj, "$proj\src", "$proj\data", "$proj\docs", $stuff, $serve) { New-Item -ItemType Directory -Force $d | Out-Null }
-$utf8 = New-Object System.Text.UTF8Encoding $false
-function Put($path, $text) { [IO.File]::WriteAllText($path, $text, $utf8) }
-Copy-Item "$src\files\main.rs" "$proj\src\main.rs" -Force
-Put "$proj\src\tide.rs" "pub struct Reading;`n"
-Put "$proj\Cargo.toml" "[package]`nname = `"tidepool`"`nversion = `"0.4.2`"`nedition = `"2021`"`n"
-Put "$proj\README.md" "# tidepool`n`nTide tables for a harbour.`n"
-Put "$proj\docs\release-0.5.md" "# 0.5`n"
-Put "$proj\data\incheon.csv" "time,height`n"
-Put "$proj\data\mokpo.csv" "time,height`n"
-Put "$proj\.gitignore" "/target`n"
-Copy-Item "$src\files\draft.txt" "$report\초안 v3.txt" -Force
-Copy-Item "$src\files\refs.txt" "$report\참고문헌.txt" -Force
-$meeting = Join-Path $docs '주간회의 메모.txt'
-Copy-Item "$src\files\meeting.txt" $meeting -Force
-New-Item -ItemType Directory -Force "$serve\site" | Out-Null
+foreach ($d in $proj, $launch, "$serve\site") { New-Item -ItemType Directory -Force $d | Out-Null }
+# Flick's own source, as this job was given it.
+foreach ($f in 'src', 'examples', 'scripts', 'assets', 'Cargo.toml', 'Cargo.lock', 'README.md', 'LICENSE', 'build.rs') { if (Test-Path $f) { Copy-Item $f $proj -Recurse -Force } }
+Copy-Item "$src\files\notice.txt" "$launch\출시 공지 초안.txt" -Force
+Copy-Item "$src\files\sns.txt" "$launch\SNS 게시물.txt" -Force
+Copy-Item 'docs\og.png' "$launch\랜딩 대표 이미지.png" -Force
+Copy-Item 'docs\icon.png' "$launch\아이콘.png" -Force
+Copy-Item 'docs\drafts\shots\real-cells.png' "$launch\스크린샷 1.png" -Force -ErrorAction SilentlyContinue
+Get-ChildItem 'docs\drafts\shots\*.png' | Select-Object -First 2 | ForEach-Object -Begin { $n = 2 } -Process { Copy-Item $_.FullName "$launch\스크린샷 $n.png" -Force; $n++ }
 Copy-Item "$src\site\*" "$serve\site" -Force
 Copy-Item "$src\files\server.js" $serve -Force
-# Field photos: the lock screen's own landscapes, whichever this PC has.
-$photos = @(Get-ChildItem 'C:\Windows\Web\Screen\*.jpg', 'C:\Windows\Web\Wallpaper\*\*.jpg' -ErrorAction SilentlyContinue | Select-Object -First 6)
-for ($i = 0; $i -lt $photos.Count; $i++) { Copy-Item $photos[$i].FullName (Join-Path $stuff ('현장사진_{0:00}.jpg' -f ($i + 1))) -Force }
-# The report's chart: shade against temperature at the three places.
-function Chart($path) {
-  $b = New-Object Drawing.Bitmap 1000, 620; $g = [Drawing.Graphics]::FromImage($b)
-  $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'ClearTypeGridFit'; $g.Clear([Drawing.Color]::White)
-  $f = New-Object Drawing.Font 'Malgun Gothic', 22, ([Drawing.FontStyle]::Bold); $s = New-Object Drawing.Font 'Malgun Gothic', 15
-  $ink = [Drawing.Brushes]::Black; $grey = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(110, 110, 110))
-  $g.DrawString('그림 1. 14시 기온 비교 (7일 평균)', $f, $ink, 110, 30)
-  $line = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(225, 225, 225)), 2
-  for ($k = 0; $k -le 4; $k++) { $y = 520 - $k * 100; $g.DrawLine($line, 190, $y, 960, $y); $g.DrawString(('{0} ℃' -f (26 + $k * 2)), $s, $grey, 110, $y - 12) }
-  $bars = @(@('공원 둘레길', 29.2, '#3f9d5a'), @('주택가 골목', 31.6, '#c9a227'), @('대로변', 32.3, '#d1553f'))
-  for ($k = 0; $k -lt 3; $k++) {
-    $v = $bars[$k][1]; $h = ($v - 26) * 50; $x = 250 + $k * 240
-    $c = New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml($bars[$k][2]))
-    $g.FillRectangle($c, $x, 520 - $h, 140, $h)
-    $g.DrawString(('{0:0.0} ℃' -f $v), $f, $ink, $x + 12, 520 - $h - 44)
-    $g.DrawString($bars[$k][0], $s, $grey, $x + 14, 540)
-  }
-  $b.Save($path, [Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()
-}
-Chart (Join-Path $stuff '기온비교.png')
-Copy-Item (Join-Path $stuff '기온비교.png') (Join-Path $stuff '녹지율 지도.png') -Force
 
 # ---------- the PC as it was, to put back ----------
 $personalize = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
@@ -164,12 +134,14 @@ ForgetTabs
 
 $edge = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
 $edgeData = Join-Path $env:TEMP 'flick-cells-edge'
+# A new profile nobody is signed in to; videos play by themselves, without sound.
+$edgeFlags = @('--no-first-run', '--no-default-browser-check', '--hide-crash-restore-bubble', '--autoplay-policy=no-user-gesture-required', '--mute-audio', "--user-data-dir=`"$edgeData`"")
 $node = Get-Command node -ErrorAction SilentlyContinue
 $server = $null
 $base = 'http://localhost:5173'
 if ($node) { $server = Start-Process $node.Source -ArgumentList "`"$serve\server.js`"" -WindowStyle Hidden -PassThru }
 else { $base = 'file:///' + ($serve -replace '\\', '/') + '/site' }
-function Url($page) { if ($node) { "$base/$page" } else { "$base/$page.html" } }
+function Url($page) { if ($page -match '^https?:') { $page } elseif ($node) { "$base/$page" } else { "$base/$page.html" } }
 Log "screen $([W]::Screen().Size) work $(([W]::WorkArea()).R)x$(([W]::WorkArea()).B) edge=$([bool]$edge) node=$([bool]$node)"
 
 # ---------- launching and placing ----------
@@ -180,7 +152,9 @@ function Start-App($app, $arg) {
     'paint'    { Start-Process mspaint.exe -ArgumentList "`"$arg`"" }
     'calc'     { Start-Process calc.exe }
     'terminal' { Start-Process powershell.exe -ArgumentList '-NoLogo', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$src\files\$arg`"" }
-    'edge'     { Start-Process $edge -ArgumentList (@('--new-window', '--no-first-run', '--no-default-browser-check', '--hide-crash-restore-bubble', "--user-data-dir=`"$edgeData`"") + @($arg | ForEach-Object { Url $_ })) }
+    'edge'     { Start-Process $edge -ArgumentList ($edgeFlags + '--new-window' + @($arg | ForEach-Object { "`"$(Url $_)`"" })) }
+    # A page as an app of its own: its window, no address bar.
+    'app'      { Start-Process $edge -ArgumentList ($edgeFlags + "--app=`"$(Url $arg)`"") }
   }
 }
 function Launch($app, $arg) {
@@ -214,40 +188,44 @@ function Crop($bmp, $r, $path) {
 }
 
 # Edge's first start in a new profile has its own pages; get it over with.
-if ($edge) { $h = Launch 'edge' @('docs'); Start-Sleep 4; CloseAll @($h) }
+if ($edge) { $h = Launch 'edge' @('https://github.com/philaxis/flick'); Start-Sleep 6; CloseAll @($h) }
 
 # One wallpaper per shelf: each piece of work has its own place.
 # Windows' own wallpapers only, none of a maker's.
 $walls = @(Get-ChildItem 'C:\Windows\Web\Wallpaper\Theme*\*.jpg', 'C:\Windows\Web\Wallpaper\Windows\*.jpg' -ErrorAction SilentlyContinue | Sort-Object FullName)
 Log "wallpapers: $(($walls | ForEach-Object { $_.Directory.Name + '\' + $_.Name }) -join ', ')"
 function Wall($pattern) { ($walls | Where-Object { $_.FullName -like $pattern } | Select-Object -First 1).FullName }
-$shelfWall = @((@((Wall '*\ThemeD\*'), (Wall '*\ThemeA\*'), (Wall '*\ThemeC\*'), (Wall '*\img0.jpg')) | Where-Object { $_ } | Select-Object -First 1), (Wall '*\img27.jpg'), (Wall '*\img19.jpg'))
+$shelfWall = @((@((Wall '*\ThemeD\*'), (Wall '*\ThemeA\*'), (Wall '*\ThemeC\*'), (Wall '*\img0.jpg')) | Where-Object { $_ } | Select-Object -First 1), (Wall '*\img19.jpg'), (Wall '*\img27.jpg'))
 
 # Each desktop: its windows bottom to top, as fractions of the work area.
+# Shelves: 0 building Flick, 1 a break, 2 marketing its launch. `frames` takes the screen again every `every` seconds.
+$video = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ&t=95'
 $scenes = @(
   @{ id = 'd00'; row = 0; wins = @(
-      @{ app = 'notepad'; arg = "$proj\src\main.rs"; at = @(.07, .06, .6, .86) },
-      @{ app = 'terminal'; arg = 'term-build.ps1'; at = @(.5, .42, .45, .52) }) },
+      @{ app = 'notepad'; arg = "$proj\src\follow.rs"; at = @(.2, .05, .56, .86) },
+      @{ app = 'terminal'; arg = 'term-build.ps1'; at = @(.52, .44, .44, .5) }) },
   @{ id = 'd01'; row = 0; wins = @(
-      @{ app = 'edge'; arg = @('index', 'docs'); at = @(.1, .05, .8, .9) }) },
+      @{ app = 'edge'; arg = @('https://github.com/philaxis/flick/releases', 'https://github.com/philaxis/flick/pulls?q=is%3Apr'); at = @(.2, .04, .76, .9) }) },
   @{ id = 'd02'; row = 0; wins = @(
-      @{ app = 'explorer'; arg = $proj; at = @(.05, .08, .52, .78) },
-      @{ app = 'terminal'; arg = 'term-git.ps1'; at = @(.48, .2, .47, .62) }) },
-  @{ id = 'd10'; row = 1; wins = @(
-      @{ app = 'edge'; arg = @('article'); at = @(.04, .06, .55, .88) },
-      @{ app = 'notepad'; arg = "$report\초안 v3.txt"; at = @(.5, .2, .45, .74) },
-      @{ app = 'explorer'; arg = $stuff; at = @(.62, .04, .35, .42) }) },
+      @{ app = 'explorer'; arg = $proj; at = @(.22, .08, .46, .74) },
+      @{ app = 'terminal'; arg = 'term-git.ps1'; at = @(.5, .22, .46, .6) }) },
+  @{ id = 'd10'; row = 1; frames = 3; every = 18; wins = @(
+      @{ app = 'edge'; arg = @($video); at = @(.06, .04, .88, .92) }) },
   @{ id = 'd11'; row = 1; wins = @(
-      @{ app = 'paint'; arg = "$stuff\기온비교.png"; at = @(.2, .06, .62, .86) }) },
+      @{ app = 'edge'; arg = @('https://www.youtube.com/results?search_query=lofi+%EA%B3%B5%EB%B6%80+%EC%9D%8C%EC%95%85'); at = @(.1, .05, .8, .88) }) },
   @{ id = 'd20'; row = 2; wins = @(
-      @{ app = 'edge'; arg = @('chat'); at = @(.12, .07, .72, .84) }) },
+      @{ app = 'edge'; arg = @('https://www.google.com/search?q=%EC%9C%88%EB%8F%84%EC%9A%B0+11+%EA%B0%80%EC%83%81+%EB%8D%B0%EC%8A%A4%ED%81%AC%ED%86%B1+%EB%8B%A8%EC%B6%95%ED%82%A4&hl=ko'); at = @(.2, .04, .5, .9) },
+      @{ app = 'notepad'; arg = "$launch\출시 공지 초안.txt"; at = @(.6, .14, .37, .74) }) },
   @{ id = 'd21'; row = 2; wins = @(
-      @{ app = 'edge'; arg = @('calendar'); at = @(.05, .07, .6, .84) },
-      @{ app = 'notepad'; arg = $meeting; at = @(.6, .14, .35, .66) }) },
-  # Pinned: the calculator on every desktop, the report's references on its shelf.
-  @{ id = 'pins'; row = 1; wins = @(
-      @{ app = 'calc'; arg = ''; at = @(.78, .3, .19, .62) },
-      @{ app = 'notepad'; arg = "$report\참고문헌.txt"; at = @(.03, .56, .26, .4) }) }
+      @{ app = 'app'; arg = 'analytics'; at = @(.2, .05, .6, .72) },
+      @{ app = 'notepad'; arg = "$launch\SNS 게시물.txt"; at = @(.64, .4, .33, .56) }) },
+  @{ id = 'd22'; row = 2; wins = @(
+      @{ app = 'paint'; arg = "$launch\랜딩 대표 이미지.png"; at = @(.2, .04, .56, .8) },
+      @{ app = 'explorer'; arg = $launch; at = @(.6, .42, .37, .52) }) },
+  # Pinned: the calculator on every shelf; the team's chat on the two shelves of work.
+  @{ id = 'pins'; row = 0; wins = @(
+      @{ app = 'calc'; arg = ''; at = @(.8, .03, .18, .58) },
+      @{ app = 'app'; arg = 'chat'; at = @(.01, .4, .18, .58) }) }
 )
 
 $work = [W]::WorkArea(); $ww = $work.R - $work.L; $wh = $work.B - $work.T
@@ -266,11 +244,20 @@ foreach ($sc in $scenes) {
     $hs += $h
   }
   foreach ($h in $hs) { if ($h -ne [IntPtr]::Zero) { [W]::Raise($h) } }
-  Start-Sleep 3
+  Start-Sleep $(if ($sc.wins | Where-Object { $_.app -eq 'edge' }) { 8 } else { 3 })
   $wins = @()
   if ($sc.id -ne 'pins') {
-    $shot = [W]::Screen(); $layout.screen = [ordered]@{ w = $shot.Width; h = $shot.Height }
-    $shot.Save("$out\$($sc.id).png", [Drawing.Imaging.ImageFormat]::Png); $shot.Dispose()
+    for ($n = 0; $n -lt $(if ($sc.frames) { $sc.frames } else { 1 }); $n++) {
+      if ($n) { Start-Sleep ($sc.every - 2) }
+      if ($sc.frames) {
+        # The pointer over the playing video brings up its controls, the bar of how far it has played.
+        $f = [W]::Frame($hs[0]); [W]::SetCursorPos($f.L + [int](($f.R - $f.L) * .3), $f.T + [int](($f.B - $f.T) * .4)); Start-Sleep -Milliseconds 300
+        [W]::SetCursorPos($f.L + [int](($f.R - $f.L) * .32), $f.T + [int](($f.B - $f.T) * .42)); Start-Sleep 2
+      }
+      $shot = [W]::Screen(); $layout.screen = [ordered]@{ w = $shot.Width; h = $shot.Height }
+      $shot.Save("$out\$($sc.id)$(if ($n) { [char](97 + $n) }).png", [Drawing.Imaging.ImageFormat]::Png); $shot.Dispose()
+    }
+    [W]::SetCursorPos(0, 0)
   }
   # Each window by itself, brought to the top to be cut out whole.
   for ($i = 0; $i -lt $hs.Count; $i++) {
@@ -301,7 +288,7 @@ if ($theme) {
 if ($wallpaper) { [W]::Wallpaper($wallpaper) }
 ForgetTabs
 if (Test-Path $tabsBackup) { Copy-Item "$tabsBackup\*" $tabs -Recurse -Force -ErrorAction SilentlyContinue }
-Remove-Item $proj, $report, $meeting, $serve, $edgeData -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $proj, $launch, $serve, $edgeData -Recurse -Force -ErrorAction SilentlyContinue
 if ($iconsView -ne [IntPtr]::Zero) { [W]::Show($iconsView, $true) }
 foreach ($h in $strays) { [W]::Show($h, $true) }
 $shell.UndoMinimizeAll()

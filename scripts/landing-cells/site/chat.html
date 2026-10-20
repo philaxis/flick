@@ -1,23 +1,19 @@
-<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>팀 대화 — #tidepool</title>
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>팀 대화</title>
 <style>
-body{margin:0;height:100vh;display:grid;grid-template-columns:230px 1fr;background:#1b1d22;color:#e3e5e8;font:14px/1.5 "Segoe UI","Malgun Gothic",sans-serif}
-aside{background:#15171b;padding:16px 10px;border-right:1px solid #262930}
-aside h3{margin:0 8px 14px;font-size:15px}aside p{margin:14px 8px 4px;font-size:11px;letter-spacing:.06em;color:#80848e;font-weight:600}
-.ch{padding:5px 10px;border-radius:6px;color:#a3a7b0}.ch.on{background:#2b2f37;color:#fff}.ch i{float:right;font-style:normal;background:#5865f2;color:#fff;border-radius:9px;padding:0 6px;font-size:11px}
-main{display:flex;flex-direction:column}
-.top{padding:14px 22px;border-bottom:1px solid #262930;font-weight:600}.top span{color:#80848e;font-weight:400;margin-left:8px}
-.msgs{flex:1;padding:10px 22px;overflow:hidden}
-.m{display:grid;grid-template-columns:40px 1fr;gap:12px;margin:14px 0}
-.av{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;font-weight:600;color:#fff}
+body{margin:0;height:100vh;display:flex;flex-direction:column;background:#1b1d22;color:#e3e5e8;font:13px/1.45 "Segoe UI","Malgun Gothic",sans-serif;overflow:hidden}
+.top{display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid #262930}
+.tab{padding:4px 10px;border-radius:6px;color:#a3a7b0}.tab.on{background:#2b2f37;color:#fff;font-weight:600}.tab i{font-style:normal;background:#579eff;color:#fff;border-radius:9px;padding:0 6px;font-size:11px;margin-left:4px}
+.msgs{flex:1;padding:4px 14px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end}
+.m{display:grid;grid-template-columns:30px 1fr;gap:9px;margin:9px 0}
+.av{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-weight:600;color:#fff;font-size:12px}
 .n{font-weight:600}.n small{color:#80848e;font-weight:400;margin-left:6px}
-.code{background:#111317;border:1px solid #262930;border-radius:6px;padding:8px 10px;font-family:Consolas,monospace;font-size:13px;margin-top:4px}
-.box{margin:0 22px 18px;background:#2b2f37;border-radius:8px;padding:11px 14px;color:#80848e}
+.code{background:#111317;border:1px solid #262930;border-radius:6px;padding:5px 8px;font-family:Consolas,monospace;font-size:12px;margin-top:3px}
+.box{margin:0 14px 12px;background:#2b2f37;border-radius:8px;padding:9px 12px;color:#80848e}
 </style></head><body>
-<aside><h3>팀 대화</h3><p>채널</p><div class="ch on"># tidepool</div><div class="ch"># 도시숲-보고서 <i>3</i></div><div class="ch"># 일반</div><div class="ch"># 점심</div>
-<p>메시지</p><div class="ch">지수</div><div class="ch">민호</div><div class="ch">서연</div></aside>
-<main><div class="top"># tidepool<span>0.5 릴리스 준비</span></div><div class="msgs">
-<div class="m"><div class="av" style="background:#3b82f6">민</div><div><div class="n">민호<small>오전 9:42</small></div>관측소 목록 정리했어요. 인천·목포 둘 다 들어갔고, 깨진 행은 건너뛰게 했습니다.</div></div>
-<div class="m"><div class="av" style="background:#10b981">지</div><div><div class="n">지수<small>오전 9:58</small></div>좋아요! 다음 만조까지 남은 시간도 보여 주니까 훨씬 낫네요.<div class="code">next high in 2h 14m</div></div></div>
-<div class="m"><div class="av" style="background:#f59e0b">서</div><div><div class="n">서연<small>오전 10:05</small></div>목요일 오후에 릴리스하죠. 그 전에 문서 첫 화면만 다시 봐 주세요 🙏</div></div>
-<div class="m"><div class="av" style="background:#3b82f6">민</div><div><div class="n">민호<small>오전 10:07</small></div>네, 테스트 14개 다 통과했어요. 체크리스트는 docs/release-0.5.md 에 있어요.</div></div>
-</div><div class="box"># tidepool 에 메시지 보내기</div></main></body></html>
+<div class="top"><span class="tab on"># flick</span><span class="tab"># 보고서 <i>2</i></span><span class="tab"># 일반</span></div>
+<div class="msgs">
+<div class="m"><div class="av" style="background:#3b82f6">민</div><div><div class="n">민호<small>오전 9:42</small></div>세로 이동이 휠처럼 한 칸씩 걸리는 거 좋네요.</div></div>
+<div class="m"><div class="av" style="background:#10b981">지</div><div><div class="n">지수<small>오전 9:58</small></div>테스트 다 통과했어요.<div class="code">test result: ok. 128 passed</div></div></div>
+<div class="m"><div class="av" style="background:#f59e0b">서</div><div><div class="n">서연<small>오전 10:05</small></div>보고서 초안 v3 올렸어요. 그림 1 확인 부탁해요 🙏</div></div>
+<div class="m"><div class="av" style="background:#3b82f6">민</div><div><div class="n">민호<small>오전 10:07</small></div>점심 먹고 볼게요!</div></div>
+</div><div class="box">메시지 보내기</div></body></html>

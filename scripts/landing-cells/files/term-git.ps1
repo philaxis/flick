@@ -1,21 +1,20 @@
-﻿Set-Location "$env:PUBLIC\Documents\tidepool"
-$Host.UI.RawUI.WindowTitle = 'tidepool'
+﻿Set-Location "$env:PUBLIC\Documents\flick"
+$Host.UI.RawUI.WindowTitle = 'flick'
 Clear-Host
 function Say($cmd) { Write-Host -NoNewline "PS $(Get-Location)> "; Write-Host $cmd }
-Say 'git log --oneline -7'
+Say 'git log --format="%h %<(58,trunc)%s" -8'
 $log = @(
-  @('a41c9e2', '(HEAD -> main) forecast: show when the next high tide comes'),
-  @('7d03b18', 'tide: find highs and lows from the readings'),
-  @('52e0f6a', 'data: add the incheon and mokpo stations'),
-  @('e91b2c4', 'web: draw the day as one curve'),
-  @('3b7a5d0', 'parse the station CSV, skip broken rows'),
-  @('0c4f218', 'cli: --station picks the harbour'),
-  @('9a11e7f', 'first cut')
+  @('5b74e24', 'Flick 0.6.0'),
+  @('ff4e450', 'A window over the whole of its desktop, maximized ones t..'),
+  @('0185400', 'Flick 0.6.0-pre.8'),
+  @('dc65ad5', 'Previews get their icons over them as soon as the icons ..'),
+  @('ca898f3', 'The board-capture test windows carry an icon as apps do'),
+  @('5027773', 'A row of the map lies on the spine by its selected cell ..'),
+  @('277f828', 'An app''s icon sits on its preview''s lower left corner, o..'),
+  @('3421c72', 'Merge the board skin into the smooth strip, drawing the ..')
 )
 foreach ($l in $log) { Write-Host -NoNewline $l[0] -ForegroundColor Yellow; Write-Host " $($l[1])" }
 Write-Host ''
-Say 'git status --short'
-Write-Host ' M src/main.rs' -ForegroundColor Red
-Write-Host ' M src/tide.rs' -ForegroundColor Red
-Write-Host '?? docs/release-0.5.md' -ForegroundColor Red
+Say 'git switch -c release/0.6.1'
+Write-Host "Switched to a new branch 'release/0.6.1'"
 Write-Host ''
