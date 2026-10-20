@@ -84,9 +84,10 @@ reverse = true
 commit_speed = "default"
 # Prototype: two faint DWM trails, costs three thumbnails per source; reopen the board.
 motion_blur = false
-# The surer and quicker the move, the less the picture zooms out, from whole
-# to all the way: "slide" (the next desktop slides in), "instant" (comes at
-# once, with a short fade), or "off" (always zoomed out).
+# A quick, sure move keeps the picture whole, through short slowings; a
+# hesitating one zooms all the way out at once: "slide" (the next desktop
+# slides in), "instant" (comes at once, with a short fade), or "off" (always
+# zoomed out).
 quick_flick = "slide"
 "#;
 

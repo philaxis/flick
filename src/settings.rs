@@ -873,9 +873,9 @@ impl Settings {
             else { self.draw_button(&p, fonts, area, names[i], Hit::Quick(i)); continue; }
             p.text(names[i], &fonts.button, area, white(1.0));
         }
-        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle. The surer the move, the less it zooms out: quick goes straight to the next desktop, middling slides half zoomed out, a pause zooms all the way. Off always zooms out; Instant adds a short fade.",
-            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다. 확실할수록 덜 축소됩니다: 빠르면 바로 넘어가고, 중간 속도면 반쯤 축소된 채 미끄러지고, 멈추면 끝까지 축소됩니다. 끔은 항상 축소, 즉시는 짧은 페이드를 더합니다.",
-            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。移动越果断，缩小越少：快速直接切换，中等速度半缩小滑过，停顿则完全缩小。关闭时总是缩小；即时加一段短淡入。"),
+        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle. A quick, sure move goes straight to the next desktop and stays whole through short slowings; pause, hesitate or turn back and it zooms all the way out at once. Off always zooms out; Instant adds a short fade.",
+            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다. 빠르고 확실하게 움직이면 축소 없이 넘어가고 잠깐 느려져도 그대로입니다. 멈추거나 머뭇거리거나 되돌리면 바로 끝까지 축소됩니다. 끔은 항상 축소, 즉시는 짧은 페이드를 더합니다.",
+            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。快速果断地移动会直接切换且短暂放慢也不缩小；停顿、犹豫或折返时立即完全缩小。关闭时总是缩小；即时加一段短淡入。"),
             &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 4.0).top + 2.0 * ROWS.1 * s, ..row(EXPERIMENT_ROW + 4.0) }, white(0.62));
 
         let hot = self.hover == Hit::File;

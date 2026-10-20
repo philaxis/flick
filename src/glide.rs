@@ -615,6 +615,9 @@ struct Strip {
     /// dark every desktop is as one comes in at once (`quick::Look`).
     calm: f64,
     flash: f64,
+    /// How far the hold has come in, whole or not: the row's name shows as
+    /// much, however sure the hand (`show_banners`).
+    named: f64,
 }
 
 impl Strip {
@@ -1156,7 +1159,7 @@ impl View {
                 } else {
                     let to = session.follow.let_go(release_time, session.hand);
                     if let Some(quick) = &mut session.quick {
-                        quick.judge.release(release_time);
+                        quick.release(release_time);
                         look = Some(quick.look(now, session.follow.aim(), to, session.follow.axis()));
                     }
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
@@ -1217,7 +1220,7 @@ impl View {
                         along
                     })
                     .collect();
-                Strip { y, along, receded, calm: 0.0, flash: 0.0 }
+                Strip { y, along, receded, calm: 0.0, flash: 0.0, named: receded }
             }
         };
         // As sure as the hand is, the moving axis as it slides, whole, as
@@ -1357,12 +1360,12 @@ fn write_trace(path: &std::path::Path, lines: &[String]) {
     }
 }
 
-/// The name of the row over each screen, as opaque as the screen has
-/// receded: drawn anew only while it changes.
+/// The name of the row over each screen, as opaque as the hold has come
+/// in, the screen whole or receded: drawn anew only while it changes.
 fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
     let names = session.label.at(now);
     let key = BannerKey::of(names);
-    let alpha = (session.shown.as_ref().map_or(0.0, |strip| strip.receded).clamp(0.0, 1.0) * 255.0).round() as u8;
+    let alpha = (session.shown.as_ref().map_or(0.0, |strip| strip.named).clamp(0.0, 1.0) * 255.0).round() as u8;
     let called: Vec<String> = (session.follow.rows.0..=session.follow.rows.1).map(|row| session.called(row)).collect();
     let rows = session.follow.rows;
     let called = |row: i32| usize::try_from(row - rows.0).ok().and_then(|at| called.get(at)).cloned().unwrap_or_default();

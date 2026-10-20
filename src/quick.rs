@@ -1,10 +1,12 @@
-//! How far the screen recedes as the hand goes (`depth`, 0 to 1): a hand
-//! sure of its way keeps the screen whole and the desktop it goes to
-//! slides in (or comes at once, `QuickFlick::Instant`); the slower and the
-//! less sure it goes, the farther the screen recedes, all the way to the
-//! zoomed-out picture once it stops, turns back or goes the other way. In
-//! between, as a marking menu does with a hand half sure, the screen stays
-//! receded part of the way and slides on so.
+//! How far the screen recedes as the hand goes (`depth`, 0 to 1), as a
+//! marking menu shows itself only to a hand that hesitates: a hand sure
+//! of its way keeps the screen whole and the desktop it goes to slides in
+//! (or comes at once, `QuickFlick::Instant`), and stays sure through a
+//! short slowing or stop between cells; once it is plainly unsure (still
+//! or slow a while, turning back, going the other way) the screen goes all
+//! the way back at once, not by halves. In between only for a moment,
+//! while a hand just set off is not yet either. A hold begun just after
+//! one let go of sure is sure from the start.
 //!
 //! The judging (`Judge`) only reads the hand; the cells gone to are still
 //! the hand's latches (`follow::Follow`), switched to once, on letting go.
@@ -17,24 +19,27 @@ pub const START: f64 = 0.02;
 pub const ONSET_LIMIT: f64 = 0.5;
 /// Just set off, for this long (s), it is taken as sure.
 pub const DECIDE: f64 = 0.15;
-/// At this speed or slower (cells a second) the screen recedes all the
-/// way; at `SURE_SPEED` or faster it stays whole; in between, part way.
-pub const SLOW: f64 = 1.0;
+/// At this speed or faster (cells a second) the hand is sure of its way;
+/// sure, it stays so until it goes slower than `KEEP` for `AMBIGUOUS`
+/// (s): a short slowing or a stop between cells does not count. Not yet
+/// sure, as long as it goes slower than `SURE_SPEED`.
 pub const SURE_SPEED: f64 = 3.0;
-/// Turning back this far (cells) from the farthest it went, or going
-/// the other way, recedes all the way for this long (s).
+pub const KEEP: f64 = 2.0;
+pub const AMBIGUOUS: f64 = 0.3;
+/// Not yet sure and this slow or slower, it is unsure at once.
+pub const SLOW: f64 = 1.0;
+/// Turning back this far (cells) from the farthest it went is unsure.
 pub const BACK: f64 = 0.15;
-pub const DOUBT: f64 = 0.15;
 /// The hand's speed is taken over this long (s).
 const WINDOW: f64 = 0.05;
-/// Let go of this soon after slowing (s), it is judged as it went before.
-const LATE: f64 = 0.1;
-/// The depth follows what the hand says as a low-pass filter: going back
-/// at once, quickest at first, settling in about three times this (s);
-/// coming forward again a little more slowly, so a hand slowing for a
-/// moment does not flicker the picture.
-pub const RECEDE: f64 = 0.06;
-pub const RETURN: f64 = 0.1;
+/// The depth follows what the hand says as a low-pass filter, quickest at
+/// first (ease-out), settling in about three times these (s): going all
+/// the way back once the hand is unsure, in about 120 ms; forward at once
+/// otherwise. In between only on the way.
+pub const RECEDE: f64 = 0.04;
+pub const RETURN: f64 = 0.025;
+/// A hold begun this soon (s) after one let go of sure is sure from the start.
+pub const CARRY: f64 = 1.0;
 /// The slide's spring: settles a cell in about 150 ms, overshooting under 1%.
 const OMEGA: f64 = 30.0;
 const ZETA: f64 = 0.85;
@@ -42,6 +47,8 @@ const ZETA: f64 = 0.85;
 const FLASH: (f64, f64) = (0.45, 0.12);
 
 static MODE: AtomicU8 = AtomicU8::new(QuickFlick::Slide as u8);
+/// When the last hold let go of sure ended, if one did.
+static SURE_END: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub fn configure(mode: QuickFlick) {
     MODE.store(mode as u8, Ordering::Relaxed);
@@ -55,40 +62,51 @@ pub fn mode() -> QuickFlick {
     }
 }
 
-/// How far the screen should recede for a hand going `speed` cells a second.
-pub fn wanted(speed: f64) -> f64 {
-    1.0 - ((speed - SLOW) / (SURE_SPEED - SLOW)).clamp(0.0, 1.0)
-}
-
-/// The depth `depth` following `wanted` over `dt` s: no jump, receding
-/// quickest at first (ease-out), exact whatever the frame rate.
+/// The depth `depth` following `wanted` over `dt` s: no jump, quickest
+/// at first (ease-out), exact whatever the frame rate.
 pub fn approach(depth: f64, wanted: f64, dt: f64) -> f64 {
     let tau = if wanted > depth { RECEDE } else { RETURN };
     let next = wanted + (depth - wanted) * (-dt.max(0.0) / tau).exp();
     if (next - wanted).abs() < 0.002 { wanted } else { next }
 }
 
+/// What the hand is taken to be: the screen whole (and while it is not
+/// yet either), or all the way receded.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Mind {
+    #[default]
+    Deciding,
+    Sure,
+    Unsure,
+}
+
 /// What the hand's way says of the hold, from its samples (time from the
 /// hold's start, cells along and down, the locked axis) and the time.
 #[derive(Clone, Debug, Default)]
 pub struct Judge {
+    pub mind: Mind,
     /// When it set off, along which axis, which way.
     onset: Option<(f64, usize, f64)>,
     /// The farthest it went its way.
     far: f64,
-    /// Until when it is in doubt (turned back, went the other way).
-    doubt: f64,
-    /// Its way so far over the last `WINDOW` and `LATE`, and one more.
+    /// Since when it has gone slower than it must to stay as it is.
+    slow_since: Option<f64>,
+    /// Its way so far over the last `WINDOW`, and one more.
     recent: Vec<(f64, f64)>,
     /// Let go of, and how far it wanted the screen to recede then.
     released: Option<f64>,
 }
 
 impl Judge {
-    /// From here on its way is `axis`, `sign`, starting at `t`, `gone` along it.
+    /// Sure from the start: a hold soon after one let go of sure.
+    pub fn sure() -> Judge { Judge { mind: Mind::Sure, ..Judge::default() } }
+
+    /// From here on its way is `axis`, `sign`, starting at `t`, `gone` along
+    /// it, and it is unsure.
     fn anchor(&mut self, t: f64, axis: usize, sign: f64, gone: f64) {
         self.onset = Some((self.onset.map_or(t, |(onset, ..)| onset), axis, sign));
         (self.far, self.recent) = (gone, vec![(t, gone)]);
+        (self.mind, self.slow_since) = (Mind::Unsure, None);
     }
 
     pub fn feed(&mut self, t: f64, at: (f64, f64), axis: usize) {
@@ -99,23 +117,42 @@ impl Judge {
                 self.onset = Some((t, axis, along.signum()));
                 self.recent = vec![(t, along.abs())];
                 self.far = along.abs();
-                // Setting off late is a doubt of its own (`wanted_at`).
             }
-            return;
+            return self.check(t);
         };
         if axis != way {
-            self.doubt = t + DOUBT;
             return self.anchor(t, axis, along.signum(), along.abs());
         }
         let gone = sign * along;
         if gone < self.far - BACK {
-            self.doubt = t + DOUBT;
             return self.anchor(t, way, -sign, -gone);
         }
         self.far = self.far.max(gone);
         self.recent.push((t, gone));
-        let keep = self.recent.iter().rposition(|(when, _)| *when <= t - WINDOW - LATE).unwrap_or(0);
+        let keep = self.recent.iter().rposition(|(when, _)| *when <= t - WINDOW).unwrap_or(0);
         self.recent.drain(..keep);
+        self.check(t);
+    }
+
+    /// What the hand is at `now`, the time going by with it or without it.
+    pub fn check(&mut self, now: f64) {
+        if self.released.is_some() { return; }
+        let speed = self.speed(now);
+        if speed >= SURE_SPEED { (self.mind, self.slow_since) = (Mind::Sure, None); return; }
+        let (sure, onset) = (self.mind == Mind::Sure, self.onset.map(|(onset, ..)| onset));
+        match onset {
+            None if !sure => { if now > ONSET_LIMIT { self.mind = Mind::Unsure; } return; }
+            // Just set off, it is sure enough, unless it was slow to.
+            Some(onset) if !sure && now - onset <= DECIDE => { if onset > ONSET_LIMIT { self.mind = Mind::Unsure; } return; }
+            _ => {}
+        }
+        if self.mind == Mind::Unsure { return; }
+        // Plainly slow, or slower than it must be long enough: unsure.
+        if !sure && speed < SLOW { self.mind = Mind::Unsure; return; }
+        let slow = if sure { KEEP } else { SURE_SPEED };
+        if speed >= slow { self.slow_since = None; return; }
+        let since = *self.slow_since.get_or_insert(now);
+        if now - since >= AMBIGUOUS { self.mind = Mind::Unsure; }
     }
 
     /// The hand's speed its way at `now`, falling off while it stays still.
@@ -128,26 +165,28 @@ impl Judge {
         ((gone - start) / span).max(0.0)
     }
 
-    /// How far the hand wants the screen to recede at `now`.
-    pub fn wanted_at(&self, now: f64) -> f64 {
-        if let Some(wanted) = self.released { return wanted; }
-        match self.onset {
-            None => if now > ONSET_LIMIT { 1.0 } else { 0.0 },
-            Some((onset, ..)) if onset > ONSET_LIMIT && now - onset <= DECIDE => 1.0,
-            Some(_) if now < self.doubt => 1.0,
-            Some((onset, ..)) if now - onset <= DECIDE => 0.0,
-            Some(_) => wanted(self.speed(now)),
-        }
+    /// How far the hand wants the screen to recede (as last `check`ed).
+    pub fn wanted(&self) -> f64 {
+        if self.mind == Mind::Unsure { 1.0 } else { 0.0 }
     }
 
-    /// Let go of: as it is, from now on (just set off counts as sure, and
-    /// so does letting go just after stopping, as a flick does).
+    /// Let go of: as it is, from now on (not yet sure counts as sure, as
+    /// does letting go just after stopping, as a flick does).
     pub fn release(&mut self, now: f64) {
-        if self.released.is_none() { self.released = Some(self.wanted_at(now).min(self.wanted_at(now - LATE))); }
+        if self.released.is_some() { return; }
+        self.check(now);
+        if self.mind == Mind::Deciding { self.mind = Mind::Sure; }
+        self.released = Some(self.wanted());
     }
 
     /// The axis it goes along.
     pub fn axis(&self) -> Option<usize> { self.onset.map(|(_, axis, _)| axis) }
+}
+
+/// Whether a hold begun `since` s after one let go of sure is sure from
+/// the start.
+pub fn carried(since: Option<f64>) -> bool {
+    since.is_some_and(|since| (0.0..=CARRY).contains(&since))
 }
 
 /// How the picture is drawn at a moment.
@@ -187,7 +226,18 @@ impl Quick {
             QuickFlick::Slide => false,
             QuickFlick::Instant => true,
         };
-        Some(Quick { instant, judge: Judge::default(), along: [Spring::default(); 2], depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
+        let since = SURE_END.lock().ok().and_then(|end| end.map(|end| end.elapsed().as_secs_f64()));
+        let judge = if carried(since) { Judge::sure() } else { Judge::default() };
+        Some(Quick { instant, judge, along: [Spring::default(); 2], depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
+    }
+
+    /// Let go of at `now`; let go of sure, the next hold soon after is sure
+    /// from the start.
+    pub fn release(&mut self, now: f64) {
+        self.judge.release(now);
+        if let Ok(mut end) = SURE_END.lock() {
+            *end = (self.judge.mind == Mind::Sure).then(std::time::Instant::now);
+        }
     }
 
     /// The picture at `now`, the hand's latches aiming at `aim` (cells
@@ -196,7 +246,8 @@ impl Quick {
     pub fn look(&mut self, now: f64, aim: (f64, f64), cell: (i32, i32), axis: usize) -> Look {
         let now = now.max(self.last.unwrap_or(now));
         let dt = self.last.replace(now).map_or(0.0, |last| now - last);
-        self.depth = approach(self.depth, self.judge.wanted_at(now), dt);
+        self.judge.check(now);
+        self.depth = approach(self.depth, self.judge.wanted(), dt);
         let aim = [aim.0, aim.1];
         for (spring, aim) in self.along.iter_mut().zip(aim) {
             spring.advance(aim, dt, OMEGA, ZETA);
@@ -210,7 +261,7 @@ impl Quick {
         } else {
             (self.along[axis].p, 0.0, self.along.iter().zip(aim).all(|(s, aim)| s.settled(aim)))
         };
-        let wanted = self.judge.wanted_at(now);
+        let wanted = self.judge.wanted();
         Look { axis, at, depth: self.depth, flash, settled: self.judge.released.is_some() && still && self.depth == wanted }
     }
 }
@@ -223,76 +274,99 @@ mod tests {
         Quick { instant: false, judge: Judge::default(), along: [Spring::default(); 2], depth: 0.0, last: None, cell: (0, 0), came: 0.0 }
     }
 
-    /// A hand along x at `x(t)` (cells), sampled every `dt` until `until`,
-    /// drawn every 120th of a second: the depth of each frame.
-    fn run(quick: &mut Quick, x: impl Fn(f64) -> f64, dt: f64, from: f64, until: f64) -> Vec<f64> {
-        let mut depths = Vec::new();
+    /// A hand along x at `x(t)` (cells), sampled every `dt` from `from`
+    /// until `until`, drawn every 120th of a second: each frame's time,
+    /// depth and what the hand was taken to be.
+    fn run(quick: &mut Quick, x: impl Fn(f64) -> f64, dt: f64, from: f64, until: f64) -> Vec<(f64, f64, Mind)> {
+        let mut frames = Vec::new();
         let (mut t, mut frame) = (from, from);
         while t <= until + 1e-9 {
             quick.judge.feed(t, (x(t), 0.0), 0);
             if t >= frame {
-                depths.push(quick.look(t, (x(t).round(), 0.0), (x(t).round() as i32, 0), 0).depth);
+                let depth = quick.look(t, (x(t).round(), 0.0), (x(t).round() as i32, 0), 0).depth;
+                frames.push((t, depth, quick.judge.mind));
                 frame += 1.0 / 120.0;
             }
             t += dt;
         }
-        depths
+        frames
     }
+
+    fn deepest(frames: &[(f64, f64, Mind)]) -> f64 { frames.iter().map(|f| f.1).fold(0.0, f64::max) }
 
     #[test]
     fn a_quick_sure_move_keeps_the_screen_whole_on_mouse_and_touchpad() {
         for dt in [0.001, 0.008] {
             let mut quick = fresh();
-            let depths = run(&mut quick, |t| 4.0 * (t - 0.05).clamp(0.0, 0.45), dt, 0.0, 0.5);
-            assert!(depths.iter().all(|d| *d < 0.05), "every {dt} s: {depths:?}");
+            let frames = run(&mut quick, |t| 4.0 * (t - 0.05).clamp(0.0, 0.45), dt, 0.0, 0.5);
+            assert!(deepest(&frames) < 0.05, "every {dt} s: {frames:?}");
             // Stopping, then letting go soon, stays whole.
-            quick.judge.release(0.52);
+            quick.release(0.52);
             assert!(quick.look(0.6, (2.0, 0.0), (2, 0), 0).depth < 0.05);
         }
     }
 
     #[test]
-    fn the_hand_s_speed_sets_how_far_the_screen_recedes_between_the_two() {
-        assert_eq!((wanted(0.5), wanted(SLOW), wanted(2.0), wanted(SURE_SPEED), wanted(9.0)), (1.0, 1.0, 0.5, 0.0, 0.0));
-        // Half sure: three quarters as large, sliding on.
-        let mut quick = fresh();
-        let depths = run(&mut quick, |t| 2.0 * (t - 0.05).max(0.0), 0.001, 0.0, 1.0);
-        let last = *depths.last().unwrap();
-        assert!((last - 0.5).abs() < 0.05, "{last}");
-        assert!((crate::follow::scale(last) - 0.75).abs() < 0.03);
-        // Slow, or held without moving: all the way.
-        let mut quick = fresh();
-        let depths = run(&mut quick, |t| 0.6 * t, 0.001, 0.0, 1.0);
-        assert!(*depths.last().unwrap() > 0.98);
-        let mut quick = fresh();
-        let depths = run(&mut quick, |_| 0.0, 0.001, 0.0, 1.0);
-        assert!(depths[..55].iter().all(|d| *d == 0.0) && *depths.last().unwrap() > 0.98);
+    fn going_on_quickly_stays_whole_through_a_short_slowing_or_stop() {
+        // Quick, then slow for 0.2 s, then quick again; and the same with a stop.
+        for between in [0.5, 0.0] {
+            let x = move |t: f64| 4.0 * t.min(0.25) + between * (t.min(0.45) - 0.25).max(0.0) + 4.0 * (t - 0.45).max(0.0);
+            let mut quick = fresh();
+            let frames = run(&mut quick, x, 0.001, 0.0, 0.8);
+            assert!(deepest(&frames) < 0.05, "{between}: {frames:?}");
+        }
     }
 
     #[test]
-    fn hesitating_recedes_at_once_without_a_jump_and_going_on_comes_forward() {
-        // Quick, stops at 0.25 s, holds still, sets off again at 0.6 s.
-        let x = |t: f64| 4.0 * t.min(0.25) + 4.0 * (t - 0.6).max(0.0);
+    fn stopping_a_while_turning_back_or_changing_axis_goes_all_the_way_back_at_once() {
+        // Quick, then still from 0.25 s on.
         let mut quick = fresh();
-        let depths = run(&mut quick, x, 0.001, 0.0, 1.0);
-        let frame = |t: f64| (t * 120.0).round() as usize;
-        assert!(depths[frame(0.25)] < 0.05);
-        // Receding starts within a few frames, quickest first, and never jumps.
-        assert!(depths[frame(0.25) + 6] > 0.3, "{:?}", &depths[frame(0.25)..frame(0.4)]);
-        let steps: Vec<f64> = depths.windows(2).map(|w| w[1] - w[0]).collect();
-        assert!(steps.iter().all(|s| s.abs() < 0.16), "{steps:?}");
-        assert!(depths[frame(0.55)] > 0.95);
-        assert!(*depths.last().unwrap() < 0.05);
-        // Turning back, or going the other way, recedes all the way for a moment.
+        let frames = run(&mut quick, |t| 4.0 * t.min(0.25), 0.001, 0.0, 0.8);
+        let at = |t: f64| frames.iter().find(|f| f.0 >= t).unwrap();
+        assert!(at(0.45).1 < 0.05);
+        let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
+        assert!((0.5..=0.6).contains(&unsure), "{unsure}");
+        assert!(at(unsure + 0.12).1 > 0.93, "{:?}", at(unsure + 0.12));
+        // Receding begins at once and has no jump.
+        assert!(frames.windows(2).all(|w| w[1].1 - w[0].1 < 0.2));
+        // Turning back, or going the other way, at once.
         let mut quick = fresh();
         run(&mut quick, |t| 4.0 * t, 0.001, 0.0, 0.2);
         quick.judge.feed(0.21, (0.6, 0.0), 0);
-        assert_eq!(quick.judge.wanted_at(0.22), 1.0);
+        assert_eq!((quick.judge.mind, quick.judge.wanted()), (Mind::Unsure, 1.0));
         let mut quick = fresh();
         run(&mut quick, |t| 4.0 * t, 0.001, 0.0, 0.2);
         quick.judge.feed(0.21, (0.8, 0.1), 1);
-        assert_eq!(quick.judge.wanted_at(0.22), 1.0);
-        assert_eq!(quick.judge.axis(), Some(1));
+        assert_eq!((quick.judge.mind, quick.judge.axis()), (Mind::Unsure, Some(1)));
+        // Going on quickly again is sure again.
+        let frames = run(&mut quick, |t| 0.8 + 4.0 * (t - 0.21), 0.001, 0.22, 0.6);
+        assert!(frames.last().unwrap().1 < 0.05);
+    }
+
+    #[test]
+    fn a_middling_hand_does_not_stay_half_receded() {
+        // Two cells a second, steadily: in between only for a moment, then all the way.
+        let mut quick = fresh();
+        let frames = run(&mut quick, |t| 2.0 * (t - 0.05).max(0.0), 0.001, 0.0, 1.2);
+        let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
+        assert!(unsure <= 0.05 + DECIDE + AMBIGUOUS + 0.02, "{unsure}");
+        assert!(frames.iter().find(|f| f.0 >= unsure + 0.12).unwrap().1 > 0.93);
+        let halfway = frames.iter().filter(|f| (0.3..0.7).contains(&f.1)).count() as f64 / 120.0;
+        assert!(halfway < 0.2, "{halfway} s half receded");
+        assert!(frames.last().unwrap().1 > 0.99);
+        // Held without moving: whole at first, all the way after a while.
+        let mut quick = fresh();
+        let frames = run(&mut quick, |_| 0.0, 0.001, 0.0, 1.0);
+        assert!(frames[..55].iter().all(|f| f.1 == 0.0) && frames.last().unwrap().1 > 0.98);
+    }
+
+    #[test]
+    fn a_hold_soon_after_a_sure_one_is_sure_from_the_start() {
+        assert!(carried(Some(0.4)) && !carried(Some(CARRY + 0.1)) && !carried(None));
+        let mut quick = Quick { judge: Judge::sure(), ..fresh() };
+        // Setting off slowly does not recede it at once.
+        let frames = run(&mut quick, |t| 1.5 * t, 0.001, 0.0, 0.28);
+        assert!(frames[0].1 == 0.0 && deepest(&frames) < 0.05, "{frames:?}");
     }
 
     #[test]
