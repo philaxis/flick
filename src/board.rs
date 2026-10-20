@@ -746,7 +746,7 @@ impl Motion {
 
 /// A hold over the board, judged as the normal view's is (`quick::Judge`):
 /// a flick leaves the board still as it is held and goes exactly one cell
-/// its way, at once, as it is let go of; any other hold is precise, the
+/// its way as it is let go of, easing there as any move does; any other hold is precise, the
 /// selection following the latches as it always has. The cell the latches
 /// come to while it is not yet unsure waits in `latched`.
 struct Flick {
@@ -1272,12 +1272,12 @@ impl Board {
             flick.latched = Some((id, grid));
             return;
         }
-        self.show_selected(id, grid, false);
+        self.show_selected(id, grid);
     }
 
     /// The hold over the board let go of (`Flick`): the cell it lands on,
-    /// shown at once when it was a flick; `None` when it was not judged.
-    pub fn let_go(&mut self) -> Option<(CellId, bool)> {
+    /// `None` when it was not judged.
+    pub fn let_go(&mut self) -> Option<CellId> {
         let mut flick = self.flick.take()?;
         flick.judge.release(flick.began.elapsed().as_secs_f64());
         if flick.still() {
@@ -1289,18 +1289,12 @@ impl Board {
                 _ => None,
             };
             let to = dir.and_then(|dir| self.grid.target(flick.start, dir)).unwrap_or(flick.start);
-            return self.grid.id_at(to).cloned().map(|id| (id, true));
+            return self.grid.id_at(to).cloned();
         }
-        flick.latched.map(|(id, _)| (id, false))
+        flick.latched.map(|(id, _)| id)
     }
 
-    /// Shows a selection at once, nothing easing into place.
-    pub fn select_at_once(&mut self, id: CellId, grid: Grid) {
-        self.flick = None;
-        self.show_selected(id, grid, true);
-    }
-
-    fn show_selected(&mut self, id: CellId, grid: Grid, at_once: bool) {
+    fn show_selected(&mut self, id: CellId, grid: Grid) {
         let now = Instant::now();
         let before = self.marks();
         let (strip_before, from) = (self.strip_marks.clone(), self.grid.find(&self.selected));
@@ -1308,7 +1302,6 @@ impl Board {
         self.selected = id;
         self.end_peek();
         self.relayout();
-        let (before, strip_before) = if at_once { (self.marks(), self.strip_marks.clone()) } else { (before, strip_before) };
         self.motion.moved(&before, &self.marks(), now);
         let t = self.strip_time(now);
         self.strip_frame = None;
@@ -1366,22 +1359,19 @@ impl Board {
     /// How far the hand pulls the selection, in cells and rows.
     fn drawn_strip(&self) -> &Strip { self.strip_frame.as_ref().unwrap_or(&self.strip) }
 
-    /// Judges the hold over the board from its samples (`Flick`): the cells
-    /// the latches came to since it began, and the hand beyond them. Gone
+    /// Judges the hold over the board from its samples (`Flick`): how far
+    /// the hand itself went since it began. Gone
     /// unsure, the cell the latches came to meanwhile is shown.
     fn judge_flick(&mut self, samples: &[crate::input::TimedHand], now: Instant) {
         let Some(flick) = &mut self.flick else { return };
-        let shown = flick.latched.as_ref().map_or(self.selected.as_str(), |(id, _)| id.as_str());
-        let Some(on) = self.grid.find(shown) else { return };
-        let gone = (if on.row == flick.start.row { on.col as f64 - flick.start.col as f64 } else { 0.0 }, on.row as f64 - flick.start.row as f64);
         for sample in samples {
             let t = sample.at.saturating_duration_since(flick.began).as_secs_f64();
-            flick.judge.feed(t, (gone.0 + sample.hand.along as f64, gone.1 + sample.hand.across as f64), sample.axis);
+            flick.judge.feed(t, sample.cells, sample.axis);
         }
         flick.judge.check(now.saturating_duration_since(flick.began).as_secs_f64());
         if !flick.still() {
             if let Some((id, grid)) = flick.latched.take() {
-                self.show_selected(id, grid, false);
+                self.show_selected(id, grid);
             }
         }
     }

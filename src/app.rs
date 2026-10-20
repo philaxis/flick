@@ -1534,14 +1534,12 @@ impl App {
     }
 
     /// A hold over the board let go of: the selection lands where it was
-    /// judged to (`Board::let_go`), at once for a flick.
+    /// judged to (`Board::let_go`).
     fn let_go_board(&mut self) {
-        let Some((id, at_once)) = self.board.let_go() else { return };
+        let Some(id) = self.board.let_go() else { return };
         self.grid.visit(&id);
         self.save();
-        if at_once {
-            self.board.select_at_once(id, self.usage_grid());
-        } else if id != self.board.selected() {
+        if id != self.board.selected() {
             self.board.select(id, self.usage_grid());
         }
     }

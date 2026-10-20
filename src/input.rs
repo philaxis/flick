@@ -290,6 +290,9 @@ pub struct TimedHand {
     pub hand: Hand,
     pub followed: Followed,
     pub axis: usize,
+    /// Cells rightwards and rows downwards from where the hold began, the
+    /// hand's own way, not held back at the latches as `hand` is.
+    pub cells: (f64, f64),
 }
 thread_local! {
     static SAMPLE_TIME: Cell<Option<(Instant, u32)>> = const { Cell::new(None) };
@@ -321,7 +324,7 @@ fn remember_follow() {
     let at = LAST_SAMPLE.replace(Some(at)).map_or(at, |last| last.max(at));
     LAST_SAMPLE.set(Some(at));
     let sample = TimedHand { at, received, scan_time: stamp.map(|s|s.1), os_ms,
-        hand: hand(), followed, axis: axis().unwrap_or(0) };
+        hand: hand(), followed, axis: axis().unwrap_or(0), cells: HAND_CELLS.get() };
     #[cfg(feature = "motion-probe")]
     PROBE_HAND.with(|v| v.borrow_mut().push(sample));
     if BOARD_OPEN.load(Ordering::SeqCst) {
@@ -663,6 +666,9 @@ thread_local! {
     /// How far the mouse got from where it was when the hold began: where it
     /// is now, and the farthest it was.
     static STRAYED: Cell<((i32, i32), i32)> = const { Cell::new(((0, 0), 0)) };
+    /// Cells rightwards and rows downwards the hand went since the hold
+    /// began, whatever the latches made of it (`TimedHand::cells`).
+    static HAND_CELLS: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     /// When a click of the trigger was last taken, and when the trigger was
     /// last clicked at all.
     static LAST_CLICK: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -906,6 +912,7 @@ fn press(source: Source) {
         STEPPED.set(false);
         LAST_ABSOLUTE.set(None);
         STRAYED.set(((0, 0), 0));
+        HAND_CELLS.set((0.0, 0.0));
         // Process ids come round again: a process found run as administrator
         // in an earlier hold may be gone, and its id another's by now.
         LEVELS.with(|levels| levels.borrow_mut().1.clear());
@@ -1423,6 +1430,7 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
     let ((x, y), farthest) = STRAYED.get();
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
+    HAND_CELLS.set((x as f64 / s.step_x.max(1) as f64, y as f64 / s.step_y.max(1) as f64));
     let following = FOLLOWING.load(Ordering::SeqCst);
     let ((mut fx, mut fy), lean) = FOLLOWED.get();
     let dx = if following & FOLLOW_X != 0 { fx += dx as i64; 0 } else { dx };
