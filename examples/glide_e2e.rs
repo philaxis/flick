@@ -4,6 +4,8 @@
 //!   glide_e2e window <rrggbb> <x> <y> <w> <h> <desktop id|pin> <secs>   (w and h 0: maximized)
 //!   glide_e2e run <dir> <exe for the row window>
 //!   glide_e2e cleanup <dir>
+//!   glide_e2e cliplift <dir>   a window half off the screen and a pinned one beneath another:
+//!                              one quick flick and one unsure hold, the screen read back in each
 //! A full-screen window of its own colour on each desktop (B's maximized), one pinned to all
 //! desktops and one of an app that goes along its row; the trigger is held
 //! and the mouse moved with SendInput, and the screen read back in between.
@@ -67,6 +69,7 @@ mod imp {
             Some("window") => window(&args[2..]),
             Some("run") => run(&args[2], &args[3]),
             Some("cleanup") => cleanup(&args[2]),
+            Some("cliplift") => cliplift(&args[2]),
             _ => eprintln!("usage: see the top of examples/glide_e2e.rs"),
         }
     }
@@ -351,6 +354,76 @@ mod imp {
             }
         }
         found
+    }
+
+    /// A's windows end at the edges of A's cell, and the pinned window stays
+    /// beneath the window over it while the screen slides whole, rising in
+    /// front only as it recedes.
+    fn cliplift(dir: &str) {
+        let mut r = Report { text: String::new(), failed: 0, dir: dir.to_owned() };
+        let ids: Vec<String> = std::fs::read_to_string(format!("{dir}/ids.txt")).unwrap().lines().map(str::to_owned).collect();
+        let (a, b) = (ids[0].clone(), ids[1].clone());
+        let desktop = |id: &str| vdapi::get_desktops().unwrap().into_iter().find(|d| d.id() == id).unwrap();
+        let _ = vdapi::switch_desktop(desktop(&a));
+        std::thread::sleep(Duration::from_millis(800));
+        let area = work_area();
+        let (w, h) = (area.right - area.left, area.bottom - area.top);
+        let me = std::env::current_exe().unwrap();
+        let spawn = |color: u32, rect: (i32, i32, i32, i32), on: &str| {
+            Command::new(&me)
+                .args(["window", &format!("{color:06x}"), &rect.0.to_string(), &rect.1.to_string(), &rect.2.to_string(), &rect.3.to_string(), on, "60"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let x = |f: f64| area.left + (w as f64 * f) as i32;
+        let y = |f: f64| area.top + (h as f64 * f) as i32;
+        let mut children = vec![spawn(RED, (area.left, area.top, w, h), &a), spawn(BLUE, (0, 0, 0, 0), &b)];
+        std::thread::sleep(Duration::from_millis(1500));
+        // Pinned, then a window of A over its lower right; and one of A half off the right.
+        children.push(spawn(GREEN, (x(0.40), y(0.10), w / 5, h / 5), "pin"));
+        std::thread::sleep(Duration::from_millis(1500));
+        children.push(spawn(YELLOW, (x(0.50), y(0.20), w * 4 / 10, h * 3 / 10), &a));
+        children.push(spawn(MAGENTA, (x(0.75), y(0.60), w / 2, h / 4), &a));
+        std::thread::sleep(Duration::from_millis(2500));
+        let start = r.shot("c0-start");
+        r.colour(&start, "start: yellow over the pinned window", (0.55, 0.25), "yellow");
+        r.colour(&start, "start: pinned window", (0.45, 0.15), "green");
+
+        // A flick: shot while the hand is still going, the screen whole.
+        hold(true);
+        std::thread::sleep(Duration::from_millis(40));
+        travel(140, 0, 50);
+        let quick = r.shot("c1-quick");
+        travel(40, 0, 20);
+        hold(false);
+        r.line(format!("quick: A ends at {:?} across (row 0.35)", edge(&quick, true, 0.35, "red")));
+        r.line(format!("quick: along y 0.72 {:?}", (0..20).map(|i| name(quick.at(i as f64 / 20.0, 0.72))).collect::<Vec<_>>()));
+        r.line(format!("quick: along y 0.25 {:?}", (0..20).map(|i| name(quick.at(i as f64 / 20.0, 0.25))).collect::<Vec<_>>()));
+        std::thread::sleep(Duration::from_millis(1500));
+        let _ = vdapi::switch_desktop(desktop(&a));
+        std::thread::sleep(Duration::from_millis(1500));
+
+        // Unsure: the screen recedes, the pinned window rises in front.
+        hold(true);
+        std::thread::sleep(Duration::from_millis(60));
+        travel(160, 0, 200);
+        std::thread::sleep(Duration::from_millis(300));
+        let receded = r.shot("c2-receded");
+        r.colour(&receded, "receded: pinned window in front of yellow", (0.55, 0.25), "green");
+        r.line(format!("receded: along y 0.6 {:?}", (0..20).map(|i| name(receded.at(i as f64 / 20.0, 0.6))).collect::<Vec<_>>()));
+        travel(-160, 0, 200);
+        std::thread::sleep(Duration::from_millis(300));
+        hold(false);
+        std::thread::sleep(Duration::from_millis(1000));
+
+        for mut child in children {
+            let _ = child.kill();
+        }
+        r.line(format!("{} failed", r.failed));
+        let _ = std::fs::write(format!("{dir}/report.txt"), &r.text);
     }
 
     fn run(dir: &str, row_exe: &str) {
