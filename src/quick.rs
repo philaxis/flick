@@ -4,7 +4,7 @@
 //! keeps the screen whole and the desktop it goes to slides in (or comes
 //! at once, `QuickFlick::Instant`); flicking again soon after a stroke
 //! ends, it stays so, each stroke going as far as it went, and let go
-//! still moving, a little farther (`Quick::coast`). Every other hand is
+//! still flung very fast, a cell farther (`Judge::coast`). Every other hand is
 //! taken as unsure, soon (still, set off slowly, stopped a while, turning
 //! back, going the other way): the screen goes all the way back at once,
 //! not by halves, and stays so until let go: a hand gone unsure does not
@@ -38,9 +38,9 @@ pub const PEAK: f64 = 5.0;
 /// within `PAUSE` (s) of that, or the hand is unsure.
 pub const KEEP: f64 = 2.5;
 pub const PAUSE: f64 = 0.25;
-/// Let go of sure and still moving, it goes on as far as it would in
-/// `COAST` (s) at that speed, `COAST_MOST` cells at most.
-pub const COAST: f64 = 0.1;
+/// Let go of sure, it goes as far as the hand went; only still going as
+/// fast as `FLING` (cells a second) does it go on `COAST_MOST` more, a cell.
+pub const FLING: f64 = 12.0;
 pub const COAST_MOST: f64 = 1.0;
 /// Turning back this far (cells) from the farthest it went is unsure.
 pub const BACK: f64 = 0.15;
@@ -201,11 +201,10 @@ impl Judge {
     pub fn way(&self) -> f64 { self.onset.map_or(0.0, |(.., sign)| sign) }
 
     /// How much farther than the hand (cells along and down) a hold let go
-    /// of sure at `now` goes, as a flung page coasts: on as fast as it went,
-    /// for a moment.
+    /// of sure at `now` goes: a cell flung as fast as `FLING`, else none.
     pub fn coast(&self, now: f64) -> (f64, f64) {
         let Some((_, axis, sign)) = self.onset.filter(|_| self.mind == Mind::Sure) else { return (0.0, 0.0) };
-        let on = sign * (self.speed(now) * COAST).min(COAST_MOST);
+        let on = if self.speed(now) >= FLING { sign * COAST_MOST } else { 0.0 };
         if axis == 0 { (on, 0.0) } else { (0.0, on) }
     }
 }
@@ -421,6 +420,35 @@ mod tests {
     }
 
     #[test]
+    fn a_flick_lands_as_far_as_the_hand_went_past_six_tenths_of_a_cell() {
+        let flick = |to: f64, speed: f64| {
+            let x = move |t: f64| (speed * (t - 0.05).max(0.0)).min(to);
+            let end = 0.05 + to / speed;
+            let mut quick = fresh();
+            let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 5)]);
+            let mut t = 0.0;
+            while t <= end + 0.001 {
+                hand.track_locked(t, (x(t), 0.0), 0);
+                quick.judge.feed(t, (x(t), 0.0), 0);
+                t += 0.001;
+            }
+            quick.release(t);
+            hand.let_go_near(t, (x(t), 0.0), quick.judge.coast(t))
+        };
+        assert_eq!(flick(1.3, 8.0), (1, 0));
+        assert_eq!(flick(1.7, 8.0), (2, 0));
+        // Let go still going eight cells a second, 1.4 on: the cell it went to.
+        assert_eq!(flick(1.4, 8.0), (1, 0));
+        // Past six tenths and back to half: still the cell beyond.
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
+        hand.track_locked(0.0, (0.65, 0.0), 0);
+        hand.track_locked(0.01, (0.5, 0.0), 0);
+        assert_eq!(hand.clone().let_go_near(0.02, (0.5, 0.0), (0.0, 0.0)), (1, 0));
+        hand.track_locked(0.02, (0.35, 0.0), 0);
+        assert_eq!(hand.let_go_near(0.03, (0.35, 0.0), (0.0, 0.0)), (0, 0));
+    }
+
+    #[test]
     fn a_flick_let_go_moving_goes_on_at_most_a_cell() {
         // Let go 1.3 cells on at 20 cells a second: a cell more, no farther.
         let fling = |t: f64| 20.0 * (t - 0.05).max(0.0);
@@ -500,7 +528,7 @@ mod tests {
     #[test]
     fn whole_the_screen_is_where_the_hand_is_and_lands_on_the_nearest_cell_in_a_tenth_of_a_second() {
         // Held: cell for cell where the hand is, from its first move.
-        let x = |t: f64| stroke(t, 0.02, 0.8, 0.05);
+        let x = |t: f64| stroke(t, 0.02, 1.2, 0.05);
         let mut quick = fresh();
         let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
         let mut t = 0.0;
@@ -511,7 +539,8 @@ mod tests {
             assert!((look.at - x(t)).abs() < 1e-9, "{t}: {} for {}", look.at, x(t));
             t += 1.0 / 120.0;
         }
-        // Let go still moving, short of a cell: to it, at once, never past it.
+        // Let go still moving, short of a cell and past six tenths of it:
+        // to it, at once, never past it.
         quick.release(t);
         let held = hand.held();
         let to = hand.let_go_near(t, (x(t), 0.0), quick.judge.coast(t));
