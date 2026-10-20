@@ -139,8 +139,9 @@ const rgba = (r, g, b, a) => `rgba(${Math.round(r * 255)},${Math.round(g * 255)}
 /* The app's colours (src/paint.rs, src/board.rs). */
 const white = a => rgba(1, 1, 1, a);
 const accent = a => rgba(.34, .62, 1, a);
-const everywhere = a => rgba(1, .74, .34, a);   // pinned to all shelves
-const onRow = a => rgba(.32, .86, .82, a);      // pinned to this shelf
+/* Pins' light: the one blue, full for every shelf, half for this shelf. */
+const everywhere = a => accent(a);
+const onRow = a => accent(.5 * a);
 const BACKDROP = rgba(.050, .055, .068, 1);
 /* The desktop strip (src/follow.rs): GAP between desktops, the others DIM darker. */
 const GAP = .07, DIM = .55;
@@ -190,17 +191,17 @@ function surface(g, x, y, w, h, r, face, alpha, lift, s) {
 }
 
 /* ---------- the desktops: real Windows 11 screens (scripts/landing-cells.ps1), one shelf per piece of work ---------- */
-const CELLS = {"sw":1920,"sh":1080,"shelves":[[{"img":"d00.webp","wins":[{"app":"notepad","r":[134,61,1152,877]},{"app":"terminal","r":[960,428,864,530]}]},{"img":"d01.webp","wins":[{"app":"edge","r":[192,51,1536,918]}]},{"img":"d02.webp","wins":[{"app":"explorer","r":[96,82,998,796]},{"app":"terminal","r":[922,204,902,632]}]}],[{"img":"d10.webp","wins":[{"app":"edge","r":[77,61,1056,898],"img":"w-d10-0.webp"},{"app":"notepad","r":[960,204,864,755],"img":"w-d10-1.webp"},{"app":"explorer","r":[1190,41,672,428],"img":"w-d10-2.webp"}]},{"img":"d11.webp","wins":[{"app":"paint","r":[384,61,1190,877]}]}],[{"img":"d20.webp","wins":[{"app":"edge","r":[230,71,1382,857]}]},{"img":"d21.webp","wins":[{"app":"edge","r":[96,71,1152,857]},{"app":"notepad","r":[1152,143,672,673]}]}]],"pinAll":{"app":"calc","r":[1498,306,402,632],"img":"w-pins-0.webp"},"pinRow":{"row":1,"app":"notepad","r":[58,571,499,408],"img":"w-pins-1.webp"}};
+const CELLS = {"sw":1920,"sh":1080,"shelves":[[{"img":"d00.webp","wins":[{"app":"notepad","r":[384,51,1075,877]},{"app":"terminal","r":[998,449,845,510]}]},{"img":"d01.webp","wins":[{"app":"edge","r":[384,41,1459,918]}]},{"img":"d02.webp","wins":[{"app":"explorer","r":[422,82,883,755]},{"app":"terminal","r":[960,224,883,612]}]}],[{"img":"d10.webp","wins":[{"app":"edge","r":[115,41,1690,938]}],"frames":["d10.webp","d10b.webp","d10c.webp"]},{"img":"d11.webp","wins":[{"app":"edge","r":[192,51,1536,898]}]}],[{"img":"d20.webp","wins":[{"app":"edge","r":[384,41,960,918]},{"app":"notepad","r":[1152,143,710,755]}]},{"img":"d21.webp","wins":[{"app":"app","r":[384,51,1152,734],"img":"w-d21-0.webp"},{"app":"notepad","r":[1229,408,634,571],"img":"w-d21-1.webp"}]},{"img":"d22.webp","wins":[{"app":"paint","r":[384,41,1075,816]},{"app":"explorer","r":[1152,428,710,530]}]}]],"pinAll":{"app":"calc","r":[1478,31,403,627],"img":"w-pins-0.webp"},"pinRow":{"rows":[0,2],"app":"app","r":[19,408,346,592],"img":"w-pins-1.webp"}};
 const SHELF_NAMES = {
-  ko: ['개발 · tidepool', '글쓰기 · 도시 숲 보고서', '소통 · 이번 주'],
-  en: ['Build · tidepool', 'Writing · urban forest report', 'Talk · this week'],
+  ko: ['개발 · Flick 0.6', '딴짓', '마케팅 · Flick 0.6 출시'],
+  en: ['Build · Flick 0.6', 'Break', 'Marketing · Flick 0.6 launch'],
 };
-const SHELF_SHORT = { ko: ['개발', '글쓰기', '소통'], en: ['Build', 'Writing', 'Talk'] };
+const SHELF_SHORT = { ko: ['개발', '딴짓', '마케팅'], en: ['Build', 'Break', 'Marketing'] };
 const shelfName = r => SHELF_NAMES[lang][r];
 const SHELVES = CELLS.shelves;
 const PINNED_ALL = CELLS.pinAll, PINNED_ROW = CELLS.pinRow;
 /* An app's colour, for its icon until the picture of it has come. */
-const TONE = { notepad: '#3d8bfd', terminal: '#8d96a8', edge: '#2fa8d8', explorer: '#e6c34a', paint: '#e46a9a', calc: '#8f7cf0' };
+const TONE = { notepad: '#3d8bfd', terminal: '#8d96a8', edge: '#2fa8d8', explorer: '#e6c34a', paint: '#e46a9a', calc: '#8f7cf0', app: '#2fa8d8' };
 
 const IMG = {};
 let onImage = () => {};
@@ -216,39 +217,45 @@ function icon(g, app, x, y, k) {
   fill(g, x, y, k, k, k * .24, TONE[app]);
 }
 
-/* ---------- the loop: every desktop and every shelf, no move made twice the same way ----------
+/* ---------- the loop: a developer who also markets, building Flick 0.6 above, launching it below, a break between ----------
    How far the screens recede follows the hand: a sure, quick flick slides them full size, a middling one
-   halfway back, a slow or unsure drag all the way. Receding, the pinned windows shrink into the board's places for them.
-   The writing shelf's references stay put while that shelf's desktops slide under them, and leave with it. */
+   to three quarters, a slow or unsure drag all the way back. The video on the break shelf plays on while the
+   person works: each time they flick down to it, it is further along, and each time they flick back up their
+   work is as they left it. The team's chat is pinned to both shelves of work and is gone on the break. */
 const SCRIPT = [
-  [.4, h => h.drag(1, 0)],                       // a quick flick: building, to the preview
-  [2.2, h => h.drag(1, 0)],                      // and on to the project folder
-  [3.9, h => h.press()],                         // held: the shelves recede
-  [4.3, h => h.drag(0, 1)],                      // down to the writing shelf, its references with it
-  [5.1, h => h.drag(1, 0)],                      // the desktops slide; the references stay
-  [5.9, h => h.drag(-1, 0)],                     // and back
-  [6.6, h => h.release()],
-  [8.1, h => h.tap()],                           // the board: what is pinned where
-  [11.0, h => h.tap()],
-  [12.0, h => h.drag(1, 0)],                     // full size: the chart slides in, the references stay
-  [13.8, h => h.press()],
-  [14.2, h => h.drag(0, 1)],                     // down to the team's shelf: the references go with theirs
-  [15.0, h => h.drag(1, 0)],
-  [15.7, h => h.release()],
-  [17.5, h => h.press(.5)],                      // a middling flick back to the chat: three quarters size
-  [17.6, h => h.drag(-1, 0)],
-  [18.1, h => h.release()],
-  [19.4, h => h.drag(0, -1)],                    // up, full size: the references come back
-  [20.9, h => h.press(.5)],
-  [21.0, h => h.drag(-1, 0)],
-  [21.5, h => h.release()],
-  [22.7, h => h.press()],
-  [23.1, h => h.drag(0, -1)],                    // up to building, then two desktops along it
-  [23.8, h => h.drag(-1, 0)],
-  [24.3, h => h.drag(-1, 0)],
-  [25.0, h => h.release()],
+  [.4, h => h.drag(1, 0)],                       // building: the source, then the release on GitHub
+  [2.0, h => h.drag(0, 1)],                      // one flick down: the video, playing
+  [3.7, h => h.drag(0, -1)],                     // one flick up: the release, as it was
+  [5.2, h => h.press()],                         // held, the shelves recede: on to the project folder
+  [5.6, h => h.drag(1, 0)],
+  [6.3, h => h.release()],
+  [7.6, h => h.drag(0, 1)],                      // down again: the video has gone on
+  [9.3, h => h.drag(0, -1)],                     // and back to work
+  [10.8, h => h.press(.5)],                      // a middling flick: three quarters size
+  [11.0, h => h.drag(0, 1)],
+  [11.6, h => h.drag(1, 0)],                     // music next to the video
+  [12.2, h => h.drag(-1, 0)],
+  [12.7, h => h.release()],
+  [14.0, h => h.press()],
+  [14.4, h => h.drag(0, 1)],                     // down to marketing: the chat comes back with it
+  [15.1, h => h.drag(1, 0)],                     // the desktops slide; the chat stays
+  [15.8, h => h.drag(1, 0)],
+  [16.5, h => h.release()],
+  [17.8, h => h.drag(-1, 0)],                    // a quick flick back to the numbers
+  [19.0, h => h.tap()],                          // the board: what is pinned where
+  [21.6, h => h.tap()],
+  [22.4, h => h.drag(0, -1)],                    // up to the break: further along still
+  [24.0, h => h.drag(0, 1)],                     // down: the launch work, as it was
+  [25.5, h => h.press()],
+  [25.9, h => h.drag(0, -1)],                    // up through the break to building, and along it home
+  [26.4, h => h.drag(0, -1)],
+  [27.0, h => h.drag(-1, 0)],
+  [27.5, h => h.drag(-1, 0)],
+  [28.0, h => h.release()],
 ];
-const LOOP = 27.5;
+const LOOP = 29.8;
+/* Which picture of the playing video each visit to the break shelf finds. */
+const VIDEO_AT = [0, 1, 1, 2, 2];
 /* Springs, a little under-damped: quick to go, a few per cent past, quick to settle. */
 const MOVE = { w: 24, z: .74 }, DEPTH = { w: 22, z: .7 }, BOARD = { w: 20, z: .72 };
 function spring(s, to, dt, { w, z }) {
@@ -265,7 +272,7 @@ class Hero {
     this.t = 0; this.si = 0;
     this.row = 0; this.col = 0; this.last = SHELVES.map(() => 0);
     this.sx = { p: 0, v: 0 }; this.sy = { p: 0, v: 0 }; this.tx = 0; this.ty = 0;   // where the strip is: column on the current shelf, and shelf
-    this.held = false; this.depth = { p: 0, v: 0 }; this.arrived = -9;   // when the pinned shelf was last come to
+    this.held = false; this.depth = { p: 0, v: 0 }; this.arrived = -9; this.breaks = 0;   // when a shelf with the chat was last come to; visits to the break
     this.board = { open: false, s: { p: 0, v: 0 } };
   }
   get x() { return this.sx.p; }
@@ -299,7 +306,7 @@ class Hero {
     /* The strip springs to where the hand sent it; the desktop it is nearest is the one chosen. */
     spring(this.sy, this.ty, dt, MOVE);
     const row = clamp(Math.round(this.y), 0, SHELVES.length - 1);
-    if (row !== this.row) { if (row === PINNED_ROW.row) this.arrived = this.t; this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
+    if (row !== this.row) { if (PINNED_ROW.rows.includes(row) && !PINNED_ROW.rows.includes(this.row)) this.arrived = this.t; if (SHELVES[row].some(d => d.frames)) this.breaks++; this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
     spring(this.sx, this.tx, dt, MOVE);
     this.col = clamp(Math.round(this.x), 0, SHELVES[this.row].length - 1);
     /* Held, the screen recedes; let go, the chosen desktop comes forward. */
@@ -315,7 +322,7 @@ class Hero {
     const s = w / win.r[2], r = 8 * s;   // one of the screen's pixels, here
     glow(g, x, y + (6 + 8 * lift) * s, w, h, r, (20 + 16 * lift) * s, `rgba(0,0,0,${.32 + .2 * lift})`);
     glow(g, x, y + s, w, h, r, 4 * s, 'rgba(0,0,0,.4)');
-    const own = win.img && image(win.img), from = own || image(desk.img);
+    const own = win.img && image(win.img), from = own || image(this.picture(desk));
     g.save(); rr(g, x, y, w, h, r); g.clip();
     if (from) {
       const k = from.naturalWidth / (own ? win.r[2] : CELLS.sw);
@@ -324,6 +331,8 @@ class Hero {
     } else { g.fillStyle = '#202328'; g.fillRect(x, y, w, h); }
     g.restore();
   }
+  /* A desktop's picture; the playing video's, as far along as this visit finds it. */
+  picture(desk) { return desk.frames ? desk.frames[Math.min(desk.frames.length - 1, VIDEO_AT[Math.max(0, this.breaks - 1)] || 0)] : desk.img; }
   /* follow::placed: where a thing `apart` desktops from the strip is drawn, and how dark. */
   place(ax, ay) {
     const { W, H } = this, sc = scaleAt(this.receded), emphasis = clamp(1 - Math.hypot(ax, ay), 0, 1);
@@ -342,7 +351,7 @@ class Hero {
     SHELVES.forEach((row, r) => row.forEach((desk, c) => {
       const p = this.place(c - this.rowX(r), r - this.y), w = W * p.k, h = H * p.k;
       if (p.x > W || p.y > H || p.x + w < 0 || p.y + h < 0) return;
-      const im = image(desk.img);
+      const im = image(this.picture(desk));
       if (im) {
         const k = im.naturalWidth / CELLS.sw;
         g.drawImage(im, -ox / sc * k, -oy / sc * k, W / sc * k, H / sc * k, p.x, p.y, w, h);
@@ -351,23 +360,19 @@ class Hero {
     }));
     /* Pinned windows stay where they are sideways; those of a shelf go up and down with it. */
     /* Each with its pin's light round it, no box: teal for this shelf, brighter as the shelf is come to; amber for every shelf. */
-    /* Full size they are where they are; receding, they shrink toward a fifth of their size in the board's place for
-       their pin, as far as the screens recede. A shelf's own go up and down with it. */
-    const pinned = (win, ay, colour, a, slot) => {
-      const d = clamp(this.receded, 0, 1), [rx, ry, rw, rh] = this.onStage(win.r), k = 1 - .8 * d;
-      const t = this.fitTile(win, ...slot), w = rw * k, h = rh * k;
-      const x = rx + (t.x + t.w / 2 - rx - rw / 2) * d + (rw - w) / 2;
-      const y = ry + (t.y + t.h / 2 - ry - rh / 2) * d + (rh - h) / 2 + ay * H * (1 + GAP) * scaleAt(this.receded);
+    /* They stay where they are; receding, one covering much of the screen shrinks about its own middle, to no less than 40%.
+       A shelf's own go up and down with it. */
+    const pinned = (win, ay, colour, a) => {
+      const d = clamp(this.receded, 0, 1), [rx, ry, rw, rh] = this.onStage(win.r);
+      const covers = win.r[2] * win.r[3] / (CELLS.sw * CELLS.sh), k = 1 - d * (1 - clamp(Math.sqrt(.03 / covers), .4, 1));
+      const w = rw * k, h = rh * k, x = rx + (rw - w) / 2, y = ry + (rh - h) / 2 + ay * H * (1 + GAP) * scaleAt(this.receded);
       const s = sc * Math.max(k, .5);   // the light shrinks less than the window, to stay seen
-      g.save();
       const lit = colour(clamp(a, 0, 1) * clamp(1 - Math.abs(ay), 0, 1));
       glow(g, x - 10 * s, y - 10 * s, w + 20 * s, h + 20 * s, 18 * s, 90 * s, lit); glow(g, x - 3 * s, y - 3 * s, w + 6 * s, h + 6 * s, 10 * s, 28 * s, lit);
       this.paintShot(g, win, win, x, y, w, h, 1);
-      g.restore();
     };
-    const slots = this.pinSlots();
-    if (Math.abs(PINNED_ROW.row - this.y) < 1.5) pinned(PINNED_ROW, PINNED_ROW.row - this.y, onRow, .55 + .45 * Math.exp(-(this.t - this.arrived) / 1.2), slots.row);
-    pinned(PINNED_ALL, 0, everywhere, .42, slots.all);
+    PINNED_ROW.rows.forEach(r => { if (Math.abs(r - this.y) < 1.5) pinned(PINNED_ROW, r - this.y, onRow, .5 + .4 * Math.exp(-(this.t - this.arrived) / 1.2)); });
+    pinned(PINNED_ALL, 0, everywhere, .5);
     if (this.receded > .01) this.drawBanner();
   }
   /* glide.rs Banner: the shelf's name in a pill above the picture, the names sliding as the shelf changes. */
@@ -399,7 +404,7 @@ class Hero {
     const top = 58 * s, bottom = mapTop - 34 * s, colW = W * .19, left = 30 * s, slots = this.pinSlots();
     const pins = [
       { win: PINNED_ALL, kind: 'all', ...this.fitTile(PINNED_ALL, ...slots.all) },
-      ...(this.row === PINNED_ROW.row ? [{ win: PINNED_ROW, kind: 'row', ...this.fitTile(PINNED_ROW, ...slots.row) }] : []),
+      ...(PINNED_ROW.rows.includes(this.row) ? [{ win: PINNED_ROW, kind: 'row', ...this.fitTile(PINNED_ROW, ...slots.row) }] : []),
     ];
     const desk = SHELVES[this.row][this.col], wins = desk.wins, ax = left + colW + 40 * s, aw = W - ax - 40 * s, tg = 26 * s;
     const asp = wins.map(w => w.r[2] / w.r[3]), sum = asp.reduce((a, b) => a + b, 0);
@@ -471,7 +476,7 @@ applyLang();
 const hero = new Hero(document.getElementById('hero'));
 /* The pictures come in their own time; a held frame is drawn again as each arrives. */
 onImage = () => { if (STILL) redrawStill(); };
-SHELVES.forEach(row => row.forEach(d => { image(d.img); d.wins.forEach(w => { image(`icons/${w.app}.png`); if (w.img) image(w.img); }); }));
+SHELVES.forEach(row => row.forEach(d => { image(d.img); (d.frames || []).forEach(image); d.wins.forEach(w => { image(`icons/${w.app}.png`); if (w.img) image(w.img); }); }));
 [PINNED_ALL, PINNED_ROW].forEach(w => { image(w.img); image(`icons/${w.app}.png`); });
 const words = [...document.querySelectorAll('#line span')];
 let beatTimer = 0;

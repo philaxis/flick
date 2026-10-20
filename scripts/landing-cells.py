@@ -28,7 +28,7 @@ def clock_hidden(im):
 
 
 # Other people's thumbnails on YouTube, softened: (left, top, right, bottom) as fractions of the browser window.
-SOFTEN = {'d10': [(.745, .17, .985, 1)], 'd11': [(.08, .2, .25, .97), (.39, .2, .62, .97)]}
+SOFTEN = {'d10': [(.70, .17, .99, 1)], 'd11': [(.08, .26, .49, 1)]}
 FRAMES = {'d10': ['d10', 'd10b', 'd10c']}   # the video, taken again as it plays
 
 
@@ -37,16 +37,6 @@ def softened(d, im):
     for l, t, r, b in SOFTEN.get(d, []):
         box = tuple(round(v) for v in (f['x'] + l * f['w'], f['y'] + t * f['h'], f['x'] + r * f['w'], min(f['y'] + b * f['h'], work['h'])))
         im.paste(im.crop(box).filter(ImageFilter.GaussianBlur(10)), box[:2])
-    return im
-
-
-def dates_hidden(d, im):
-    """Explorer's "date modified" column is today's real date and time too."""
-    for w in layout['scenes'][d]['windows']:
-        if w['app'] == 'explorer' and d == 'd02':
-            f = w['frame']
-            box = (f['x'] + 538, f['y'] + 208, f['x'] + 716, f['y'] + 432)
-            im.paste(im.crop(box).filter(ImageFilter.GaussianBlur(9)), box[:2])
     return im
 
 
@@ -71,7 +61,7 @@ shelves = []
 for row in SHELVES:
     out = []
     for d in row:
-        pics = [save(softened(d, dates_hidden(d, clock_hidden(Image.open(src / f'{n}.png').convert('RGB')))), n, DESK_W) for n in FRAMES.get(d, [d])]
+        pics = [save(softened(d, clock_hidden(Image.open(src / f'{n}.png').convert('RGB'))), n, DESK_W) for n in FRAMES.get(d, [d])]
         img = pics[0]
         wins = []
         for i, w in enumerate(layout['scenes'][d]['windows']):
@@ -89,6 +79,8 @@ cells = {'sw': sw, 'sh': sh, 'shelves': shelves, 'pinAll': pin(0), 'pinRow': {'r
 
 for p in (src / 'icons').glob('*.png'):
     shutil.copy(p, dst / 'icons' / p.name)
+# A page opened as an app of its own is Edge's.
+shutil.copy(src / 'icons' / 'edge.png', dst / 'icons' / 'app.png')
 # The new Paint, Notepad and Calculator keep their icons out of their exes; their title bars have them.
 for app, shot, box in (('paint', 'w-d22-0', (9, 12, 29, 32)), ('calc', 'w-pins-0', (23, 11, 43, 31)), ('notepad', 'w-d20-1', (20, 21, 40, 41))):
     Image.open(src / f'{shot}.png').crop(box).resize((32, 32), Image.LANCZOS).save(dst / 'icons' / f'{app}.png')
