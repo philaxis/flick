@@ -34,7 +34,7 @@ pub const ONSET_LIMIT: f64 = 0.15;
 pub const DECIDE: f64 = 0.08;
 pub const PEAK: f64 = 5.0;
 /// Sure and not let go of this long (s) after setting off, it is unsure.
-pub const QUICK_MOST: f64 = 0.25;
+pub const QUICK_MOST: f64 = 0.35;
 /// Turning back this far (cells) from the farthest it went is unsure.
 pub const BACK: f64 = 0.15;
 /// The hand's speed is taken over this long (s).
@@ -466,7 +466,7 @@ mod tests {
         let at = |t: f64| frames.iter().find(|f| f.0 >= t).unwrap();
         assert!(at(0.25).1 < 0.05);
         let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
-        assert!((0.3..=0.32).contains(&unsure), "{unsure}");
+        assert!((0.05 + QUICK_MOST..=0.07 + QUICK_MOST).contains(&unsure), "{unsure}");
         assert!(at(unsure + 0.12).1 > 0.93, "{:?}", at(unsure + 0.12));
         // Receding begins at once and has no jump.
         assert!(frames.windows(2).all(|w| w[1].1 - w[0].1 < 0.21));
