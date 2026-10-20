@@ -1632,14 +1632,21 @@ impl App {
     /// the current desktop already, it only gives focus back.
     fn cancel_board(&mut self) {
         let selected = self.board.selected();
-        let current = self.sync().map(|d| d.current);
-        if let Some(id) = current.as_deref().and_then(|current| dismissal_target(&selected, current)) {
+        let Some(current) = self.sync().map(|d| d.current) else { return self.board.close() };
+        if let Some(id) = dismissal_target(&selected, &current) {
             return self.leave_board(id, None);
         }
-        self.board.close();
-        if unsafe { IsWindow(self.focus_before_board) }.as_bool() {
-            vd::force_foreground(self.focus_before_board);
+        // Come to an empty desktop, the keyboard was still with a window of
+        // the one left as the board opened: given back to it, Windows goes
+        // back there. The keyboard goes before the board does (`leave_board`).
+        let before = self.focus_before_board;
+        let on = vdapi::get_desktop_by_window(before).ok().map(|desktop| desktop.id());
+        if unsafe { IsWindow(before) }.as_bool() && gives_focus_back(vd::pinned_everywhere(before), on.as_deref(), &current) {
+            vd::force_foreground(before);
+        } else {
+            vd::focus_top_window();
         }
+        self.board.close();
     }
 
     /// Closes the board and goes to cell `id`, focusing `window` if given.
@@ -2832,9 +2839,25 @@ fn dismissal_target<'a>(selected: &'a str, current: &str) -> Option<&'a str> {
     (!selected.is_empty() && selected != current).then_some(selected)
 }
 
+/// Whether the window that had the keyboard as the board opened, on
+/// desktop `on` or on every one (`pinned`), may have it back as the board
+/// closes on desktop `current`.
+fn gives_focus_back(pinned: bool, on: Option<&str>, current: &str) -> bool {
+    pinned || on == Some(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_the_board_gives_no_keyboard_to_a_window_of_the_cell_left() {
+        // A row moved to an empty desktop "b" left the keyboard on "a".
+        assert!(!gives_focus_back(false, Some("a"), "b"));
+        assert!(!gives_focus_back(false, None, "b"));
+        assert!(gives_focus_back(false, Some("b"), "b"));
+        assert!(gives_focus_back(true, Some("a"), "b"));
+    }
 
     #[test]
     fn closing_the_board_goes_to_a_selection_moved_off_the_current_desktop() {
