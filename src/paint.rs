@@ -5,17 +5,19 @@
 use std::{cell::{Cell, OnceCell, RefCell}, collections::HashMap, ffi::c_void};
 use windows::{
     core::{w, ComInterface, Interface, Result},
+    Foundation::Numerics::Matrix3x2,
     Win32::{
         Foundation::RECT,
         Graphics::{
             Direct2D::{
-                Common::{D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U},
+                Common::{D2D1_FILL_MODE_ALTERNATE, D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U},
                 D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1LinearGradientBrush, ID2D1RenderTarget,
                 ID2D1SolidColorBrush, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_GRADIENT_STOP, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
                 D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
+                D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT, ID2D1Geometry,
+                D2D1_LAYER_PARAMETERS, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_LAYER_OPTIONS_NONE,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
@@ -77,15 +79,6 @@ pub fn pin_light(all: bool) -> (f32, f32) {
 pub fn pinned(all: bool, a: f32) -> D2D1_COLOR_F {
     let ([r, g, b], strength) = if all { PIN_ALL } else { PIN_ROW };
     rgba(r, g, b, a * strength)
-}
-
-/// A colour's blue, green and red as bytes.
-pub const fn bgr([r, g, b]: [f32; 3]) -> [u8; 3] {
-    [byte(b), byte(g), byte(r)]
-}
-
-const fn byte(c: f32) -> u8 {
-    (c * 255.0 + 0.5) as u8
 }
 
 /// The colour of a cell the user marked to stand out. Warm, so that it is
@@ -391,6 +384,37 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// Draws with nothing of it shown within `hole`, a rectangle with
+    /// corners of `radius`: light about something that shows through.
+    pub fn outside(&self, hole: &Rect, radius: f32, draw: impl FnOnce()) {
+        let far = 1.0e6;
+        let masked = unsafe {
+            self.target.GetFactory().ok().and_then(|factory: ID2D1Factory| {
+                let all: ID2D1Geometry = factory.CreateRectangleGeometry(&Rect { left: -far, top: -far, right: far, bottom: far }).ok()?.cast().ok()?;
+                let within: ID2D1Geometry = factory.CreateRoundedRectangleGeometry(&rounded(hole, radius)).ok()?.cast().ok()?;
+                let group = factory.CreateGeometryGroup(D2D1_FILL_MODE_ALTERNATE, &[Some(all), Some(within)]).ok()?;
+                let parameters = D2D1_LAYER_PARAMETERS {
+                    contentBounds: Rect { left: -far, top: -far, right: far, bottom: far },
+                    geometricMask: std::mem::ManuallyDrop::new(Some(group.cast().ok()?)),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: Matrix3x2::identity(),
+                    opacity: 1.0,
+                    opacityBrush: std::mem::ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                };
+                self.target.PushLayer(&parameters, None);
+                let D2D1_LAYER_PARAMETERS { geometricMask, opacityBrush, .. } = parameters;
+                drop(std::mem::ManuallyDrop::into_inner(geometricMask));
+                drop(std::mem::ManuallyDrop::into_inner(opacityBrush));
+                Some(())
+            })
+        };
+        draw();
+        if masked.is_some() {
+            unsafe { self.target.PopLayer() };
+        }
+    }
+
     /// A soft shadow or glow (`Glow`) cast by a rounded rectangle at
     /// `area`: `corner` is how large each of its corners is drawn, which
     /// sets how far it spreads and how round it is.
@@ -436,12 +460,7 @@ impl Glow {
 
     pub fn new(target: &ID2D1RenderTarget, colour: D2D1_COLOR_F) -> Option<Glow> {
         let n = Self::SIZE;
-        let mask = glow_mask(n, Self::INSET, Self::RADIUS, Self::BLUR);
-        let mut pixels = vec![0u8; n * n * 4];
-        for (pixel, a) in pixels.chunks_exact_mut(4).zip(mask) {
-            let a = a * colour.a;
-            pixel.copy_from_slice(&[(colour.b * a * 255.0) as u8, (colour.g * a * 255.0) as u8, (colour.r * a * 255.0) as u8, (a * 255.0) as u8]);
-        }
+        let pixels = premultiplied(&glow_mask(n, Self::INSET, Self::RADIUS, Self::BLUR), [colour.r, colour.g, colour.b], colour.a);
         let properties = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0,
@@ -450,6 +469,17 @@ impl Glow {
         let size = D2D_SIZE_U { width: n as u32, height: n as u32 };
         unsafe { target.CreateBitmap(size, Some(pixels.as_ptr().cast()), (n * 4) as u32, &properties).ok().map(Glow) }
     }
+}
+
+/// Blue, green, red and alpha bytes, premultiplied, of `colour` as opaque
+/// as `alpha` times each of `mask`.
+pub fn premultiplied(mask: &[f32], [r, g, b]: [f32; 3], alpha: f32) -> Vec<u8> {
+    let mut pixels = vec![0u8; mask.len() * 4];
+    for (pixel, a) in pixels.chunks_exact_mut(4).zip(mask) {
+        let a = a * alpha;
+        pixel.copy_from_slice(&[(b * a * 255.0) as u8, (g * a * 255.0) as u8, (r * a * 255.0) as u8, (a * 255.0) as u8]);
+    }
+    pixels
 }
 
 /// How much of each pixel of an `n` by `n` square is covered by a
@@ -464,26 +494,48 @@ fn glow_mask(n: usize, inset: f32, radius: f32, blur: f32) -> Vec<f32> {
         if within && dx.hypot(dy) <= radius { 1.0 } else { 0.0 }
     };
     let mut mask: Vec<f32> = (0..n * n).map(|i| inside((i % n) as f32 + 0.5, (i / n) as f32 + 0.5)).collect();
-    let reach = (3.0 * blur).ceil() as isize;
-    let kernel: Vec<f32> = (-reach..=reach).map(|i| (-(i * i) as f32 / (2.0 * blur * blur)).exp()).collect();
-    let total: f32 = kernel.iter().sum();
-    for horizontal in [true, false] {
-        let from = mask.clone();
-        for y in 0..n {
-            for x in 0..n {
+    spread(&mut mask, n, [blur, blur], [blur, blur]);
+    mask
+}
+
+/// Blurs a `width` wide mask, row by row, across by Gaussians of
+/// `across` deviations and down by `down`: the first of each how far
+/// what is covered spreads left (up), the second right (down), each side
+/// half the light, so an edge is half lit whichever way it faces.
+pub fn spread(mask: &mut [f32], width: usize, across: [f32; 2], down: [f32; 2]) {
+    let height = mask.len() / width;
+    for (horizontal, [before, after]) in [(true, across), (false, down)] {
+        // What lies `o` before a pixel lights it with the `after` side.
+        let weight = |o: isize, s: f32| (-(o * o) as f32 / (2.0 * s * s)).exp() / s;
+        let reach = |s: f32| (3.0 * s).ceil() as isize;
+        let kernel: Vec<(isize, f32)> = (-reach(before)..=reach(after))
+            .map(|o| (o, match o { 0 => (weight(0, before) + weight(0, after)) / 2.0, o if o > 0 => weight(o, after), o => weight(o, before) }))
+            .collect();
+        let total: f32 = kernel.iter().map(|(_, w)| w).sum();
+        let from = mask.to_vec();
+        for y in 0..height {
+            for x in 0..width {
                 let mut sum = 0.0;
-                for (k, weight) in kernel.iter().enumerate() {
-                    let o = k as isize - reach;
-                    let (sx, sy) = if horizontal { (x as isize + o, y as isize) } else { (x as isize, y as isize + o) };
-                    if sx >= 0 && sy >= 0 && (sx as usize) < n && (sy as usize) < n {
-                        sum += weight * from[sy as usize * n + sx as usize];
+                for &(o, weight) in &kernel {
+                    let (sx, sy) = if horizontal { (x as isize - o, y as isize) } else { (x as isize, y as isize - o) };
+                    if sx >= 0 && sy >= 0 && (sx as usize) < width && (sy as usize) < height {
+                        sum += weight * from[sy as usize * width + sx as usize];
                     }
                 }
-                mask[y * n + x] = sum / total;
+                mask[y * width + x] = sum / total;
             }
         }
     }
-    mask
+}
+
+/// How much of a pixel whose middle is at `x`, `y` a rectangle with
+/// corners of `radius` covers, smoothly over a pixel at its edge.
+pub fn covered(area: [f32; 4], radius: f32, x: f32, y: f32) -> f32 {
+    let [left, top, right, bottom] = area;
+    let r = radius.min((right - left) / 2.0).min((bottom - top) / 2.0).max(0.0);
+    let (dx, dy) = ((left + r - x).max(x - right + r), (top + r - y).max(y - bottom + r));
+    let outside = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - r;
+    (0.5 - outside).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
