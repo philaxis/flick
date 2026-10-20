@@ -1533,6 +1533,19 @@ impl App {
         self.board.select(id, self.usage_grid());
     }
 
+    /// A hold over the board let go of: the selection lands where it was
+    /// judged to (`Board::let_go`), at once for a flick.
+    fn let_go_board(&mut self) {
+        let Some((id, at_once)) = self.board.let_go() else { return };
+        self.grid.visit(&id);
+        self.save();
+        if at_once {
+            self.board.select_at_once(id, self.usage_grid());
+        } else if id != self.board.selected() {
+            self.board.select(id, self.usage_grid());
+        }
+    }
+
     fn model(&self, desktops: &Desktops) -> Model {
         let mut windows = vd::windows(&desktops.current);
         let parents = vd::process_parents();
@@ -2277,6 +2290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_RELEASE => {
             let heard = with_app(|app| {
                 if !app.gliding.as_ref().is_some_and(|g| g.hold == lparam.0 as u32) { input::forget_hold(lparam.0 as u32); }
+                app.let_go_board();
                 app.finish_gesture();
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });
