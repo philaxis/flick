@@ -342,16 +342,16 @@ struct Veil {
 
 /// One opaque source bitmap of four squares: black, white, and the lights
 /// of what is pinned to every shelf and to its shelf (`paint::PIN_ALL`
-/// and `PIN_ROW`). The white keeps the off-screen surface from being entirely
+/// and `PIN_ROW`, drawn as strong as they are). The white keeps the off-screen surface from being entirely
 /// black, which DWM would drop as empty.
 struct Paints { hwnd: HWND }
 
 /// Each colour's square in `Paints`.
 const BLACK: RECT = RECT { left: 0, top: 0, right: 16, bottom: 16 };
-const AMBER: RECT = RECT { left: 32, top: 0, right: 48, bottom: 16 };
-const TEAL: RECT = RECT { left: 48, top: 0, right: 64, bottom: 16 };
+const ALL_LIGHT: RECT = RECT { left: 32, top: 0, right: 48, bottom: 16 };
+const ROW_LIGHT: RECT = RECT { left: 48, top: 0, right: 64, bottom: 16 };
 /// Blue, green, red of each square, in order.
-const PAINTS: [[u8; 3]; 4] = [[0, 0, 0], [255, 255, 255], paint::bgr(paint::PIN_ALL), paint::bgr(paint::PIN_ROW)];
+const PAINTS: [[u8; 3]; 4] = [[0, 0, 0], [255, 255, 255], paint::bgr(paint::PIN_ALL.0), paint::bgr(paint::PIN_ROW.0)];
 
 impl Paints {
     fn new() -> Option<Paints> {
@@ -907,7 +907,7 @@ impl View {
             let inside = |a: &RECT| cx >= a.left && cx < a.right && cy >= a.top && cy < a.bottom;
             let on = monitors.iter().position(|m| inside(&m.bounds)).unwrap_or(0).min(screens.len() - 1);
             // A pinned window's light beneath it.
-            let colour = match shot.place { Place::Pinned => Some(AMBER), Place::Row(_) => Some(TEAL), _ => None };
+            let colour = match shot.place { Place::Pinned => Some(ALL_LIGHT), Place::Row(_) => Some(ROW_LIGHT), _ => None };
             let lit: Vec<Thumb> = colour
                 .zip(self.paints.as_ref())
                 .map(|(colour, paints)| (0..LIGHT.len()).filter_map(|_| Thumb::new(&screens[on], paints.hwnd, (screens[on].area.left, screens[on].area.top), Some(colour))).collect())
@@ -1437,19 +1437,19 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
             Place::Cell(row, col) => {
                 let apart = (col as f64 - strip.along(rows, row), row as f64 - strip.y);
                 let (lift, _) = follow::standing_out(session.focus.at(col, row), strip.receded);
-                (follow::placed(edges, whole, scale, apart, lift), 1.0, false)
+                (follow::placed(edges, whole, scale, apart, lift), 1.0, 0.0)
             }
             Place::Row(row) => {
                 let (at, shown) = follow::row_window(follow::tucked(edges, whole, share), whole, row, strip.y, strip.receded, session.farthest_y);
-                (at, shown, true)
+                (at, shown, paint::PIN_ROW.1 as f64)
             }
-            Place::Pinned => (follow::tucked(edges, whole, share), 1.0, true),
-            Place::Fixed => (edges, 1.0, false),
+            Place::Pinned => (follow::tucked(edges, whole, share), 1.0, paint::PIN_ALL.1 as f64),
+            Place::Fixed => (edges, 1.0, 0.0),
         };
-        if lit {
+        if lit > 0.0 {
             for (halo, (out, alpha)) in session.halos[index].iter_mut().zip(LIGHT) {
                 let out = out * screen.scale as f64;
-                moved += halo.draw(Some([at[0] - out, at[1] - out, at[2] + out, at[3] + out]), size, opacity(alpha * share * shown)) as u32;
+                moved += halo.draw(Some([at[0] - out, at[1] - out, at[2] + out, at[3] + out]), size, opacity(alpha * share * shown * lit)) as u32;
             }
         }
         moved += thumb.draw(Some(at), size, opacity(shown)) as u32;
