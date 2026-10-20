@@ -1158,9 +1158,10 @@ impl View {
                     look = session.quick.as_mut().map(|quick| quick.look(now, session.follow.aim(), session.follow.selected(), session.follow.axis()));
                     result
                 } else {
-                    let to = session.follow.let_go(release_time, session.hand);
+                    // Let go of a flick still moving, it goes on a little (`Judge::coast`).
+                    let coast = session.quick.as_mut().map_or((0.0, 0.0), |quick| { quick.release(release_time); quick.judge.coast(release_time) });
+                    let to = session.follow.let_go(release_time, (session.hand.0 + coast.0, session.hand.1 + coast.1));
                     if let Some(quick) = &mut session.quick {
-                        quick.release(release_time);
                         look = Some(quick.look(now, session.follow.aim(), to, session.follow.axis()));
                     }
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
