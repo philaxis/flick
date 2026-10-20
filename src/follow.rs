@@ -1,5 +1,5 @@
 //! Variant F on the desktop grid; the same springs drive the board and minimap.
-use crate::transition_curve::{deepen, kicked, Latch, Spring};
+use crate::transition_curve::{deepen, give, kicked, Latch, Spring};
 pub const GAP: f64 = 0.07;
 pub const DIM: f64 = 0.55;
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
@@ -327,14 +327,27 @@ impl Follow {
         let y = if !self.released && self.axis == 1 { self.rows_hand.target(self.rows) } else { self.row as f64 };
         (x, y)
     }
-    /// Where the hand is (`quick`), cell for cell as it went, the cells at
-    /// either end of the row and of the rows as far as it goes.
+    /// Where the hand is (`quick`), cell for cell as it went; past the
+    /// cells at either end of the row and of the rows, only as far as the
+    /// latches give there (`give`).
     pub fn held(&self) -> (f64, f64) {
         let i = (self.row - self.rows.0) as usize;
         let (left, right) = self.cols[i];
         let column = &self.columns[i];
         let x = if self.axis == 0 { (column.cell as f64 + column.hand).clamp(left as f64, right as f64) } else { column.cell as f64 };
         let y = if self.axis == 1 { (self.rows_hand.cell as f64 + self.rows_hand.hand).clamp(self.rows.0 as f64, self.rows.1 as f64) } else { self.row as f64 };
+        let past = self.past();
+        (x + past.0, y + past.1)
+    }
+    /// How far past the end of the row, and of the rows, the hand shows
+    /// (`held`), along and down.
+    pub fn past(&self) -> (f64, f64) {
+        let i = (self.row - self.rows.0) as usize;
+        let (left, right) = self.cols[i];
+        let column = &self.columns[i];
+        let over = |at: f64, (low, high): (i32, i32)| give(at - at.clamp(low as f64, high as f64));
+        let x = if self.axis == 0 { over(column.cell as f64 + column.hand, (left, right)) } else { 0.0 };
+        let y = if self.axis == 1 { over(self.rows_hand.cell as f64 + self.rows_hand.hand, self.rows) } else { 0.0 };
         (x, y)
     }
     pub fn axis(&self) -> usize { self.axis }
