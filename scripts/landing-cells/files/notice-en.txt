@@ -1,0 +1,18 @@
+Flick 0.6 launch notice — draft v2
+
+Title: Your virtual desktops as a grid, Flick 0.6
+
+Hold a button, push the mouse, and you are on the next desktop.
+Flick 0.6 takes you between work and a break in one move.
+
+What's new
+- Up and down goes one row at a time, like a mouse wheel
+- A sure flick slides right over; an unsure one steps back to show you
+- Name every shelf, and pin windows to a shelf
+
+Download: github.com/philaxis/flick (free, open source)
+
+Checklist
+[x] Landing page headline
+[ ] Replace the 3 screenshots
+[ ] Match the numbers with the release notes

@@ -75,7 +75,7 @@ const shelfName = r => PAGE.shelves[r];
 const SHELVES = CELLS.shelves;
 const PINNED_ALL = CELLS.pinAll, PINNED_ROW = CELLS.pinRow;
 /* An app's colour, for its icon until the picture of it has come. */
-const TONE = { notepad: '#3d8bfd', terminal: '#8d96a8', edge: '#2fa8d8', explorer: '#e6c34a', paint: '#e46a9a', calc: '#8f7cf0', app: '#2fa8d8' };
+const TONE = { notepad: '#3d8bfd', terminal: '#8d96a8', edge: '#2fa8d8', explorer: '#e6c34a', paint: '#e46a9a', pip: '#2fa8d8', app: '#2fa8d8' };
 
 const IMG = {};
 let onImage = () => {};
@@ -95,11 +95,13 @@ function icon(g, app, x, y, k) {
    How far the screens recede follows the hand: a sure, quick flick slides them full size, a middling one
    to three quarters, a slow or unsure drag all the way back. The video on the break shelf plays on while the
    person works: each time they flick down to it, it is further along, and each time they flick back up their
-   work is as they left it. The team's chat is pinned to both shelves of work and is gone on the break. */
+   work is as they left it. Leaving it the first time, they take the video along in its picture-in-picture window,
+   pinned to every shelf: it stays in its corner, playing, wherever they go. The team's chat is pinned to both
+   shelves of work and is gone on the break. */
 const SCRIPT = [
   [.4, h => h.drag(1, 0)],                       // building: the source, then the release on GitHub
   [2.0, h => h.drag(0, 1)],                      // one flick down: the video, playing
-  [3.7, h => h.drag(0, -1)],                     // one flick up: the release, as it was
+  [3.7, h => h.drag(0, -1)],                     // one flick up: the release, as it was, the video along in its corner
   [5.2, h => h.press()],                         // held, the shelves recede: on to the project folder
   [5.6, h => h.drag(1, 0)],
   [6.3, h => h.release()],
@@ -147,6 +149,7 @@ class Hero {
     this.row = 0; this.col = 0; this.last = SHELVES.map(() => 0);
     this.sx = { p: 0, v: 0 }; this.sy = { p: 0, v: 0 }; this.tx = 0; this.ty = 0;   // where the strip is: column on the current shelf, and shelf
     this.held = false; this.depth = { p: 0, v: 0 }; this.arrived = -9; this.breaks = 0;   // when a shelf with the chat was last come to; visits to the break
+    this.pipAt = null;   // when the video went into its picture-in-picture window
     this.board = { open: false, s: { p: 0, v: 0 } };
   }
   get x() { return this.sx.p; }
@@ -180,7 +183,7 @@ class Hero {
     /* The strip springs to where the hand sent it; the desktop it is nearest is the one chosen. */
     spring(this.sy, this.ty, dt, MOVE);
     const row = clamp(Math.round(this.y), 0, SHELVES.length - 1);
-    if (row !== this.row) { if (PINNED_ROW.rows.includes(row) && !PINNED_ROW.rows.includes(this.row)) this.arrived = this.t; if (SHELVES[row].some(d => d.frames)) this.breaks++; this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
+    if (row !== this.row) { if (PINNED_ROW.rows.includes(row) && !PINNED_ROW.rows.includes(this.row)) this.arrived = this.t; if (SHELVES[row].some(d => d.frames)) this.breaks++; if (this.pipAt === null && SHELVES[this.row].some(d => d.frames)) this.pipAt = this.t; this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
     spring(this.sx, this.tx, dt, MOVE);
     this.col = clamp(Math.round(this.x), 0, SHELVES[this.row].length - 1);
     /* Held, the screen recedes; let go, the chosen desktop comes forward. */
@@ -196,7 +199,7 @@ class Hero {
     const s = w / win.r[2], r = 8 * s;   // one of the screen's pixels, here
     glow(g, x, y + (6 + 8 * lift) * s, w, h, r, (20 + 16 * lift) * s, `rgba(0,0,0,${.32 + .2 * lift})`);
     glow(g, x, y + s, w, h, r, 4 * s, 'rgba(0,0,0,.4)');
-    const own = win.img && image(win.img), from = own || image(this.picture(desk));
+    const own = win.img && image(this.shot(win)), from = own || image(this.picture(desk));
     g.save(); rr(g, x, y, w, h, r); g.clip();
     if (from) {
       const k = from.naturalWidth / (own ? win.r[2] : CELLS.sw);
@@ -204,6 +207,12 @@ class Hero {
       else g.drawImage(from, win.r[0] * k, win.r[1] * k, win.r[2] * k, win.r[3] * k, x, y, w, h);
     } else { g.fillStyle = '#202328'; g.fillRect(x, y, w, h); }
     g.restore();
+  }
+  /* A window's own picture; the picture-in-picture video's, further along through the rest of the loop. */
+  shot(win) {
+    if (!win.frames) return win.img;
+    const n = win.frames.length, since = this.pipAt === null ? 0 : (this.t - this.pipAt) / (LOOP - this.pipAt);
+    return win.frames[clamp(Math.floor(since * n), 0, n - 1)];
   }
   /* A desktop's picture; the playing video's, as far along as this visit finds it. */
   picture(desk) { return desk.frames ? desk.frames[Math.min(desk.frames.length - 1, VIDEO_AT[Math.max(0, this.breaks - 1)] || 0)] : desk.img; }
@@ -236,16 +245,19 @@ class Hero {
     /* Each with its pin's light round it, no box: this shelf's brighter as the shelf is come to. */
     /* They stay where they are; receding, one covering much of the screen shrinks about its own middle, to no less than 40%.
        A shelf's own go up and down with it. */
-    const pinned = (win, ay, kind, a) => {
+    const pinned = (win, ay, kind, a, on = 1) => {
       const d = clamp(this.receded, 0, 1), [rx, ry, rw, rh] = this.onStage(win.r);
-      const covers = win.r[2] * win.r[3] / (CELLS.sw * CELLS.sh), k = 1 - d * (1 - clamp(Math.sqrt(.03 / covers), .4, 1));
+      const covers = win.r[2] * win.r[3] / (CELLS.sw * CELLS.sh), k = (1 - d * (1 - clamp(Math.sqrt(.03 / covers), .4, 1))) * (.82 + .18 * on);
       const w = rw * k, h = rh * k, x = rx + (rw - w) / 2, y = ry + (rh - h) / 2 + ay * H * (1 + GAP) * scaleAt(this.receded);
       const s = sc * Math.max(k, .5);   // the light shrinks less than the window, to stay seen
+      g.save(); g.globalAlpha = on;
       pinLight(g, x, y, w, h, s, kind, a * clamp(1 - Math.abs(ay), 0, 1));
       this.paintShot(g, win, win, x, y, w, h, 1);
+      g.restore();
     };
     PINNED_ROW.rows.forEach(r => { if (Math.abs(r - this.y) < 1.5) pinned(PINNED_ROW, r - this.y, 'row', 1 + .4 * Math.exp(-(this.t - this.arrived) / 1.2)); });
-    pinned(PINNED_ALL, 0, 'all', 1);
+    /* The video comes out of its tab as the break shelf is left, and stays. */
+    if (this.pipAt !== null) pinned(PINNED_ALL, 0, 'all', 1, ease((this.t - this.pipAt) / .45));
     if (this.receded > .01) this.drawBanner();
   }
   /* glide.rs Banner: the shelf's name in a pill above the picture, the names sliding as the shelf changes. */
@@ -276,7 +288,7 @@ class Hero {
     /* Pinned windows at the left, all shelves above this shelf; the chosen desktop's windows as large previews beside them. */
     const top = 58 * s, bottom = mapTop - 34 * s, colW = W * .19, left = 30 * s, slots = this.pinSlots();
     const pins = [
-      { win: PINNED_ALL, kind: 'all', ...this.fitTile(PINNED_ALL, ...slots.all) },
+      ...(this.pipAt !== null ? [{ win: PINNED_ALL, kind: 'all', ...this.fitTile(PINNED_ALL, ...slots.all) }] : []),
       ...(PINNED_ROW.rows.includes(this.row) ? [{ win: PINNED_ROW, kind: 'row', ...this.fitTile(PINNED_ROW, ...slots.row) }] : []),
     ];
     const desk = SHELVES[this.row][this.col], wins = desk.wins, ax = left + colW + 40 * s, aw = W - ax - 40 * s, tg = 26 * s;
@@ -349,7 +361,7 @@ const hero = new Hero(document.getElementById('hero'));
 /* The pictures come in their own time; a held frame is drawn again as each arrives. */
 onImage = () => { if (STILL) redrawStill(); };
 SHELVES.forEach(row => row.forEach(d => { image(d.img); (d.frames || []).forEach(image); d.wins.forEach(w => { image(`icons/${w.app}.png`); if (w.img) image(w.img); }); }));
-[PINNED_ALL, PINNED_ROW].forEach(w => { image(w.img); image(`icons/${w.app}.png`); });
+[PINNED_ALL, PINNED_ROW].forEach(w => { (w.frames || [w.img]).forEach(image); image(`icons/${w.app}.png`); });
 const words = [...document.querySelectorAll('#line span')];
 let beatTimer = 0;
 hero.onBeat = i => { words.forEach((w, j) => w.classList.toggle('on', j === i)); clearTimeout(beatTimer); beatTimer = setTimeout(() => words.forEach(w => w.classList.remove('on')), 650); };
