@@ -15,8 +15,8 @@ dst.mkdir(parents=True, exist_ok=True)
 layout = json.loads((src / 'layout.json').read_text(encoding='utf-8-sig'))
 sw, sh = layout['screen']['w'], layout['screen']['h']
 work = layout['work']
-SHELVES = [['d00', 'd01', 'd02'], ['d10', 'd11'], ['d20', 'd21']]
-OWN = {'d10'}            # the desktop the board opens on: its windows by themselves
+SHELVES = [['d00', 'd01', 'd02'], ['d10', 'd11'], ['d20', 'd21', 'd22']]   # building, a break, marketing
+OWN = {'d21'}            # the desktop the board opens on: its windows by themselves
 DESK_W, Q = 1920, 80
 
 
@@ -24,6 +24,19 @@ def clock_hidden(im):
     """The clock and date at the taskbar's right end, blurred past reading."""
     box = (sw - 140, work['h'] + 2, sw, sh)
     im.paste(im.crop(box).filter(ImageFilter.GaussianBlur(14)), box[:2])
+    return im
+
+
+# Other people's thumbnails on YouTube, softened: (left, top, right, bottom) as fractions of the browser window.
+SOFTEN = {'d10': [(.745, .17, .985, 1)], 'd11': [(.08, .2, .25, .97), (.39, .2, .62, .97)]}
+FRAMES = {'d10': ['d10', 'd10b', 'd10c']}   # the video, taken again as it plays
+
+
+def softened(d, im):
+    f = layout['scenes'][d]['windows'][0]['frame']
+    for l, t, r, b in SOFTEN.get(d, []):
+        box = tuple(round(v) for v in (f['x'] + l * f['w'], f['y'] + t * f['h'], f['x'] + r * f['w'], min(f['y'] + b * f['h'], work['h'])))
+        im.paste(im.crop(box).filter(ImageFilter.GaussianBlur(10)), box[:2])
     return im
 
 
@@ -58,25 +71,26 @@ shelves = []
 for row in SHELVES:
     out = []
     for d in row:
-        img = save(dates_hidden(d, clock_hidden(Image.open(src / f'{d}.png').convert('RGB'))), d, DESK_W)
+        pics = [save(softened(d, dates_hidden(d, clock_hidden(Image.open(src / f'{n}.png').convert('RGB')))), n, DESK_W) for n in FRAMES.get(d, [d])]
+        img = pics[0]
         wins = []
         for i, w in enumerate(layout['scenes'][d]['windows']):
             win = {'app': w['app'], 'r': rect(w['frame'])}
             if d in OWN:
                 win['img'] = save(window(src / f'w-{d}-{i}.png'), f'w-{d}-{i}', round(w['frame']['w'] * .8), 80)
             wins.append(win)
-        out.append({'img': img, 'wins': wins})
+        out.append({'img': img, 'wins': wins, **({'frames': pics} if d in FRAMES else {})})
     shelves.append(out)
 
 pins = layout['scenes']['pins']['windows']
 pin = lambda i: {'app': pins[i]['app'], 'r': rect(pins[i]['frame']),
                  'img': save(window(src / f'w-pins-{i}.png'), f'w-pins-{i}', round(pins[i]['frame']['w'] * .8), 82)}
-cells = {'sw': sw, 'sh': sh, 'shelves': shelves, 'pinAll': pin(0), 'pinRow': {'row': 1, **pin(1)}}
+cells = {'sw': sw, 'sh': sh, 'shelves': shelves, 'pinAll': pin(0), 'pinRow': {'rows': [0, 2], **pin(1)}}
 
 for p in (src / 'icons').glob('*.png'):
     shutil.copy(p, dst / 'icons' / p.name)
 # The new Paint, Notepad and Calculator keep their icons out of their exes; their title bars have them.
-for app, shot, box in (('paint', 'w-d11-0', (9, 12, 29, 32)), ('calc', 'w-pins-0', (23, 11, 43, 31)), ('notepad', 'w-pins-1', (20, 21, 40, 41))):
+for app, shot, box in (('paint', 'w-d22-0', (9, 12, 29, 32)), ('calc', 'w-pins-0', (23, 11, 43, 31)), ('notepad', 'w-d20-1', (20, 21, 40, 41))):
     Image.open(src / f'{shot}.png').crop(box).resize((32, 32), Image.LANCZOS).save(dst / 'icons' / f'{app}.png')
 total = sum(p.stat().st_size for p in dst.rglob('*') if p.is_file())
 print(f'const CELLS = {json.dumps(cells, ensure_ascii=False, separators=(",", ":"))};')
