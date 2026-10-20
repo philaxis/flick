@@ -400,6 +400,128 @@ pub unsafe fn recede(out: &Path, flick: &str) {
     for window in &mut windows { let _ = window.kill(); let _ = window.wait(); }
 }
 
+/// Where a window of pure magenta and one of pure cyan are in a frame:
+/// their boxes (left, top, right, bottom), on every 2nd pixel.
+fn pin_boxes(raw: &[u8], width: u32, height: u32) -> [Option<(u32, u32, u32, u32)>; 2] {
+    let mut boxes = [None; 2];
+    for y in (0..height).step_by(2) { for x in (0..width).step_by(2) {
+        let i = ((y * width + x) * 4) as usize;
+        let (r, g, b) = (raw[i + 2] as f64, raw[i + 1] as f64, raw[i] as f64);
+        let which = if r > 90.0 && g < 0.25 * r && (r - b).abs() < 0.2 * r { 0 } else if g > 90.0 && r < 0.25 * g && (g - b).abs() < 0.2 * g { 1 } else { continue };
+        let at = boxes[which].get_or_insert((x, y, x, y));
+        *at = (at.0.min(x), at.1.min(y), at.2.max(x), at.3.max(y));
+    }}
+    boxes
+}
+
+/// Pinned windows put by as the screen recedes, as deep as the hand is
+/// unsure: a window pinned to every shelf (magenta) and one to its shelf
+/// (cyan), a fast, a middling and a slow move. `dock.csv`: each frame's
+/// boxes; `report.txt`: per hold the least scale (trace) and the boxes then.
+pub unsafe fn dock(out: &Path, flick: &str) {
+    use std::sync::{atomic::{AtomicBool, AtomicI64, Ordering}, Arc};
+    let wait = |ms| std::thread::sleep(Duration::from_millis(ms));
+    let cfg = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("Flick");
+    std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2\"\nminimap = false\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = true\nfollow_y = true\nreverse = false\n[experimental]\nquick_flick = \"slide\"\n").unwrap();
+    let made = std::fs::read_to_string(out.join("made.txt")).unwrap();
+    let ids: Vec<_> = made.lines().collect();
+    let all = super::vdapi::get_desktops().unwrap();
+    let desk = |i: usize| *all.iter().find(|d| d.id() == ids[i]).unwrap();
+    let other: Vec<_> = all.iter().map(|d| d.id()).filter(|id| !ids.contains(&id.as_str())).collect();
+    std::fs::write(cfg.join("state.json"), serde_json::json!({"rows":[{"name":"Dock","cells":&ids[0..3],"last":ids[1]},{"name":"Below","cells":&ids[3..6],"last":ids[4]},{"name":"Existing","cells":other}],"follow_apps":["dock-row.exe"],"guide_seen":true}).to_string()).unwrap();
+    super::vdapi::switch_desktop(desk(1)).unwrap(); wait(800);
+    let me = std::env::current_exe().unwrap();
+    let row_exe = out.join("dock-row.exe");
+    std::fs::copy(&me, &row_exe).unwrap();
+    let mut windows = Vec::new();
+    for (exe, rgb, title, rect) in [(&me, "255 0 255", "F dock all", "700 160 640 400"), (&row_exe, "0 255 255", "F dock row", "760 600 560 340")] {
+        let mut args = vec!["hold".to_string()];
+        args.extend(rgb.split(' ').map(str::to_owned));
+        args.push(title.into());
+        args.extend(rect.split(' ').map(str::to_owned));
+        args.push("300".into());
+        windows.push(Command::new(exe).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        wait(600);
+        let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title)); assert!(hwnd.0 != 0, "{title}");
+        if title.ends_with("all") { super::vdapi::pin_window(hwnd).unwrap(); } else { super::vdapi::move_window_to_desktop(desk(1), hwnd).unwrap(); }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let since = Arc::new(AtomicI64::new(0));
+    let (o, s1, s2) = (out.to_owned(), stop.clone(), since.clone());
+    let recorder = std::thread::spawn(move || {
+        let capture = Capture::new().unwrap();
+        let mut frequency = 0; QueryPerformanceFrequency(&mut frequency).unwrap();
+        let mut csv = String::from("hold,ms,all_box,row_box\n");
+        let (mut hold, mut nth, mut was) = (0, 0, 0i64);
+        let mut real = None;
+        while !s1.load(Ordering::SeqCst) {
+            if let Some((present, raw)) = capture.grab().unwrap() {
+                let from = s2.load(Ordering::SeqCst);
+                if from != was { was = from; if from != 0 { hold += 1; nth = 0; } }
+                let boxes = pin_boxes(&raw, capture.width, capture.height);
+                if from == 0 && real.is_none() && boxes.iter().all(Option::is_some) {
+                    real = Some(boxes);
+                    save_bmp(&o.join("real.bmp"), &raw, capture.width, capture.height);
+                    writeln!(csv, "0,0,{:?},{:?}", boxes[0], boxes[1]).unwrap();
+                }
+                if from != 0 {
+                    let ms = (present - from) as f64 * 1000.0 / frequency as f64;
+                    writeln!(csv, "{hold},{ms:.1},{:?},{:?}", boxes[0], boxes[1]).unwrap();
+                    if nth % 6 == 0 { save_bmp(&o.join(format!("d{hold}-{nth:03}-{ms:.0}ms.bmp")), &raw, capture.width, capture.height); }
+                    nth += 1;
+                }
+            }
+        }
+        std::fs::write(o.join("dock.csv"), csv).unwrap();
+    });
+    wait(1500);
+    let trace = out.join("trace.csv");
+    let _ = std::fs::remove_file(&trace);
+    let mut child = Command::new(flick).arg("--portable").env("FLICK_TRACE", &trace)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait(3000);
+    assert!(FindWindowW(w!("flick.main"), None).0 != 0, "Flick did not start");
+    let mouse = |flags, dx, dy| {
+        let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: 2, dwFlags: flags, ..Default::default() } } };
+        assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
+    };
+    let stroke = |dx: i32, ms: u64| {
+        let n = (ms / 8).max(1) as i32;
+        for i in 1..=n { mouse(MOUSEEVENTF_MOVE, dx * i / n - dx * (i - 1) / n, 0); wait(ms / n as u64); }
+    };
+    // 1.5 cells (220 px each): fast (15 a second), middling (2), slow (1, then held).
+    let mut report = String::new();
+    for (label, dx, ms, rest) in [("fast", 330, 100, 40), ("middling", -330, 750, 30), ("slow", 330, 1500, 400)] {
+        since.store(qpc(), Ordering::SeqCst);
+        mouse(MOUSEEVENTF_XDOWN, 0, 0); wait(80);
+        stroke(dx, ms); wait(rest);
+        mouse(MOUSEEVENTF_XUP, 0, 0); wait(1800);
+        since.store(0, Ordering::SeqCst); wait(300);
+        report += &format!("{label}: on {}\n", super::vdapi::get_current_desktop().unwrap().id());
+    }
+    stop.store(true, Ordering::SeqCst);
+    recorder.join().unwrap();
+    let _ = child.kill(); let _ = child.wait();
+    for window in &mut windows { let _ = window.kill(); let _ = window.wait(); }
+    // Per hold, the least scale and the mean scale while following.
+    let text = std::fs::read_to_string(&trace).unwrap_or_default();
+    let mut holds: Vec<(String, f64, f64, usize)> = Vec::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<_> = line.split(',').collect();
+        let (Some(hold), Some(phase), Some(scale)) = (cols.first(), cols.get(6), cols.get(11).and_then(|s| s.parse::<f64>().ok())) else { continue };
+        if *phase != "following" { continue; }
+        match holds.iter_mut().find(|(h, ..)| h == hold) {
+            Some((_, least, sum, n)) => { *least = least.min(scale); *sum += scale; *n += 1; }
+            None => holds.push((hold.to_string(), scale, scale, 1)),
+        }
+    }
+    for (hold, least, sum, n) in &holds {
+        report += &format!("hold {hold}: least scale {least:.3} (depth {:.2}), mean {:.3} over {n} frames\n", 2.0 * (1.0 - least), sum / *n as f64);
+    }
+    std::fs::write(out.join("report.txt"), &report).unwrap();
+    print!("{report}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
