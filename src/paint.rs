@@ -57,12 +57,17 @@ pub fn accent(a: f32) -> D2D1_COLOR_F {
     rgba(0.34, 0.62, 1.0, a)
 }
 
-/// The colour of what is pinned, wherever it shows (the board, the light
-/// about the pinned windows while the screen follows the hand, whole or
-/// receded), and how strongly: Flick's blue, full to every shelf, fainter
-/// to its own shelf. Changed here, changed everywhere.
+/// The colour of what is pinned on the board (its pin, its place), and
+/// how strongly: Flick's blue, full to every shelf, fainter to its own
+/// shelf.
 pub const PIN_ALL: ([f32; 3], f32) = ([0.34, 0.62, 1.0], 1.0);
 pub const PIN_ROW: ([f32; 3], f32) = ([0.34, 0.62, 1.0], 0.6);
+/// The light about a pinned window, wherever it shows (the board, while
+/// the screen follows the hand, whole or receded), and how strongly:
+/// white, and no stronger than it takes to be seen over a light window,
+/// to every shelf; fainter to its own. Changed here, changed everywhere.
+pub const PIN_ALL_LIGHT: ([f32; 3], f32) = ([1.0, 1.0, 1.0], 0.55);
+pub const PIN_ROW_LIGHT: ([f32; 3], f32) = ([1.0, 1.0, 1.0], 0.32);
 /// How far the light about a pinned window reaches, of the farthest: to
 /// every shelf, far, and most below it, as a lamp under it would; to its
 /// own shelf, about half as far.
@@ -72,7 +77,14 @@ pub const PIN_ROW_REACH: f32 = 0.55;
 /// How strong and how far the light about a pinned window is (`all`
 /// pinned to every shelf, or to its own).
 pub fn pin_light(all: bool) -> (f32, f32) {
-    if all { (PIN_ALL.1, PIN_ALL_REACH) } else { (PIN_ROW.1, PIN_ROW_REACH) }
+    if all { (PIN_ALL_LIGHT.1, PIN_ALL_REACH) } else { (PIN_ROW_LIGHT.1, PIN_ROW_REACH) }
+}
+
+/// The colour of the light about a window pinned to every shelf (`all`)
+/// or to its own, at `a`, as strong as it is.
+pub fn lit(all: bool, a: f32) -> D2D1_COLOR_F {
+    let ([r, g, b], strength) = if all { PIN_ALL_LIGHT } else { PIN_ROW_LIGHT };
+    rgba(r, g, b, a * strength)
 }
 
 /// `PIN_ALL` or `PIN_ROW` (`all`) at `a`, as strong as it is.

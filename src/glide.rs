@@ -372,7 +372,7 @@ struct Veil {
 
 /// One source bitmap of two opaque squares, black and white, and the
 /// lights of what is pinned to every shelf and to its shelf (`Lamp`, in
-/// `paint::PIN_ALL` and `PIN_ROW`), made once. The white keeps the
+/// `paint::PIN_ALL_LIGHT` and `PIN_ROW_LIGHT`), made once. The white keeps the
 /// off-screen surface from being entirely black, which DWM would drop as
 /// empty.
 struct Paints { hwnd: HWND }
@@ -411,7 +411,7 @@ impl Paints {
                 let (left, top) = Self::lamp(all);
                 for (square, mask) in Lamp::masks(all).iter().enumerate() {
                     let left = left + square as i32 * Lamp::APART;
-                    let light = paint::premultiplied(mask, if all { paint::PIN_ALL.0 } else { paint::PIN_ROW.0 }, 1.0);
+                    let light = paint::premultiplied(mask, if all { paint::PIN_ALL_LIGHT.0 } else { paint::PIN_ROW_LIGHT.0 }, 1.0);
                     for (y, line) in light.chunks_exact(Glow::SIZE * 4).enumerate() {
                         let row = ((top as usize + y) * size.0 as usize + left as usize) * 4;
                         pixels[row..row + Glow::SIZE * 4].copy_from_slice(line);
@@ -732,9 +732,10 @@ struct Session {
     /// The windows' thumbnails, bottom first, where each is drawn and which
     /// picture of its window it is.
     shots: Vec<(Thumb, usize, Place, Layer)>,
-    /// As `shots`: each pinned one's light beneath it, `paint::PIN_ALL`
-    /// pinned to every shelf, `PIN_ROW` to its own (`Lamp`).
-    halos: Vec<Vec<Thumb>>,
+    /// As `shots`: each pinned one's light beneath it, `paint::PIN_ALL_LIGHT`
+    /// pinned to every shelf, `PIN_ROW_LIGHT` to its own (`Lamp`), and what
+    /// of its frame shows, which it is cast about (`visible::shown`).
+    halos: Vec<(Vec<Thumb>, Option<[f64; 4]>)>,
     /// The desktops (screen, row and cell) a window covers the whole of
     /// (`covering`): their wallpaper is not drawn, to show at its edges.
     bare: Vec<(usize, (i32, i32))>,
@@ -772,7 +773,7 @@ impl Session {
         if let (Some(path), Some(trace)) = (path, &self.trace) { write_trace(path, &trace.lines); }
         let mut thumbs: Vec<Thumb> = self.leftover;
         thumbs.extend(self.shots.into_iter().map(|(thumb, ..)| thumb));
-        thumbs.extend(self.halos.into_iter().flatten());
+        thumbs.extend(self.halos.into_iter().flat_map(|(halo, _)| halo));
         for veil in self.veils {
             thumbs.extend(veil.shades);
         }
@@ -1059,7 +1060,7 @@ impl View {
         let ranked = |(shot, layer): &(&Shot, Layer)| if *layer == Layer::Under { 0 } else { rank(&shot.place) };
         order.sort_by_key(ranked);
         let mut shots = Vec::new();
-        let mut halos: Vec<Vec<Thumb>> = Vec::new();
+        let mut halos: Vec<(Vec<Thumb>, Option<[f64; 4]>)> = Vec::new();
         let mut bare = Vec::new();
         let mut veils: Vec<Veil> = Vec::new();
         if self.paints.is_none() {
@@ -1112,7 +1113,9 @@ impl View {
                     }
                 }
                 shots.push((thumb, on, shot.place, layer));
-                halos.push(lit);
+                // Looked at once, not as it moves.
+                let shown = if lit.is_empty() { None } else { crate::visible::shown(shot.hwnd) };
+                halos.push((lit, shown));
             }
         }
         if veils.is_empty() {
@@ -1745,7 +1748,9 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
         let (shown, light) = layered(*layer, shown, share);
         if let Some(all) = lit {
             let (strength, _) = paint::pin_light(all);
-            for (halo, part) in session.halos[index].iter_mut().zip(Lamp::parts(at, screen.scale as f64, all)) {
+            let (halos, shown) = &mut session.halos[index];
+            let body = shown.map_or(at, |shown| crate::visible::within(at, shown));
+            for (halo, part) in halos.iter_mut().zip(Lamp::parts(body, screen.scale as f64, all)) {
                 moved += halo.draw_within(Some(part.dest), part.clip, size, opacity(strength as f64 * part.share * light * strip.lit)) as u32;
             }
         }

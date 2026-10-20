@@ -501,8 +501,11 @@ fn on_row(a: f32) -> D2D1_COLOR_F {
 struct Glows {
     shadow: Glow,
     light: Glow,
+    /// The light of what is pinned to every shelf, and to its own.
     all: Glow,
     row: Glow,
+    /// The glow of the mark of a row pinned to.
+    row_mark: Glow,
     accent: Glow,
     warm: Glow,
 }
@@ -512,8 +515,9 @@ impl Glows {
         Some(Glows {
             shadow: Glow::new(target, rgba(0.0, 0.0, 0.0, 1.0))?,
             light: Glow::new(target, rgba(0.80, 0.86, 1.0, 1.0))?,
-            all: Glow::new(target, everywhere(1.0))?,
-            row: Glow::new(target, on_row(1.0))?,
+            all: Glow::new(target, paint::lit(true, 1.0))?,
+            row: Glow::new(target, paint::lit(false, 1.0))?,
+            row_mark: Glow::new(target, on_row(1.0))?,
             accent: Glow::new(target, accent(1.0))?,
             warm: Glow::new(target, warm(1.0))?,
         })
@@ -3052,8 +3056,9 @@ impl Board {
         }
     }
 
-    /// A place of the pinned windows: a faint pool of its colour on its
-    /// floor, brighter while a window is dragged, and most under it.
+    /// A place of the pinned windows: a faint pool of its light on its
+    /// floor, brighter while a window is dragged, and most under it, and
+    /// over it a tint of its colour while one is.
     fn draw_zone(&self, p: &Painter, section: &Section) {
         let s = self.scale;
         let Some(glows) = &self.glows else { return };
@@ -3108,13 +3113,23 @@ impl Board {
         let dim = if dragged { 0.35 } else { 1.0 };
         let body = if tile.icon_only { tile.frame } else { tile.thumb };
         let (bw, _) = size(&body);
+        // What of its window shows, where its light is cast (`visible`).
+        let shown = match pin {
+            Pin::Off => None,
+            _ if tile.icon_only => None,
+            _ => crate::visible::shown(tile.hwnd),
+        }
+        .map_or(body, |shown| {
+            let [left, top, right, bottom] = crate::visible::within([body.left, body.top, body.right, body.bottom].map(f64::from), shown).map(|v| v as f32);
+            Rect { left, top, right, bottom }
+        });
         let lift = if window.topmost { 1.0 } else if pointed { 0.4 } else { 0.0 };
         if let Some(glows) = &self.glows {
             // Pinned: a glow of its place's colour under it.
             if let Some(glow) = glows.of(pin) {
                 // None within it, which would show through a window seen through.
-                p.outside(&body, paint::PIN_FRAME * s, || {
-                    for (area, corner, opacity) in paint::pin_glows(&body, s, pin == Pin::Everywhere) {
+                p.outside(&shown, paint::PIN_FRAME * s, || {
+                    for (area, corner, opacity) in paint::pin_glows(&shown, s, pin == Pin::Everywhere) {
                         p.glow(glow, &area, corner, opacity * dim);
                     }
                 });
@@ -3321,7 +3336,7 @@ impl Board {
         if row.pinned && editing.is_none() {
             let (x, y) = ((row.name.right + 8.0 * s).min(row.header.right - 4.0 * s), centre(&row.name).1);
             if let Some(glows) = &self.glows {
-                p.glow(&glows.row, &rect(x - 1.5 * s, y - 1.5 * s, 3.0 * s, 3.0 * s), 10.0 * s, 0.45);
+                p.glow(&glows.row_mark, &rect(x - 1.5 * s, y - 1.5 * s, 3.0 * s, 3.0 * s), 10.0 * s, 0.45);
             }
             p.disc((x, y), 2.6 * s, on_row(0.95));
         }

@@ -59,6 +59,8 @@ mod tray;
 #[cfg(windows)]
 mod vd;
 #[cfg(any(windows, test))]
+mod visible;
+#[cfg(any(windows, test))]
 mod vdapi;
 
 #[cfg(windows)]
