@@ -3146,12 +3146,16 @@ impl Board {
 
         let (cx, cy) = centre(&tile.pin);
         let ink = pin_colour(pin, if hot(Hit::Pin(h)) { 1.0 } else { 0.85 });
-        p.line((cx + 0.5 * s, cy - 0.5 * s), (cx - 4.0 * s, cy + 4.5 * s), 1.4 * s, ink);
-        if pin == Pin::Off {
-            p.stroke(&rect(cx - 0.5 * s, cy - 5.5 * s, 6.0 * s, 6.0 * s), 3.0 * s, 1.2 * s, ink);
-        } else {
-            p.disc((cx + 2.5 * s, cy - 2.5 * s), 3.4 * s, ink);
-        }
+        // A pushpin: needle, flange, body and head end to end (none drawn
+        // over another), leaning while it pins nothing, upright once it does.
+        let (ux, uy) = if pin == Pin::Off { (0.71, -0.71) } else { (0.0, -1.0) };
+        let at = |v: f32, w: f32| (cx + (ux * (v + 0.9) - uy * w) * s, cy + (uy * (v + 0.9) + ux * w) * s);
+        let along = |from: f32, to: f32, width: f32| p.line(at(from, 0.0), at(to, 0.0), width * s, ink);
+        let across = |v: f32, half: f32, width: f32| p.line(at(v, -half), at(v, half), width * s, ink);
+        along(-6.0, -2.1, 1.2);
+        across(-1.5, 3.5, 1.2);
+        along(-0.9, 2.6, 3.4);
+        across(3.4, 3.0, 1.6);
         if window.pin_from_app {
             // The app's pin, which a window cannot take off.
             p.disc((cx + 5.5 * s, cy + 4.0 * s), 1.4 * s, ink);
