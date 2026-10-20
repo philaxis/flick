@@ -285,16 +285,16 @@ pub struct Follow {
     along: Vec<Spring>, columns: Vec<Latch>, vertical: Spring, rows_hand: Latch,
     committing: Vec<bool>, row_committing: bool,
     depth: Spring, last: Option<f64>, axis: usize, hand: (f64, f64), released: bool, path_cursor: usize,
-    /// The cell a sure hand is taken to be on (`passed`), the axis and row
-    /// it is counted along, and the cell it set off from along them.
-    passed: Option<(usize, i32, i32, i32)>,
+    /// The axis and row the hand goes along, and the cell it set off from
+    /// along them.
+    start: Option<(usize, i32, i32)>,
 }
 impl Follow {
     pub fn new(rows: (i32, i32), cols: Vec<(i32, i32)>) -> Self {
         let n = (rows.1 - rows.0 + 1).max(1) as usize;
         Self { rows, cols, row: 0, along: vec![Spring::default(); n], columns: vec![Latch::default(); n],
             vertical: Spring::default(), rows_hand: Latch::default(), depth: Spring::default(),
-            committing: vec![false; n], row_committing: false, last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0, passed: None }
+            committing: vec![false; n], row_committing: false, last: None, axis: 0, hand: (0.0, 0.0), released: false, path_cursor: 0, start: None }
     }
     pub fn cols_of(&self, row: i32) -> (i32, i32) {
         self.cols.get((row - self.rows.0) as usize).copied().unwrap_or((0, 0))
@@ -389,6 +389,8 @@ impl Follow {
         self.hand = at;
         self.released = false;
         let old_row = self.row;
+        let along = if axis == 0 { self.row } else { 0 };
+        let before = if axis == 0 { self.columns[(self.row - self.rows.0) as usize].cell } else { self.row };
         let commits = if axis == 1 {
             let n = self.rows_hand.track(at.1, self.rows);
             self.row = self.rows_hand.cell;
@@ -402,11 +404,7 @@ impl Follow {
             if axis == 1 { self.row_committing=true; } else { self.committing[(self.row-self.rows.0) as usize]=true; }
         }
         if commits != 0 { self.depth.v = kicked(self.depth, 5.0 * commits.abs() as f64); }
-        let held = if axis == 0 { self.held().0 } else { self.held().1 };
-        let along = if axis == 0 { self.row } else { 0 };
-        let (start, from) = self.passed.filter(|&(a, r, ..)| a == axis && r == along)
-            .map_or((held.round() as i32, held.round() as i32), |(.., start, cell)| (start, cell));
-        self.passed = Some((axis, along, start, passed(from, held)));
+        if !self.start.is_some_and(|(a, r, _)| a == axis && r == along) { self.start = Some((axis, along, before)); }
         (self.offset(self.row), self.vertical.p)
     }
     pub fn track_path(&mut self, now: f64, path: &[(f64, f64, usize)]) {
@@ -423,41 +421,27 @@ impl Follow {
         self.track_locked(now, at, self.axis); self.released = true;
         (self.columns[(self.row - self.rows.0) as usize].cell, self.row)
     }
-    /// Let go of `at` as a sure hand is (`quick`): to the cell it has gone
-    /// past six tenths of (`passed`) and `coast` farther, not the latches'
-    /// next, but never past the cells either side of the hand: a flick does
-    /// not skip a cell.
-    pub fn let_go_near(&mut self, now: f64, at: (f64, f64), coast: (f64, f64)) -> (i32, i32) {
-        self.track_locked(now, at, self.axis);
-        let (x, y) = self.held();
-        let on = self.passed.map_or(0, |(.., cell)| cell);
-        let i = (self.row - self.rows.0) as usize;
-        if self.axis == 0 {
-            let (left, right) = self.cols[i];
-            self.columns[i].cell = (near(x, on, coast.0) as i32).clamp(left, right);
-        } else {
-            let row = (near(y, on, coast.1) as i32).clamp(self.rows.0, self.rows.1);
-            if row != self.row {
-                (self.rows_hand.cell, self.row) = (row, row);
-                self.columns[(row - self.rows.0) as usize].rebase(at.0);
-            }
-        }
-        self.released = true;
-        self.selected()
+    /// Where the hand `at` (`held`) is shown as a sure hand is (`quick`):
+    /// no more than a cell either side of the cell it set off from.
+    pub fn within_a_cell(&self, at: (f64, f64)) -> (f64, f64) {
+        let Some((axis, _, start)) = self.start.filter(|&(axis, ..)| axis == self.axis) else { return at };
+        let near = |at: f64| at.clamp(start as f64 - 1.0, start as f64 + 1.0);
+        if axis == 0 { (near(at.0), at.1) } else { (at.0, near(at.1)) }
     }
-    /// Let go of (`let_go`, `let_go_near`) as a tapped hand is
-    /// (`quick::Judge::tap`): still on the cell it set off from, to the
-    /// next one its way; past it, where it was let go to.
-    pub fn tapped(&mut self, at: (f64, f64), tap: (f64, f64)) -> (i32, i32) {
-        let Some((axis, along, start, _)) = self.passed else { return self.selected() };
-        let way = if axis == 0 { tap.0 } else { tap.1 };
-        if way == 0.0 || axis != self.axis || (axis == 0 && along != self.row) { return self.selected(); }
-        let next = start + way.signum() as i32;
+    /// Let go of `at` as a sure hand is (`quick`): `step` (cells along and
+    /// down, `quick::Judge::step`) from the cell it set off from, however
+    /// far the hand went, and no farther than the row's end.
+    pub fn let_go_one(&mut self, now: f64, at: (f64, f64), step: (f64, f64)) -> (i32, i32) {
+        self.track_locked(now, at, self.axis);
+        self.released = true;
+        let Some((axis, along, start)) = self.start else { return self.selected() };
+        if axis != self.axis || (axis == 0 && along != self.row) { return self.selected(); }
+        let next = start + if axis == 0 { step.0 } else { step.1 } as i32;
         let i = (self.row - self.rows.0) as usize;
         if axis == 0 {
             let (left, right) = self.cols[i];
-            if self.columns[i].cell == start { self.columns[i].cell = next.clamp(left, right); }
-        } else if self.row == start {
+            self.columns[i].cell = next.clamp(left, right);
+        } else {
             let row = next.clamp(self.rows.0, self.rows.1);
             if row != self.row {
                 (self.rows_hand.cell, self.row) = (row, row);
@@ -480,23 +464,6 @@ impl Follow {
         frame
     }
 
-}
-
-/// How far past halfway a hand goes to be on the next cell: on one, it is
-/// on the next six tenths of the way there, and back on it below four.
-pub const PASS: f64 = 0.1;
-
-/// The cell a hand at `at` is on, having been on `from`.
-fn passed(from: i32, at: f64) -> i32 {
-    let mut cell = from;
-    while at >= cell as f64 + 0.5 + PASS { cell += 1; }
-    while at <= cell as f64 - 0.5 - PASS { cell -= 1; }
-    cell
-}
-
-/// The cell `on` gone `coast` farther, of the two either side of `at`.
-fn near(at: f64, on: i32, coast: f64) -> f64 {
-    (on as f64 + coast).round().clamp(at.floor(), at.ceil())
 }
 
 /// A short visual prediction; stale, stationary, reversed, or changed-axis input is not predicted.

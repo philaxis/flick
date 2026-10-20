@@ -1,28 +1,24 @@
 //! How far the screen recedes as the hand goes (`depth`, 0 to 1), as a
 //! marking menu shows itself only to a hand that hesitates: a hand that
-//! flicks (a stroke set off sharply, whatever its length or how it ends)
-//! keeps the screen whole and the desktop it goes to slides in (or comes
-//! at once, `QuickFlick::Instant`); flicking again soon after a stroke
-//! ends, it stays so, each stroke going as far as it went, and let go
-//! still flung very fast, a cell farther (`Judge::coast`). Every other hand is
-//! taken as unsure, soon (still, set off slowly, stopped a while, turning
-//! back, going the other way): the screen goes all the way back at once,
-//! not by halves, and stays so until let go: a hand gone unsure does not
-//! get the screen whole again by going on quickly. A hold begun just
-//! after one let go of sure is sure from the start; one let go of unsure
-//! carries nothing over.
+//! flicks (a stroke set off sharply) and lets go soon (within `QUICK_MOST`
+//! of setting off) means one cell, no more: the screen stays whole and the
+//! desktop next to it its way slides in (or comes at once,
+//! `QuickFlick::Instant`), however short or long, slow or fast the stroke
+//! went. Every other hand is taken as unsure, soon (still, set off slowly,
+//! held on, turning back, going the other way): the screen goes all the
+//! way back at once, not by halves, and stays so until let go: a hand
+//! gone unsure does not get the screen whole again by going on quickly.
 //!
 //! The hand is read in cells, which each device counts in its own units
 //! (mouse counts, touchpad steps of the pad's own size, `input`), so a
 //! flick is judged alike on either.
 //!
 //! The judging (`Judge`) only reads the hand. Whole, the screen is where
-//! the hand is, cell for cell, as it goes (`follow::Follow::held`), and let
-//! go of sure it lands on the cell nearest where it was going, coast and
-//! all (`Follow::let_go_near`); unsure, the cells gone to are the hand's
+//! the hand is, cell for cell, but no more than a cell from where it set
+//! off (`follow::Follow::within_a_cell`), and let go of sure it lands on
+//! the next cell its way (`Judge::step`, `Follow::let_go_one`), or back on
+//! the last one at the row's end; unsure, the cells gone to are the hand's
 //! latches (`follow::Follow`), switched to once, on letting go.
-//! Either way, a hand let go of tapped (sharp just before, however short,
-//! `Judge::tap`) still on the cell it set off from goes to the next one.
 use crate::{config::QuickFlick, transition_curve::Spring};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -35,22 +31,8 @@ pub const ONSET_LIMIT: f64 = 0.15;
 /// speed kept up. Not so, it is unsure.
 pub const DECIDE: f64 = 0.08;
 pub const PEAK: f64 = 5.0;
-/// Sure, a stroke goes on as long as it goes `KEEP` or faster; slower,
-/// it has ended, and another flick (as fast as `PEAK` again) must come
-/// within `PAUSE` (s) of that, or the hand is unsure.
-pub const KEEP: f64 = 2.5;
-pub const PAUSE: f64 = 0.25;
-/// Let go of sure, it goes as far as the hand went; only still going as
-/// fast as `FLING` (cells a second) does it go on `COAST_MOST` more, a cell.
-pub const FLING: f64 = 12.0;
-pub const COAST_MOST: f64 = 1.0;
-/// A tap: let go of having gone its way as fast as `TAP` (cells a second)
-/// within `TAP_LATE` (s), and come back no more than `TAP_BACK` (cells)
-/// from the farthest it went, the hand goes at least to the next cell,
-/// however short it went, sure or not (`Follow::tapped`).
-pub const TAP: f64 = 4.0;
-pub const TAP_LATE: f64 = 0.06;
-pub const TAP_BACK: f64 = 0.05;
+/// Sure and not let go of this long (s) after setting off, it is unsure.
+pub const QUICK_MOST: f64 = 0.25;
 /// Turning back this far (cells) from the farthest it went is unsure.
 pub const BACK: f64 = 0.15;
 /// The hand's speed is taken over this long (s).
@@ -61,8 +43,6 @@ const WINDOW: f64 = 0.03;
 /// otherwise. In between only on the way.
 pub const RECEDE: f64 = 0.04;
 pub const RETURN: f64 = 0.025;
-/// A hold begun this soon (s) after one let go of sure is sure from the start.
-pub const CARRY: f64 = 1.0;
 /// Let go of, the screen lands as a critically damped spring of this
 /// (rad/s): from half a cell still in about 0.1 s, never past the cell.
 const LAND: f64 = 75.0;
@@ -70,8 +50,6 @@ const LAND: f64 = 75.0;
 const FLASH: (f64, f64) = (0.45, 0.12);
 
 static MODE: AtomicU8 = AtomicU8::new(QuickFlick::Slide as u8);
-/// When the last hold let go of sure ended, if one did.
-static SURE_END: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub fn configure(mode: QuickFlick) {
     MODE.store(mode as u8, Ordering::Relaxed);
@@ -112,26 +90,18 @@ pub struct Judge {
     onset: Option<(f64, usize, f64)>,
     /// The farthest it went its way.
     far: f64,
-    /// Sure, since when its stroke has ended (gone slower than `KEEP`).
-    slow_since: Option<f64>,
     /// Its way so far over the last `WINDOW`, and one more.
     recent: Vec<(f64, f64)>,
-    /// When it last went its way as fast as `TAP`.
-    sharp: Option<f64>,
     /// Let go of, and how far it wanted the screen to recede then.
     released: Option<f64>,
 }
 
 impl Judge {
-    /// Sure from the start: a hold soon after one let go of sure.
-    pub fn sure() -> Judge { Judge { mind: Mind::Sure, ..Judge::default() } }
-
     /// From here on its way is `axis`, `sign`, starting at `t`, `gone` along
     /// it, and it is unsure (for good, this hold).
     fn anchor(&mut self, t: f64, axis: usize, sign: f64, gone: f64) {
         self.onset = Some((self.onset.map_or(t, |(onset, ..)| onset), axis, sign));
-        (self.far, self.recent, self.sharp) = (gone, vec![(t, gone)], None);
-        (self.mind, self.slow_since) = (Mind::Unsure, None);
+        (self.far, self.recent, self.mind) = (gone, vec![(t, gone)], Mind::Unsure);
     }
 
     pub fn feed(&mut self, t: f64, at: (f64, f64), axis: usize) {
@@ -156,7 +126,6 @@ impl Judge {
         self.recent.push((t, gone));
         let keep = self.recent.iter().rposition(|(when, _)| *when <= t - WINDOW).unwrap_or(0);
         self.recent.drain(..keep);
-        if self.speed(t) >= TAP { self.sharp = Some(t); }
         self.check(t);
     }
 
@@ -172,13 +141,8 @@ impl Judge {
                 if onset > ONSET_LIMIT || (speed < PEAK && now - onset > DECIDE) { self.mind = Mind::Unsure; }
                 else if speed >= PEAK { self.mind = Mind::Sure; }
             }
-            _ => {
-                // Its stroke going on, or ended and the next as sharp soon enough.
-                let going = if self.slow_since.is_some() { PEAK } else { KEEP };
-                if speed >= going { self.slow_since = None; return; }
-                let since = *self.slow_since.get_or_insert(now);
-                if now - since >= PAUSE { self.mind = Mind::Unsure; }
-            }
+            // Held on, it is no flick.
+            (_, onset) => if onset.is_some_and(|onset| now - onset > QUICK_MOST) { self.mind = Mind::Unsure; },
         }
     }
 
@@ -197,12 +161,11 @@ impl Judge {
         if self.mind == Mind::Unsure { 1.0 } else { 0.0 }
     }
 
-    /// Let go of: as it is, from now on (not yet sure counts as sure, as
-    /// does letting go just after stopping, as a flick does).
+    /// Let go of: as it is, from now on (not yet sure, the screen whole
+    /// and the latches' cell).
     pub fn release(&mut self, now: f64) {
         if self.released.is_some() { return; }
         self.check(now);
-        if self.mind == Mind::Deciding { self.mind = Mind::Sure; }
         self.released = Some(self.wanted());
     }
 
@@ -212,23 +175,11 @@ impl Judge {
     /// Which way along it, 1 or -1 (0 not yet set off).
     pub fn way(&self) -> f64 { self.onset.map_or(0.0, |(.., sign)| sign) }
 
-    /// How much farther than the hand (cells along and down) a hold let go
-    /// of sure at `now` goes: a cell flung as fast as `FLING`, else none.
-    pub fn coast(&self, now: f64) -> (f64, f64) {
+    /// Where a hold let go of goes from the cell it set off from (cells
+    /// along and down): sure, a cell its way; else nowhere of its own.
+    pub fn step(&self) -> (f64, f64) {
         let Some((_, axis, sign)) = self.onset.filter(|_| self.mind == Mind::Sure) else { return (0.0, 0.0) };
-        let on = if self.speed(now) >= FLING { sign * COAST_MOST } else { 0.0 };
-        if axis == 0 { (on, 0.0) } else { (0.0, on) }
-    }
-
-    /// Which way (cells along and down, 1 or -1) a hold let go of at `now`
-    /// was tapped, sure or not: gone its way as fast as `TAP` just before,
-    /// not come back, and still on its side of where it set off.
-    pub fn tap(&self, now: f64) -> (f64, f64) {
-        let Some((_, axis, sign)) = self.onset else { return (0.0, 0.0) };
-        let gone = self.recent.last().map_or(0.0, |&(_, gone)| gone);
-        let tapped = self.sharp.is_some_and(|sharp| now - sharp <= TAP_LATE) && gone > 0.0 && self.far - gone <= TAP_BACK;
-        let on = if tapped { sign } else { 0.0 };
-        if axis == 0 { (on, 0.0) } else { (0.0, on) }
+        if axis == 0 { (sign, 0.0) } else { (0.0, sign) }
     }
 }
 
@@ -237,12 +188,6 @@ impl Judge {
 /// not away.
 fn launch(off: f64, speed: f64) -> f64 {
     if speed * off >= 0.0 { 0.0 } else { speed.clamp(-LAND * off.abs(), LAND * off.abs()) }
-}
-
-/// Whether a hold begun `since` s after one let go of sure is sure from
-/// the start.
-pub fn carried(since: Option<f64>) -> bool {
-    since.is_some_and(|since| (0.0..=CARRY).contains(&since))
 }
 
 /// How the picture is drawn at a moment.
@@ -290,19 +235,11 @@ impl Quick {
             QuickFlick::Slide => false,
             QuickFlick::Instant => true,
         };
-        let since = SURE_END.lock().ok().and_then(|end| end.map(|end| end.elapsed().as_secs_f64()));
-        let judge = if carried(since) { Judge::sure() } else { Judge::default() };
-        Some(Quick { instant, judge, along: [Spring::default(); 2], landing: false, past: [0.0; 2], back: [Spring::default(); 2], rebound: false, depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
+        Some(Quick { instant, judge: Judge::default(), along: [Spring::default(); 2], landing: false, past: [0.0; 2], back: [Spring::default(); 2], rebound: false, depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
     }
 
-    /// Let go of at `now`; let go of sure, the next hold soon after is sure
-    /// from the start.
-    pub fn release(&mut self, now: f64) {
-        self.judge.release(now);
-        if let Ok(mut end) = SURE_END.lock() {
-            *end = (self.judge.mind == Mind::Sure).then(std::time::Instant::now);
-        }
-    }
+    /// Let go of at `now`.
+    pub fn release(&mut self, now: f64) { self.judge.release(now); }
 
     /// How far past the end the hand shows (`Follow::past`) for the next
     /// `look`: turned back from there the picture eases in as the latches
@@ -384,6 +321,28 @@ mod tests {
 
     fn deepest(frames: &[(f64, f64, Mind)]) -> f64 { frames.iter().map(|f| f.1).fold(0.0, f64::max) }
 
+    /// The hand at `x(t)` until `end` on a row of `cols`, let go of as
+    /// `glide` lets go: the cell gone to and what the hand was taken to be.
+    fn let_go(x: &dyn Fn(f64) -> f64, end: f64, cols: (i32, i32)) -> ((i32, i32), Mind) {
+        let mut quick = fresh();
+        let mut hand = crate::follow::Follow::new((0, 0), vec![cols]);
+        let mut t = 0.0;
+        while t <= end + 1e-9 {
+            hand.track_locked(t, (x(t), 0.0), 0);
+            quick.judge.feed(t, (x(t), 0.0), 0);
+            if quick.judge.mind == Mind::Sure { assert!(hand.within_a_cell(hand.held()).0.abs() <= 1.0 + EDGE); }
+            t += 0.001;
+        }
+        quick.release(t);
+        let to = if quick.judge.mind == Mind::Sure { hand.let_go_one(t, (x(t), 0.0), quick.judge.step()) } else { hand.let_go(t, (x(t), 0.0)) };
+        (to, quick.judge.mind)
+    }
+
+    /// The hand going from 0 to `to` (cells) at `speed`, set off at 0.05 s.
+    fn go(to: f64, speed: f64) -> impl Fn(f64) -> f64 {
+        move |t: f64| to.signum() * (speed * (t - 0.05).max(0.0)).min(to.abs())
+    }
+
     /// A stroke `cells` long set off at `from`, sharp at first and slowing
     /// as a flick does (`tau` s to go most of the way).
     fn stroke(t: f64, from: f64, cells: f64, tau: f64) -> f64 {
@@ -395,11 +354,11 @@ mod tests {
         for dt in [0.001, 0.008] {
             // Under three cells a second on average, but set off sharply.
             let mut quick = fresh();
-            let frames = run(&mut quick, |t| stroke(t, 0.05, 0.6, 0.06), dt, 0.0, 0.3);
-            assert!(stroke(0.3, 0.05, 0.6, 0.06) / 0.25 < 2.5 && deepest(&frames) < 0.05, "every {dt} s: {frames:?}");
+            let frames = run(&mut quick, |t| stroke(t, 0.05, 0.6, 0.06), dt, 0.0, 0.25);
+            assert!(stroke(0.25, 0.05, 0.6, 0.06) / 0.2 < 3.0 && deepest(&frames) < 0.05, "every {dt} s: {frames:?}");
             assert_eq!(quick.judge.mind, Mind::Sure);
             // Stopping, then letting go soon, stays whole.
-            quick.release(0.32);
+            quick.release(0.27);
             assert!(quick.look(0.4, (1.0, 0.0), None, (1, 0), 0).depth < 0.05);
         }
     }
@@ -438,129 +397,43 @@ mod tests {
     }
 
     #[test]
-    fn a_flick_of_six_cells_a_second_stays_quick() {
-        let mut quick = fresh();
-        let frames = run(&mut quick, |t| 6.0 * (t - 0.05).max(0.0), 0.001, 0.0, 1.0);
-        assert!(deepest(&frames) < 0.05, "{frames:?}");
-        assert!(frames.iter().filter(|f| f.0 >= 0.05 + DECIDE).all(|f| f.2 == Mind::Sure));
+    fn a_flick_let_go_soon_goes_one_cell_however_far_the_hand_went() {
+        // A tenth of a cell at eight a second, or two cells at twenty: a cell, either way.
+        assert_eq!(let_go(&go(0.1, 8.0), 0.07, (-3, 3)), ((1, 0), Mind::Sure));
+        assert_eq!(let_go(&go(-0.1, 8.0), 0.07, (-3, 3)), ((-1, 0), Mind::Sure));
+        assert_eq!(let_go(&go(2.0, 20.0), 0.16, (-3, 3)), ((1, 0), Mind::Sure));
+        assert_eq!(let_go(&go(2.0, 20.0), 0.25, (-3, 3)), ((1, 0), Mind::Sure));
+        // At the row's end, back on the last cell.
+        assert_eq!(let_go(&go(0.6, 20.0), 0.1, (-3, 0)), ((0, 0), Mind::Sure));
     }
 
     #[test]
-    fn two_flicks_go_two_cells_whole_all_the_way() {
-        let x = |t: f64| stroke(t, 0.05, 1.1, 0.04) + stroke(t, 0.35, 1.1, 0.04);
+    fn a_flick_held_on_is_precise_and_lands_on_the_latches() {
+        let x = go(2.7, 6.0);
         let mut quick = fresh();
-        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 4)]);
+        let frames = run(&mut quick, &x, 0.001, 0.0, 0.6);
+        let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
+        assert!(frames.iter().any(|f| f.2 == Mind::Sure) && (0.05 + QUICK_MOST..=0.05 + QUICK_MOST + 0.01).contains(&unsure), "{unsure}");
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(-3, 3)]);
         let mut t = 0.0;
         while t <= 0.6 {
             hand.track_locked(t, (x(t), 0.0), 0);
             t += 0.001;
         }
-        let frames = run(&mut quick, x, 0.001, 0.0, 0.6);
-        assert!(deepest(&frames) < 0.05, "{frames:?}");
-        quick.release(0.6);
-        let coast = quick.judge.coast(0.6);
-        assert_eq!(hand.let_go_near(0.6, (x(0.6), 0.0), coast), (2, 0));
-    }
-
-    #[test]
-    fn a_flick_lands_as_far_as_the_hand_went_past_six_tenths_of_a_cell() {
-        let flick = |to: f64, speed: f64| {
-            let x = move |t: f64| (speed * (t - 0.05).max(0.0)).min(to);
-            let end = 0.05 + to / speed;
-            let mut quick = fresh();
-            let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 5)]);
-            let mut t = 0.0;
-            while t <= end + 0.001 {
-                hand.track_locked(t, (x(t), 0.0), 0);
-                quick.judge.feed(t, (x(t), 0.0), 0);
-                t += 0.001;
-            }
-            quick.release(t);
-            hand.let_go_near(t, (x(t), 0.0), quick.judge.coast(t))
-        };
-        assert_eq!(flick(1.3, 8.0), (1, 0));
-        assert_eq!(flick(1.7, 8.0), (2, 0));
-        // Let go still going eight cells a second, 1.4 on: the cell it went to.
-        assert_eq!(flick(1.4, 8.0), (1, 0));
-        // Past six tenths and back to half: still the cell beyond.
-        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
-        hand.track_locked(0.0, (0.65, 0.0), 0);
-        hand.track_locked(0.01, (0.5, 0.0), 0);
-        assert_eq!(hand.clone().let_go_near(0.02, (0.5, 0.0), (0.0, 0.0)), (1, 0));
-        hand.track_locked(0.02, (0.35, 0.0), 0);
-        assert_eq!(hand.let_go_near(0.03, (0.35, 0.0), (0.0, 0.0)), (0, 0));
-    }
-
-    #[test]
-    fn a_tap_goes_to_the_next_cell_however_short_sure_or_not() {
-        // The hand at `x(t)` until `end`, let go of as `glide` lets go.
-        let let_go = |x: &dyn Fn(f64) -> f64, end: f64| {
-            let mut quick = fresh();
-            let mut hand = crate::follow::Follow::new((0, 0), vec![(-3, 3)]);
-            let mut t = 0.0;
-            while t <= end + 1e-9 {
-                hand.track_locked(t, (x(t), 0.0), 0);
-                quick.judge.feed(t, (x(t), 0.0), 0);
-                t += 0.001;
-            }
-            quick.release(t);
-            let (coast, tap) = (quick.judge.coast(t), quick.judge.tap(t));
-            if quick.judge.mind == Mind::Sure { hand.let_go_near(t, (x(t), 0.0), coast); } else { hand.let_go(t, (x(t), 0.0)); }
-            (hand.tapped((x(t), 0.0), tap), quick.judge.mind)
-        };
-        let go = |from: f64, to: f64, speed: f64| move |t: f64| from + (to - from).signum() * (speed * (t - 0.05).max(0.0)).min((to - from).abs());
-        // A tap, 0.15 of a cell at eight a second: the next cell, either way.
-        assert_eq!(let_go(&go(0.0, 0.15, 8.0), 0.07), ((1, 0), Mind::Sure));
-        assert_eq!(let_go(&go(0.0, -0.15, 8.0), 0.07), ((-1, 0), Mind::Sure));
-        // Still a moment (40 ms) before let go of: a tap still.
-        assert_eq!(let_go(&go(0.0, 0.15, 8.0), 0.11), ((1, 0), Mind::Sure));
-        // Receded (still at first), the same.
-        let late = |t: f64| go(0.0, 0.15, 8.0)(t - 0.3);
-        assert_eq!(let_go(&late, 0.37), ((1, 0), Mind::Unsure));
-        // Pushed slowly, 0.3 of a cell at a cell a second: back where it was.
-        assert_eq!(let_go(&go(0.0, 0.3, 1.0), 0.35).0, (0, 0));
-        // Still a while before let go of: no tap.
-        assert_eq!(let_go(&go(0.0, 0.15, 8.0), 0.2).0, (0, 0));
-        // 1.3 cells at eight a second: a cell, no more.
-        assert_eq!(let_go(&go(0.0, 1.3, 8.0), 0.22).0, (1, 0));
-        // Turned back as it was let go of, a little or far: where it was.
-        let back = |to: f64| move |t: f64| if t < 0.1 { go(0.0, 0.3, 8.0)(t) } else { go(0.3, to, 8.0)(t - 0.05) };
-        assert_eq!(let_go(&back(0.22), 0.11), ((0, 0), Mind::Sure));
-        assert_eq!(let_go(&back(0.1), 0.125).0, (0, 0));
-    }
-
-    #[test]
-    fn a_flick_let_go_moving_goes_on_at_most_a_cell() {
-        // Let go 1.3 cells on at 20 cells a second: a cell more, no farther.
-        let fling = |t: f64| 20.0 * (t - 0.05).max(0.0);
-        let mut quick = fresh();
-        run(&mut quick, fling, 0.001, 0.0, 0.115);
-        quick.release(0.115);
-        let coast = quick.judge.coast(0.115);
-        assert!((coast.0 - COAST_MOST).abs() < 1e-9 && coast.1 == 0.0, "{coast:?}");
-        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 5)]);
-        hand.track_locked(0.1, (fling(0.1), 0.0), 0);
-        assert_eq!(hand.let_go_near(0.115, (fling(0.115), 0.0), coast), (2, 0));
-        // Let go once stopped, as far as it went; let go of unsure, too.
-        let mut quick = fresh();
-        run(&mut quick, |t| stroke(t, 0.05, 1.3, 0.04), 0.001, 0.0, 0.3);
-        quick.release(0.3);
-        assert!(quick.judge.coast(0.3).0.abs() < 0.05);
-        let mut quick = fresh();
-        run(&mut quick, |t| 3.0 * t, 0.001, 0.0, 0.4);
-        quick.release(0.4);
-        assert_eq!(quick.judge.coast(0.4), (0.0, 0.0));
+        let latched = hand.clone().let_go(0.6, (x(0.6), 0.0));
+        assert!(latched.0 >= 2, "{latched:?}");
+        assert_eq!(let_go(&x, 0.6, (-3, 3)), (latched, Mind::Unsure));
     }
 
     #[test]
     fn stopping_a_while_turning_back_or_changing_axis_goes_all_the_way_back_at_once() {
-        // A flick, then still.
+        // A flick, then held on.
         let mut quick = fresh();
         let frames = run(&mut quick, |t| stroke(t, 0.05, 1.5, 0.04), 0.001, 0.0, 0.8);
         let at = |t: f64| frames.iter().find(|f| f.0 >= t).unwrap();
         assert!(at(0.25).1 < 0.05);
         let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
-        assert!((0.3..=0.5).contains(&unsure), "{unsure}");
+        assert!((0.3..=0.32).contains(&unsure), "{unsure}");
         assert!(at(unsure + 0.12).1 > 0.93, "{:?}", at(unsure + 0.12));
         // Receding begins at once and has no jump.
         assert!(frames.windows(2).all(|w| w[1].1 - w[0].1 < 0.21));
@@ -589,21 +462,12 @@ mod tests {
         quick.judge.feed(0.21, (0.9, 0.0), 0);
         let frames = run(&mut quick, |t| 0.9 - 6.0 * (t - 0.21), 0.001, 0.22, 0.6);
         assert!(frames.last().unwrap().1 > 0.99 && frames.last().unwrap().2 == Mind::Unsure);
-        // Let go unsure, it is not carried (`Quick::release`): the next hold starts afresh.
+        // Let go unsure, the next hold starts afresh.
         quick.release(0.61);
         assert_eq!(quick.judge.mind, Mind::Unsure);
         let mut next = fresh();
         let frames = run(&mut next, |t| stroke(t, 0.05, 1.0, 0.04), 0.001, 0.0, 0.25);
         assert!(deepest(&frames) < 0.05, "{frames:?}");
-    }
-
-    #[test]
-    fn a_hold_soon_after_a_sure_one_is_sure_from_the_start() {
-        assert!(carried(Some(0.4)) && !carried(Some(CARRY + 0.1)) && !carried(None));
-        let mut quick = Quick { judge: Judge::sure(), ..fresh() };
-        // Setting off slowly does not recede it at once.
-        let frames = run(&mut quick, |t| 1.5 * t, 0.001, 0.0, 0.18);
-        assert!(frames[0].1 == 0.0 && deepest(&frames) < 0.05, "{frames:?}");
     }
 
     #[test]
@@ -624,7 +488,7 @@ mod tests {
         // to it, at once, never past it.
         quick.release(t);
         let held = hand.held();
-        let to = hand.let_go_near(t, (x(t), 0.0), quick.judge.coast(t));
+        let to = hand.let_go_one(t, (x(t), 0.0), quick.judge.step());
         assert_eq!(to, (1, 0));
         let mut look = quick.look(t, hand.aim(), Some(held), to, 0);
         assert_eq!(look.at, held.0);
@@ -643,13 +507,6 @@ mod tests {
         quick.look(0.0, (1.0, 0.0), Some((0.5, 0.0)), (1, 0), 0);
         let near = (1..60).map(|f| f as f64 / 120.0).find(|&now| (quick.look(now, (1.0, 0.0), None, (1, 0), 0).at - 1.0).abs() < 0.005);
         assert!(near.is_some_and(|t| t <= 0.1), "{near:?}");
-        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
-        hand.track_locked(0.0, (0.4, 0.0), 0);
-        assert_eq!(hand.let_go_near(0.01, (0.4, 0.0), (0.0, 0.0)), (0, 0));
-        // Coasting far, no farther than the cell beyond the hand.
-        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
-        hand.track_locked(0.0, (0.9, 0.0), 0);
-        assert_eq!(hand.let_go_near(0.01, (0.9, 0.0), (COAST_MOST, 0.0)), (1, 0));
         // At the row's end, held only as far as the latches give there.
         let mut hand = crate::follow::Follow::new((0, 0), vec![(-1, 0)]);
         hand.track_locked(0.0, (0.3, 0.0), 0);
@@ -688,12 +545,12 @@ mod tests {
             t += 1.0 / 120.0;
         }
 
-        // Let go past the end, flung or not, back onto it as a latch's commit
+        // Let go past the end, flicked or not, back onto it as a latch's commit
         // comes back (`Spring::commit`), never past the end beyond.
-        for speed in [2.0, FLING * 1.5] {
+        for speed in [2.0, 18.0] {
             let mut quick = fresh();
-            let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
-            let x = |t: f64| 2.9 + speed * t;
+            let mut hand = crate::follow::Follow::new((0, 0), vec![(-3, 0)]);
+            let x = |t: f64| speed * t;
             let mut t = 0.0;
             while t < 0.1 {
                 hand.track_locked(t, (x(t), 0.0), 0);
@@ -704,21 +561,19 @@ mod tests {
             }
             quick.release(t);
             let (held, past) = (hand.held(), hand.past());
-            let coast = quick.judge.coast(t);
-            let to = if quick.judge.mind == Mind::Sure { hand.let_go_near(t, (x(t), 0.0), coast) } else { hand.let_go(t, (x(t), 0.0)) };
-            assert_eq!(hand.tapped((x(t), 0.0), quick.judge.tap(t)), (3, 0));
-            assert_eq!(to, (3, 0));
+            let to = if quick.judge.mind == Mind::Sure { hand.let_go_one(t, (x(t), 0.0), quick.judge.step()) } else { hand.let_go(t, (x(t), 0.0)) };
+            assert_eq!((to, quick.judge.mind == Mind::Sure), ((0, 0), speed > PEAK));
             quick.past_end(past);
             let mut look = quick.look(t, hand.aim(), Some(held), to, 0);
             let mut commit = Spring { p: look.at, v: 0.0 };
             let mut most = look.at;
             for frame in 1..=48 {
                 look = quick.look(t + frame as f64 / 120.0, hand.aim(), None, to, 0);
-                commit.commit(3.0, 1.0 / 120.0, false);
+                commit.commit(0.0, 1.0 / 120.0, false);
                 assert!((look.at - commit.p).abs() < 1e-6);
                 most = most.max(look.at);
             }
-            assert!(most < 3.0 + EDGE && look.settled && look.at == 3.0, "{speed}: {most} {look:?}");
+            assert!(most < EDGE && look.settled && look.at == 0.0, "{speed}: {most} {look:?}");
         }
     }
 }

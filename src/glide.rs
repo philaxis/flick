@@ -1298,26 +1298,29 @@ impl View {
                     let prediction = follow::resample(&session.input_samples, now);
                     let frame = session.follow.sampled(now, prediction);
                     let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
-                    // Whole, the screen is where the hand is, resampled to the frame's time.
+                    // Whole, the screen is where the hand is, resampled to the frame's time;
+                    // sure, no more than a cell from where it set off.
                     let (held, past) = (frame.held(), frame.past());
+                    let sure = session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure);
+                    let held = if sure { frame.within_a_cell(held) } else { held };
                     following_frame = Some(frame);
                     look = session.quick.as_mut().map(|quick| { quick.past_end(past); quick.look(now, session.follow.aim(), Some(held), session.follow.selected(), session.follow.axis()) });
                     result
                 } else {
-                    // Let go of a flick still moving, it goes on a little (`Judge::coast`);
-                    // sure, to the cell nearest, unsure, to the latches'; tapped, either
-                    // way, at least to the next cell (`Judge::tap`).
-                    let (coast, tap) = session.quick.as_mut().map_or(((0.0, 0.0), (0.0, 0.0)), |quick| {
+                    // Let go of a flick, a cell its way from where it set off
+                    // (`Judge::step`); unsure, to the latches'.
+                    let sure = session.quick.as_mut().is_some_and(|quick| {
                         quick.release(release_time);
-                        (quick.judge.coast(release_time), quick.judge.tap(release_time))
+                        quick.judge.mind == crate::quick::Mind::Sure
                     });
-                    let (held, past) = (session.follow.held(), session.follow.past());
-                    if session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure) {
-                        session.follow.let_go_near(release_time, session.hand, coast);
+                    let (mut held, past) = (session.follow.held(), session.follow.past());
+                    let to = if sure {
+                        held = session.follow.within_a_cell(held);
+                        let step = session.quick.as_ref().map_or((0.0, 0.0), |quick| quick.judge.step());
+                        session.follow.let_go_one(release_time, session.hand, step)
                     } else {
-                        session.follow.let_go(release_time, (session.hand.0 + coast.0, session.hand.1 + coast.1));
-                    }
-                    let to = session.follow.tapped(session.hand, tap);
+                        session.follow.let_go(release_time, session.hand)
+                    };
                     if let Some(quick) = &mut session.quick {
                         quick.past_end(past);
                         look = Some(quick.look(now, session.follow.aim(), Some(held), to, session.follow.axis()));
