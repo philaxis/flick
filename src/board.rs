@@ -2226,7 +2226,10 @@ impl Board {
         let slot = tile.and_then(|tile| self.sheet.as_ref()?.slot(tile.hwnd.0));
         if let (Some(tile), Some((x, y, side)), Some((place, clip, bright))) = (tile, slot, placing) {
             let source = self.source_rect(thumb, tile.hwnd);
-            let plain = minimized || source.is_none_or(|source| source.frame.right - source.frame.left < 40.0 || source.frame.bottom - source.frame.top < 40.0);
+            // A minimized window with a kept picture shows it (`put_thumbnail`),
+            // so its icon goes on the corner like any other.
+            let kept = source.is_some_and(|source| source.full.1 >= 80.0);
+            let plain = (minimized && !kept) || source.is_none_or(|source| source.frame.right - source.frame.left < 40.0 || source.frame.bottom - source.frame.top < 40.0);
             if shown || plain {
                 let r = match source {
                     _ if plain => middle_icon(&tile.thumb, self.scale),
