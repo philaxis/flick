@@ -11,6 +11,7 @@ use crate::{
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_PRESSED, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
+    raised,
     settings::{self, Settings},
     stack::{self, Kind},
     tray::{self, Command, PinCommand, PinState, RowCommand},
@@ -191,6 +192,13 @@ struct App {
     /// Windows that follow the user from cell to cell inside their row.
     /// Window handles do not outlive a session, so this is not saved.
     following: vd::WindowPins,
+    /// The pinned windows the user left in front of a cell's own windows,
+    /// in front on every cell they go to; the others right under its front
+    /// one (`raised`).
+    raised: HashSet<isize>,
+    /// The cell Flick went to and put the pinned windows in place on, the
+    /// switch there not to be taken for the user's (`desktop_changed`).
+    arranged: Option<String>,
     /// A pin menu to show once the current handler has returned.
     pending_menu: Option<(HWND, PinState)>,
     /// Likewise the menu of a shelf in the board.
@@ -402,6 +410,8 @@ impl App {
             gliding: None,
             prepared: None,
             following: vd::WindowPins::default(),
+            raised: HashSet::new(),
+            arranged: None,
             pending_menu: None,
             pending_row_menu: None,
             seen: HashMap::new(),
@@ -574,9 +584,58 @@ impl App {
     // ---- windows that follow --------------------------------------------------
 
     fn follows(&self, window: &vd::WindowInfo) -> bool {
-        self.following.contains(&window.hwnd.0)
-            || (!self.grid.follow_apps.is_empty()
-                && vd::exe_name(window.pid).is_some_and(|exe| self.grid.follow_apps.contains(&exe)))
+        self.follows_window(window.hwnd, window.pid)
+    }
+
+    fn follows_window(&self, hwnd: HWND, pid: u32) -> bool {
+        self.following.contains(&hwnd.0)
+            || (!self.grid.follow_apps.is_empty() && vd::exe_name(pid).is_some_and(|exe| self.grid.follow_apps.contains(&exe)))
+    }
+
+    /// The windows showing on cell `id`, topmost first, each with whether it
+    /// is the cell's own, not pinned to every shelf or its own.
+    fn stack_of(&self, id: &str) -> Vec<(HWND, bool)> {
+        vd::stacked_on(id)
+            .into_iter()
+            .map(|(hwnd, everywhere)| {
+                let mut pid = 0;
+                unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+                (hwnd, !everywhere && !self.follows_window(hwnd, pid))
+            })
+            .collect()
+    }
+
+    /// Notes of the pinned windows on cell `id`, about to be left, whether
+    /// the user left them in front of its own windows (`raised::judged`).
+    fn judge_raised(&mut self, id: &str) {
+        let stack = self.stack_of(id);
+        for &(hwnd, own) in &stack {
+            if own {
+                continue;
+            }
+            if raised::judged(self.raised.contains(&hwnd.0), hwnd, &stack) {
+                self.raised.insert(hwnd.0);
+            } else {
+                self.raised.remove(&hwnd.0);
+            }
+        }
+    }
+
+    /// Puts the pinned windows on cell `id`, come to, where they go among its
+    /// own: the raised ones in front, the others right under the front one
+    /// (`raised::spot`). Going bottom first, they keep their order.
+    fn arrange_pinned(&mut self, id: &str) {
+        let stack = self.stack_of(id);
+        let own: Vec<HWND> = stack.iter().filter(|(_, own)| *own).map(|(hwnd, _)| *hwnd).collect();
+        for &(hwnd, mine) in stack.iter().rev() {
+            if !mine {
+                match raised::spot(self.raised.contains(&hwnd.0), &own) {
+                    raised::Spot::Front => vd::place_under(hwnd, None),
+                    raised::Spot::Under(front) => vd::place_under(hwnd, Some(front)),
+                }
+            }
+        }
+        self.arranged = Some(id.to_owned());
     }
 
     /// Brings the windows that follow within a row over to cell `to` from the
@@ -727,6 +786,7 @@ impl App {
     /// by now be another app's window).
     fn forget_gone_windows(&mut self) {
         self.following.prune();
+        self.raised.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
         self.grid.kept_on_top.retain(|(hwnd, exe)| {
             unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && vd::exe_of_window(HWND(*hwnd)).unwrap_or_default() == *exe
         });
@@ -922,12 +982,16 @@ impl App {
     fn go(&mut self, desktops: &Desktops, from: Pos, to: &str, carry: bool) {
         let Some(target) = desktops.get(to) else { return };
         self.going = None;
+        if let Some(left) = self.grid.id_at(from).cloned() {
+            self.judge_raised(&left);
+        }
         let window = unsafe { GetForegroundWindow() };
         let carried = carry
             && vd::is_app_window(window)
             && vdapi::is_window_on_current_desktop(window).unwrap_or(false)
             && vdapi::move_window_to_desktop(target, window).is_ok();
         self.bring_followers(desktops, to);
+        self.arrange_pinned(to);
         if self.in_flight.is_some() {
             debug_log!("app: {} waits for the switch under way", &to[..4.min(to.len())]);
             self.queued = Some(to.to_owned());
@@ -1095,6 +1159,8 @@ impl App {
         // A window carried along stays where it is, as one on every desktop.
         let carried = self.carry_held().then(|| unsafe { GetForegroundWindow() });
         let mut shots: Vec<(i32, Shot)> = Vec::new();
+        // Whether each pinned window is in front, as the cell begun on is now.
+        let mut stack: Option<Vec<(HWND, bool)>> = None;
         for window in vd::shown_windows(&desktops.current) {
             let place = if carried == Some(window.hwnd) {
                 Place::Fixed
@@ -1115,7 +1181,10 @@ impl App {
                 Place::Row(row) => 2 * row.abs(),
                 Place::Cell(row, col) => 2 * row.abs() + col.abs(),
             };
-            shots.push((far, Shot { hwnd: window.hwnd, rect: window.rect, place }));
+            let was = self.raised.contains(&window.hwnd.0);
+            let raised = matches!(place, Place::Pinned | Place::Row(_))
+                && raised::judged(was, window.hwnd, stack.get_or_insert_with(|| self.stack_of(origin)));
+            shots.push((far, Shot { hwnd: window.hwnd, rect: window.rect, place, raised }));
         }
         // The nearest within the limit, in their order, bottom first.
         let mut nearest: Vec<usize> = (0..shots.len()).collect();
@@ -1357,7 +1426,15 @@ impl App {
     }
 
     /// The current desktop changed, by us or by Windows' own shortcuts.
-    fn desktop_changed(&mut self, new: &str) {
+    fn desktop_changed(&mut self, old: Option<&str>, new: &str) {
+        // Gone there some other way (Windows' own shortcuts), the cell left
+        // is as the user left it.
+        let ours = self.arranged.take().as_deref() == Some(new) || self.in_flight.is_some();
+        if !ours {
+            if let Some(old) = old {
+                self.judge_raised(old);
+            }
+        }
         self.glide_arrived(new);
         self.usage_cell.suspend();
         debug_log!("app: the desktop is now {}", &new[..4.min(new.len())]);
@@ -1390,6 +1467,8 @@ impl App {
         self.record_arrival(&desktops.current);
         self.visit(new);
         self.bring_followers(&desktops, new);
+        self.arrange_pinned(new);
+        self.arranged = None;
         self.save();
         let view = self.view(&desktops.current);
         self.minimap.update(view);
@@ -1659,7 +1738,9 @@ impl App {
         let Some(desktops) = self.sync() else { return self.board.close() };
         if !id.is_empty() && id != desktops.current {
             let Some(target) = desktops.get(id) else { return self.board.close() };
+            self.judge_raised(&desktops.current);
             self.bring_followers(&desktops, id);
+            self.arrange_pinned(id);
             if !self.switch(target) {
                 return self.board.close();
             }
@@ -2220,7 +2301,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     let _ = KillTimer(hwnd, FLIGHT_TIMER_ID);
                     debug_log!("app: switch recovery read the current desktop");
                     if !app.land(&now) {
-                        app.desktop_changed(&now);
+                        app.desktop_changed(None, &now);
                     }
                 }
             });
@@ -2270,8 +2351,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_DESKTOP_EVENT => {
             with_app(|app| {
-                while let Ok((_, new)) = app.events.try_recv() {
-                    app.desktop_changed(&new);
+                while let Ok((old, new)) = app.events.try_recv() {
+                    app.desktop_changed(Some(&old), &new);
                 }
             });
         }

@@ -138,6 +138,9 @@ pub struct Shot {
     pub hwnd: HWND,
     /// Its visible frame on the screen (`DWMWA_EXTENDED_FRAME_BOUNDS`).
     pub rect: RECT,
+    /// For a pinned one, whether it is in front of the windows of each
+    /// desktop it shows on, or right under the front one (`raised`).
+    pub raised: bool,
     pub place: Place,
 }
 
@@ -1059,6 +1062,19 @@ impl View {
         }
         let ranked = |(shot, layer): &(&Shot, Layer)| if *layer == Layer::Under { 0 } else { rank(&shot.place) };
         order.sort_by_key(ranked);
+        // Among each desktop's windows, the pinned ones where they will be
+        // once it is come to: the screen slides whole into it as it will stay.
+        let among = order.iter().take_while(|layered| ranked(layered) == 0).count();
+        let items: Vec<(usize, crate::raised::Item)> = order[..among]
+            .iter()
+            .enumerate()
+            .map(|(at, (shot, layer))| match (shot.place, layer) {
+                (Place::Cell(row, col), Layer::Whole) => (at, crate::raised::Item::Own((row, col))),
+                _ => (at, crate::raised::Item::Pinned(shot.raised)),
+            })
+            .collect();
+        let among: Vec<(&Shot, Layer)> = crate::raised::pictured(&items, (0, 0)).into_iter().map(|at| order[at]).collect();
+        order.splice(..among.len(), among);
         let mut shots = Vec::new();
         let mut halos: Vec<(Vec<Thumb>, Option<[f64; 4]>)> = Vec::new();
         let mut bare = Vec::new();

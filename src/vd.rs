@@ -29,8 +29,8 @@ use windows::{
             WindowsAndMessaging::{
                 EnumWindows, FindWindowExW, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
                 GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-                IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
-                ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOMOVE,
+                IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
+                ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOMOVE,
                 SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, SC_CLOSE, WM_SYSCOMMAND,
                 WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
@@ -192,6 +192,33 @@ pub fn stack(order: &[HWND]) {
             let _ = SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         }
         after = hwnd;
+    }
+}
+
+/// The app windows showing on desktop `id`, topmost first, each with
+/// whether it is shown on every desktop: not minimized, nor kept above the
+/// others, which are above all of them whatever happens.
+pub fn stacked_on(id: &str) -> Vec<(HWND, bool)> {
+    app_windows()
+        .into_iter()
+        .filter(|hwnd| unsafe { !IsIconic(*hwnd).as_bool() } && !is_topmost(*hwnd) && !is_shell_surface(*hwnd))
+        .filter_map(|hwnd| {
+            if pinned_everywhere(hwnd) {
+                return Some((hwnd, true));
+            }
+            (vdapi::get_desktop_by_window(hwnd).ok()?.id() == id).then_some((hwnd, false))
+        })
+        .collect()
+}
+
+/// Puts a window right under `under`, or in front of the windows not kept
+/// above the others, without moving, sizing or activating it. One not
+/// answering is left where it is: Windows would wait on it.
+pub fn place_under(hwnd: HWND, under: Option<HWND>) {
+    unsafe {
+        if !IsHungAppWindow(hwnd).as_bool() {
+            let _ = SetWindowPos(hwnd, under.unwrap_or(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 }
 
