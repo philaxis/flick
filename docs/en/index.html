@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flick — Windows 11 virtual desktops as a 2D grid</title>
+<meta name="description" content="Hold a button, flick the mouse, land on the next desktop. Windows 11 virtual desktops as a 2D grid. Free and open source.">
+<link rel="canonical" href="https://philaxis.github.io/flick/en/">
+<link rel="alternate" hreflang="ko" href="https://philaxis.github.io/flick/ko/">
+<link rel="alternate" hreflang="en" href="https://philaxis.github.io/flick/en/">
+<link rel="alternate" hreflang="x-default" href="https://philaxis.github.io/flick/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Flick">
+<meta property="og:title" content="Flick — Hold. Flick. Next desktop.">
+<meta property="og:description" content="Windows 11 virtual desktops as a 2D grid. Free and open source.">
+<meta property="og:url" content="https://philaxis.github.io/flick/en/">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="ko_KR">
+<meta property="og:image" content="https://philaxis.github.io/flick/og-en.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0d0e11">
+<link rel="icon" type="image/png" href="../icon.png">
+<link rel="stylesheet" href="../landing.css">
+</head>
+<body>
+<div class="col">
+  <header class="top">
+    <a class="brand" href="./"><img src="../icon.png" alt="" width="24" height="24">Flick</a>
+    <nav>
+      <a class="btn" href="../ko/" hreflang="ko" aria-label="Korean version">Korean</a>
+      <a class="btn" href="https://github.com/philaxis/flick">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="say">
+        <h1 id="line"><span>Hold.</span> <span>Flick.</span> <span>Next desktop.</span></h1>
+        <a class="dl" href="https://github.com/philaxis/flick/releases/latest/download/Flick.exe">
+          <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 2.5v9M5 8l4 4 4-4M3 15.5h12"/></svg>
+          <span>Download</span>
+        </a>
+      </div>
+
+      <div class="stage" id="stage" role="img" aria-label="Flick in use: hold the mouse side button and flick to land on the next desktop; tap it to see every window.">
+        <canvas id="hero"></canvas>
+      </div>
+    </section>
+
+    <section class="end">
+      <div class="brand"><img src="../icon.png" alt="" width="48" height="48">Flick</div>
+    </section>
+  </main>
+
+  <footer>
+    <span>MIT</span><span>·</span>
+    <a href="https://github.com/philaxis/flick">source</a><span>·</span>
+    <span>made by <a href="https://philaxis.github.io">philaxis</a></span>
+  </footer>
+  <p class="inspiration"><b>Design inspiration</b><span>The idea for Flick was partly inspired by protein folding — how a linear chain of amino acids can fold into a complex spatial structure. It made me wonder: why should virtual desktops be confined to a single line? What if we could arrange them in a space that better reflects how we organize our work?</span></p>
+</div>
+
+<script>window.FLICK = { base: '../cells/en/', shelves: ["Development · Flick 0.6", "Break", "Marketing · Flick 0.6 launch"], short: ["Dev", "Break", "Marketing"] };</script>
+<script src="../cells/en/cells.js"></script>
+<script src="../landing.js"></script>
+</body>
+</html>
