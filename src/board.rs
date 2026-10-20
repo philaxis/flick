@@ -3582,7 +3582,7 @@ pub fn icon_key(hwnd: HWND) -> u64 {
 }
 
 /// The window's icon, `size` pixels square, premultiplied.
-fn icon_pixels(hwnd: HWND, size: i32) -> Option<Vec<u8>> {
+pub(crate) fn icon_pixels(hwnd: HWND, size: i32) -> Option<Vec<u8>> {
     let icon = window_icon(hwnd)?;
     unsafe {
         let mut dib = Dib::new((size, size)).ok()?;
@@ -3601,7 +3601,7 @@ fn icon_pixels(hwnd: HWND, size: i32) -> Option<Vec<u8>> {
 }
 
 /// An icon's `pixels` as a Direct2D bitmap of `size` pixels.
-fn icon_bitmap(target: &ID2D1RenderTarget, pixels: &[u8], size: i32) -> Option<ID2D1Bitmap> {
+pub(crate) fn icon_bitmap(target: &ID2D1RenderTarget, pixels: &[u8], size: i32) -> Option<ID2D1Bitmap> {
     unsafe {
         let (bits, pitch) = (pixels.as_ptr() as *const std::ffi::c_void, size as u32 * 4);
         let properties = D2D1_BITMAP_PROPERTIES {

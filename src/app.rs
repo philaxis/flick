@@ -1092,8 +1092,10 @@ impl App {
         let carried = self.carry_held().then(|| unsafe { GetForegroundWindow() });
         let mut shots: Vec<(i32, Shot)> = Vec::new();
         for window in vd::shown_windows(&desktops.current) {
-            let place = if window.desktop.is_empty() || carried == Some(window.hwnd) {
+            let place = if carried == Some(window.hwnd) {
                 Place::Fixed
+            } else if window.desktop.is_empty() {
+                Place::Pinned
             } else if self.follows(&window) {
                 // A shelf's last cell can differ from its anchor while the board is open.
                 let Some(pos) = self.grid.find(&window.desktop) else { continue };
@@ -1105,7 +1107,7 @@ impl App {
                 Place::Cell(row, col)
             };
             let far = match place {
-                Place::Fixed => 0,
+                Place::Fixed | Place::Pinned => 0,
                 Place::Row(row) => 2 * row.abs(),
                 Place::Cell(row, col) => 2 * row.abs() + col.abs(),
             };

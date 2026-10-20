@@ -28,11 +28,21 @@ const ROW_WINDOWS_JOIN: f64 = 0.15;
 
 /// Shelf followers stay in front only on the starting row; other rows enter with the strip.
 pub fn row_window(rect: [f64; 4], size: (f64, f64), row: i32, y: f64, depth: f64, farthest_y: f64) -> ([f64; 4], f64) {
-    let join = if row == 0 { (farthest_y / ROW_WINDOWS_JOIN).min(1.0) } else { 1.0 };
+    let join = row_join(row, farthest_y);
     let apart = row as f64 - y;
     let at = between(rect, on_strip(rect, size, scale(depth), (0.0, apart)), join);
     let near = (1.0 - apart.abs()).clamp(0.0, 1.0);
     (at, 1.0 - DIM * (1.0 - near) * depth * join)
+}
+
+fn row_join(row: i32, farthest_y: f64) -> f64 {
+    if row == 0 { (farthest_y / ROW_WINDOWS_JOIN).min(1.0) } else { 1.0 }
+}
+
+/// How far down a shelf follower put by at the edge goes with its row
+/// (`row_window`'s way up and down, its size kept), on a screen `h` down.
+pub fn row_shift(h: f64, row: i32, y: f64, depth: f64, farthest_y: f64) -> f64 {
+    row_join(row, farthest_y) * (row as f64 - y) * h * (1.0 + GAP) * scale(depth)
 }
 
 /// Selection weights follow their own springs, independent of the hand's lean.

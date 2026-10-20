@@ -11,6 +11,8 @@ mod pin;
 #[cfg(windows)]
 mod i18n;
 #[cfg(any(windows, test))]
+mod dock;
+#[cfg(any(windows, test))]
 mod follow;
 mod grid;
 mod usage;

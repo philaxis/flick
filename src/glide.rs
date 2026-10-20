@@ -23,6 +23,7 @@
 //! keeps the app's thread busy for tens of milliseconds at a time.
 
 use crate::{
+    dock::{self, Spot},
     follow::{self, Follow, Label, Name, Step},
     paint::{self, rgba, white, DcTarget, Dib, Painter},
 };
@@ -103,8 +104,11 @@ pub enum Place {
     Cell(i32, i32),
     /// Going along its row, `Cell`'s row: up and down with it, never sideways.
     Row(i32),
-    /// Shown on every desktop: where it is.
+    /// Shown on every desktop, carried along: where it is.
     Fixed,
+    /// Pinned to every shelf: where it is while the screen is whole, put
+    /// by at the edge as it recedes (`dock`).
+    Pinned,
 }
 
 pub struct Shot {
@@ -224,6 +228,8 @@ struct Screen {
     walls: Vec<Thumb>,
     /// The name of the row above the picture.
     banner: Option<Banner>,
+    /// The icons and counts of the pinned windows put by (`Mark`).
+    dock: Option<Banner>,
 }
 
 impl Screen {
@@ -233,7 +239,7 @@ impl Screen {
         unsafe {
             let flags = SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
             let _ = SetWindowPos(self.hwnd, None, 0, 0, 0, 0, flags);
-            if let Some(banner) = &self.banner {
+            for banner in [&self.banner, &self.dock].into_iter().flatten() {
                 let _ = SetWindowPos(banner.hwnd, None, 0, 0, 0, 0, flags);
             }
         }
@@ -322,6 +328,7 @@ impl Drop for Screen {
         self.hide();
         self.walls.clear();
         self.banner = None;
+        self.dock = None;
         unsafe {
             crate::composition::forget(self.hwnd);
             let _ = DestroyWindow(self.hwnd);
@@ -337,10 +344,18 @@ struct Veil {
     shades: Vec<Thumb>,
 }
 
-/// One opaque source bitmap: black on the left, white on the right. The
-/// white half keeps the off-screen surface from being entirely black, which
-/// DWM would drop as empty.
+/// One opaque source bitmap of four squares: black, white, and the lights
+/// of what is pinned to every shelf and to its shelf (the board's amber
+/// and teal). The white keeps the off-screen surface from being entirely
+/// black, which DWM would drop as empty.
 struct Paints { hwnd: HWND }
+
+/// Each colour's square in `Paints`.
+const BLACK: RECT = RECT { left: 0, top: 0, right: 16, bottom: 16 };
+const AMBER: RECT = RECT { left: 32, top: 0, right: 48, bottom: 16 };
+const TEAL: RECT = RECT { left: 48, top: 0, right: 64, bottom: 16 };
+/// Blue, green, red of each square, in order.
+const PAINTS: [[u8; 3]; 4] = [[0, 0, 0], [255, 255, 255], [87, 189, 255], [209, 219, 82]];
 
 impl Paints {
     fn new() -> Option<Paints> {
@@ -348,17 +363,18 @@ impl Paints {
             let origin = POINT { x: GetSystemMetrics(SM_XVIRTUALSCREEN) - 200, y: GetSystemMetrics(SM_YVIRTUALSCREEN) - 200 };
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
-                WHITE_CLASS, w!("Flick"), WS_POPUP, origin.x, origin.y, 32, 16,
+                WHITE_CLASS, w!("Flick"), WS_POPUP, origin.x, origin.y, 64, 16,
                 None, None, GetModuleHandleW(None).ok()?, None,
             );
             if hwnd.0 == 0 { return None; }
             let seeded = (|| {
-                let mut dib = Dib::new((32, 16)).ok()?;
+                let mut dib = Dib::new((64, 16)).ok()?;
                 for (i, pixel) in dib.pixels_mut().chunks_exact_mut(4).enumerate() {
-                    pixel.copy_from_slice(if i % 32 < 16 { &[0, 0, 0, 255] } else { &[255, 255, 255, 255] });
+                    let [b, g, r] = PAINTS[i % 64 / 16];
+                    pixel.copy_from_slice(&[b, g, r, 255]);
                 }
                 let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
-                UpdateLayeredWindow(hwnd, None, Some(&origin), Some(&SIZE { cx: 32, cy: 16 }),
+                UpdateLayeredWindow(hwnd, None, Some(&origin), Some(&SIZE { cx: 64, cy: 16 }),
                     dib.dc, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA).ok()
             })();
             if seeded.is_none() { let _ = DestroyWindow(hwnd); return None; }
@@ -381,6 +397,8 @@ struct Banner {
     dib: Option<Dib>,
     /// What it shows and how opaque it is, as last given to the window.
     drawn: Option<(BannerKey, u8)>,
+    /// As a dock (`show_docks`): where its marks are and how opaque.
+    marked: Option<(Vec<(i32, u8)>, u8)>,
 }
 
 /// The names shown and how far each has come, in thousandths.
@@ -419,7 +437,7 @@ impl Banner {
             return None;
         }
         let _ = crate::vdapi::pin_window(hwnd);
-        Some(Banner { hwnd, dib: None, drawn: None })
+        Some(Banner { hwnd, dib: None, drawn: None, marked: None })
     }
 }
 
@@ -501,6 +519,68 @@ impl Ink {
     }
 }
 
+/// A pinned window put by at the edge as the screen recedes (`dock`).
+struct Docked {
+    spot: Spot,
+    /// Its light beneath it: amber pinned to every shelf, teal to its own.
+    halos: Vec<Thumb>,
+}
+
+/// Drawn in a screen's dock window where a picture would be too small: an
+/// app's icon, or how many more there are.
+struct Mark {
+    on: usize,
+    /// The shelf it goes up and down with, pinned to its shelf.
+    row: Option<i32>,
+    at: dock::Edges,
+    what: Marked,
+}
+
+enum Marked {
+    /// The pixels of an icon so many across.
+    Icon(Vec<u8>, i32),
+    More(usize),
+}
+
+impl Ink {
+    /// Draws the marks of a dock into `dib`: each where it is, as opaque as
+    /// it is, an icon or a count, lit in the colour of its pin (`all`: of
+    /// every shelf).
+    fn marks(&mut self, dib: &Dib, scale: f32, marks: &[(dock::Edges, f32, &Marked, bool)]) -> Option<()> {
+        let format = self.format(scale)?;
+        self.target.bind(dib).ok()?;
+        let target = &self.target.target;
+        unsafe {
+            target.BeginDraw();
+            target.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
+        }
+        if let Ok(p) = Painter::new(target) {
+            for (at, shown, what, all) in marks {
+                let area = paint::rect(at[0] as f32, at[1] as f32, (at[2] - at[0]) as f32, (at[3] - at[1]) as f32);
+                let light = |a: f32| if *all { rgba(1.0, 0.74, 0.34, a * shown) } else { rgba(0.32, 0.86, 0.82, a * shown) };
+                // A light about it, no box.
+                for (out, a) in [(2.0, 0.22), (6.0, 0.10), (12.0, 0.05)] {
+                    let out = out * scale;
+                    let lit = paint::Rect { left: area.left - out, top: area.top - out, right: area.right + out, bottom: area.bottom + out };
+                    p.fill(&lit, 6.0 * scale + out, light(a));
+                }
+                match what {
+                    Marked::Icon(pixels, side) => {
+                        if let Some(bitmap) = crate::board::icon_bitmap(target, pixels, *side) {
+                            p.bitmap(&bitmap, &area, *shown);
+                        }
+                    }
+                    Marked::More(n) => {
+                        p.fill(&area, 6.0 * scale, rgba(0.06, 0.065, 0.08, 0.7 * shown));
+                        p.text(&format!("+{n}"), &format, &area, white(0.92 * shown));
+                    }
+                }
+            }
+        }
+        unsafe { target.EndDraw(None, None) }.ok()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Following,
@@ -531,7 +611,7 @@ struct Strip {
     y: f64,
     along: Vec<f64>,
     receded: f64,
-    /// How much of the others' darkening a quick flick takes away, and how
+    /// How much of the others' darkening a sure hand takes away, and how
     /// dark every desktop is as one comes in at once (`quick::Look`).
     calm: f64,
     flash: f64,
@@ -581,6 +661,9 @@ struct Session {
     screens: Vec<Screen>,
     /// The windows' thumbnails, bottom first, and where each is drawn.
     shots: Vec<(Thumb, usize, Place)>,
+    /// As `shots`: where each pinned one is put by, and its marks.
+    docked: Vec<Option<Docked>>,
+    marks: Vec<Mark>,
     /// The desktops (screen, row and cell) a window covers the whole of
     /// (`covering`): their wallpaper is not drawn, to show at its edges.
     bare: Vec<(usize, (i32, i32))>,
@@ -604,7 +687,7 @@ struct Session {
     label: Label,
     last_frame: Option<Instant>,
     input_samples: Vec<(f64, f64, f64, usize)>,
-    /// A hold followed while it may be a quick flick (`quick`).
+    /// How far a followed hold recedes as the hand goes (`quick`).
     quick: Option<crate::quick::Quick>,
     visible: bool,
     stats: Stats,
@@ -617,6 +700,7 @@ impl Session {
         if let (Some(path), Some(trace)) = (path, &self.trace) { write_trace(path, &trace.lines); }
         let mut thumbs: Vec<Thumb> = self.leftover;
         thumbs.extend(self.shots.into_iter().map(|(thumb, ..)| thumb));
+        thumbs.extend(self.docked.into_iter().flatten().flat_map(|docked| docked.halos));
         for veil in self.veils {
             thumbs.extend(veil.shades);
         }
@@ -842,7 +926,7 @@ impl View {
                         let size = (monitor.work.right - monitor.work.left, monitor.work.bottom - monitor.work.top);
                         if let Err(e) = unsafe { crate::composition::back(hwnd, size) } { crate::app::log(&format!("composition backing failed: {e}")); }
                     }
-                    screens.push(Screen { hwnd, area: monitor.work, scale: monitor.scale, walls: Vec::new(), banner: Banner::new() });
+                    screens.push(Screen { hwnd, area: monitor.work, scale: monitor.scale, walls: Vec::new(), banner: Banner::new(), dock: None });
                 }
             }
         }
@@ -869,11 +953,12 @@ impl View {
         let rank = |place: &Place| match place {
             Place::Cell(..) => 0,
             Place::Row(_) => 1,
-            Place::Fixed => 2,
+            Place::Fixed | Place::Pinned => 2,
         };
         let mut order: Vec<&Shot> = scene.shots.iter().collect();
         order.sort_by_key(|shot| rank(&shot.place));
         let mut shots = Vec::new();
+        let mut lights: Vec<(HWND, Vec<Thumb>)> = Vec::new();
         let mut bare = Vec::new();
         let mut veils: Vec<Veil> = Vec::new();
         if self.paints.is_none() {
@@ -886,6 +971,12 @@ impl View {
             let (cx, cy) = ((shot.rect.left + shot.rect.right) / 2, (shot.rect.top + shot.rect.bottom) / 2);
             let inside = |a: &RECT| cx >= a.left && cx < a.right && cy >= a.top && cy < a.bottom;
             let on = monitors.iter().position(|m| inside(&m.bounds)).unwrap_or(0).min(screens.len() - 1);
+            // A pinned window's light beneath it.
+            let colour = match shot.place { Place::Pinned => Some(AMBER), Place::Row(_) => Some(TEAL), _ => None };
+            let halos: Vec<Thumb> = colour
+                .zip(self.paints.as_ref())
+                .map(|(colour, paints)| (0..LIGHT.len()).filter_map(|_| Thumb::new(&screens[on], paints.hwnd, (screens[on].area.left, screens[on].area.top), Some(colour))).collect())
+                .unwrap_or_default();
             if let Some(mut thumb) = Thumb::new(&screens[on], shot.hwnd, (shot.rect.left, shot.rect.top), None) {
                 if let Place::Cell(row, col) = shot.place {
                     let area = screens[on].area;
@@ -895,8 +986,10 @@ impl View {
                     }
                 }
                 shots.push((thumb, on, shot.place));
+                lights.push((shot.hwnd, halos));
             }
         }
+        let (docked, marks) = put_by(&screens, &shots, lights);
         if veils.is_empty() {
             veils = self.veils(&screens);
         }
@@ -911,6 +1004,8 @@ impl View {
             follow,
             screens,
             shots,
+            docked,
+            marks,
             bare,
             veils,
             leftover,
@@ -954,7 +1049,7 @@ impl View {
             .map(|screen| {
                 let at = (screen.area.left, screen.area.top);
                 Veil {
-                    shades: (0..WALLS).filter_map(|_| Thumb::new(screen, paints.hwnd, at, Some(RECT { left: 0, top: 0, right: 16, bottom: 16 }))).collect(),
+                    shades: (0..WALLS).filter_map(|_| Thumb::new(screen, paints.hwnd, at, Some(BLACK))).collect(),
                 }
             })
             .collect()
@@ -1074,9 +1169,10 @@ impl View {
             Phase::Settling(to, _) => {
                 let (at, mut settled) = session.follow.settle(now);
                 if let Some(quick) = &mut session.quick {
-                    // Until the receded picture is all there is, the quick one settles.
+                    // The picture whole, the slide settles it; receded all
+                    // the way, the strip; part way, both.
                     let seen = quick.look(now, session.follow.aim(), to, session.follow.axis());
-                    if !quick.gone(now) { settled = seen.mix == 0.0 && seen.settled; }
+                    if seen.depth < 1.0 { settled = seen.settled && (seen.depth == 0.0 || settled); }
                     look = Some(seen);
                 }
                 let receded = session.follow.depth();
@@ -1124,14 +1220,14 @@ impl View {
                 Strip { y, along, receded, calm: 0.0, flash: 0.0 }
             }
         };
-        // A quick flick: the moving axis as it slides, whole, as bright as
-        // it is; blending into the receded picture once the hand hesitates.
+        // As sure as the hand is, the moving axis as it slides, whole, as
+        // bright as it is; the less sure, the more the receded picture.
         if let Some(look) = look.filter(|_| !matches!(session.phase, Phase::Arriving(..))) {
-            let keep = 1.0 - look.mix;
+            let keep = 1.0 - look.depth;
             let current = (session.follow.row - session.follow.rows.0) as usize;
             let moving = if look.axis == 0 { strip.along.get_mut(current) } else { Some(&mut strip.y) };
             if let Some(moving) = moving { *moving += (look.at - *moving) * keep; }
-            strip.receded *= look.mix;
+            strip.receded *= look.depth;
             (strip.calm, strip.flash) = (keep, look.flash * keep);
         }
         // The row whose name is shown: the one the hand is on, or the one
@@ -1163,6 +1259,7 @@ impl View {
         }
         if let Some(ink) = &mut self.ink {
             show_banners(ink, session, now);
+            show_docks(ink, session);
         }
         for screen in &session.screens {
             if let Err(e) = crate::composition::commit(screen.hwnd) { crate::app::log(&format!("composition commit failed: {e}")); }
@@ -1179,7 +1276,7 @@ impl View {
                     // Its black at once, not when the loop next takes messages.
                     let _ = RedrawWindow(screen.hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ERASENOW | RDW_UPDATENOW);
                 }
-                for banner in session.screens.iter().filter_map(|screen| screen.banner.as_ref()) {
+                for banner in session.screens.iter().flat_map(|screen| [&screen.banner, &screen.dock]).flatten() {
                     let _ = SetWindowPos(banner.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
                 }
                 for minimap in minimap_windows() {
@@ -1303,6 +1400,80 @@ fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
     }
 }
 
+/// The icons and counts of each screen's pinned windows put by, where
+/// their pictures would be too small, as opaque as they are near their
+/// places: drawn anew only while they move or fade.
+fn show_docks(ink: &mut Ink, session: &mut Session) {
+    let strip = session.shown.clone().unwrap_or_default();
+    let share = strip.receded.clamp(0.0, 1.0);
+    let alpha = opacity(dock::overlay(share));
+    let (marks, farthest_y) = (&session.marks, session.farthest_y);
+    for (index, screen) in session.screens.iter_mut().enumerate() {
+        let (area, scale) = (screen.area, screen.scale);
+        let mine: Vec<&Mark> = marks.iter().filter(|mark| mark.on == index).collect();
+        if mine.is_empty() {
+            // What the hold before put by goes.
+            if let Some(dock) = screen.dock.as_mut().filter(|dock| dock.marked.is_some()) {
+                dock.marked = None;
+                unsafe {
+                    let _ = SetWindowPos(dock.hwnd, None, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+            continue;
+        }
+        if screen.dock.is_none() {
+            screen.dock = Banner::new();
+        }
+        let Some(dock) = &mut screen.dock else { continue };
+        let whole = ((area.right - area.left) as f64, (area.bottom - area.top) as f64);
+        // Each mark up and down with its row, as faint as its row's windows.
+        let placed: Vec<(dock::Edges, f32)> = mine
+            .iter()
+            .map(|mark| match mark.row {
+                Some(row) => {
+                    let down = follow::row_shift(whole.1, row, strip.y, strip.receded, farthest_y);
+                    let (_, shown) = follow::row_window(mark.at, whole, row, strip.y, strip.receded, farthest_y);
+                    let at = mark.at;
+                    ([at[0], at[1] + down, at[2], at[3] + down], shown as f32)
+                }
+                None => (mark.at, 1.0),
+            })
+            .collect();
+        let key: Vec<(i32, u8)> = placed.iter().map(|(at, shown)| (at[1].round() as i32, (shown * 255.0).round() as u8)).collect();
+        if dock.marked.as_ref() == Some(&(key.clone(), alpha)) {
+            continue;
+        }
+        let (all, _) = dock::places(whole, scale as f64);
+        let size = ((all[2] + 24.0 * scale as f64).ceil() as i32, whole.1 as i32);
+        if !dock.dib.as_ref().is_some_and(|dib| dib.size == size) {
+            dock.dib = Dib::new(size).ok();
+            dock.marked = None;
+        }
+        let Some(dib) = &dock.dib else { continue };
+        if dock.marked.as_ref().map(|(key, _)| key) != Some(&key) {
+            let items: Vec<(dock::Edges, f32, &Marked, bool)> = mine.iter().zip(&placed).map(|(mark, (at, shown))| (*at, *shown, &mark.what, mark.row.is_none())).collect();
+            if ink.marks(dib, scale, &items).is_none() {
+                continue;
+            }
+        }
+        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: AC_SRC_ALPHA as u8 };
+        let origin = POINT { x: area.left, y: area.top };
+        let shown = unsafe {
+            UpdateLayeredWindow(dock.hwnd, None, Some(&origin), Some(&SIZE { cx: size.0, cy: size.1 }), dib.dc, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA)
+        };
+        if shown.is_ok() && dock.marked.is_none() {
+            // Above the picture, the minimap above it still.
+            unsafe {
+                let _ = SetWindowPos(dock.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                for minimap in minimap_windows() {
+                    let _ = SetWindowPos(minimap, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                }
+            }
+        }
+        dock.marked = shown.is_ok().then_some((key, alpha));
+    }
+}
+
 /// One desktop in sight: how far from the middle of the screen (sideways,
 /// up and down), and how it stands out (`follow::standing_out`).
 struct Desk {
@@ -1357,6 +1528,54 @@ fn opacity(share: f64) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Where each pinned window of `shots` is put by as the screen recedes,
+/// with its `lights` (by its window), and what the docks show where
+/// pictures would be too small.
+fn put_by(screens: &[Screen], shots: &[(Thumb, usize, Place)], lights: Vec<(HWND, Vec<Thumb>)>) -> (Vec<Option<Docked>>, Vec<Mark>) {
+    let mut spots: Vec<Option<Spot>> = vec![None; shots.len()];
+    let mut marks = Vec::new();
+    // Every shelf's on each screen, and each shelf's own.
+    let mut groups: Vec<((usize, Option<i32>), Vec<usize>)> = Vec::new();
+    for (i, (_, on, place)) in shots.iter().enumerate() {
+        let key = match *place {
+            Place::Pinned => (*on, None),
+            Place::Row(row) => (*on, Some(row)),
+            _ => continue,
+        };
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, at)) => at.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    for ((on, row), at) in groups {
+        let screen = &screens[on];
+        let size = ((screen.area.right - screen.area.left) as f64, (screen.area.bottom - screen.area.top) as f64);
+        let (all, own) = dock::places(size, screen.scale as f64);
+        // The topmost first: the bottom ones are folded into the count.
+        let order: Vec<usize> = at.into_iter().rev().collect();
+        let frames: Vec<dock::Edges> = order.iter().map(|&i| shots[i].0.edges()).collect();
+        let place = dock::fill(if row.is_none() { all } else { own }, &frames, screen.scale as f64);
+        for (&i, spot) in order.iter().zip(place.spots) {
+            if let Spot::Icon(at) = spot {
+                let side = ((at[2] - at[0]).round() as i32).max(1);
+                if let Some(pixels) = crate::board::icon_pixels(lights[i].0, side) {
+                    marks.push(Mark { on, row, at, what: Marked::Icon(pixels, side) });
+                }
+            }
+            spots[i] = Some(spot);
+        }
+        if let Some((at, n)) = place.more {
+            marks.push(Mark { on, row, at, what: Marked::More(n) });
+        }
+    }
+    let docked = lights.into_iter().zip(spots).map(|((_, halos), spot)| spot.map(|spot| Docked { spot, halos })).collect();
+    (docked, marks)
+}
+
+/// How far out each step of a pinned window's light goes (unscaled), and
+/// how opaque it is.
+const LIGHT: [(f64, f64); 3] = [(2.0, 0.30), (6.0, 0.15), (12.0, 0.07)];
+
 /// Draws every thumbnail of `session` for `strip`; how many moved.
 fn draw(session: &mut Session, strip: &Strip) -> u32 {
     let mut moved = 0;
@@ -1389,20 +1608,48 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
             moved += thumb.draw(None, size, 0) as u32;
         }
     }
-    for (thumb, on, place) in &mut session.shots {
-        let area = session.screens[*on].area;
+    // Pinned windows go to their places at the edge as far as the screen
+    // has receded, and back as it comes forward.
+    let share = strip.receded.clamp(0.0, 1.0);
+    for (index, (thumb, on, place)) in session.shots.iter_mut().enumerate() {
+        let screen = &session.screens[*on];
+        let area = screen.area;
         let size = (area.right - area.left, area.bottom - area.top);
         let whole = (size.0 as f64, size.1 as f64);
         let edges = thumb.edges();
-        let (at, shown) = match *place {
-            Place::Cell(row, col) => {
+        let docked = session.docked.get_mut(index).and_then(Option::as_mut);
+        let (at, shown, lit) = match (*place, docked) {
+            (Place::Cell(row, col), _) => {
                 let apart = (col as f64 - strip.along(rows, row), row as f64 - strip.y);
                 let (lift, _) = follow::standing_out(session.focus.at(col, row), strip.receded);
-                (follow::placed(edges, whole, scale, apart, lift), 1.0)
+                (follow::placed(edges, whole, scale, apart, lift), 1.0, None)
             }
-            Place::Row(row) => follow::row_window(edges, whole, row, strip.y, strip.receded, session.farthest_y),
-            Place::Fixed => (edges, 1.0),
+            (Place::Row(row), docked) => {
+                let (real, shown) = follow::row_window(edges, whole, row, strip.y, strip.receded, session.farthest_y);
+                match docked {
+                    Some(docked) => {
+                        // Up and down with its row, at the edge.
+                        let down = follow::row_shift(whole.1, row, strip.y, strip.receded, session.farthest_y);
+                        let (at, keep) = dock::at(real, docked.spot.moved(down), share);
+                        (at, shown * keep, Some((docked, shown, keep)))
+                    }
+                    None => (real, shown, None),
+                }
+            }
+            (Place::Pinned, Some(docked)) => {
+                let (at, keep) = dock::at(edges, docked.spot, share);
+                (at, keep, Some((docked, 1.0, keep)))
+            }
+            (Place::Pinned | Place::Fixed, _) => (edges, 1.0, None),
         };
+        // Its light, as it goes to its place: the colour of its pin.
+        if let Some((docked, shown, keep)) = lit {
+            let lit = share * shown * if matches!(docked.spot, Spot::Preview(_)) { 1.0 } else { keep };
+            for (halo, (out, alpha)) in docked.halos.iter_mut().zip(LIGHT) {
+                let out = out * screen.scale as f64;
+                moved += halo.draw(Some([at[0] - out, at[1] - out, at[2] + out, at[3] + out]), size, opacity(alpha * lit)) as u32;
+            }
+        }
         moved += thumb.draw(Some(at), size, opacity(shown)) as u32;
     }
     moved
