@@ -853,8 +853,8 @@ pub unsafe fn onset(out: &Path, flick: &str) {
     let mut report = format!("width {width}, frames {}\n", frames.len());
     let (mut sums, mut counts): (std::collections::BTreeMap<&str, [f64; 7]>, std::collections::BTreeMap<&str, f64>) = Default::default();
     for (i, hold) in holds.iter().enumerate() {
-        // At rest on the middle desktop: its cyan, none of the yellow beside it.
-        let before: Vec<_> = frames.iter().filter(|f| f.0 < hold.press && f.1[1].4 >= 32 && f.1[2].4 < 32).collect();
+        // At rest on the middle desktop: its cyan whole, well in from the edge.
+        let before: Vec<_> = frames.iter().filter(|f| f.0 < hold.press && f.1[1].4 >= 32 && f.1[1].0 > 100).collect();
         let Some(rest) = before.last() else { report += &format!("{i} {}: no resting frame\n", hold.label); continue };
         let x0 = (rest.1[1].0 as f64, rest.1[1].2 as f64);
         // Before the desktop is switched back for the next.

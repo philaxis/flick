@@ -337,16 +337,17 @@ impl Follow {
         (self.columns[(self.row - self.rows.0) as usize].cell, self.row)
     }
     /// Let go of `at` as a sure hand is (`quick`): to the cell nearest where
-    /// it is (`held`) and `coast` farther, not the latches' next.
+    /// it is (`held`) and `coast` farther, not the latches' next, but never
+    /// past the cells either side of the hand: a flick does not skip a cell.
     pub fn let_go_near(&mut self, now: f64, at: (f64, f64), coast: (f64, f64)) -> (i32, i32) {
         self.track_locked(now, at, self.axis);
         let (x, y) = self.held();
         let i = (self.row - self.rows.0) as usize;
         if self.axis == 0 {
             let (left, right) = self.cols[i];
-            self.columns[i].cell = ((x + coast.0).round() as i32).clamp(left, right);
+            self.columns[i].cell = (near(x, coast.0) as i32).clamp(left, right);
         } else {
-            let row = ((y + coast.1).round() as i32).clamp(self.rows.0, self.rows.1);
+            let row = (near(y, coast.1) as i32).clamp(self.rows.0, self.rows.1);
             if row != self.row {
                 (self.rows_hand.cell, self.row) = (row, row);
                 self.columns[(row - self.rows.0) as usize].rebase(at.0);
@@ -369,6 +370,11 @@ impl Follow {
         frame
     }
 
+}
+
+/// The cell nearest `at` gone `coast` farther, of the two either side of `at`.
+fn near(at: f64, coast: f64) -> f64 {
+    (at + coast).round().clamp(at.floor(), at.ceil())
 }
 
 /// A short visual prediction; stale, stationary, reversed, or changed-axis input is not predicted.

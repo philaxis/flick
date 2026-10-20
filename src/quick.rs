@@ -536,6 +536,10 @@ mod tests {
         let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
         hand.track_locked(0.0, (0.4, 0.0), 0);
         assert_eq!(hand.let_go_near(0.01, (0.4, 0.0), (0.0, 0.0)), (0, 0));
+        // Coasting far, no farther than the cell beyond the hand.
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
+        hand.track_locked(0.0, (0.9, 0.0), 0);
+        assert_eq!(hand.let_go_near(0.01, (0.9, 0.0), (COAST_MOST, 0.0)), (1, 0));
         // At the row's end, held there.
         let mut hand = crate::follow::Follow::new((0, 0), vec![(-1, 0)]);
         hand.track_locked(0.0, (0.3, 0.0), 0);
