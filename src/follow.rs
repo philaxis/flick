@@ -39,10 +39,49 @@ fn row_join(row: i32, farthest_y: f64) -> f64 {
     if row == 0 { (farthest_y / ROW_WINDOWS_JOIN).min(1.0) } else { 1.0 }
 }
 
-/// How far down a shelf follower put by at the edge goes with its row
-/// (`row_window`'s way up and down, its size kept), on a screen `h` down.
-pub fn row_shift(h: f64, row: i32, y: f64, depth: f64, farthest_y: f64) -> f64 {
-    row_join(row, farthest_y) * (row as f64 - y) * h * (1.0 + GAP) * scale(depth)
+/// A pinned window left where it is as the screen recedes hides the
+/// receded desktops: one larger than `TUCK.0` of the screen, or over more
+/// than `TUCK.1` of the middle desktop receded all the way (half the
+/// screen across and down, about its middle), goes smaller about its own
+/// middle until it is neither, to `TUCK.2` of its size at least.
+pub const TUCK: (f64, f64, f64) = (0.2, 0.25, 0.4);
+
+/// How large (of its size) a pinned window of `frame` (left, top, right,
+/// bottom on a screen `size` across and down) is with the screen receded
+/// all the way (`TUCK`); a small one, as it is.
+pub fn tuck(frame: [f64; 4], size: (f64, f64)) -> f64 {
+    let (w, h) = size;
+    let middle = [w / 4.0, h / 4.0, 3.0 * w / 4.0, 3.0 * h / 4.0];
+    let area = |r: [f64; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
+    let over = |r: [f64; 4]| area([r[0].max(middle[0]), r[1].max(middle[1]), r[2].min(middle[2]), r[3].min(middle[3])]);
+    let hides = |k: f64| {
+        let r = sized(frame, k);
+        area(r) > TUCK.0 * w * h || over(r) > TUCK.1 * area(middle)
+    };
+    if w <= 0.0 || h <= 0.0 || !hides(1.0) { return 1.0; }
+    if hides(TUCK.2) { return TUCK.2; }
+    // Smaller about its middle, it hides less and less: the largest that does not.
+    let (mut small, mut large) = (TUCK.2, 1.0);
+    for _ in 0..24 {
+        let k = (small + large) / 2.0;
+        if hides(k) { large = k } else { small = k }
+    }
+    small
+}
+
+/// `frame` `k` times as large about its middle.
+fn sized(frame: [f64; 4], k: f64) -> [f64; 4] {
+    let (cx, cy) = ((frame[0] + frame[2]) / 2.0, (frame[1] + frame[3]) / 2.0);
+    let (hw, hh) = ((frame[2] - frame[0]) * k / 2.0, (frame[3] - frame[1]) * k / 2.0);
+    [cx - hw, cy - hh, cx + hw, cy + hh]
+}
+
+/// Where a pinned window of `frame` is drawn, the screen receded `depth`:
+/// where it is, as much smaller as it is receded (`tuck`).
+pub fn tucked(frame: [f64; 4], size: (f64, f64), depth: f64) -> [f64; 4] {
+    let depth = depth.clamp(0.0, 1.0);
+    if depth == 0.0 { return frame; }
+    sized(frame, 1.0 - (1.0 - tuck(frame, size)) * depth)
 }
 
 /// Selection weights follow their own springs, independent of the hand's lean.
@@ -346,6 +385,33 @@ mod tests {
             for (a, b) in leaving.0.into_iter().zip(returning.0) { assert!((a - b).abs() < 1e-9); }
             assert!((leaving.1 - returning.1).abs() < 1e-9);
         }
+    }
+    #[test]
+    fn a_pinned_window_stays_where_it_is_smaller_only_if_it_hides_much() {
+        let size = (1920.0, 1080.0);
+        // Small, and out of the middle: as it is, however far receded.
+        let small = [100.0, 100.0, 500.0, 400.0];
+        assert_eq!(tuck(small, size), 1.0);
+        assert_eq!(tucked(small, size, 1.0), small);
+        // Large: smaller about its own middle, as far as it is receded, to 40% at least.
+        let large = [200.0, 100.0, 1700.0, 1000.0];
+        let k = tuck(large, size);
+        assert!((TUCK.2..0.5).contains(&k), "{k}");
+        assert_eq!(tucked(large, size, 0.0), large);
+        let half = tucked(large, size, 0.5);
+        let mid = |r: [f64; 4]| ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+        assert!((mid(half).0 - mid(large).0).abs() < 1e-9 && (mid(half).1 - mid(large).1).abs() < 1e-9);
+        assert!(((half[2] - half[0]) / 1500.0 - (1.0 - (1.0 - k) / 2.0)).abs() < 1e-9);
+        let all = tucked(large, size, 1.0);
+        assert!(((all[2] - all[0]) / 1500.0 - k).abs() < 1e-9);
+        // Not large but over the middle desktop: smaller until it hides little of it.
+        let centred = [660.0, 340.0, 1260.0, 740.0];
+        let k = tuck(centred, size);
+        assert!(k < 1.0 && k > TUCK.2, "{k}");
+        let r = sized(centred, k);
+        assert!(((r[2] - r[0]) * (r[3] - r[1]) / (960.0 * 540.0) - TUCK.1).abs() < 1e-3);
+        // The whole screen: 40%.
+        assert_eq!(tuck([0.0, 0.0, 1920.0, 1080.0], size), TUCK.2);
     }
     #[test]
     fn preparing_the_first_picture_does_not_spend_the_dead_zone_zooming() {
