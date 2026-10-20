@@ -216,22 +216,34 @@ function icon(g, app, x, y, k) {
   fill(g, x, y, k, k, k * .24, TONE[app]);
 }
 
-/* ---------- the loop: hold, flick right, right, down, let go; tap for the board; back again ---------- */
+/* ---------- the loop: every desktop and every shelf, no move made twice the same way ----------
+   A flick with the button up slides the screens full size; held, they recede and the hand drags them.
+   The writing shelf's references stay put while that shelf's desktops slide under them, and leave with it. */
 const SCRIPT = [
-  [.15, h => h.press()],
-  [.45, h => h.drag(1, 0)],
-  [.85, h => h.drag(1, 0)],
-  [1.4, h => h.drag(0, 1)],
-  [2.0, h => h.release()],
-  [2.75, h => h.tap()],
-  [5.2, h => h.tap()],
-  [5.75, h => h.press()],
-  [6.05, h => h.drag(0, -1)],
-  [6.6, h => h.drag(-1, 0)],
-  [7.0, h => h.drag(-1, 0)],
-  [7.5, h => h.release()],
+  [.4, h => h.drag(1, 0)],                       // a quick flick: building, to the preview
+  [2.2, h => h.drag(1, 0)],                      // and on to the project folder
+  [3.9, h => h.press()],                         // held: the shelves recede
+  [4.3, h => h.drag(0, 1)],                      // down to the writing shelf, its references with it
+  [5.1, h => h.drag(1, 0)],                      // the desktops slide; the references stay
+  [5.9, h => h.drag(-1, 0)],                     // and back
+  [6.6, h => h.release()],
+  [8.1, h => h.tap()],                           // the board: what is pinned where
+  [11.0, h => h.tap()],
+  [12.0, h => h.drag(1, 0)],                     // full size: the chart slides in, the references stay
+  [13.8, h => h.press()],
+  [14.2, h => h.drag(0, 1)],                     // down to the team's shelf: the references go with theirs
+  [15.0, h => h.drag(1, 0)],
+  [15.7, h => h.release()],
+  [17.6, h => h.drag(-1, 0)],                    // a quick flick back to the chat
+  [19.4, h => h.drag(0, -1)],                    // up, full size: the references come back
+  [21.0, h => h.drag(-1, 0)],
+  [22.7, h => h.press()],
+  [23.1, h => h.drag(0, -1)],                    // up to building, then two desktops along it
+  [23.8, h => h.drag(-1, 0)],
+  [24.3, h => h.drag(-1, 0)],
+  [25.0, h => h.release()],
 ];
-const LOOP = 8.6;
+const LOOP = 27.5;
 /* Springs, a little under-damped: quick to go, a few per cent past, quick to settle. */
 const MOVE = { w: 24, z: .74 }, DEPTH = { w: 22, z: .7 }, BOARD = { w: 20, z: .72 };
 function spring(s, to, dt, { w, z }) {
@@ -248,7 +260,7 @@ class Hero {
     this.t = 0; this.si = 0;
     this.row = 0; this.col = 0; this.last = SHELVES.map(() => 0);
     this.sx = { p: 0, v: 0 }; this.sy = { p: 0, v: 0 }; this.tx = 0; this.ty = 0;   // where the strip is: column on the current shelf, and shelf
-    this.held = false; this.depth = { p: 0, v: 0 };
+    this.held = false; this.depth = { p: 0, v: 0 }; this.arrived = -9;   // when the pinned shelf was last come to
     this.board = { open: false, s: { p: 0, v: 0 } };
   }
   get x() { return this.sx.p; }
@@ -282,7 +294,7 @@ class Hero {
     /* The strip springs to where the hand sent it; the desktop it is nearest is the one chosen. */
     spring(this.sy, this.ty, dt, MOVE);
     const row = clamp(Math.round(this.y), 0, SHELVES.length - 1);
-    if (row !== this.row) { this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
+    if (row !== this.row) { if (row === PINNED_ROW.row) this.arrived = this.t; this.last[this.row] = this.col; this.row = row; this.col = this.last[row]; this.tx = this.col; this.sx = { p: this.col, v: 0 }; }
     spring(this.sx, this.tx, dt, MOVE);
     this.col = clamp(Math.round(this.x), 0, SHELVES[this.row].length - 1);
     /* Held, the screen recedes; let go, the chosen desktop comes forward. */
@@ -333,15 +345,18 @@ class Hero {
       if (p.dark > 0) { g.fillStyle = `rgba(0,0,0,${p.dark})`; g.fillRect(p.x, p.y, w, h); }
     }));
     /* Pinned windows stay where they are sideways; those of a shelf go up and down with it. */
-    const pinned = (win, ay) => {
-      const p = this.place(0, ay), [x, y, w, h] = this.onStage(win.r);
+    /* Each with its pin's light round it, no box: teal for this shelf, brighter as the shelf is come to; amber for every shelf. */
+    const pinned = (win, ay, colour, a) => {
+      const p = this.place(0, ay), [x, y, w, h] = this.onStage(win.r), s = sc;
       g.save(); g.translate(p.x, p.y); g.scale(p.k, p.k);
+      const lit = colour(clamp(a, 0, 1) * clamp(1 - Math.abs(ay), 0, 1));
+      glow(g, x - 10 * s, y - 10 * s, w + 20 * s, h + 20 * s, 18 * s, 90 * s, lit); glow(g, x - 3 * s, y - 3 * s, w + 6 * s, h + 6 * s, 10 * s, 28 * s, lit);
       this.paintShot(g, win, win, x, y, w, h, 1);
       if (p.dark > 0) fill(g, x, y, w, h, 8 * sc, `rgba(0,0,0,${p.dark})`);
       g.restore();
     };
-    if (Math.abs(PINNED_ROW.row - this.y) < 1.5) pinned(PINNED_ROW, PINNED_ROW.row - this.y);
-    pinned(PINNED_ALL, 0);
+    if (Math.abs(PINNED_ROW.row - this.y) < 1.5) pinned(PINNED_ROW, PINNED_ROW.row - this.y, onRow, .55 + .45 * Math.exp(-(this.t - this.arrived) / 1.2));
+    pinned(PINNED_ALL, 0, everywhere, .42);
     if (this.receded > .01) this.drawBanner();
   }
   /* glide.rs Banner: the shelf's name in a pill above the picture, the names sliding as the shelf changes. */
