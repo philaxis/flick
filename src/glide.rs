@@ -25,7 +25,7 @@
 
 use crate::{
     follow::{self, Follow, Label, Linger, Name, Step},
-    paint::{self, rgba, white, DcTarget, Dib, Painter},
+    paint::{self, rgba, white, DcTarget, Dib, Glow, Painter},
 };
 use std::{
     io::Write,
@@ -385,12 +385,11 @@ impl Paints {
     /// Where the light of what is pinned to every shelf (`all`) or to its
     /// shelf is, a little apart from the rest so none of it bleeds in.
     fn lamp(all: bool) -> (i32, i32) {
-        if all { (WHITE.right + 2, 0) } else { (WHITE.right + 2 + Lamp::of(true).size().0 + 2, 0) }
+        if all { (WHITE.right + 2, 0) } else { (WHITE.right + 2 + Lamp::size().0 + 2, 0) }
     }
 
     fn size() -> (i32, i32) {
-        let (row, all) = (Lamp::of(false).size(), Lamp::of(true).size());
-        (Self::lamp(false).0 + row.0, all.1.max(row.1).max(BLACK.bottom))
+        (Self::lamp(false).0 + Lamp::size().0, Lamp::size().1.max(BLACK.bottom))
     }
 
     /// Its pixels, row by row, worked out once: the lights' blur is
@@ -409,12 +408,14 @@ impl Paints {
                 }
             }
             for all in [true, false] {
-                let (lamp, (left, top)) = (Lamp::of(all), Self::lamp(all));
-                let width = lamp.size().0 as usize;
-                let light = paint::premultiplied(&lamp.mask(), if all { paint::PIN_ALL.0 } else { paint::PIN_ROW.0 }, 1.0);
-                for (y, line) in light.chunks_exact(width * 4).enumerate() {
-                    let row = ((top as usize + y) * size.0 as usize + left as usize) * 4;
-                    pixels[row..row + width * 4].copy_from_slice(line);
+                let (left, top) = Self::lamp(all);
+                for (square, mask) in Lamp::masks(all).iter().enumerate() {
+                    let left = left + square as i32 * Lamp::APART;
+                    let light = paint::premultiplied(mask, if all { paint::PIN_ALL.0 } else { paint::PIN_ROW.0 }, 1.0);
+                    for (y, line) in light.chunks_exact(Glow::SIZE * 4).enumerate() {
+                        let row = ((top as usize + y) * size.0 as usize + left as usize) * 4;
+                        pixels[row..row + Glow::SIZE * 4].copy_from_slice(line);
+                    }
                 }
             }
             pixels
@@ -732,7 +733,7 @@ struct Session {
     /// picture of its window it is.
     shots: Vec<(Thumb, usize, Place, Layer)>,
     /// As `shots`: each pinned one's light beneath it, `paint::PIN_ALL`
-    /// pinned to every shelf, `PIN_ROW` to its own (`LIGHT`).
+    /// pinned to every shelf, `PIN_ROW` to its own (`Lamp`).
     halos: Vec<Vec<Thumb>>,
     /// The desktops (screen, row and cell) a window covers the whole of
     /// (`covering`): their wallpaper is not drawn, to show at its edges.
@@ -1077,12 +1078,13 @@ impl View {
                 .zip(self.paints.as_ref())
                 .map(|(all, paints)| {
                     let (left, top) = Paints::lamp(all);
-                    let parts = Lamp::of(all).sources();
+                    // What of it each part shows is the same wherever it goes.
+                    let parts = Lamp::parts([0.0, 0.0, 1.0, 1.0], 1.0, all);
                     let source = |r: RECT| RECT { left: r.left + left, top: r.top + top, right: r.right + left, bottom: r.bottom + top };
-                    parts.into_iter().filter_map(|part| Thumb::new(&screens[on], paints.hwnd, (screens[on].area.left, screens[on].area.top), Some(source(part)))).collect::<Vec<_>>()
+                    parts.iter().filter_map(|part| Thumb::new(&screens[on], paints.hwnd, (screens[on].area.left, screens[on].area.top), Some(source(part.source)))).collect::<Vec<_>>()
                 })
                 // All its parts or none.
-                .filter(|parts| parts.len() == 8)
+                .filter(|parts| parts.len() == LAMP_PARTS)
                 .unwrap_or_default();
             if let Some(mut thumb) = Thumb::new(&screens[on], shot.hwnd, (shot.rect.left, shot.rect.top), None) {
                 let mut covered = false;
@@ -1624,92 +1626,63 @@ fn opacity(share: f64) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// How far out a pinned window's light goes (unscaled, at
-/// `paint::PIN_ALL_REACH`): to the sides, above and below it, farthest
-/// below, as a lamp under it would.
-const LIGHT: (f32, f32, f32) = (38.0, 16.0, 80.0);
-/// How round a window's frame is at its corners (unscaled).
-const FRAME_CORNER: f32 = 8.0;
+/// The light about a pinned window, cast as the board casts it
+/// (`paint::pin_glows`) from two squares of `Glow`'s blur made once in
+/// `Paints`: its pool below it in the nine parts the board draws it in
+/// (`paint::glow_parts`), only what is below the frame shown, then its
+/// faint light all round in eight, the frame's inside left out of its
+/// square, so none of it shows through a window seen through.
+struct Lamp;
 
-/// The light about a pinned window, out of its frame only, so none of it
-/// shows through a window seen through: one smooth blur, made once in
-/// `Paints` and drawn in eight parts (its corners and its sides, the
-/// frame's inside left out) stretched along each side of the window.
+/// One of a lamp's parts: where it goes and what of it shows there, what
+/// of the lamp's squares it shows, and how much of its pin's light.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Lamp {
-    /// How far out it goes, to the sides, above and below.
-    side: i32,
-    above: i32,
-    below: i32,
-    /// How far into the frame each corner part reaches, across and down:
-    /// past its round corner and far enough that the light along the
-    /// middle of each side no longer changes.
-    inner: (i32, i32),
+struct Part {
+    dest: [f64; 4],
+    clip: Option<[f64; 4]>,
+    source: RECT,
+    share: f64,
 }
+
+/// How many parts a lamp is drawn in.
+const LAMP_PARTS: usize = 17;
 
 impl Lamp {
-    /// To every shelf (`all`) or to its own, as far as `paint::pin_light` says.
-    fn of(all: bool) -> Lamp {
+    /// Where its second square begins, a little apart from the first.
+    const APART: i32 = Glow::SIZE as i32 + 2;
+
+    fn size() -> (i32, i32) {
+        (Self::APART + Glow::SIZE as i32, Glow::SIZE as i32)
+    }
+
+    /// How opaque each pixel of its squares is, the pool's and the round
+    /// one's, to every shelf (`all`) or to its own: the round one with
+    /// the frame left out, its corners as round as the board's.
+    fn masks(all: bool) -> [Vec<f32>; 2] {
         let reach = paint::pin_light(all).1;
-        let (side, above, below) = (LIGHT.0 * reach, LIGHT.1 * reach, LIGHT.2 * reach);
-        let inner = ((FRAME_CORNER + side).ceil() as i32, (FRAME_CORNER + above.max(below)).ceil() as i32);
-        Lamp { side: side.ceil() as i32, above: above.ceil() as i32, below: below.ceil() as i32, inner }
+        [Glow::mask(None), Glow::mask(Some(paint::PIN_FRAME * Glow::CORNER / (paint::PIN_ROUND.0 * reach)))]
     }
 
-    fn size(&self) -> (i32, i32) {
-        (2 * (self.side + self.inner.0) + 2, self.above + self.below + 2 * self.inner.1 + 2)
-    }
-
-    /// How opaque each of its pixels is, row by row: the frame within, a
-    /// third of each way out a Gaussian's deviation, blurred and left out.
-    /// Half the light at the frame's edge is drawn three quarters opaque,
-    /// fading smoothly to none.
-    fn mask(&self) -> Vec<f32> {
-        let (w, h) = self.size();
-        let frame = [self.side as f32, self.above as f32, (w - self.side) as f32, (h - self.below) as f32];
-        let within: Vec<f32> = (0..(w * h) as usize).map(|i| paint::covered(frame, FRAME_CORNER, (i % w as usize) as f32 + 0.5, (i / w as usize) as f32 + 0.5)).collect();
-        let mut light = within.clone();
-        let (side, above, below) = (self.side as f32 / 3.0, self.above as f32 / 3.0, self.below as f32 / 3.0);
-        paint::spread(&mut light, w as usize, [side, side], [above, below]);
-        light.iter().zip(&within).map(|(l, inside)| (1.0 - inside) * (1.0 - (1.0 - l) * (1.0 - l))).collect()
-    }
-
-    /// Where each part's columns and rows begin and end in it, with each
-    /// corner part `inner` (or less) into the frame.
-    fn cuts(&self, inner: (i32, i32)) -> ([i32; 4], [i32; 4]) {
-        let (w, h) = self.size();
-        ([0, self.side + inner.0, w - self.side - inner.0, w], [0, self.above + inner.1, h - self.below - inner.1, h])
-    }
-
-    /// What of it each part shows, the middle left out.
-    fn sources(&self) -> [RECT; 8] {
-        let (xs, ys) = self.cuts(self.inner);
-        parts().map(|(c, r)| RECT { left: xs[c], top: ys[r], right: xs[c + 1], bottom: ys[r + 1] })
-    }
-
-    /// Where each part goes about a window at `at`, `k` times its size,
-    /// and what of it it shows, the same as `sources` unless the window
-    /// is too small for its corners, whose parts then reach in only half
-    /// way. Whole pixels, so no part leaves a gap or overlaps the next.
-    fn placed(&self, at: [f64; 4], k: f64) -> [(Option<[f64; 4]>, RECT); 8] {
-        let half = |a: f64, b: f64, most: i32| (((b - a) / 2.0 / k).floor() as i32).clamp(0, most);
-        let inner = (half(at[0], at[2], self.inner.0), half(at[1], at[3], self.inner.1));
-        let (xs, ys) = self.cuts(inner);
-        let (ix, iy) = (inner.0 as f64 * k, inner.1 as f64 * k);
-        let dx = [at[0] - self.side as f64 * k, at[0] + ix, at[2] - ix, at[2] + self.side as f64 * k].map(f64::round);
-        let dy = [at[1] - self.above as f64 * k, at[1] + iy, at[3] - iy, at[3] + self.below as f64 * k].map(f64::round);
-        parts().map(|(c, r)| {
-            let dest = [dx[c], dy[r], dx[c + 1], dy[r + 1]];
-            let shown = dest[2] > dest[0] && dest[3] > dest[1] && xs[c + 1] > xs[c] && ys[r + 1] > ys[r];
-            (shown.then_some(dest), RECT { left: xs[c], top: ys[r], right: xs[c + 1], bottom: ys[r + 1] })
-        })
+    /// Its parts about a window at `at`, `k` times their size, the pool
+    /// first: in whole pixels, so none leaves a gap or overlaps the next.
+    fn parts(at: [f64; 4], k: f64, all: bool) -> Vec<Part> {
+        let body = paint::Rect { left: at[0] as f32, top: at[1] as f32, right: at[2] as f32, bottom: at[3] as f32 };
+        let [(under, below, pool), (round, about, faint)] = paint::pin_glows(&body, k as f32, all);
+        let whole = |r: paint::Rect| [r.left, r.top, r.right, r.bottom].map(|v| (v as f64).round());
+        let source = |r: paint::Rect, square: i32| {
+            let left = square * Self::APART;
+            RECT { left: left + r.left as i32, top: r.top as i32, right: left + r.right as i32, bottom: r.bottom as i32 }
+        };
+        let pool = paint::glow_parts(&under, below).map(|(dest, from)| {
+            let dest = whole(dest);
+            Part { dest, clip: Some([dest[0], at[3], dest[2], dest[3]]), source: source(from, 0), share: pool as f64 }
+        });
+        let round = paint::glow_parts(&round, about).map(|(dest, from)| Part { dest: whole(dest), clip: None, source: source(from, 1), share: faint as f64 });
+        // The round one's middle is all within the frame.
+        pool.into_iter().chain(round.into_iter().enumerate().filter(|(i, _)| *i != 4).map(|(_, part)| part)).collect()
     }
 }
 
-/// The column and row of each of a lamp's parts, all but the middle.
-fn parts() -> [(usize, usize); 8] {
-    [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (1, 2), (2, 2)]
-}
 /// How long (s) the light comes in as the picture shows, and goes as it settles.
 const LIGHT_FADE: f64 = 0.08;
 
@@ -1772,15 +1745,8 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
         let (shown, light) = layered(*layer, shown, share);
         if let Some(all) = lit {
             let (strength, _) = paint::pin_light(all);
-            let (left, top) = Paints::lamp(all);
-            for (halo, (dest, source)) in session.halos[index].iter_mut().zip(Lamp::of(all).placed(at, screen.scale as f64)) {
-                let source = RECT { left: source.left + left, top: source.top + top, right: source.right + left, bottom: source.bottom + top };
-                if halo.source != Some(source) {
-                    halo.source = Some(source);
-                    // Drawn anew, even where it was.
-                    halo.drawn = Some((RECT::default(), 0, None));
-                }
-                moved += halo.draw(dest, size, opacity(strength as f64 * light * strip.lit)) as u32;
+            for (halo, part) in session.halos[index].iter_mut().zip(Lamp::parts(at, screen.scale as f64, all)) {
+                moved += halo.draw_within(Some(part.dest), part.clip, size, opacity(strength as f64 * part.share * light * strip.lit)) as u32;
             }
         }
         // What of it is off its screen stays out of sight, the screen's edges
@@ -1835,78 +1801,54 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_windows_light_is_one_smooth_blur_out_of_its_frame_only() {
-        for all in [true, false] {
-            let lamp = Lamp::of(all);
-            let (w, h) = lamp.size();
-            let mask = lamp.mask();
-            let at = |x: i32, y: i32| mask[(y * w + x) as usize];
-            let (mid_x, mid_y) = (w / 2, lamp.above + lamp.inner.1 / 2);
-            // None within the frame, its round corners too, nor at its edges.
-            assert_eq!(at(w / 2, h / 2), 0.0);
-            assert_eq!(at(lamp.side + 3, lamp.above + 3), 0.0);
-            assert!(at(0, 0) < 1.0 / 255.0 && at(w - 1, h - 1) < 1.0 / 255.0 && at(mid_x, 0) < 1.0 / 255.0);
-            // About three quarters just out of the frame, all round.
-            for edge in [at(mid_x, lamp.above - 1), at(mid_x, h - lamp.below), at(lamp.side - 1, mid_y), at(w - lamp.side, mid_y)] {
-                assert!((0.6..0.85).contains(&edge), "{edge}");
+    fn a_pinned_windows_light_is_cast_as_the_boards() {
+        let at = [100.3, 200.7, 900.2, 700.6];
+        let (w, h) = (at[2] - at[0], at[3] - at[1]);
+        let near = |a: f64, b: f64| (a - b).abs() <= 0.5 + 1e-3;
+        let mut farthest = Vec::new();
+        for (all, k) in [(true, 1.25), (false, 1.25)] {
+            let parts = Lamp::parts(at, k, all);
+            assert_eq!(parts.len(), LAMP_PARTS);
+            let reach = paint::pin_light(all).1 as f64 * k;
+            let (pool, round) = parts.split_at(9);
+            // The pool as the board's: in from the sides by 4% of the
+            // window, from 30% of it up within it to PIN_BELOW below it,
+            // spreading 30/44 of its corners past that; only what is below
+            // the frame shown, at nearly all its light.
+            let spread = |corner: f32| corner as f64 * reach * 30.0 / 44.0;
+            let out = spread(paint::PIN_BELOW.0);
+            assert!(near(pool[0].dest[0], at[0] + w * 0.04 - out) && near(pool[8].dest[2], at[2] - w * 0.04 + out));
+            assert!(near(pool[0].dest[1], at[3] - h * 0.30 - out));
+            assert!(near(pool[8].dest[3], at[3] + paint::PIN_BELOW.1 as f64 * reach + out));
+            assert!(pool.iter().all(|part| part.clip.unwrap()[1] == at[3] && part.share == paint::PIN_BELOW.2 as f64));
+            // Faint all round, out as far as the board's.
+            let out = spread(paint::PIN_ROUND.0);
+            assert!(near(round[0].dest[0], at[0] - out) && near(round[0].dest[1], at[1] - out) && near(round[7].dest[3], at[3] + out));
+            assert!(round.iter().all(|part| part.clip.is_none() && part.share == paint::PIN_ROUND.1 as f64));
+            // Most below it: farther than all round, many times.
+            assert!(pool[8].dest[3] - at[3] > 3.0 * (round[7].dest[3] - at[3]));
+            // Each part ends where the next begins, in whole pixels.
+            for row in [&pool[..3], &pool[3..6], &pool[6..]] {
+                assert!(row.windows(2).all(|pair| pair[0].dest[2] == pair[1].dest[0]));
             }
-            // Out of the frame's round corner, a little.
-            assert!(at(lamp.side + 1, lamp.above + 1) > 0.2);
-            // Farthest below, then to the sides, least above.
-            let (below, side, above) = (at(mid_x, h - lamp.below + 8), at(lamp.side - 9, mid_y), at(mid_x, lamp.above - 9));
-            assert!(below > side && side > above, "{below} {side} {above}");
-            // Fading smoothly, no steps, every way out.
-            let lines: [Vec<f32>; 3] = [
-                (0..lamp.above).rev().map(|y| at(mid_x, y)).collect(),
-                (h - lamp.below..h).map(|y| at(mid_x, y)).collect(),
-                (0..lamp.side).rev().map(|x| at(x, mid_y)).collect(),
-            ];
-            for line in lines {
-                for pair in line.windows(2) {
-                    assert!(pair[1] <= pair[0] && pair[0] - pair[1] < 0.2, "{pair:?}");
-                }
-            }
-            // What the side parts stretch is alike all along.
-            let ([_, x0, x1, _], [_, y0, y1, _]) = lamp.cuts(lamp.inner);
-            for y in 0..h {
-                assert!((at(x0, y) - at(x1 - 1, y)).abs() < 1e-3);
-            }
-            for x in 0..w {
-                assert!((at(x, y0) - at(x, y1 - 1)).abs() < 1e-3);
-            }
+            assert!(parts.iter().flat_map(|part| part.dest).all(|v| v.fract() == 0.0));
+            // Shown from the board's square, the round one's beside it.
+            assert_eq!(pool.iter().map(|part| part.source).collect::<Vec<_>>(), paint::glow_parts(&paint::rect(0.0, 0.0, 1.0, 1.0), 1.0).map(|(_, r)| RECT { left: r.left as i32, top: r.top as i32, right: r.right as i32, bottom: r.bottom as i32 }));
+            assert!(round.iter().all(|part| part.source.left >= Lamp::APART));
+            farthest.push(pool[8].dest[3] - at[3]);
         }
         // To its own shelf, less far.
-        assert!(Lamp::of(false).size().0 < Lamp::of(true).size().0);
-    }
-
-    #[test]
-    fn a_pinned_windows_light_is_drawn_in_parts_that_meet_about_its_frame() {
-        let lamp = Lamp::of(true);
-        let k = 1.25;
-        let at = [100.3, 200.7, 900.2, 700.6];
-        let placed = lamp.placed(at, k);
-        let dest = |i: usize| placed[i].0.unwrap();
-        // Out as far as the light goes, the frame's inside left out.
-        assert_eq!(dest(0)[..2], [(at[0] - lamp.side as f64 * k).round(), (at[1] - lamp.above as f64 * k).round()]);
-        assert_eq!(dest(7)[2..], [(at[2] + lamp.side as f64 * k).round(), (at[3] + lamp.below as f64 * k).round()]);
-        assert_eq!(dest(3)[2], (at[0] + lamp.inner.0 as f64 * k).round());
-        // Each part ends where the next begins, in whole pixels.
-        for (a, b) in [(0, 1), (1, 2), (5, 6), (6, 7)] {
-            assert_eq!(dest(a)[2], dest(b)[0]);
-            assert_eq!((dest(a)[1], dest(a)[3]), (dest(b)[1], dest(b)[3]));
+        assert!(farthest[1] < farthest[0]);
+        // The round square has none of the light within the frame, some just out of it.
+        for all in [true, false] {
+            let [pool, round] = Lamp::masks(all);
+            let (n, inset) = (Glow::SIZE, 30);
+            let at = |mask: &[f32], x: usize, y: usize| mask[y * n + x];
+            assert_eq!(at(&round, n / 2, inset), 0.0);
+            assert_eq!(at(&round, inset + 6, inset + 6), 0.0);
+            assert!(at(&round, n / 2, inset - 1) > 0.3 && at(&round, inset - 1, n / 2) > 0.3);
+            // The pool's the board's own square, whole.
+            assert_eq!(pool, Glow::mask(None));
         }
-        for (a, b) in [(0, 3), (3, 5), (2, 4), (4, 7)] {
-            assert_eq!(dest(a)[3], dest(b)[1]);
-        }
-        assert!(placed.iter().flat_map(|(d, _)| d.unwrap()).all(|v| v.fract() == 0.0));
-        // Shown as made.
-        assert_eq!(placed.map(|(_, source)| source), lamp.sources());
-        // A window too small for the corners: they reach in half way,
-        // showing as much less of the light, and the sides between go.
-        let small = lamp.placed([0.0, 0.0, 40.0, 300.0], 1.0);
-        assert_eq!(small[0].1.right, lamp.side + 20);
-        assert_eq!(small[0].0.unwrap()[2], 20.0);
-        assert_eq!(small[1].0, None);
-        assert_eq!(small[3].0.unwrap()[2], 20.0);
     }
 }

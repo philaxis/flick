@@ -422,26 +422,52 @@ impl<'a> Painter<'a> {
         if opacity <= 0.0 || corner <= 0.0 {
             return;
         }
-        let spread = corner * Glow::INSET / Glow::CORNER;
-        let d = Rect { left: area.left - spread, top: area.top - spread, right: area.right + spread, bottom: area.bottom + spread };
-        // Not narrower than its two corners.
-        let k = corner.min((d.right - d.left) / 2.0).min((d.bottom - d.top) / 2.0);
-        let (c, n) = (Glow::CORNER, Glow::SIZE as f32);
-        let xs = [(d.left, d.left + k, 0.0, c), (d.left + k, d.right - k, c, n - c), (d.right - k, d.right, n - c, n)];
-        let ys = [(d.top, d.top + k, 0.0, c), (d.top + k, d.bottom - k, c, n - c), (d.bottom - k, d.bottom, n - c, n)];
-        for (top, bottom, sy0, sy1) in ys {
-            for (left, right, sx0, sx1) in xs {
-                if right - left < 0.01 || bottom - top < 0.01 {
-                    continue;
-                }
-                let dest = Rect { left, top, right, bottom };
-                let source = Rect { left: sx0, top: sy0, right: sx1, bottom: sy1 };
-                unsafe {
-                    self.target.DrawBitmap(&glow.0, Some(&dest), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&source));
-                }
+        for (dest, source) in glow_parts(area, corner) {
+            if dest.right - dest.left < 0.01 || dest.bottom - dest.top < 0.01 {
+                continue;
+            }
+            unsafe {
+                self.target.DrawBitmap(&glow.0, Some(&dest), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&source));
             }
         }
     }
+}
+
+/// Where each of the nine parts of a glow cast by a rounded rectangle at
+/// `area` goes (`Painter::glow`), row by row, and what of `Glow`'s square
+/// it shows: `corner` is how large each of its corners is drawn.
+pub fn glow_parts(area: &Rect, corner: f32) -> [(Rect, Rect); 9] {
+    let spread = corner * Glow::INSET / Glow::CORNER;
+    let d = Rect { left: area.left - spread, top: area.top - spread, right: area.right + spread, bottom: area.bottom + spread };
+    // Not narrower than its two corners.
+    let k = corner.min((d.right - d.left) / 2.0).min((d.bottom - d.top) / 2.0);
+    let (c, n) = (Glow::CORNER, Glow::SIZE as f32);
+    let xs = [(d.left, d.left + k, 0.0, c), (d.left + k, d.right - k, c, n - c), (d.right - k, d.right, n - c, n)];
+    let ys = [(d.top, d.top + k, 0.0, c), (d.top + k, d.bottom - k, c, n - c), (d.bottom - k, d.bottom, n - c, n)];
+    std::array::from_fn(|i| {
+        let ((left, right, sx0, sx1), (top, bottom, sy0, sy1)) = (xs[i % 3], ys[i / 3]);
+        (Rect { left, top, right, bottom }, Rect { left: sx0, top: sy0, right: sx1, bottom: sy1 })
+    })
+}
+
+/// A pinned window's light (in `pinned`, at `pin_light`): below it, how
+/// large its corners are drawn (so how far it spreads), how far under it
+/// it goes and how opaque; about it all round, its corners and opacity;
+/// and how round the frame is that none of it shows within. The same on
+/// the board and while the screen follows the hand.
+pub const PIN_BELOW: (f32, f32, f32) = (80.0, 16.0, 0.95);
+pub const PIN_ROUND: (f32, f32) = (26.0, 0.40);
+pub const PIN_FRAME: f32 = 8.0;
+
+/// The two glows of a window at `body` pinned to every shelf (`all`) or
+/// to its own, `s` times their size: where each is cast, how large its
+/// corners and how opaque. Most below it, spreading down as a lamp under
+/// it would; faint all round.
+pub fn pin_glows(body: &Rect, s: f32, all: bool) -> [(Rect, f32, f32); 2] {
+    let reach = pin_light(all).1 * s;
+    let (bw, bh) = (body.right - body.left, body.bottom - body.top);
+    let under = Rect { left: body.left + bw * 0.04, right: body.right - bw * 0.04, top: body.bottom - bh * 0.30, bottom: body.bottom + PIN_BELOW.1 * reach };
+    [(under, PIN_BELOW.0 * reach, PIN_BELOW.2), (*body, PIN_ROUND.0 * reach, PIN_ROUND.1)]
 }
 
 /// A blurred rounded square of one colour, drawn stretched in nine parts
@@ -455,12 +481,12 @@ impl Glow {
     /// How far in from the bitmap's edge the square is.
     const INSET: f32 = 3.0 * Self::BLUR;
     /// The corner parts, out to the edge.
-    const CORNER: f32 = Self::INSET + Self::RADIUS;
-    const SIZE: usize = 2 * Self::CORNER as usize + 2;
+    pub const CORNER: f32 = Self::INSET + Self::RADIUS;
+    pub const SIZE: usize = 2 * Self::CORNER as usize + 2;
 
     pub fn new(target: &ID2D1RenderTarget, colour: D2D1_COLOR_F) -> Option<Glow> {
         let n = Self::SIZE;
-        let pixels = premultiplied(&glow_mask(n, Self::INSET, Self::RADIUS, Self::BLUR), [colour.r, colour.g, colour.b], colour.a);
+        let pixels = premultiplied(&Self::mask(None), [colour.r, colour.g, colour.b], colour.a);
         let properties = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0,
@@ -468,6 +494,21 @@ impl Glow {
         };
         let size = D2D_SIZE_U { width: n as u32, height: n as u32 };
         unsafe { target.CreateBitmap(size, Some(pixels.as_ptr().cast()), (n * 4) as u32, &properties).ok().map(Glow) }
+    }
+
+    /// How opaque each pixel of its square is, row by row, `SIZE` by
+    /// `SIZE`; with `cut`, none within what casts it, whose corners are
+    /// that round (in its pixels, no rounder than its own).
+    pub fn mask(cut: Option<f32>) -> Vec<f32> {
+        let n = Self::SIZE;
+        let mut mask = glow_mask(n, Self::INSET, Self::RADIUS, Self::BLUR);
+        if let Some(radius) = cut {
+            let (lo, hi) = (Self::INSET, n as f32 - Self::INSET);
+            for (i, a) in mask.iter_mut().enumerate() {
+                *a *= 1.0 - covered([lo, lo, hi, hi], radius.min(Self::RADIUS), (i % n) as f32 + 0.5, (i / n) as f32 + 0.5);
+            }
+        }
+        mask
     }
 }
 
