@@ -115,12 +115,24 @@ pub fn app_windows() -> Vec<HWND> {
 
 /// Request activation without joining another application's input queue.
 pub fn force_foreground(hwnd: HWND) {
+    FORCED.set(hwnd.0);
     unsafe {
         if GetForegroundWindow() != hwnd {
             // AttachThreadInput makes even SetFocus wait indefinitely on the other UI thread.
             let _ = SetForegroundWindow(hwnd);
         }
     }
+}
+
+thread_local! {
+    /// The window Flick last brought to the front (`force_foreground`).
+    static FORCED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `hwnd`, come to the front, was brought there by Flick; asked
+/// once for each time it was.
+pub fn forced(hwnd: HWND) -> bool {
+    FORCED.with(|forced| forced.get() == hwnd.0 && forced.replace(0) != 0)
 }
 
 /// A programmatic desktop switch leaves keyboard focus on a window of the

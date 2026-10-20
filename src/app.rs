@@ -194,8 +194,8 @@ struct App {
     following: vd::WindowPins,
     /// The pinned windows the user left in front of a cell's own windows,
     /// in front on every cell they go to; the others right under its front
-    /// one (`raised`).
-    raised: HashSet<isize>,
+    /// one (`raised`). Just pinned, they are raised.
+    raised: raised::Raised<HWND>,
     /// The cell Flick went to and put the pinned windows in place on, the
     /// switch there not to be taken for the user's (`desktop_changed`).
     arranged: Option<String>,
@@ -410,7 +410,7 @@ impl App {
             gliding: None,
             prepared: None,
             following: vd::WindowPins::default(),
-            raised: HashSet::new(),
+            raised: raised::Raised::new(),
             arranged: None,
             pending_menu: None,
             pending_row_menu: None,
@@ -610,14 +610,26 @@ impl App {
     fn judge_raised(&mut self, id: &str) {
         let stack = self.stack_of(id);
         for &(hwnd, own) in &stack {
-            if own {
-                continue;
+            if !own {
+                self.raised.judge(hwnd, &stack);
             }
-            if raised::judged(self.raised.contains(&hwnd.0), hwnd, &stack) {
-                self.raised.insert(hwnd.0);
-            } else {
-                self.raised.remove(&hwnd.0);
-            }
+        }
+    }
+
+    /// A window came to the front. Brought there by the user, not by Flick
+    /// (the board, a switch under way, a window it focused), the windows
+    /// just pinned are judged by where they are from then on.
+    fn came_to_front(&mut self, hwnd: HWND) {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let flicks = vd::forced(hwnd)
+            || self.board.is_open()
+            || self.in_flight.is_some()
+            || self.going.as_ref().is_some_and(|(_, when)| when.elapsed() < Duration::from_millis(GOING_SETTLES_MS))
+            || pid == unsafe { GetCurrentProcessId() }
+            || !vd::is_app_window(hwnd);
+        if !flicks {
+            self.raised.brought(hwnd);
         }
     }
 
@@ -629,7 +641,7 @@ impl App {
         let own: Vec<HWND> = stack.iter().filter(|(_, own)| *own).map(|(hwnd, _)| *hwnd).collect();
         for &(hwnd, mine) in stack.iter().rev() {
             if !mine {
-                match raised::spot(self.raised.contains(&hwnd.0), &own) {
+                match raised::spot(self.raised.contains(hwnd), &own) {
                     raised::Spot::Front => vd::place_under(hwnd, None),
                     raised::Spot::Under(front) => vd::place_under(hwnd, Some(front)),
                 }
@@ -686,6 +698,9 @@ impl App {
                 if let Err(e) = result { log(&format!("app pin change failed: {e:?}")); return; }
                 self.grid.follow_apps.retain(|e| *e != exe);
                 if row { self.grid.follow_apps.push(exe); }
+                let now = self.pin_state(hwnd);
+                self.pin_changed(hwnd, crate::pin::Pin::from_flags(state.row_window || state.row_app, state.all_window || state.all_app),
+                    crate::pin::Pin::from_flags(now.row_window || now.row_app, now.all_window || now.all_app));
             }
         }
         self.save();
@@ -716,7 +731,20 @@ impl App {
             return;
         }
         if !row { self.following.remove(&window.0); }
+        self.pin_changed(window, crate::pin::Pin::from_flags(state.row_window, state.all_window), requested);
         self.restack();
+    }
+
+    /// `window`'s pin went from `was` to `now`. Pinned, or pinned another
+    /// way, it is raised and put in front of the windows where it is;
+    /// unpinned, that is forgotten.
+    fn pin_changed(&mut self, window: HWND, was: crate::pin::Pin, now: crate::pin::Pin) {
+        if now == crate::pin::Pin::Off {
+            self.raised.unpinned(window);
+        } else if now != was {
+            self.raised.pinned(window);
+            vd::place_under(window, None);
+        }
     }
 
     /// Puts the windows kept on top in their order: the board while it is up
@@ -786,7 +814,7 @@ impl App {
     /// by now be another app's window).
     fn forget_gone_windows(&mut self) {
         self.following.prune();
-        self.raised.retain(|hwnd| unsafe { IsWindow(HWND(*hwnd)) }.as_bool());
+        self.raised.retain(|hwnd| unsafe { IsWindow(hwnd) }.as_bool());
         self.grid.kept_on_top.retain(|(hwnd, exe)| {
             unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && vd::exe_of_window(HWND(*hwnd)).unwrap_or_default() == *exe
         });
@@ -1181,9 +1209,8 @@ impl App {
                 Place::Row(row) => 2 * row.abs(),
                 Place::Cell(row, col) => 2 * row.abs() + col.abs(),
             };
-            let was = self.raised.contains(&window.hwnd.0);
             let raised = matches!(place, Place::Pinned | Place::Row(_))
-                && raised::judged(was, window.hwnd, stack.get_or_insert_with(|| self.stack_of(origin)));
+                && self.raised.judged(window.hwnd, stack.get_or_insert_with(|| self.stack_of(origin)));
             shots.push((far, Shot { hwnd: window.hwnd, rect: window.rect, place, raised }));
         }
         // The nearest within the limit, in their order, bottom first.
@@ -1756,6 +1783,10 @@ impl App {
                 vd::force_foreground(hwnd);
             },
             _ => vd::focus_top_window(),
+        }
+        // The windows just pinned stay in front of the one Flick focused.
+        for hwnd in self.raised.fresh() {
+            vd::place_under(hwnd, None);
         }
         debug_log!("ui: leave board close");
         self.board.close();
@@ -2340,6 +2371,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(|app| {
                 let window = HWND(wparam.0 as _);
                 app.record_foreground(window);
+                app.came_to_front(window);
                 app.restack_clicked(window);
             });
             admin_in_front(HWND(wparam.0 as _));
