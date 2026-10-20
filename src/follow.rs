@@ -4,6 +4,19 @@ pub const GAP: f64 = 0.07;
 pub const DIM: f64 = 0.55;
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
 pub fn scale(depth: f64) -> f64 { 1.0 - 0.5 * depth.clamp(0.0, 1.0) }
+/// How fast the screen recedes as a hold moves, and comes forward again.
+const RECEDE_RATE: f64 = 24.0;
+const RETURN_RATE: f64 = 22.0;
+
+/// The depth going toward receded (`moving`) or whole, fastest at first:
+/// never slower than an exponential approach (95% in 0.125 s receding),
+/// rather than a spring setting off from rest, which lingers near whole.
+pub fn deepen(depth: &mut Spring, moving: bool, dt: f64) {
+    let (target, rate) = if moving { (1.0, RECEDE_RATE) } else { (0.0, RETURN_RATE) };
+    let least = rate * (target - depth.p);
+    if (least > 0.0 && depth.v < least) || (least < 0.0 && depth.v > least) { depth.v = least; }
+    depth.advance(target, dt, rate, 1.0);
+}
 /// Where `rect` (left, top, right, bottom on a screen `size` across and
 /// down) of a desktop `apart` desktops from where the strip is (sideways,
 /// up and down) is drawn, the screen at `scale`: the strip's desktops side
@@ -98,7 +111,7 @@ impl Step {
         x.commit(self.to.0 as f64, dt, false); y.commit(self.to.1 as f64, dt, true);
         let moving = (x.p - self.to.0 as f64).abs() > 0.01 || (y.p - self.to.1 as f64).abs() > 0.01;
         let mut depth = Spring { p: self.receded, v: self.depth_speed };
-        depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
+        deepen(&mut depth, moving, dt);
         (self.from, self.speed, self.receded, self.depth_speed, self.began) = ((x.p, y.p), (x.v, y.v), depth.p, depth.v, now);
     }
     pub fn then(&self, now: f64, to: (i32, i32)) -> Self {
@@ -227,7 +240,7 @@ impl Follow {
         else { self.vertical.position(target,dt,true); }
         if self.vertical.settled(self.row as f64) { self.row_committing=false; }
         moving |= (self.vertical.p - self.row as f64).abs() > 0.01;
-        self.depth.advance(if moving { 1.0 } else { 0.0 }, dt, if moving { 22.0 } else { 14.0 }, 1.0);
+        deepen(&mut self.depth, moving, dt);
         let done = self.released && self.vertical.settled(self.row as f64)
             && self.along.iter().zip(&self.columns).all(|(s, l)| s.settled(l.cell as f64)) && self.depth.settled(0.0);
         ((self.along[current].p, self.vertical.p), done)
@@ -334,6 +347,22 @@ mod tests {
         f.track_locked(0.0,(0.0,0.0),0);f.track_locked(3.0,(0.01,0.0),0);
         let (selected,offset)=(f.selected(),f.offset(0));
         f.start_picture();assert_eq!(f.depth(),0.0);assert_eq!(f.selected(),selected);assert_eq!(f.offset(0),offset);
+    }
+    #[test]
+    fn the_screen_recedes_at_once_and_comes_back_as_quickly() {
+        let mut f = Follow::new((0, 0), vec![(-1, 1)]);
+        f.track_locked(0.0, (0.0, 0.0), 0);
+        f.start_picture();
+        // Most of the way in the first frames, not lingering near whole.
+        let _ = f.settle(1.0 / 60.0);
+        assert!(f.depth() > 0.3, "{}", f.depth());
+        let _ = f.settle(0.125);
+        assert!(f.depth() > 0.94, "{}", f.depth());
+        f.let_go(0.4, (0.0, 0.0));
+        let _ = f.settle(0.4 + 1.0 / 60.0);
+        assert!(f.depth() < 0.7, "{}", f.depth());
+        let _ = f.settle(0.4 + 0.14);
+        assert!(f.depth() < 0.06, "{}", f.depth());
     }
     #[test]
     fn selected_size_changes_by_spring_and_cells_do_not_overlap() {
