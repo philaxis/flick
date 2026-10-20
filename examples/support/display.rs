@@ -414,6 +414,18 @@ fn pin_boxes(raw: &[u8], width: u32, height: u32) -> [Option<(u32, u32, u32, u32
     boxes
 }
 
+/// Of a frame: how many pixels of the band at the top middle, where the
+/// shelf's name is, are near white (its letters).
+fn banner_white(raw: &[u8], width: u32, height: u32) -> u32 {
+    let (x0, x1, y1) = (width / 2 - width / 7, width / 2 + width / 7, (height / 18).max(40));
+    let mut white = 0;
+    for y in 4..y1 { for x in x0..x1 {
+        let i = ((y * width + x) * 4) as usize;
+        if raw[i] > 200 && raw[i + 1] > 200 && raw[i + 2] > 200 { white += 1; }
+    }}
+    white
+}
+
 /// Pinned windows put by as the screen recedes, as deep as the hand is
 /// unsure: a window pinned to every shelf (magenta) and one to its shelf
 /// (cyan), a fast, a middling and a slow move. `dock.csv`: each frame's
@@ -451,7 +463,7 @@ pub unsafe fn dock(out: &Path, flick: &str) {
     let recorder = std::thread::spawn(move || {
         let capture = Capture::new().unwrap();
         let mut frequency = 0; QueryPerformanceFrequency(&mut frequency).unwrap();
-        let mut csv = String::from("hold,ms,all_box,row_box\n");
+        let mut csv = String::from("hold,ms,banner_white,all_box,row_box\n");
         let (mut hold, mut nth, mut was) = (0, 0, 0i64);
         let mut real = None;
         while !s1.load(Ordering::SeqCst) {
@@ -462,11 +474,11 @@ pub unsafe fn dock(out: &Path, flick: &str) {
                 if from == 0 && real.is_none() && boxes.iter().all(Option::is_some) {
                     real = Some(boxes);
                     save_bmp(&o.join("real.bmp"), &raw, capture.width, capture.height);
-                    writeln!(csv, "0,0,{:?},{:?}", boxes[0], boxes[1]).unwrap();
+                    writeln!(csv, "0,0,{},{:?},{:?}", banner_white(&raw, capture.width, capture.height), boxes[0], boxes[1]).unwrap();
                 }
                 if from != 0 {
                     let ms = (present - from) as f64 * 1000.0 / frequency as f64;
-                    writeln!(csv, "{hold},{ms:.1},{:?},{:?}", boxes[0], boxes[1]).unwrap();
+                    writeln!(csv, "{hold},{ms:.1},{},{:?},{:?}", banner_white(&raw, capture.width, capture.height), boxes[0], boxes[1]).unwrap();
                     if nth % 6 == 0 { save_bmp(&o.join(format!("d{hold}-{nth:03}-{ms:.0}ms.bmp")), &raw, capture.width, capture.height); }
                     nth += 1;
                 }
