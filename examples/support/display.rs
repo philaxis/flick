@@ -239,6 +239,163 @@ pub unsafe fn run(out: &Path, flick: &str) {
     for window in &mut windows {let _=window.kill();let _=window.wait();}
 }
 
+impl Capture {
+    /// The next composed frame, tightly packed BGRA, and when it was presented.
+    unsafe fn grab(&self) -> Result<Option<(i64, Vec<u8>)>> {
+        let (mut info, mut resource) = (DXGI_OUTDUPL_FRAME_INFO::default(), None);
+        match self.duplication.AcquireNextFrame(30, &mut info, &mut resource) {
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            r => r?,
+        }
+        if info.LastPresentTime == 0 { self.duplication.ReleaseFrame()?; return Ok(None); }
+        let source = resource.unwrap().cast::<ID3D11Texture2D>();
+        if let Ok(source) = &source { self.context.CopyResource(&self.staging, source); }
+        self.duplication.ReleaseFrame()?;
+        source?;
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let mut raw = Vec::with_capacity((self.width * self.height * 4) as usize);
+        for y in 0..self.height { raw.extend_from_slice(std::slice::from_raw_parts((mapped.pData as *const u8).add((y * mapped.RowPitch) as usize), self.width as usize * 4)); }
+        self.context.Unmap(&self.staging, 0);
+        Ok(Some((info.LastPresentTime, raw)))
+    }
+}
+
+/// Half size, as a 24-bit BMP.
+fn save_bmp(path: &Path, raw: &[u8], width: u32, height: u32) {
+    let (w, h) = (width / 2, height / 2);
+    let row = ((w * 3 + 3) / 4 * 4) as usize;
+    let mut out = Vec::with_capacity(54 + row * h as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + row * h as usize) as u32).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0]);
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(-(h as i32)).to_le_bytes());
+    out.extend_from_slice(&[1, 0, 24, 0]);
+    out.extend_from_slice(&[0u8; 24]);
+    for y in 0..h {
+        let start = out.len();
+        for x in 0..w { let i = ((y * 2 * width + x * 2) * 4) as usize; out.extend_from_slice(&raw[i..i + 3]); }
+        out.resize(start + row, 0);
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+const RECEDE_COLOURS: [(u8, u8, u8); 4] = [(255, 0, 255), (0, 255, 255), (255, 255, 0), (0, 200, 0)];
+
+/// Of a frame: the width of the longest run of the middle desktop's cyan
+/// across the middle line, as a fraction of the screen, and the fraction of
+/// pixels (every 4th) that are neither dark nor a window's colour, dimmed or not.
+fn recede_stats(raw: &[u8], width: u32, height: u32) -> (f64, f64) {
+    let px = |x: u32, y: u32| { let i = ((y * width + x) * 4) as usize; (raw[i + 2] as f64, raw[i + 1] as f64, raw[i] as f64) };
+    let cyan = |(r, g, b): (f64, f64, f64)| r < 60.0 && g > 60.0 && b > 60.0 && (g - b).abs() < 0.2 * g.max(b);
+    let (mut best, mut run) = (0u32, 0u32);
+    for x in 0..width { if cyan(px(x, height / 2)) { run += 1; best = best.max(run); } else { run = 0; } }
+    let (mut other, mut all) = (0u64, 0u64);
+    for y in (0..height).step_by(4) { for x in (0..width).step_by(4) {
+        let (r, g, b) = px(x, y);
+        all += 1;
+        if r.max(g).max(b) < 40.0 { continue; }
+        let window = RECEDE_COLOURS.iter().any(|&(cr, cg, cb)| {
+            let (cr, cg, cb) = (cr as f64, cg as f64, cb as f64);
+            let k = (r * cr + g * cg + b * cb) / (cr * cr + cg * cg + cb * cb);
+            (0.15..1.1).contains(&k) && (r - k * cr).abs() + (g - k * cg).abs() + (b - k * cb).abs() < 45.0
+        });
+        if !window { other += 1; }
+    }}
+    (best as f64 / width as f64, other as f64 / all as f64)
+}
+
+/// The normal view receding over maximized windows, recorded as composed:
+/// `recede-frames.csv` (each frame's time from the trigger, the middle
+/// desktop's width and how much is neither dark nor a window), and frames
+/// as BMPs: the real desktops before, the first ones of each hold, then
+/// every fifth.
+pub unsafe fn recede(out: &Path, flick: &str) {
+    use std::sync::{atomic::{AtomicBool, AtomicI64, Ordering}, Arc, Mutex};
+    let wait = |ms| std::thread::sleep(Duration::from_millis(ms));
+    let cfg = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap()).join("Flick");
+    std::fs::write(cfg.join("config.toml"), "config_version = 3\ntrigger = \"xbutton2\"\nminimap = false\nhotkeys = false\n[mouse]\nstep_x = 220\nstep_y = 220\nnotch_x = 40\nnotch_y = 100\nfollow_x = true\nfollow_y = true\nreverse = false\n").unwrap();
+    let made = std::fs::read_to_string(out.join("made.txt")).unwrap();
+    let ids: Vec<_> = made.lines().collect();
+    let all = super::vdapi::get_desktops().unwrap();
+    let desk = |i: usize| *all.iter().find(|d| d.id() == ids[i]).unwrap();
+    let other: Vec<_> = all.iter().map(|d| d.id()).filter(|id| !ids.contains(&id.as_str())).collect();
+    std::fs::write(cfg.join("state.json"), serde_json::json!({"rows":[{"name":"Recede","cells":&ids[0..3],"last":ids[1]},{"name":"Below","cells":&ids[3..6],"last":ids[4]},{"name":"Existing","cells":other}],"guide_seen":true}).to_string()).unwrap();
+    super::vdapi::switch_desktop(desk(1)).unwrap(); wait(800);
+    // Maximized windows on the row's three desktops and the one below the middle;
+    // a small one on the next below, the last one bare.
+    let me = std::env::current_exe().unwrap();
+    let mut windows = Vec::new();
+    for (i, rgb, rect) in [(0, (255, 0, 255), "0 0 0 0"), (1, (0, 255, 255), "0 0 0 0"), (2, (255, 255, 0), "0 0 0 0"), (4, (0, 200, 0), "0 0 0 0"), (3, (0, 200, 0), "300 200 700 450")] {
+        let title = format!("F recede {i}");
+        let mut args = vec!["hold".to_string(), rgb.0.to_string(), rgb.1.to_string(), rgb.2.to_string(), title.clone()];
+        args.extend(rect.split(' ').map(str::to_owned));
+        args.push("600".into());
+        windows.push(Command::new(&me).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        wait(500);
+        let hwnd = FindWindowW(w!("flick.test.hold"), &windows::core::HSTRING::from(title)); assert!(hwnd.0 != 0);
+        super::vdapi::move_window_to_desktop(desk(i), hwnd).unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let since = Arc::new(AtomicI64::new(0));
+    let snap: Arc<Mutex<Option<String>>> = Arc::default();
+    let (o, s1, s2, s3) = (out.to_owned(), stop.clone(), since.clone(), snap.clone());
+    let recorder = std::thread::spawn(move || {
+        let capture = Capture::new().unwrap();
+        let mut frequency = 0; QueryPerformanceFrequency(&mut frequency).unwrap();
+        let mut csv = String::from("hold,ms,middle_width,other\n");
+        let (mut latest, mut hold, mut nth, mut was) = (Vec::new(), 0, 0, 0i64);
+        while !s1.load(Ordering::SeqCst) {
+            if let Some((present, raw)) = capture.grab().unwrap() {
+                let from = s2.load(Ordering::SeqCst);
+                if from != was { was = from; if from != 0 { hold += 1; nth = 0; } }
+                if from != 0 {
+                    let (middle, other) = recede_stats(&raw, capture.width, capture.height);
+                    let ms = (present - from) as f64 * 1000.0 / frequency as f64;
+                    writeln!(csv, "{hold},{ms:.1},{middle:.4},{other:.4}").unwrap();
+                    if nth < 14 || nth % 5 == 0 { save_bmp(&o.join(format!("h{hold}-{nth:03}-{ms:.0}ms.bmp")), &raw, capture.width, capture.height); }
+                    nth += 1;
+                }
+                latest = raw;
+            }
+            if let Some(label) = s3.lock().unwrap().take() {
+                if !latest.is_empty() { save_bmp(&o.join(format!("{label}.bmp")), &latest, capture.width, capture.height); }
+            }
+        }
+        std::fs::write(o.join("recede-frames.csv"), csv).unwrap();
+    });
+    wait(600);
+    for (label, i) in [("real-0", 0), ("real-2", 2), ("real-3", 3), ("real-1", 1)] {
+        super::vdapi::switch_desktop(desk(i)).unwrap(); wait(1200);
+        *snap.lock().unwrap() = Some(label.into()); wait(150);
+    }
+    let mut child = Command::new(flick).arg("--portable").env("FLICK_GLIDE_STATS", "1").env("FLICK_TRACE", out.join("trace.csv"))
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    wait(3000);
+    assert!(FindWindowW(w!("flick.main"), None).0 != 0, "Flick did not start");
+    let mouse = |flags, dx, dy| {
+        let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: 2, dwFlags: flags, ..Default::default() } } };
+        assert_eq!(SendInput(&[input], std::mem::size_of::<INPUT>() as i32), 1);
+    };
+    let stroke = |dx: i32, dy: i32, ms: u64| {
+        let n = (ms / 8).max(1) as i32;
+        for i in 1..=n { mouse(MOUSEEVENTF_MOVE, dx * i / n - dx * (i - 1) / n, dy * i / n - dy * (i - 1) / n); wait(ms / n as u64); }
+    };
+    let begin = || { since.store(qpc(), Ordering::SeqCst); mouse(MOUSEEVENTF_XDOWN, 0, 0); };
+    let rest = || { wait(1500); since.store(0, Ordering::SeqCst); wait(300); };
+    // 1: a short pull that commits nothing, held still: the recede and the return, timed.
+    begin(); wait(80); stroke(60, 0, 80); wait(700); mouse(MOUSEEVENTF_XUP, 0, 0); rest();
+    // 2: across to the right desktop, slowly, and let go there.
+    begin(); wait(80); stroke(330, 4, 700); wait(400); mouse(MOUSEEVENTF_XUP, 0, 0); rest();
+    // 3: from there down to the row below.
+    begin(); wait(80); stroke(4, 330, 700); wait(400); mouse(MOUSEEVENTF_XUP, 0, 0); rest();
+    stop.store(true, Ordering::SeqCst);
+    recorder.join().unwrap();
+    let _ = child.kill(); let _ = child.wait();
+    for window in &mut windows { let _ = window.kill(); let _ = window.wait(); }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

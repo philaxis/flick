@@ -10,9 +10,9 @@
 //!   drive post <class> <message> <wparam> <lparam> | client <class>
 //!   drive key <down|up> <vk hex>... [unseen] | keystate <vk hex>... | levels | front <class|0xHWND> | mem
 //!   drive desk | mkdesk | rmdesk <desktop id prefix>
-//!   drive hold <r> <g> <b> <title> <x> <y> <w> <h> <seconds>
+//!   drive hold <r> <g> <b> <title> <x> <y> <w> <h> <seconds>  (w and h 0: maximized)
 //!   drive holds <hold arguments>...  (several windows in one process)
-//!   drive navigation shelves|cube <out dir> <flick exe>
+//!   drive navigation shelves|cube|recede <out dir> <flick exe>
 //!   drive pinprobe <flick exe> <out dir>
 //!   drive boardshot <flick exe> <out dir>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
@@ -700,6 +700,8 @@ fn hold(args: &[String]) {
         let window = CreateWindowExW(WINDOW_EX_STYLE(0), class, &HSTRING::from(args[3].as_str()), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             n(4), n(5), n(6), n(7), None, None, instance, None);
         assert!(window.0 != 0);
+        // No size: maximized, as an app's window is.
+        if n(6) == 0 && n(7) == 0 { ShowWindow(window, SW_SHOWMAXIMIZED); }
         let until = std::time::Instant::now() + std::time::Duration::from_secs(n(8) as u64);
         let mut message = MSG::default();
         while std::time::Instant::now() < until && IsWindow(window).as_bool() {
