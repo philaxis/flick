@@ -14,7 +14,8 @@
 //! in the middle stands out: the others are darkened by thumbnails of a
 //! black window over them (`follow::standing_out`). Above the picture the
 //! name of the row is shown while receded, in a small window of its own
-//! (`Banner`).
+//! (`Banner`), which stays a while after the picture has gone
+//! (`follow::Linger`).
 //!
 //! With `FLICK_TRACE` set to a file, each frame is written to it as a line
 //! of CSV (`Trace`), kept in memory until the picture goes.
@@ -23,7 +24,7 @@
 //! keeps the app's thread busy for tens of milliseconds at a time.
 
 use crate::{
-    follow::{self, Follow, Label, Name, Step},
+    follow::{self, Follow, Label, Linger, Name, Step},
     paint::{self, rgba, white, DcTarget, Dib, Painter},
 };
 use std::{
@@ -248,8 +249,6 @@ struct Screen {
     /// The wallpaper, one for each desktop that can be in sight at once
     /// (`WALLS`).
     walls: Vec<Thumb>,
-    /// The name of the row above the picture.
-    banner: Option<Banner>,
 }
 
 impl Screen {
@@ -259,9 +258,6 @@ impl Screen {
         unsafe {
             let flags = SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
             let _ = SetWindowPos(self.hwnd, None, 0, 0, 0, 0, flags);
-            if let Some(banner) = &self.banner {
-                let _ = SetWindowPos(banner.hwnd, None, 0, 0, 0, 0, flags);
-            }
         }
     }
 }
@@ -359,7 +355,6 @@ impl Drop for Screen {
     fn drop(&mut self) {
         self.hide();
         self.walls.clear();
-        self.banner = None;
         unsafe {
             crate::composition::forget(self.hwnd);
             let _ = DestroyWindow(self.hwnd);
@@ -475,6 +470,73 @@ impl Drop for Banner {
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
+    }
+}
+
+/// The name of the row above the picture on each screen (its work area
+/// and scale), kept from one hold to the next and lasting past the picture.
+struct Names {
+    banners: Vec<(RECT, f32, Banner)>,
+    label: Label,
+    /// The rows' names, from `rows.0`.
+    called: Vec<String>,
+    rows: (i32, i32),
+    linger: Linger,
+    /// What the times of `label` and `linger` are from.
+    epoch: Instant,
+    /// The windows are out.
+    out: bool,
+}
+
+impl Names {
+    fn new() -> Names {
+        Names { banners: Vec::new(), label: Label::new(0), called: Vec::new(), rows: (0, 0), linger: Linger::default(), epoch: Instant::now(), out: false }
+    }
+
+    fn now(&self) -> f64 {
+        self.epoch.elapsed().as_secs_f64()
+    }
+
+    /// A hold begins with `rows` called `called`: its row's name at once,
+    /// the windows made anew if the monitors are not as they were.
+    fn begin(&mut self, monitors: &[crate::vd::Monitor], rows: (i32, i32), called: Vec<String>) {
+        if self.banners.len() != monitors.len() || self.banners.iter().zip(monitors).any(|((area, scale, _), m)| *area != m.work || *scale != m.scale) {
+            self.banners = monitors.iter().filter_map(|m| Some((m.work, m.scale, Banner::new()?))).collect();
+            self.out = false;
+        }
+        for (_, _, banner) in &mut self.banners {
+            banner.drawn = None;
+        }
+        (self.rows, self.called, self.label) = (rows, called, Label::new(0));
+        let now = self.now();
+        self.linger.restart(now);
+    }
+
+    /// Still to be shown or taken down, the picture gone.
+    fn lingering(&self) -> bool {
+        self.out
+    }
+
+    /// Out of sight at once.
+    fn hide(&mut self) {
+        let flags = SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        for (_, _, banner) in &self.banners {
+            unsafe {
+                let _ = SetWindowPos(banner.hwnd, None, 0, 0, 0, 0, flags);
+            }
+        }
+        self.out = false;
+    }
+
+    /// In front of everything, over the picture.
+    fn raise(&mut self) {
+        let raise = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+        for (_, _, banner) in &self.banners {
+            unsafe {
+                let _ = SetWindowPos(banner.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
+            }
+        }
+        self.out = true;
     }
 }
 
@@ -657,7 +719,6 @@ struct Session {
     farthest_y: f64,
     focus: follow::Focus,
     names: Vec<String>,
-    label: Label,
     last_frame: Option<Instant>,
     input_samples: Vec<(f64, f64, f64, usize)>,
     /// How far a followed hold recedes as the hand goes (`quick`).
@@ -713,6 +774,7 @@ struct View {
     frame: Instant,
     paints: Option<Paints>,
     ink: Option<Ink>,
+    names: Names,
     trace: Option<std::path::PathBuf>,
 }
 
@@ -736,7 +798,7 @@ fn run(app: HWND, inbox: mpsc::Receiver<Request>) {
         return crate::app::log("the sliding picture has no frame clock");
     };
     let trace = std::env::var_os("FLICK_TRACE").filter(|path| !path.is_empty()).map(std::path::PathBuf::from);
-    let mut view = View { app, session: None, pacer, period: Duration::from_secs_f64(1.0 / 60.0), frame: Instant::now(), paints: None, ink: Ink::new(), trace };
+    let mut view = View { app, session: None, pacer, period: Duration::from_secs_f64(1.0 / 60.0), frame: Instant::now(), paints: None, ink: Ink::new(), names: Names::new(), trace };
     loop {
         unsafe {
             let mut message = MSG::default();
@@ -754,6 +816,8 @@ fn run(app: HWND, inbox: mpsc::Receiver<Request>) {
         }
         if view.session.is_some() {
             view.tick();
+        } else if view.names.lingering() {
+            view.linger();
         }
     }
 }
@@ -875,7 +939,12 @@ impl View {
                     session.hide_after = Some(Instant::now() + self.period * 2);
                 }
             }
-            Request::Cancel => self.finish(),
+            Request::Cancel => {
+                self.finish();
+                // The board takes the screen: no name over it.
+                self.names.linger.quench();
+                self.names.hide();
+            }
             Request::Warm => crate::composition::warm(),
         }
     }
@@ -909,7 +978,7 @@ impl View {
                         let size = (monitor.work.right - monitor.work.left, monitor.work.bottom - monitor.work.top);
                         if let Err(e) = unsafe { crate::composition::back(hwnd, size) } { crate::app::log(&format!("composition backing failed: {e}")); }
                     }
-                    screens.push(Screen { hwnd, area: monitor.work, scale: monitor.scale, walls: Vec::new(), banner: Banner::new() });
+                    screens.push(Screen { hwnd, area: monitor.work, scale: monitor.scale, walls: Vec::new() });
                 }
             }
         }
@@ -1005,6 +1074,7 @@ impl View {
         let stats = Stats { setup: started.elapsed().as_secs_f64() * 1000.0, thumbnails: shots.len(), ..Stats::default() };
         let follow = Follow::new(scene.rows, scene.cols);
         let visible = screens.iter().any(|screen| screen.walls.iter().any(|wall| wall.drawn.is_some()));
+        self.names.begin(&monitors, scene.rows, scene.names.clone());
         let trace = self.trace.as_ref().map(|_| Trace { lines: Vec::with_capacity(512), last: None });
         self.session = Some(Session {
             hold: scene.hold,
@@ -1025,7 +1095,6 @@ impl View {
             farthest_y: 0.0,
             focus: follow::Focus::default(),
             names: scene.names,
-            label: Label::new(0),
             last_frame: None,
             input_samples: Vec::new(),
             quick: if phase == Phase::Following { crate::quick::Quick::new() } else { None },
@@ -1068,6 +1137,9 @@ impl View {
     fn finish(&mut self) {
         let Some(session) = self.session.take() else { return };
         *DRAWN.lock().unwrap() = None;
+        // The name stays on, by itself, for a while yet.
+        let now = self.names.now();
+        self.names.linger.settle(now);
         // Out of sight in one go first; then what was in it.
         for screen in &session.screens {
             screen.hide();
@@ -1118,6 +1190,7 @@ impl View {
         }
         let (cpu, work) = (thread_cpu(), Instant::now());
         let app = self.app;
+        let named_at = self.names.now();
         let Some(session) = &mut self.session else { return };
         let mut now = session.began.elapsed().as_secs_f64();
         let mut done = false;
@@ -1202,6 +1275,7 @@ impl View {
                 if settled {
                     // A subthreshold release must also retire the app's hold.
                     tell(WM_GLIDE_SETTLED, to, session.hold);
+                    self.names.linger.settle(named_at);
                     if to == (0, 0) {
                         done = true;
                     } else {
@@ -1216,6 +1290,7 @@ impl View {
                 let (at, receded) = step.at();
                 if step.done() {
                     tell(WM_GLIDE_SETTLED, step.to, session.hold);
+                    self.names.linger.settle(named_at);
                     session.phase = Phase::Arriving(step.to, Instant::now());
                 }
                 (at, receded, true)
@@ -1266,7 +1341,8 @@ impl View {
             Phase::Stepping(step) => step.to,
         };
         let focus_changed = session.focus.advance(selected, now);
-        session.label.show(now, row);
+        self.names.label.show(named_at, row);
+        self.names.linger.feed(strip.named);
         session.farthest_y = session.farthest_y.max(strip.y.abs());
         let mut moves = 0;
         let drawing = Instant::now();
@@ -1281,7 +1357,7 @@ impl View {
             self.ink = Ink::new();
         }
         if let Some(ink) = &mut self.ink {
-            show_banners(ink, session, now);
+            show_banners(ink, &mut self.names, named_at);
         }
         for screen in &session.screens {
             if let Err(e) = crate::composition::commit(screen.hwnd) { crate::app::log(&format!("composition commit failed: {e}")); }
@@ -1298,9 +1374,7 @@ impl View {
                     // Its black at once, not when the loop next takes messages.
                     let _ = RedrawWindow(screen.hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ERASENOW | RDW_UPDATENOW);
                 }
-                for banner in session.screens.iter().filter_map(|screen| screen.banner.as_ref()) {
-                    let _ = SetWindowPos(banner.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
-                }
+                self.names.raise();
                 for minimap in minimap_windows() {
                     let _ = SetWindowPos(minimap, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
                 }
@@ -1349,6 +1423,19 @@ impl View {
         }
     }
 
+    /// The name over each screen going on by itself, the picture gone, until
+    /// it has gone too.
+    fn linger(&mut self) {
+        let now = self.names.now();
+        if self.ink.is_none() {
+            self.ink = Ink::new();
+        }
+        match &mut self.ink {
+            Some(ink) => show_banners(ink, &mut self.names, now),
+            None => self.names.hide(),
+        }
+    }
+
     /// Waits for this output's DXGI refresh, with a bounded timer fallback.
     fn pace(&mut self) -> Paced {
         let before = Instant::now();
@@ -1381,17 +1468,25 @@ fn write_trace(path: &std::path::Path, lines: &[String]) {
 }
 
 /// The name of the row over each screen, as opaque as the hold has come
-/// in, the screen whole or receded: drawn anew only while it changes.
-fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
-    let names = session.label.at(now);
-    let key = BannerKey::of(names);
-    let alpha = (session.shown.as_ref().map_or(0.0, |strip| strip.named).clamp(0.0, 1.0) * 255.0).round() as u8;
-    let called: Vec<String> = (session.follow.rows.0..=session.follow.rows.1).map(|row| session.called(row)).collect();
-    let rows = session.follow.rows;
-    let called = |row: i32| usize::try_from(row - rows.0).ok().and_then(|at| called.get(at)).cloned().unwrap_or_default();
-    for screen in &mut session.screens {
-        let (area, scale) = (screen.area, screen.scale);
-        let Some(banner) = &mut screen.banner else { continue };
+/// in at most, until a while after it settled (`follow::Linger`): drawn
+/// anew only while it changes, taken down once gone.
+fn show_banners(ink: &mut Ink, names: &mut Names, now: f64) {
+    let shown = names.label.at(now);
+    let key = BannerKey::of(shown);
+    let alpha = (names.linger.at(now).clamp(0.0, 1.0) * 255.0).round() as u8;
+    if alpha == 0 {
+        if names.out {
+            names.hide();
+        }
+        return;
+    }
+    if !names.out {
+        names.raise();
+    }
+    let (rows, list) = (names.rows, &names.called);
+    let called = |row: i32| usize::try_from(row - rows.0).ok().and_then(|at| list.get(at)).cloned().unwrap_or_default();
+    for (area, scale, banner) in &mut names.banners {
+        let (area, scale) = (*area, *scale);
         if banner.drawn == Some((key, alpha)) {
             continue;
         }
@@ -1401,12 +1496,12 @@ fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
             banner.drawn = None;
         }
         let Some(dib) = &banner.dib else { continue };
-        if banner.drawn.map(|(key, _)| key) != Some(key) && ink.draw(dib, scale, names, &called).is_none() {
+        if banner.drawn.map(|(key, _)| key) != Some(key) && ink.draw(dib, scale, shown, &called).is_none() {
             continue;
         }
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: AC_SRC_ALPHA as u8 };
         let origin = POINT { x: (area.left + area.right - size.0) / 2, y: area.top + (BANNER_TOP * scale).round() as i32 };
-        let shown = unsafe {
+        let updated = unsafe {
             UpdateLayeredWindow(
                 banner.hwnd,
                 None,
@@ -1419,7 +1514,7 @@ fn show_banners(ink: &mut Ink, session: &mut Session, now: f64) {
                 ULW_ALPHA,
             )
         };
-        banner.drawn = shown.is_ok().then_some((key, alpha));
+        banner.drawn = updated.is_ok().then_some((key, alpha));
     }
 }
 

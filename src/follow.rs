@@ -221,6 +221,60 @@ impl Label {
     }
 }
 
+/// How long the row's name stays whole once the picture has settled, and
+/// how long it then takes to go, in seconds.
+pub const NAME_STAY: f64 = 1.0;
+pub const NAME_FADE: f64 = 0.6;
+
+/// How much of the row's name shows `after` the picture settled (none: it
+/// has not yet): whole for `NAME_STAY`, then going over `NAME_FADE`, quickly
+/// at first.
+pub fn lingering(after: Option<f64>) -> f64 {
+    let Some(after) = after else { return 1.0 };
+    let left = 1.0 - ((after - NAME_STAY) / NAME_FADE).clamp(0.0, 1.0);
+    left * left
+}
+
+/// How long the row's name lasts, apart from how far the screen recedes
+/// and from the picture itself: as much of it as ever showed since the
+/// hold began, `lingering` from when it settled.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Linger {
+    pub most: f64,
+    pub settled: Option<f64>,
+}
+
+impl Linger {
+    /// A hold begins at `now`: a name still showing shows whole again, at
+    /// once; one gone shows again only as much as the new hold has it.
+    pub fn restart(&mut self, now: f64) {
+        if self.at(now) == 0.0 {
+            self.most = 0.0;
+        }
+        self.settled = None;
+    }
+
+    /// The hold has the name `shown` (0 to 1).
+    pub fn feed(&mut self, shown: f64) {
+        self.most = self.most.max(shown.clamp(0.0, 1.0));
+    }
+
+    /// The picture settled, or went, at `now`; the first time counts.
+    pub fn settle(&mut self, now: f64) {
+        self.settled.get_or_insert(now);
+    }
+
+    /// Gone at once.
+    pub fn quench(&mut self) {
+        *self = Linger { most: 0.0, settled: Some(f64::NEG_INFINITY) };
+    }
+
+    /// How much of the name shows at `now`.
+    pub fn at(&self, now: f64) -> f64 {
+        self.most * lingering(self.settled.map(|since| now - since))
+    }
+}
+
 /// Each row keeps its own committed column and spring; changing rows never
 /// waits for the previous spring to park before accepting the next input.
 #[derive(Clone, Debug)]
@@ -456,6 +510,32 @@ pub fn remember(path: &mut Vec<(f64, f64, usize)>, point: (f64, f64, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_rows_name_stays_a_second_after_settling_then_goes() {
+        let mut name = Linger::default();
+        name.feed(1.0);
+        assert_eq!(name.at(-5.0), 1.0);
+        name.settle(0.0);
+        name.settle(0.5);
+        assert_eq!(name.at(0.0), 1.0);
+        assert_eq!(name.at(1.0), 1.0);
+        let half = name.at(1.3);
+        assert!(half > 0.0 && half < 1.0, "{half}");
+        assert_eq!(name.at(1.6), 0.0);
+        assert_eq!(name.at(9.0), 0.0);
+        // A hold beginning while it goes shows it whole again.
+        name.restart(1.3);
+        assert_eq!(name.at(1.3), 1.0);
+        assert_eq!(name.at(30.0), 1.0);
+        // Gone, it shows again only as much as the new hold has it.
+        name.settle(31.0);
+        name.restart(34.0);
+        assert_eq!(name.at(14.0), 0.0);
+        name.feed(0.4);
+        assert_eq!(name.at(14.1), 0.4);
+        name.quench();
+        assert_eq!(name.at(14.2), 0.0);
+    }
     #[test]
     fn a_desktops_windows_end_at_the_edges_of_its_cell() {
         let size = (1920.0, 1080.0);
