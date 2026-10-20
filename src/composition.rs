@@ -236,6 +236,17 @@ pub unsafe fn begin_paint(hwnd: HWND, size: (i32,i32)) -> Result<(IDCompositionS
     })
 }
 
+/// A host's surface black all over, beneath its thumbnails and in their commit.
+pub unsafe fn back(hwnd: HWND, size: (i32,i32)) -> Result<()> {
+    let (surface,target,offset)=begin_paint(hwnd,size)?;
+    target.SetTransform(&Matrix3x2::identity());
+    let (x,y)=(offset.x as f32,offset.y as f32);
+    target.PushAxisAlignedClip(&D2D_RECT_F {left:x,top:y,right:x+size.0 as f32,bottom:y+size.1 as f32},D2D1_ANTIALIAS_MODE_ALIASED);
+    target.Clear(Some(&D2D1_COLOR_F {r:0.0,g:0.0,b:0.0,a:1.0}));
+    target.PopAxisAlignedClip();
+    surface.EndDraw()
+}
+
 fn transform(source: RECT, dest: [f32;4]) -> Matrix3x2 {
     let sx=(dest[2]-dest[0])/(source.right-source.left) as f32;
     let sy=(dest[3]-dest[1])/(source.bottom-source.top) as f32;

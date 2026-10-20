@@ -46,7 +46,7 @@ use windows::{
                 DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Gdi::{
-                GetStockObject, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
+                GetStockObject, RedrawWindow, RDW_ERASE, RDW_ERASENOW, RDW_INVALIDATE, RDW_UPDATENOW, AC_SRC_ALPHA, AC_SRC_OVER, BLACK_BRUSH, BLENDFUNCTION, HBRUSH, WHITE_BRUSH,
             },
         },
         System::{
@@ -829,6 +829,13 @@ impl View {
             screens.clear();
             for monitor in &monitors {
                 if let Some(hwnd) = new_window(monitor.work) {
+                    // Black beneath the thumbnails in their own commit: the window's own
+                    // background is painted only after it shows, and meanwhile what is
+                    // behind it, the desktop, would show around the receding picture.
+                    if crate::composition::follow_enabled() {
+                        let size = (monitor.work.right - monitor.work.left, monitor.work.bottom - monitor.work.top);
+                        if let Err(e) = unsafe { crate::composition::back(hwnd, size) } { crate::app::log(&format!("composition backing failed: {e}")); }
+                    }
                     screens.push(Screen { hwnd, area: monitor.work, scale: monitor.scale, walls: Vec::new(), banner: Banner::new() });
                 }
             }
@@ -1138,6 +1145,8 @@ impl View {
                 let raise = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
                 for screen in &session.screens {
                     let _ = SetWindowPos(screen.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
+                    // Its black at once, not when the loop next takes messages.
+                    let _ = RedrawWindow(screen.hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ERASENOW | RDW_UPDATENOW);
                 }
                 for banner in session.screens.iter().filter_map(|screen| screen.banner.as_ref()) {
                     let _ = SetWindowPos(banner.hwnd, HWND_TOPMOST, 0, 0, 0, 0, raise);
