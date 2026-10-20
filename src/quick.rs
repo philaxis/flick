@@ -4,9 +4,11 @@
 //! (or comes at once, `QuickFlick::Instant`), and stays sure through a
 //! short slowing or stop between cells; once it is plainly unsure (still
 //! or slow a while, turning back, going the other way) the screen goes all
-//! the way back at once, not by halves. In between only for a moment,
-//! while a hand just set off is not yet either. A hold begun just after
-//! one let go of sure is sure from the start.
+//! the way back at once, not by halves, and stays so until let go: a hand
+//! gone unsure does not get the screen whole again by going on quickly.
+//! In between only for a moment, while a hand just set off is not yet
+//! either. A hold begun just after one let go of sure is sure from the
+//! start; one let go of unsure carries nothing over.
 //!
 //! The judging (`Judge`) only reads the hand; the cells gone to are still
 //! the hand's latches (`follow::Follow`), switched to once, on letting go.
@@ -102,7 +104,7 @@ impl Judge {
     pub fn sure() -> Judge { Judge { mind: Mind::Sure, ..Judge::default() } }
 
     /// From here on its way is `axis`, `sign`, starting at `t`, `gone` along
-    /// it, and it is unsure.
+    /// it, and it is unsure (for good, this hold).
     fn anchor(&mut self, t: f64, axis: usize, sign: f64, gone: f64) {
         self.onset = Some((self.onset.map_or(t, |(onset, ..)| onset), axis, sign));
         (self.far, self.recent) = (gone, vec![(t, gone)]);
@@ -134,9 +136,10 @@ impl Judge {
         self.check(t);
     }
 
-    /// What the hand is at `now`, the time going by with it or without it.
+    /// What the hand is at `now`, the time going by with it or without it;
+    /// once unsure, it stays so for the rest of the hold.
     pub fn check(&mut self, now: f64) {
-        if self.released.is_some() { return; }
+        if self.released.is_some() || self.mind == Mind::Unsure { return; }
         let speed = self.speed(now);
         if speed >= SURE_SPEED { (self.mind, self.slow_since) = (Mind::Sure, None); return; }
         let (sure, onset) = (self.mind == Mind::Sure, self.onset.map(|(onset, ..)| onset));
@@ -146,7 +149,6 @@ impl Judge {
             Some(onset) if !sure && now - onset <= DECIDE => { if onset > ONSET_LIMIT { self.mind = Mind::Unsure; } return; }
             _ => {}
         }
-        if self.mind == Mind::Unsure { return; }
         // Plainly slow, or slower than it must be long enough: unsure.
         if !sure && speed < SLOW { self.mind = Mind::Unsure; return; }
         let slow = if sure { KEEP } else { SURE_SPEED };
@@ -338,9 +340,28 @@ mod tests {
         run(&mut quick, |t| 4.0 * t, 0.001, 0.0, 0.2);
         quick.judge.feed(0.21, (0.8, 0.1), 1);
         assert_eq!((quick.judge.mind, quick.judge.axis()), (Mind::Unsure, Some(1)));
-        // Going on quickly again is sure again.
-        let frames = run(&mut quick, |t| 0.8 + 4.0 * (t - 0.21), 0.001, 0.22, 0.6);
-        assert!(frames.last().unwrap().1 < 0.05);
+    }
+
+    #[test]
+    fn once_unsure_it_stays_receded_until_let_go() {
+        // Still a while, then quick again: all the way back, and kept so.
+        let x = |t: f64| 4.0 * t.min(0.25) + 4.0 * (t - 0.8).max(0.0);
+        let mut quick = fresh();
+        let frames = run(&mut quick, x, 0.001, 0.0, 1.4);
+        let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
+        assert!(frames.iter().filter(|f| f.0 >= unsure + 0.12).all(|f| f.1 > 0.93 && f.2 == Mind::Unsure), "{frames:?}");
+        // Turned back, then quick on: still all the way.
+        let mut quick = fresh();
+        run(&mut quick, |t| 4.0 * t, 0.001, 0.0, 0.2);
+        quick.judge.feed(0.21, (0.6, 0.0), 0);
+        let frames = run(&mut quick, |t| 0.6 - 4.0 * (t - 0.21), 0.001, 0.22, 0.6);
+        assert!(frames.last().unwrap().1 > 0.99 && frames.last().unwrap().2 == Mind::Unsure);
+        // Let go unsure, it is not carried (`Quick::release`): the next hold starts afresh.
+        quick.release(0.61);
+        assert_eq!(quick.judge.mind, Mind::Unsure);
+        let mut next = fresh();
+        let frames = run(&mut next, |t| 4.0 * (t - 0.05).clamp(0.0, 0.45), 0.001, 0.0, 0.5);
+        assert!(deepest(&frames) < 0.05, "{frames:?}");
     }
 
     #[test]
