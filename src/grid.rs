@@ -191,6 +191,14 @@ impl Grid {
         self.rows.iter().map(Row::anchor).ne(before)
     }
 
+    /// The cell a hold from `from` ends on, `to` counted as `counted` does
+    /// before the rows it turned (`turns`) are kept turned: counted after,
+    /// a turned row's cells would be counted twice. True when a row changed.
+    pub fn land(&mut self, from: Pos, to: (i32, i32), turns: &[(i32, i32)]) -> (Option<CellId>, bool) {
+        let id = self.counted(from, to).and_then(|at| self.id_at(at).cloned());
+        (id, self.keep_turns(from, turns))
+    }
+
     pub fn visit(&mut self, id: &str) {
         if let Some(pos) = self.find(id) {
             self.rows[pos.row].last = Some(id.to_owned());
@@ -398,6 +406,17 @@ mod tests {
         assert_eq!(g.counted(from, (0, -1)), Some(Pos { row: 1, col: 2 }));
         assert_eq!(g.across(2, -1).unwrap().0, Pos { row: 1, col: 2 });
         assert_eq!(g.rows[2].anchor(), 1);
+    }
+
+    #[test]
+    fn down_a_shelf_and_along_it_lands_where_the_hand_let_go() {
+        let mut g = grid(&[&["a"], &["b0", "b1", "b2"]]);
+        let from = g.find("a").unwrap();
+        for (along, cell) in [(1, "b1"), (1, "b2"), (-2, "b0")] {
+            let (id, _) = g.land(from, (along, 1), &[(0, 0), (along, 1)]);
+            assert_eq!(id.as_deref(), Some(cell));
+            assert_eq!(g.rows[1].anchor(), g.find(cell).unwrap().col);
+        }
     }
 
     fn grid(rows: &[&[&str]]) -> Grid {

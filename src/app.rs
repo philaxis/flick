@@ -1253,8 +1253,9 @@ impl App {
     /// Hold `hold` was let go of and settles on `to`: the minimap goes there
     /// along with the picture.
     fn glide_target(&mut self, hold: u32, to: (i32, i32)) {
-        let Some((origin, turns)) = self.gliding.as_mut().filter(|gliding| gliding.hold == hold).map(|g| (g.origin.clone(), g.turns())) else { return };
-        self.glide_remember(&origin, &turns);
+        // The turns are kept once it lands (`glide_go`): kept now, `to`
+        // would be counted from them a second time there.
+        let Some(origin) = self.gliding.as_ref().filter(|gliding| gliding.hold == hold).map(|g| g.origin.clone()) else { return };
         if let Some(id) = self.glide_cell(&origin, to) {
             let view = self.view(&id);
             self.minimap.update(view);
@@ -1274,8 +1275,12 @@ impl App {
     /// the rows turned on the way (`turns`) staying so. The cell when that
     /// is another one.
     fn glide_go(&mut self, origin: &str, to: (i32, i32), turns: &[(i32, i32)], carry: bool) -> Option<String> {
-        self.glide_remember(origin, turns);
-        let id = self.glide_cell(origin, to)?;
+        let from = self.grid.find(origin)?;
+        let (id, turned) = self.grid.land(from, to, turns);
+        if turned {
+            self.save();
+        }
+        let id = id?;
         let desktops = self.sync()?;
         let heading = self.heading(&desktops);
         let from = self.grid.find(&heading)?;
