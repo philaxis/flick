@@ -136,6 +136,12 @@ impl Model {
         self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)
     }
 
+    /// The desktop has no windows of its own, only those pinned, as known
+    /// from the model rather than from previews still on their way.
+    fn has_no_own_windows(&self, id: &str) -> bool {
+        self.cell(id).is_some_and(|cell| cell.windows.iter().all(|w| w.follows))
+    }
+
     /// Normalize across the whole cell, before splitting monitors or pinned
     /// sections, so a window has the same weight wherever it is shown.
     fn window_weights(&self, id: &str, grid: &Grid) -> HashMap<isize, f32> {
@@ -825,6 +831,8 @@ struct Fonts {
     centered: IDWriteTextFormat,
     /// How many windows a cell of icons stands for.
     tiny: IDWriteTextFormat,
+    /// The word in a desktop's picture when it has no windows of its own.
+    empty: IDWriteTextFormat,
 }
 
 #[derive(Clone, Copy)]
@@ -2982,6 +2990,9 @@ impl Board {
                 self.surface(p, &plate, radius, 0.075, depth, 0.6);
             });
         }
+        if own {
+            self.draw_empty(p, fonts, m, id, sections, place);
+        }
         let shows = |carried: Carried, r: &Rect| {
             if carried != which || !on_m(r) {
                 return None;
@@ -2992,6 +3003,26 @@ impl Board {
         if own && depth > 0.001 {
             self.placed(p, place, || p.fill(&plate, 16.0 * s / place.s, rgba(0.0, 0.0, 0.0, 1.0 - self.picture_shade(pos))));
         }
+    }
+
+    /// A faint word in the middle of the picture of a desktop with no
+    /// windows of its own, on the home monitor, under any pinned there; so
+    /// that it does not look like one whose previews are late. Left out
+    /// where the picture is drawn too small for it.
+    fn draw_empty(&self, p: &Painter, fonts: &Fonts, m: usize, id: &str, sections: &[Section], place: Place) {
+        let s = self.scale;
+        if m != self.home_index() || !self.model.has_no_own_windows(id) {
+            return;
+        }
+        let on_m = |r: &Rect| self.monitor_at(r) == m;
+        let part = sections.iter().find(|section| section.carried == Carried::Own && on_m(&section.part)).map_or(self.plates[m], |section| section.part);
+        let (w, h) = size(&part);
+        if w * place.s < 160.0 * s || h * place.s < 60.0 * s {
+            return;
+        }
+        let (_, cy) = centre(&part);
+        let line = rect(part.left, cy - 12.0 * s, w, 24.0 * s);
+        self.placed(p, place, || p.text(crate::i18n::text("No windows", "창 없음", "无窗口"), &fonts.empty, &line, white(0.40)));
     }
 
     /// The tiles of cell `id`, and the cells standing for the windows that
@@ -3554,6 +3585,7 @@ fn make_fonts(scale: f32) -> Result<Fonts> {
         small: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
         centered: make(12.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
         tiny: make(10.0, 600, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+        empty: make(15.0, 400, DWRITE_TEXT_ALIGNMENT_CENTER)?,
     })
 }
 
@@ -4032,6 +4064,15 @@ mod tests {
         WindowModel { hwnd: HWND(hwnd), rect: RECT { right: 1280, bottom: 720, ..Default::default() },
             follows, pin_from_app: false, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
             icon_key: 0, app_name: String::new(), topmost: false }
+    }
+
+    #[test]
+    fn a_desktop_is_empty_with_only_pinned_windows_or_none() {
+        let mut rows = vec![row(&["a", "b", "c"])];
+        rows[0].cells[0].windows = vec![window(1, true)];
+        rows[0].cells[1].windows = vec![window(2, true), window(3, false)];
+        let model = Model { rows, pinned: vec![window(4, false)], current: "a".into() };
+        assert_eq!(["a", "b", "c", "gone"].map(|id| model.has_no_own_windows(id)), [true, false, true, false]);
     }
 
     #[test]
