@@ -550,6 +550,8 @@ struct Strip {
     /// How far the hold has come in, whole or not: the row's name shows as
     /// much, however sure the hand (`show_banners`).
     named: f64,
+    /// How much of the light about pinned windows shows (`LIGHT_FADE`).
+    lit: f64,
 }
 
 impl Strip {
@@ -624,6 +626,8 @@ struct Session {
     input_samples: Vec<(f64, f64, f64, usize)>,
     /// How far a followed hold recedes as the hand goes (`quick`).
     quick: Option<crate::quick::Quick>,
+    /// When the picture first showed, for its pinned windows' light.
+    lit_from: Option<f64>,
     visible: bool,
     stats: Stats,
     trace: Option<Trace>,
@@ -650,6 +654,14 @@ impl Session {
             Phase::Stepping(step) => step.to,
         };
         Some((to, self.shown.as_ref()?))
+    }
+
+    /// How much of the light about the pinned windows shows at `now`: coming
+    /// in as the picture shows, going as it settles.
+    fn lit(&mut self, now: f64) -> f64 {
+        let from = *self.lit_from.get_or_insert(now);
+        let going = match self.phase { Phase::Settling(_, since) => 1.0 - (now - since) / LIGHT_FADE, _ => 1.0 };
+        ((now - from) / LIGHT_FADE).min(going).clamp(0.0, 1.0)
     }
 
     fn called(&self, row: i32) -> String {
@@ -810,14 +822,14 @@ impl View {
                     self.session = Some(old);
                     return;
                 }
-                let (hand, visible, began, farthest_y, trace) = (old.hand, old.visible, old.began, old.farthest_y, old.trace.take());
+                let (hand, visible, began, farthest_y, trace, lit_from) = (old.hand, old.visible, old.began, old.farthest_y, old.trace.take(), old.lit_from);
                 let mut follow = old.follow.clone();
                 follow.reframe(scene.rows, scene.cols.clone(), hand, scene.origin.row != old.origin.row);
                 let (screens, leftover) = old.retire(self.trace.as_deref());
                 self.begin(scene, screens, leftover, Phase::Following);
                 if let Some(new) = &mut self.session {
                     new.follow = follow;
-                    (new.hand, new.visible, new.began, new.farthest_y) = (hand, visible, began, farthest_y);
+                    (new.hand, new.visible, new.began, new.farthest_y, new.lit_from) = (hand, visible, began, farthest_y, lit_from);
                     new.trace = trace.or(new.trace.take());
                 }
             }
@@ -971,6 +983,7 @@ impl View {
             last_frame: None,
             input_samples: Vec::new(),
             quick: if phase == Phase::Following { crate::quick::Quick::new() } else { None },
+            lit_from: None,
             visible,
             stats,
             trace,
@@ -1100,15 +1113,23 @@ impl View {
                     let prediction = follow::resample(&session.input_samples, now);
                     let frame = session.follow.sampled(now, prediction);
                     let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
+                    // Whole, the screen is where the hand is, resampled to the frame's time.
+                    let held = frame.held();
                     following_frame = Some(frame);
-                    look = session.quick.as_mut().map(|quick| quick.look(now, session.follow.aim(), session.follow.selected(), session.follow.axis()));
+                    look = session.quick.as_mut().map(|quick| quick.look(now, session.follow.aim(), Some(held), session.follow.selected(), session.follow.axis()));
                     result
                 } else {
-                    // Let go of a flick still moving, it goes on a little (`Judge::coast`).
+                    // Let go of a flick still moving, it goes on a little (`Judge::coast`);
+                    // sure, to the cell nearest, unsure, to the latches'.
                     let coast = session.quick.as_mut().map_or((0.0, 0.0), |quick| { quick.release(release_time); quick.judge.coast(release_time) });
-                    let to = session.follow.let_go(release_time, (session.hand.0 + coast.0, session.hand.1 + coast.1));
+                    let held = session.follow.held();
+                    let to = if session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure) {
+                        session.follow.let_go_near(release_time, session.hand, coast)
+                    } else {
+                        session.follow.let_go(release_time, (session.hand.0 + coast.0, session.hand.1 + coast.1))
+                    };
                     if let Some(quick) = &mut session.quick {
-                        look = Some(quick.look(now, session.follow.aim(), to, session.follow.axis()));
+                        look = Some(quick.look(now, session.follow.aim(), Some(held), to, session.follow.axis()));
                     }
                     DECIDED.store((session.hold as u64) << 32 | pack(to) as u32 as u64, Ordering::SeqCst);
                     tell(WM_GLIDE_TARGET, to, session.hold);
@@ -1122,7 +1143,7 @@ impl View {
                 if let Some(quick) = &mut session.quick {
                     // The picture whole, the slide settles it; receded all
                     // the way, the strip; part way, both.
-                    let seen = quick.look(now, session.follow.aim(), to, session.follow.axis());
+                    let seen = quick.look(now, session.follow.aim(), None, to, session.follow.axis());
                     if seen.depth < 1.0 { settled = seen.settled && (seen.depth == 0.0 || settled); }
                     look = Some(seen);
                 }
@@ -1168,7 +1189,7 @@ impl View {
                         along
                     })
                     .collect();
-                Strip { y, along, receded, calm: 0.0, flash: 0.0, named: receded }
+                Strip { y, along, receded, calm: 0.0, flash: 0.0, named: receded, lit: session.lit(now) }
             }
         };
         // As sure as the hand is, the moving axis as it slides, whole, as
@@ -1237,6 +1258,7 @@ impl View {
         if session.stats.frames == 0 && session.phase != Phase::Following {
             // Thumbnail/font setup is not animation time: the next visible frame starts from zero.
             session.began = Instant::now();
+            session.lit_from = None;
             self.frame = session.began;
         }
         session.stats.frames += 1;
@@ -1411,9 +1433,12 @@ fn opacity(share: f64) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// How far out each step of a pinned window's light goes (unscaled), and
-/// how opaque it is.
-const LIGHT: [(f64, f64); 3] = [(2.0, 0.30), (6.0, 0.15), (12.0, 0.07)];
+/// How far out each step of a pinned window's light goes (unscaled, at
+/// `paint::PIN_ALL_REACH`): to the sides, above and below it, farthest
+/// below; and how opaque it is (at full strength).
+const LIGHT: [(f64, f64, f64, f64); 4] = [(3.0, 3.0, 5.0, 0.55), (10.0, 8.0, 22.0, 0.26), (22.0, 12.0, 46.0, 0.14), (38.0, 16.0, 80.0, 0.08)];
+/// How long (s) the light comes in as the picture shows, and goes as it settles.
+const LIGHT_FADE: f64 = 0.08;
 
 /// Draws every thumbnail of `session` for `strip`; how many moved.
 fn draw(session: &mut Session, strip: &Strip) -> u32 {
@@ -1461,19 +1486,21 @@ fn draw(session: &mut Session, strip: &Strip) -> u32 {
             Place::Cell(row, col) => {
                 let apart = (col as f64 - strip.along(rows, row), row as f64 - strip.y);
                 let (lift, _) = follow::standing_out(session.focus.at(col, row), strip.receded);
-                (follow::placed(edges, whole, scale, apart, lift), 1.0, 0.0)
+                (follow::placed(edges, whole, scale, apart, lift), 1.0, None)
             }
             Place::Row(row) => {
                 let (at, shown) = follow::row_window(follow::tucked(edges, whole, share), whole, row, strip.y, strip.receded, session.farthest_y);
-                (at, shown, paint::PIN_ROW.1 as f64)
+                (at, shown, Some(false))
             }
-            Place::Pinned => (follow::tucked(edges, whole, share), 1.0, paint::PIN_ALL.1 as f64),
-            Place::Fixed => (edges, 1.0, 0.0),
+            Place::Pinned => (follow::tucked(edges, whole, share), 1.0, Some(true)),
+            Place::Fixed => (edges, 1.0, None),
         };
-        if lit > 0.0 {
-            for (halo, (out, alpha)) in session.halos[index].iter_mut().zip(LIGHT) {
-                let out = out * screen.scale as f64;
-                moved += halo.draw(Some([at[0] - out, at[1] - out, at[2] + out, at[3] + out]), size, opacity(alpha * share * shown * lit)) as u32;
+        if let Some(all) = lit {
+            let (strength, reach) = paint::pin_light(all);
+            for (halo, (side, above, below, alpha)) in session.halos[index].iter_mut().zip(LIGHT) {
+                let k = reach as f64 * screen.scale as f64;
+                let out = [at[0] - side * k, at[1] - above * k, at[2] + side * k, at[3] + below * k];
+                moved += halo.draw(Some(out), size, opacity(alpha * strength as f64 * shown * strip.lit)) as u32;
             }
         }
         moved += thumb.draw(Some(at), size, opacity(shown)) as u32;

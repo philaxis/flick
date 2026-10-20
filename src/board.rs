@@ -211,6 +211,13 @@ pub enum Action {
 /// Height of the line at the bottom that says what the thing under the
 /// cursor is or does (shown the first time, and with ?), in unscaled units.
 const FOOTER: f32 = 44.0;
+
+/// A pinned window's light on the board (at `paint::PIN_ALL_REACH`, its
+/// glow as strong as its pin, `paint::pin_light`): below it, how large its
+/// corners are drawn (so how far it spreads), how far under it it goes and
+/// how opaque; about it all round, its corners and opacity.
+const PIN_BELOW: (f32, f32, f32) = (80.0, 16.0, 0.95);
+const PIN_ROUND: (f32, f32) = (26.0, 0.40);
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
 const ON_TOP_MS: u32 = 250;
@@ -3025,9 +3032,9 @@ impl Board {
     fn draw_zone(&self, p: &Painter, section: &Section) {
         let s = self.scale;
         let Some(glows) = &self.glows else { return };
-        let (glow, colour): (&Glow, fn(f32) -> D2D1_COLOR_F) = match section.carried {
-            Carried::Fixed => (&glows.all, everywhere),
-            _ => (&glows.row, on_row),
+        let (glow, colour, reach): (&Glow, fn(f32) -> D2D1_COLOR_F, f32) = match section.carried {
+            Carried::Fixed => (&glows.all, everywhere, paint::PIN_ALL_REACH),
+            _ => (&glows.row, on_row, paint::PIN_ROW_REACH),
         };
         let dragging = self.dragged_window().is_some();
         let over = dragging && contains(&grow(&section.part, 14.0 * s), self.cursor.0, self.cursor.1);
@@ -3037,7 +3044,7 @@ impl Board {
         let empty = !self.tiles.iter().any(|tile| contains(&part, centre(&tile.frame).0, centre(&tile.frame).1)) && section.more.is_none();
         if empty || dragging {
             let floor = rect(part.left + w * 0.12, part.bottom - 10.0 * s, w * 0.76, 6.0 * s);
-            p.glow(glow, &floor, 70.0 * s, if over { 0.55 } else if dragging { 0.30 } else { 0.13 });
+            p.glow(glow, &floor, 90.0 * reach * s, if over { 0.70 } else if dragging { 0.40 } else { 0.22 });
         }
         if dragging {
             p.fill(&part, 16.0 * s, colour(if over { 0.075 } else { 0.035 }));
@@ -3080,8 +3087,11 @@ impl Board {
         if let Some(glows) = &self.glows {
             // Pinned: a glow of its place's colour under it.
             if let Some(glow) = glows.of(pin) {
-                let under = Rect { left: body.left + bw * 0.08, right: body.right - bw * 0.08, top: body.bottom - bh * 0.35, bottom: body.bottom + 6.0 * s };
-                p.glow(glow, &under, 40.0 * s, 0.50 * dim);
+                // Most below it, spreading down as a lamp under it would; faint all round.
+                let reach = paint::pin_light(pin == Pin::Everywhere).1 * s;
+                let under = Rect { left: body.left + bw * 0.04, right: body.right - bw * 0.04, top: body.bottom - bh * 0.30, bottom: body.bottom + PIN_BELOW.1 * reach };
+                p.glow(glow, &under, PIN_BELOW.0 * reach, PIN_BELOW.2 * dim);
+                p.glow(glow, &body, PIN_ROUND.0 * reach, PIN_ROUND.1 * dim);
             }
             if pointed && !dragged {
                 p.glow(&glows.light, &body, 30.0 * s, 0.16);

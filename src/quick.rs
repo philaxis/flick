@@ -16,8 +16,11 @@
 //! (mouse counts, touchpad steps of the pad's own size, `input`), so a
 //! flick is judged alike on either.
 //!
-//! The judging (`Judge`) only reads the hand; the cells gone to are still
-//! the hand's latches (`follow::Follow`), switched to once, on letting go.
+//! The judging (`Judge`) only reads the hand. Whole, the screen is where
+//! the hand is, cell for cell, as it goes (`follow::Follow::held`), and let
+//! go of sure it lands on the cell nearest where it was going, coast and
+//! all (`Follow::let_go_near`); unsure, the cells gone to are the hand's
+//! latches (`follow::Follow`), switched to once, on letting go.
 use crate::{config::QuickFlick, transition_curve::Spring};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -51,9 +54,9 @@ pub const RECEDE: f64 = 0.04;
 pub const RETURN: f64 = 0.025;
 /// A hold begun this soon (s) after one let go of sure is sure from the start.
 pub const CARRY: f64 = 1.0;
-/// The slide's spring: settles a cell in about 150 ms, overshooting under 1%.
-const OMEGA: f64 = 30.0;
-const ZETA: f64 = 0.85;
+/// Let go of, the screen lands as a critically damped spring of this
+/// (rad/s): from half a cell still in about 0.1 s, never past the cell.
+const LAND: f64 = 75.0;
 /// `Instant`: how dark a desktop comes in, and how soon it is clear (s).
 const FLASH: (f64, f64) = (0.45, 0.12);
 
@@ -194,6 +197,9 @@ impl Judge {
     /// The axis it goes along.
     pub fn axis(&self) -> Option<usize> { self.onset.map(|(_, axis, _)| axis) }
 
+    /// Which way along it, 1 or -1 (0 not yet set off).
+    pub fn way(&self) -> f64 { self.onset.map_or(0.0, |(.., sign)| sign) }
+
     /// How much farther than the hand (cells along and down) a hold let go
     /// of sure at `now` goes, as a flung page coasts: on as fast as it went,
     /// for a moment.
@@ -202,6 +208,13 @@ impl Judge {
         let on = sign * (self.speed(now) * COAST).min(COAST_MOST);
         if axis == 0 { (on, 0.0) } else { (0.0, on) }
     }
+}
+
+/// The speed a landing `off` (cells) from its cell sets off at, the hand
+/// going `speed`: as fast towards it as can still stop on it (`LAND`), and
+/// not away.
+fn launch(off: f64, speed: f64) -> f64 {
+    if speed * off >= 0.0 { 0.0 } else { speed.clamp(-LAND * off.abs(), LAND * off.abs()) }
 }
 
 /// Whether a hold begun `since` s after one let go of sure is sure from
@@ -232,6 +245,8 @@ pub struct Quick {
     instant: bool,
     pub judge: Judge,
     along: [Spring; 2],
+    /// Let go of, and set off landing from where the hand was.
+    landing: bool,
     depth: f64,
     last: Option<f64>,
     /// The cell last shown and when it came (`Instant`).
@@ -249,7 +264,7 @@ impl Quick {
         };
         let since = SURE_END.lock().ok().and_then(|end| end.map(|end| end.elapsed().as_secs_f64()));
         let judge = if carried(since) { Judge::sure() } else { Judge::default() };
-        Some(Quick { instant, judge, along: [Spring::default(); 2], depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
+        Some(Quick { instant, judge, along: [Spring::default(); 2], landing: false, depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
     }
 
     /// Let go of at `now`; let go of sure, the next hold soon after is sure
@@ -261,18 +276,30 @@ impl Quick {
         }
     }
 
-    /// The picture at `now`, the hand's latches aiming at `aim` (cells
-    /// along and down, leaning as the hand does) on `cell`; `axis` the
-    /// hand's locked axis.
-    pub fn look(&mut self, now: f64, aim: (f64, f64), cell: (i32, i32), axis: usize) -> Look {
+    /// The picture at `now`, the hand `held` where it is (cells along and
+    /// down, `Follow::held`) while it holds and as it lets go, and the
+    /// cell gone to `aim` (`Follow::aim`) on `cell`; `axis` the hand's
+    /// locked axis.
+    pub fn look(&mut self, now: f64, aim: (f64, f64), held: Option<(f64, f64)>, cell: (i32, i32), axis: usize) -> Look {
         let now = now.max(self.last.unwrap_or(now));
         let dt = self.last.replace(now).map_or(0.0, |last| now - last);
         self.judge.check(now);
         self.depth = approach(self.depth, self.judge.wanted(), dt);
         let aim = [aim.0, aim.1];
-        for (spring, aim) in self.along.iter_mut().zip(aim) {
-            spring.advance(aim, dt, OMEGA, ZETA);
-            if spring.settled(aim) { *spring = Spring { p: aim, v: 0.0 }; }
+        if let Some(held) = held {
+            // Where the hand is, no later; let go of, off as fast as it went.
+            self.along = [Spring { p: held.0, v: 0.0 }, Spring { p: held.1, v: 0.0 }];
+            if self.judge.released.is_some() && !self.landing {
+                self.landing = true;
+                if let Some(way) = self.judge.axis() {
+                    self.along[way].v = launch(self.along[way].p - aim[way], self.judge.way() * self.judge.speed(now));
+                }
+            }
+        } else {
+            for (spring, aim) in self.along.iter_mut().zip(aim) {
+                spring.advance(aim, dt, LAND, 1.0);
+                if spring.settled(aim) { *spring = Spring { p: aim, v: 0.0 }; }
+            }
         }
         if cell != self.cell { (self.cell, self.came) = (cell, now); }
         let axis = self.judge.axis().unwrap_or(axis);
@@ -292,7 +319,7 @@ mod tests {
     use super::*;
 
     fn fresh() -> Quick {
-        Quick { instant: false, judge: Judge::default(), along: [Spring::default(); 2], depth: 0.0, last: None, cell: (0, 0), came: 0.0 }
+        Quick { instant: false, judge: Judge::default(), along: [Spring::default(); 2], landing: false, depth: 0.0, last: None, cell: (0, 0), came: 0.0 }
     }
 
     /// A hand along x at `x(t)` (cells), sampled every `dt` from `from`
@@ -304,7 +331,7 @@ mod tests {
         while t <= until + 1e-9 {
             quick.judge.feed(t, (x(t), 0.0), 0);
             if t >= frame {
-                let depth = quick.look(t, (x(t).round(), 0.0), (x(t).round() as i32, 0), 0).depth;
+                let depth = quick.look(t, (x(t).round(), 0.0), Some((x(t), 0.0)), (x(t).round() as i32, 0), 0).depth;
                 frames.push((t, depth, quick.judge.mind));
                 frame += 1.0 / 120.0;
             }
@@ -331,7 +358,7 @@ mod tests {
             assert_eq!(quick.judge.mind, Mind::Sure);
             // Stopping, then letting go soon, stays whole.
             quick.release(0.32);
-            assert!(quick.look(0.4, (1.0, 0.0), (1, 0), 0).depth < 0.05);
+            assert!(quick.look(0.4, (1.0, 0.0), None, (1, 0), 0).depth < 0.05);
         }
     }
 
@@ -390,7 +417,7 @@ mod tests {
         assert!(deepest(&frames) < 0.05, "{frames:?}");
         quick.release(0.6);
         let coast = quick.judge.coast(0.6);
-        assert_eq!(hand.let_go(0.6, (x(0.6) + coast.0, coast.1)), (2, 0));
+        assert_eq!(hand.let_go_near(0.6, (x(0.6), 0.0), coast), (2, 0));
     }
 
     #[test]
@@ -404,7 +431,7 @@ mod tests {
         assert!((coast.0 - COAST_MOST).abs() < 1e-9 && coast.1 == 0.0, "{coast:?}");
         let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 5)]);
         hand.track_locked(0.1, (fling(0.1), 0.0), 0);
-        assert_eq!(hand.let_go(0.115, (fling(0.115) + coast.0, 0.0)), (2, 0));
+        assert_eq!(hand.let_go_near(0.115, (fling(0.115), 0.0), coast), (2, 0));
         // Let go once stopped, as far as it went; let go of unsure, too.
         let mut quick = fresh();
         run(&mut quick, |t| stroke(t, 0.05, 1.3, 0.04), 0.001, 0.0, 0.3);
@@ -471,16 +498,47 @@ mod tests {
     }
 
     #[test]
-    fn the_slide_takes_about_150_ms_a_cell_and_hardly_overshoots() {
+    fn whole_the_screen_is_where_the_hand_is_and_lands_on_the_nearest_cell_in_a_tenth_of_a_second() {
+        // Held: cell for cell where the hand is, from its first move.
+        let x = |t: f64| stroke(t, 0.02, 0.8, 0.05);
         let mut quick = fresh();
-        let (mut most, mut near) = (0.0f64, None);
-        for frame in 0..=60 {
-            let now = frame as f64 / 120.0;
-            let look = quick.look(now, (1.0, 0.0), (1, 0), 0);
-            most = most.max(look.at);
-            if near.is_none() && (look.at - 1.0).abs() < 0.03 { near = Some(now); }
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
+        let mut t = 0.0;
+        while t < 0.06 {
+            hand.track_locked(t, (x(t), 0.0), 0);
+            quick.judge.feed(t, (x(t), 0.0), 0);
+            let look = quick.look(t, hand.aim(), Some(hand.held()), hand.selected(), 0);
+            assert!((look.at - x(t)).abs() < 1e-9, "{t}: {} for {}", look.at, x(t));
+            t += 1.0 / 120.0;
         }
-        assert!(most < 1.02, "overshoot {most}");
-        assert!(near.is_some_and(|t| (0.1..=0.18).contains(&t)), "{near:?}");
+        // Let go still moving, short of a cell: to it, at once, never past it.
+        quick.release(t);
+        let held = hand.held();
+        let to = hand.let_go_near(t, (x(t), 0.0), quick.judge.coast(t));
+        assert_eq!(to, (1, 0));
+        let mut look = quick.look(t, hand.aim(), Some(held), to, 0);
+        assert_eq!(look.at, held.0);
+        let (from, mut most, mut near) = (t, 0.0f64, None);
+        for frame in 1..=60 {
+            let now = from + frame as f64 / 120.0;
+            look = quick.look(now, hand.aim(), None, to, 0);
+            most = most.max(look.at);
+            if near.is_none() && (look.at - 1.0).abs() < 0.005 { near = Some(now - from); }
+        }
+        assert!(most <= 1.01 && look.settled, "overshoot {most}");
+        assert!(near.is_some_and(|t| t <= 0.1), "{near:?}");
+        // Still, half a cell on: there in about a tenth of a second too; short of half, back.
+        let mut quick = fresh();
+        quick.release(0.0);
+        quick.look(0.0, (1.0, 0.0), Some((0.5, 0.0)), (1, 0), 0);
+        let near = (1..60).map(|f| f as f64 / 120.0).find(|&now| (quick.look(now, (1.0, 0.0), None, (1, 0), 0).at - 1.0).abs() < 0.005);
+        assert!(near.is_some_and(|t| t <= 0.1), "{near:?}");
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(0, 3)]);
+        hand.track_locked(0.0, (0.4, 0.0), 0);
+        assert_eq!(hand.let_go_near(0.01, (0.4, 0.0), (0.0, 0.0)), (0, 0));
+        // At the row's end, held there.
+        let mut hand = crate::follow::Follow::new((0, 0), vec![(-1, 0)]);
+        hand.track_locked(0.0, (0.3, 0.0), 0);
+        assert_eq!(hand.held(), (0.0, 0.0));
     }
 }

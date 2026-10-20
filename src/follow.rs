@@ -258,6 +258,16 @@ impl Follow {
         let y = if !self.released && self.axis == 1 { self.rows_hand.target(self.rows) } else { self.row as f64 };
         (x, y)
     }
+    /// Where the hand is (`quick`), cell for cell as it went, the cells at
+    /// either end of the row and of the rows as far as it goes.
+    pub fn held(&self) -> (f64, f64) {
+        let i = (self.row - self.rows.0) as usize;
+        let (left, right) = self.cols[i];
+        let column = &self.columns[i];
+        let x = if self.axis == 0 { (column.cell as f64 + column.hand).clamp(left as f64, right as f64) } else { column.cell as f64 };
+        let y = if self.axis == 1 { (self.rows_hand.cell as f64 + self.rows_hand.hand).clamp(self.rows.0 as f64, self.rows.1 as f64) } else { self.row as f64 };
+        (x, y)
+    }
     pub fn axis(&self) -> usize { self.axis }
     pub fn velocity(&self) -> ((f64, f64), f64) {
         ((self.along[(self.row - self.rows.0) as usize].v, self.vertical.v), self.depth.v)
@@ -325,6 +335,25 @@ impl Follow {
     pub fn let_go(&mut self, now: f64, at: (f64, f64)) -> (i32, i32) {
         self.track_locked(now, at, self.axis); self.released = true;
         (self.columns[(self.row - self.rows.0) as usize].cell, self.row)
+    }
+    /// Let go of `at` as a sure hand is (`quick`): to the cell nearest where
+    /// it is (`held`) and `coast` farther, not the latches' next.
+    pub fn let_go_near(&mut self, now: f64, at: (f64, f64), coast: (f64, f64)) -> (i32, i32) {
+        self.track_locked(now, at, self.axis);
+        let (x, y) = self.held();
+        let i = (self.row - self.rows.0) as usize;
+        if self.axis == 0 {
+            let (left, right) = self.cols[i];
+            self.columns[i].cell = ((x + coast.0).round() as i32).clamp(left, right);
+        } else {
+            let row = ((y + coast.1).round() as i32).clamp(self.rows.0, self.rows.1);
+            if row != self.row {
+                (self.rows_hand.cell, self.row) = (row, row);
+                self.columns[(row - self.rows.0) as usize].rebase(at.0);
+            }
+        }
+        self.released = true;
+        self.selected()
     }
     pub fn settle(&mut self, now: f64) -> ((f64, f64), bool) { self.advance(now) }
 
