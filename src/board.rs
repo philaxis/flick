@@ -1353,8 +1353,9 @@ impl Board {
     /// went meanwhile taken in, and the cell it is on shown, eased to as
     /// any move is (`show_selected`). Returns the hand as the board follows
     /// it (how far it leans from the cell shown, as `input::Hand` has it),
-    /// whether it is still held, and its axis; `None` without one.
-    fn take_hold(&mut self, now: Instant) -> Option<(crate::input::Hand, bool, Option<usize>)> {
+    /// whether it is still held, its axis, and whether the board is to stay
+    /// whole (not yet unsure); `None` without one.
+    fn take_hold(&mut self, now: Instant) -> Option<(crate::input::Hand, bool, Option<usize>, bool)> {
         let hold = self.hold.as_mut()?;
         let t = now.saturating_duration_since(hold.began).as_secs_f64();
         if hold.released.is_none() {
@@ -1367,15 +1368,16 @@ impl Board {
         let at = hold.released.unwrap_or(t);
         if let Some(judge) = &mut hold.judge { judge.check(at); }
         let holding = hold.released.is_none();
-        // Not yet unsure, on the cell it began on, the board still.
+        // Not yet unsure, on the cell it began on, the board still but
+        // for giving as the latches do when pushed past the end (`Follow::past`).
         let (cell, lean) = if hold.still() {
-            ((0, 0), (0.0, 0.0))
+            ((0, 0), hold.follow.past())
         } else {
             let (cell, aim) = (hold.follow.selected(), hold.follow.aim());
             (cell, (aim.0 - cell.0 as f64, aim.1 - cell.1 as f64))
         };
         let lean = if holding { lean } else { (0.0, 0.0) };
-        let (id, axis) = (hold.id, hold.follow.axis());
+        let (id, axis, whole) = (hold.id, hold.follow.axis(), hold.still());
         if cell != hold.shown {
             let turns = if hold.still() { Vec::new() } else { hold.follow.turns() };
             let to = hold.grid.counted(hold.from, cell).and_then(|at| hold.grid.id_at(at)).cloned();
@@ -1388,7 +1390,7 @@ impl Board {
         }
         // Changes with the cell shown and with letting go, as `input::Hand`'s does.
         let counted_from = (id as u64) << 33 | (holding as u64) << 32 | (cell.1 as i16 as u16 as u64) << 16 | cell.0 as i16 as u16 as u64;
-        Some((crate::input::Hand { along: lean.0 as f32, across: lean.1 as f32, counted_from }, holding, Some(axis)))
+        Some((crate::input::Hand { along: lean.0 as f32, across: lean.1 as f32, counted_from }, holding, Some(axis), whole))
     }
 
     fn show_selected(&mut self, id: CellId, grid: Grid) {
@@ -1553,10 +1555,13 @@ impl Board {
         let now = samples.last().map_or(now, |s| now.max(s.at));
         // A hold the screen follows is read as the normal view reads it
         // (`Hold`), not from where the app last answered.
-        let (hand, holding, axis, samples) = match self.take_hold(now) {
-            Some((hand, holding, axis)) => (hand, holding, axis, Vec::new()),
-            None => (hand, holding, axis, samples),
+        // Its lean gives past the end of a row and of the rows as the
+        // normal view's does, rather than stopping there (`strip_pull`).
+        let (hand, holding, axis, samples, gives, whole) = match self.take_hold(now) {
+            Some((hand, holding, axis, whole)) => (hand, holding, axis, Vec::new(), true, whole),
+            None => (hand, holding, axis, samples, false, false),
         };
+        self.strip.keep_whole(whole);
         let dragging = self.press.as_ref().is_some_and(|press| press.dragging);
         let t = self.strip_time(now);
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
@@ -1572,7 +1577,8 @@ impl Board {
             self.strip_samples.push((at as f64,h.along as f64,h.across as f64,sample.axis));
         }
         if samples.is_empty() && self.strip_input != Some((hand, holding)) {
-            self.strip.follow(self.strip_pull((hand.along, hand.across)), row, hand.counted_from, holding, t);
+            let pull = if gives { (hand.along, hand.across) } else { self.strip_pull((hand.along, hand.across)) };
+            self.strip.follow(pull, row, hand.counted_from, holding, t);
         }
         self.strip_input = Some((hand, holding));
         self.strip.advance_depth(t);

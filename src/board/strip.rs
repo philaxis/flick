@@ -204,6 +204,8 @@ pub struct Strip {
     last_input: f32,
     /// The last move only slides (`moved`): its sliding takes nothing back.
     sliding_only: bool,
+    /// The hand is not to take the strip back (`keep_whole`).
+    whole: bool,
 }
 
 impl Strip {
@@ -251,6 +253,12 @@ impl Strip {
         }
     }
 
+    /// While `whole`, a hand pulling the strip (as a flick pushed past the
+    /// end gives) only moves it, at full size.
+    pub fn keep_whole(&mut self, whole: bool) {
+        self.whole = whole;
+    }
+
     /// One frame at `now` with the hand pulling the selected `row` by `hand`
     /// (cells), counted from `counted_from`. A hold recedes the strip; let
     /// go, it settles on the committed cell without predicting a fling.
@@ -258,9 +266,9 @@ impl Strip {
         let now = now.max(self.last_input);
         self.last_input = now;
         let hand = if holding { hand } else { (0.0, 0.0) };
-        self.sliding_only &= hand == (0.0, 0.0);
-        if holding && hand != (0.0, 0.0) && self.recede.settled(now) { self.recede.hold(now); }
-        if holding && hand.1.abs() > 0.02 {
+        self.sliding_only &= hand == (0.0, 0.0) || self.whole;
+        if holding && hand != (0.0, 0.0) && !self.whole && self.recede.settled(now) { self.recede.hold(now); }
+        if holding && hand.1.abs() > 0.02 && !self.whole {
             self.row_recede.hold(now);
         }
         // Hand targets change; carry the displayed position and velocity through
@@ -284,10 +292,12 @@ impl Strip {
 
     /// Depth still settles on idle frames; translation targets only change on real input.
     pub fn advance_depth(&mut self, now: f32) {
-        let rows_moving = self.across.at(now).abs() > 0.01 && !self.sliding_only;
-        let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01) && !self.sliding_only;
-        self.recede.moving(now, moving || self.holding && (self.hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
-        self.row_recede.moving(now, rows_moving || self.holding && self.hand.1.abs() > 0.01);
+        let flat = self.sliding_only || self.whole;
+        let rows_moving = self.across.at(now).abs() > 0.01 && !flat;
+        let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01) && !flat;
+        let pulled = self.holding && !self.whole;
+        self.recede.moving(now, moving || pulled && (self.hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
+        self.row_recede.moving(now, rows_moving || pulled && self.hand.1.abs() > 0.01);
     }
 
     /// How far the cells of `row` are drawn from where they are laid out,
@@ -473,6 +483,20 @@ mod tests {
             slid |= strip.offset(0, now).0.abs() > 0.01;
         }
         assert!(slid && strip.offset(0, 2.0).0.abs() < 0.001 && !strip.active(2.0));
+    }
+
+    #[test]
+    fn a_whole_strip_pulled_past_the_end_gives_at_full_size() {
+        let mut strip = Strip::default();
+        strip.keep_whole(true);
+        let mut gave = false;
+        for frame in 0..120 {
+            let t = frame as f32 / 120.0;
+            strip.follow((0.1, 0.0), 0, 1, true, t);
+            assert_eq!((strip.depth(t), strip.row_depth(t)), (0.0, 0.0), "{t}");
+            gave |= strip.offset(0, t).0.abs() > 0.01;
+        }
+        assert!(gave);
     }
 
     #[test]
