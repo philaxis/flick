@@ -25,8 +25,6 @@ pub enum Status {
     Unavailable,
 }
 
-pub const NOTICE: &str =
-    "Windows' three-finger gestures (swipes and taps) must be set to Nothing to use this";
 static REGISTRATION_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub fn registration_failed(failed: bool) {

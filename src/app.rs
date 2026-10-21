@@ -1935,12 +1935,6 @@ impl App {
         settings::View {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
             capturing: self.capturing,
-            autostart: self.autostart,
-            admin: self.admin,
-            minimap: self.config.minimap,
-            mouse: self.config.mouse,
-            touchpad: self.config.touchpad,
-            touchpad_status: crate::touchpad::status(),
             flick_ms: self.config.experimental.flick_ms,
         }
     }
@@ -1951,16 +1945,6 @@ impl App {
     fn read_startup(&mut self) {
         self.admin = admin::enabled();
         self.autostart = if self.admin { admin::at_sign_in() } else { tray::autostart_enabled() };
-    }
-
-    fn set_autostart(&mut self, on: bool) {
-        if self.admin {
-            admin::set_at_sign_in(on);
-        } else {
-            tray::set_autostart(on);
-        }
-        self.read_startup();
-        self.refresh_settings();
     }
 
     fn open_settings(&mut self) {
@@ -2046,32 +2030,8 @@ impl App {
     fn settings_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match self.settings.handle(message, wparam, lparam)? {
             settings::Action::None => {}
-            settings::Action::Try { mouse, touchpad } => {
-                // Felt at once while dragging; written when the drag ends.
-                let config = Config { mouse, touchpad, ..self.config.clone() };
-                input::install(self.hwnd, triggers(&config).0, &config);
-            }
             settings::Action::Set(key, value) => self.set_config(key, &value),
             settings::Action::Capture(on) => self.capture_trigger(on),
-            settings::Action::Autostart(on) => self.set_autostart(on),
-            settings::Action::Admin(on) => {
-                if on {
-                    let taken_over = admin::turn_on(self.autostart);
-                    if admin::enabled() { tray::set_autostart(false); }
-                    if taken_over { unsafe { PostQuitMessage(0); } }
-                } else if admin::turn_off() {
-                    tray::set_autostart(self.autostart);
-                }
-                self.read_startup();
-                self.refresh_settings();
-            }
-            settings::Action::OpenFile => unsafe {
-                let path = HSTRING::from(config::config_path().as_os_str());
-                ShellExecuteW(None, w!("open"), w!("notepad.exe"), &path, PCWSTR::null(), SW_SHOWNORMAL);
-            },
-            settings::Action::TouchpadSettings => unsafe {
-                ShellExecuteW(None, w!("open"), w!("ms-settings:devices-touchpad"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-            },
             settings::Action::Close => self.close_settings(),
         }
         Some(LRESULT(0))
@@ -2115,9 +2075,6 @@ impl App {
         let trigger = self.settings_view().trigger;
         if let Some(guide) = &mut self.guide { guide.set_trigger(trigger); }
         self.refresh_settings();
-        if crate::touchpad::status() == crate::touchpad::Status::Conflict && !self.settings.is_open() {
-            self.settings.open(self.settings_view());
-        }
     }
 
     /// Ctrl+Alt+Win with an arrow moves, with Shift added it carries the
@@ -2400,7 +2357,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 let status = crate::touchpad::poll(app.config.touchpad.three_finger);
                 if status != before {
                     app.refresh_settings();
-                    if status == crate::touchpad::Status::Conflict { app.open_settings(); }
                 }
                 app.usage_tick();
                 // Piggyback on the existing timer, at most once per half minute.
@@ -2436,7 +2392,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_TRAY => {
             let event = lparam.0 as u32 & 0xFFFF;
             if event == WM_LBUTTONUP {
-                with_app(App::open_board);
+                with_app(App::open_settings);
             } else if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                 // The menu runs its own message loop, so it must not hold the app.
                 if let Some(command) = tray::menu(hwnd) {
@@ -2967,23 +2923,16 @@ pub fn render_guide(path: &str, seconds: f32) {
 }
 
 /// Renders the settings window with the default config into `path` (see
-/// `write_raw`), on the touchpad's tab with `touchpad`.
-pub fn render_settings(path: &str, touchpad: bool) {
+/// `write_raw`).
+pub fn render_settings(path: &str) {
     let Ok(mut window) = Settings::new(wndproc, Default::default()) else { return };
     let config = Config::default();
     let view = settings::View {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
-        autostart: true,
-        admin: false,
-        minimap: config.minimap,
-        mouse: config.mouse,
-        touchpad: config.touchpad,
-        touchpad_status: if touchpad { crate::touchpad::Status::Conflict } else { crate::touchpad::Status::Absent },
         flick_ms: config.experimental.flick_ms,
     };
-    let tab = if touchpad { settings::Tab::Touchpad } else { settings::Tab::Mouse };
-    if let Some((size, pixels)) = window.render_to_pixels(view, tab, 1.5) {
+    if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {
         write_raw(path, size, &pixels);
     }
 }

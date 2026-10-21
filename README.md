@@ -16,7 +16,7 @@
 
 **Tap to see everything.** Tap the trigger for the windows on this desktop and a small map of all of them. Drag a window onto the map to move it.
 
-**Any button you like.** It starts as the mouse "forward" button. Right-click the tray icon → *Settings…* → *Change* and press whatever you want instead, even several keys at once.
+**Any button you like.** It starts as the mouse "forward" button. Click the tray icon for Settings → *Change* and press whatever you want instead, even several keys at once.
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
 
@@ -32,7 +32,7 @@
 
 **Settings with the keyboard.** Tab / Shift+Tab move the visible focus, arrow keys adjust a focused slider, and Space / Enter activate a button or toggle. Ctrl+Tab switches device tabs; 1 / 2 still work. The window fits the monitor’s work area and scrolls vertically when needed, with the wheel, scrollbar or Page Up / Page Down; keyboard focus scrolls into view. Settings and the guide use the Windows UI language (Korean, Chinese, or English otherwise), and the guide names the current trigger.
 
-**Startup stays quiet.** Elevation is opt-in through *Run as administrator* in Settings, so declining or postponing it never triggers another UAC request on startup. Turning it off affects the next launch; the current process keeps its privileges until restarted. The tray-location balloon appears only when the first guide is completed. Hover previews still appear immediately: the obsolete `dwell_ms` key is ignored and can be removed from older config files.
+**Startup stays quiet.** Flick never asks for administrator rights on its own. The tray-location balloon appears only when the first guide is completed. A cell of the board's map shows its windows once the cursor rests on it a moment, so passing over the map does not stick; the obsolete `dwell_ms` key is ignored and can be removed from older config files.
 
 ## Get started
 

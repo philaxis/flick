@@ -83,10 +83,6 @@ fn main() {
         if flag == "--render-board" {
             return app::render_board(path, Some(sizes));
         }
-        // `--render-settings <file> touchpad`: on the touchpad's tab.
-        if flag == "--render-settings" {
-            return app::render_settings(path, sizes == "touchpad");
-        }
     }
     if let [_, flag, path] = args.as_slice() {
         if flag == "--render" {
@@ -102,7 +98,7 @@ fn main() {
             return app::time_minimap(path);
         }
         if flag == "--render-settings" {
-            return app::render_settings(path, false);
+            return app::render_settings(path);
         }
     }
     // `--render-guide <file> <seconds>`: the first-run window that far into
