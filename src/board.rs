@@ -744,20 +744,32 @@ impl Motion {
     }
 }
 
-/// A hold over the board, judged as the normal view's is (`quick::Judge`):
-/// a flick leaves the board still as it is held and goes exactly one cell
-/// its way as it is let go of, easing there as any move does; any other hold is precise, the
-/// selection following the latches as it always has. The cell the latches
-/// come to while it is not yet unsure waits in `latched`.
-struct Flick {
-    start: Pos,
+/// A hold over the board the screen follows (`input::FOLLOWING`), its hand
+/// read as the normal view reads it (`follow::Follow::take`): the latches
+/// counted from the cell it began on as a picture of a hold counts them
+/// (`Grid::counted`, in `grid` as it was then), and the flick judge
+/// (`quick::Judge`). Not yet unsure, the selection stays on the cell it
+/// began on; unsure, it is the latches' cell, easing there as any move
+/// does. Let go of, a flick goes exactly one cell its way (`Board::let_go`).
+struct Hold {
+    id: u32,
     began: Instant,
-    judge: crate::quick::Judge,
-    latched: Option<(CellId, Grid)>,
+    start: CellId,
+    from: Pos,
+    grid: Grid,
+    follow: crate::follow::Follow,
+    judge: Option<crate::quick::Judge>,
+    /// Where the hand is (`input::Followed`), and when it was let go of.
+    hand: (f64, f64),
+    released: Option<f64>,
+    /// The cell shown, as the latches count it, and the rows shown turned
+    /// on the way there (`Follow::turns`).
+    shown: (i32, i32),
+    turns: Vec<(i32, i32)>,
 }
 
-impl Flick {
-    fn still(&self) -> bool { self.judge.mind != crate::quick::Mind::Unsure }
+impl Hold {
+    fn still(&self) -> bool { self.judge.as_ref().is_some_and(|judge| judge.mind != crate::quick::Mind::Unsure) }
 }
 
 /// How far the hand pulls the selected row sideways and the selection up or
@@ -879,9 +891,9 @@ pub struct Board {
     /// being drawn; whether it is moving, with the cells beside the
     /// selection laid out and their live previews registered.
     strip: Strip,
-    /// A hold over the board judged as the normal view's is (`quick`), while
-    /// it goes on: see `Flick`.
-    flick: Option<Flick>,
+    /// A hold over the board the screen follows, while it goes on: see
+    /// `Hold`.
+    hold: Option<Hold>,
     #[cfg(feature = "motion-probe")]
     probe_marker: Cell<Option<f32>>,
     strip_frame: Option<Strip>,
@@ -1036,7 +1048,7 @@ impl Board {
                 clock: FrameClock::default(),
                 vblank_frame: None,
                 strip: Strip::default(),
-                flick: None,
+                hold: None,
                 #[cfg(feature = "motion-probe")]
                 probe_marker: Cell::new(None),
                 strip_frame: None,
@@ -1188,12 +1200,27 @@ impl Board {
     }
 
     /// Replaces the content, keeping the selection when its cell still exists.
-    pub fn set_model(&mut self, model: Model, grid: Grid) {
+    pub fn set_model(&mut self, model: Model, mut grid: Grid) {
         if !self.open {
             return;
         }
         self.model = model;
         self.source_sizes.borrow_mut().clear();
+        // A hold going on is counted in the grid as it is now, and shows
+        // the rows it turned as it did.
+        let mut lost = false;
+        if let Some(hold) = &mut self.hold {
+            match grid.find(&hold.start) {
+                Some(from) => {
+                    (hold.grid, hold.from) = (grid.clone(), from);
+                    grid.keep_turns(from, &hold.turns);
+                }
+                None => lost = true,
+            }
+        }
+        if lost {
+            self.hold = None;
+        }
         self.grid = grid;
         if self.grid.find(&self.selected).is_none() {
             self.selected = self.model.current.clone();
@@ -1238,7 +1265,7 @@ impl Board {
             return;
         }
         self.open = false;
-        self.flick = None;
+        self.hold = None;
         crate::input::set_board_open(false);
         self.end_peek();
         self.stop_motion();
@@ -1268,30 +1295,94 @@ impl Board {
     /// shown before and after (on every desktop, or in the row while the
     /// row stays) stay; those of the cell gone to come in from its side.
     pub fn select(&mut self, id: CellId, grid: Grid) {
-        if let Some(flick) = self.flick.as_mut().filter(|flick| flick.still()) {
-            flick.latched = Some((id, grid));
-            return;
-        }
         self.show_selected(id, grid);
     }
 
-    /// The hold over the board let go of (`Flick`): the cell it lands on,
-    /// `None` when it was not judged.
-    pub fn let_go(&mut self) -> Option<CellId> {
-        let mut flick = self.flick.take()?;
-        flick.judge.release(flick.began.elapsed().as_secs_f64());
-        if flick.still() {
-            let dir = match flick.judge.step() {
-                (x, _) if x > 0.0 => Some(Dir::Right),
-                (x, _) if x < 0.0 => Some(Dir::Left),
-                (_, y) if y > 0.0 => Some(Dir::Down),
-                (_, y) if y < 0.0 => Some(Dir::Up),
-                _ => None,
-            };
-            let to = dir.and_then(|dir| self.grid.target(flick.start, dir)).unwrap_or(flick.start);
-            return self.grid.id_at(to).cloned();
+    /// Hold `id`, which the screen follows, began over the open board: its
+    /// hand is read from now on as the normal view reads it (`Hold`), the
+    /// latches given the rows and cells a picture of it would have.
+    pub fn hold(&mut self, id: u32) {
+        if !self.open || self.hold.as_ref().is_some_and(|hold| hold.id == id) {
+            return;
         }
-        flick.latched.map(|(id, _)| id)
+        let Some(saved) = crate::input::follow_hold(id).filter(|saved| saved.hand.hold == id) else { return };
+        let Some(from) = self.grid.find(&self.selected) else { return };
+        let (rows, cols) = self.grid.reach(from, true, true);
+        self.hold = Some(Hold {
+            id,
+            began: saved.started.unwrap_or_else(Instant::now),
+            start: self.selected.clone(),
+            from,
+            grid: self.grid.clone(),
+            follow: crate::follow::Follow::new(rows, cols),
+            judge: (crate::quick::mode() != crate::config::QuickFlick::Off).then(crate::quick::Judge::default),
+            hand: (0.0, 0.0),
+            released: None,
+            shown: (0, 0),
+            turns: Vec::new(),
+        });
+        self.follow_hand();
+    }
+
+    /// Whether hold `id` over the board has gone to another cell by now:
+    /// let go of, it is a move, never a click.
+    pub fn moved(&mut self, id: u32) -> bool {
+        self.take_hold(Instant::now());
+        self.hold.as_ref().is_some_and(|hold| hold.id == id && hold.follow.selected() != (0, 0))
+    }
+
+    /// The hold over the board let go of (`Hold`), landing as the normal
+    /// view's does (`Follow::land`): the cell it began on, the cell it
+    /// lands on and the rows it turned, as `Grid::land` takes them. `None`
+    /// when no hold the screen follows went on.
+    pub fn let_go(&mut self) -> Option<(CellId, (i32, i32), Vec<(i32, i32)>)> {
+        self.take_hold(Instant::now());
+        let mut hold = self.hold.take()?;
+        let at = hold.released.unwrap_or_else(|| hold.began.elapsed().as_secs_f64());
+        let (to, _) = hold.follow.land(hold.judge.as_mut(), at, hold.hand);
+        Some((hold.start, to, hold.follow.turns()))
+    }
+
+    /// The hold over the board (`Hold`) brought up to `now`: the hand it
+    /// went meanwhile taken in, and the cell it is on shown, eased to as
+    /// any move is (`show_selected`). Returns the hand as the board follows
+    /// it (how far it leans from the cell shown, as `input::Hand` has it),
+    /// whether it is still held, and its axis; `None` without one.
+    fn take_hold(&mut self, now: Instant) -> Option<(crate::input::Hand, bool, Option<usize>)> {
+        let hold = self.hold.as_mut()?;
+        let t = now.saturating_duration_since(hold.began).as_secs_f64();
+        if hold.released.is_none() {
+            if let Some(saved) = crate::input::follow_frame(hold.id) {
+                let (_, released) = hold.follow.take(hold.judge.as_mut(), &saved, hold.began, t, |_, _| {});
+                hold.hand = (saved.hand.x, saved.hand.y);
+                hold.released = released.or_else(|| (!saved.hand.holding).then_some(t));
+            }
+        }
+        let at = hold.released.unwrap_or(t);
+        if let Some(judge) = &mut hold.judge { judge.check(at); }
+        let holding = hold.released.is_none();
+        // Not yet unsure, on the cell it began on, the board still.
+        let (cell, lean) = if hold.still() {
+            ((0, 0), (0.0, 0.0))
+        } else {
+            let (cell, aim) = (hold.follow.selected(), hold.follow.aim());
+            (cell, (aim.0 - cell.0 as f64, aim.1 - cell.1 as f64))
+        };
+        let lean = if holding { lean } else { (0.0, 0.0) };
+        let (id, axis) = (hold.id, hold.follow.axis());
+        if cell != hold.shown {
+            let turns = if hold.still() { Vec::new() } else { hold.follow.turns() };
+            let to = hold.grid.counted(hold.from, cell).and_then(|at| hold.grid.id_at(at)).cloned();
+            if let Some(to) = to {
+                let mut grid = hold.grid.clone();
+                grid.keep_turns(hold.from, &turns);
+                (hold.shown, hold.turns) = (cell, turns);
+                self.show_selected(to, grid);
+            }
+        }
+        // Changes with the cell shown and with letting go, as `input::Hand`'s does.
+        let counted_from = (id as u64) << 33 | (holding as u64) << 32 | (cell.1 as i16 as u16 as u64) << 16 | cell.0 as i16 as u16 as u64;
+        Some((crate::input::Hand { along: lean.0 as f32, across: lean.1 as f32, counted_from }, holding, Some(axis)))
     }
 
     fn show_selected(&mut self, id: CellId, grid: Grid) {
@@ -1359,28 +1450,6 @@ impl Board {
     /// How far the hand pulls the selection, in cells and rows.
     fn drawn_strip(&self) -> &Strip { self.strip_frame.as_ref().unwrap_or(&self.strip) }
 
-    /// Judges the hold over the board from its samples (`Flick`): how far
-    /// the hand itself went since it began. Gone
-    /// unsure, the cell the latches came to meanwhile is shown.
-    fn judge_flick(&mut self, samples: &[crate::input::TimedHand], now: Instant) {
-        let Some(flick) = &mut self.flick else { return };
-        for sample in samples {
-            let t = sample.at.saturating_duration_since(flick.began).as_secs_f64();
-            flick.judge.feed(t, sample.cells, sample.axis);
-        }
-        flick.judge.check(now.saturating_duration_since(flick.began).as_secs_f64());
-        if !flick.still() {
-            if let Some((id, grid)) = flick.latched.take() {
-                self.show_selected(id, grid);
-            }
-        }
-    }
-
-    /// The hand as the board follows it: not at all while a flick is held.
-    fn flick_hand(&self, hand: crate::input::Hand) -> crate::input::Hand {
-        if self.flick.as_ref().is_some_and(Flick::still) { crate::input::Hand { along: 0.0, across: 0.0, ..hand } } else { hand }
-    }
-
     fn strip_pull(&self, hand: (f32, f32)) -> (f32, f32) {
         let Some(at) = self.grid.find(&self.selected).filter(|_| hand != (0.0, 0.0)) else { return (0.0, 0.0) };
         hand_pull(&self.grid, at, hand)
@@ -1390,11 +1459,6 @@ impl Board {
     /// the hand from now on, as the minimap's do.
     pub fn follow_hand(&mut self) {
         if self.open {
-            if self.flick.is_none() && crate::quick::mode() != crate::config::QuickFlick::Off {
-                if let Some(start) = self.grid.find(&self.selected) {
-                    self.flick = Some(Flick { start, began: Instant::now(), judge: Default::default(), latched: None });
-                }
-            }
             if self.end_peek() {
                 self.relayout();
                 self.register_thumbnails();
@@ -1476,6 +1540,12 @@ impl Board {
     fn tick_motion(&mut self, now: Instant, by_vblank: bool) {
         let (hand, holding, axis, samples) = crate::input::board_frame();
         let now = samples.last().map_or(now, |s| now.max(s.at));
+        // A hold the screen follows is read as the normal view reads it
+        // (`Hold`), not from where the app last answered.
+        let (hand, holding, axis, samples) = match self.take_hold(now) {
+            Some((hand, holding, axis)) => (hand, holding, axis, Vec::new()),
+            None => (hand, holding, axis, samples),
+        };
         let dragging = self.press.as_ref().is_some_and(|press| press.dragging);
         let t = self.strip_time(now);
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
@@ -1483,9 +1553,6 @@ impl Board {
         self.advance_peek(now);
         let changed_origin = self.strip_input.is_none_or(|(last, _)| last.counted_from != hand.counted_from);
         if changed_origin { self.strip_samples.clear(); }
-        self.judge_flick(&samples, now);
-        let samples: Vec<_> = samples.into_iter().map(|mut sample| { sample.hand = self.flick_hand(sample.hand); sample }).collect();
-        let hand = self.flick_hand(hand);
         for sample in &samples {
             let at = self.strip_time(sample.at);
             let h = sample.hand;

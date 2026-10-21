@@ -1,5 +1,7 @@
 //! Variant F on the desktop grid; the same springs drive the board and minimap.
 use crate::transition_curve::{deepen, give, kicked, Latch, Spring};
+use crate::{input::{FollowHold, TimedHand}, quick::{Judge, Mind}};
+use std::time::Instant;
 pub const GAP: f64 = 0.07;
 pub const DIM: f64 = 0.55;
 pub fn smoothstep(t: f64) -> f64 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
@@ -452,6 +454,57 @@ impl Follow {
     }
     pub fn settle(&mut self, now: f64) -> ((f64, f64), bool) { self.advance(now) }
 
+    /// One sample of the hand, `t` s into the hold, for the latches and the
+    /// flick judge alike (`quick::Judge`, none when flicks are off).
+    pub fn feed(&mut self, judge: Option<&mut Judge>, t: f64, at: (f64, f64), axis: usize) {
+        self.track_locked(t, at, axis);
+        if let Some(judge) = judge { judge.feed(t, at, axis); }
+    }
+
+    /// A batch of the hand (`input::follow_frame`) taken in, as the normal
+    /// view and the board alike read it: each sample at its own time since
+    /// the hold `began`, `each` told of it once fed. Returns the latest
+    /// time, from `now` on, and when it was let go of, if it was.
+    pub fn take(&mut self, mut judge: Option<&mut Judge>, saved: &FollowHold, began: Instant, mut now: f64, mut each: impl FnMut(f64, &TimedHand)) -> (f64, Option<f64>) {
+        let mut released = None;
+        if saved.overflowed {
+            // A blocked renderer keeps every semantic turn via the compact path.
+            self.track_path(now, &saved.path);
+            if let (Some(judge), Some(&(x, y, axis))) = (judge, saved.path.last()) { judge.feed(now, (x, y), axis); }
+            return (now, released);
+        }
+        for sample in &saved.samples {
+            let t = sample.at.saturating_duration_since(began).as_secs_f64();
+            now = now.max(t);
+            self.feed(judge.as_deref_mut(), t, (sample.followed.x, sample.followed.y), sample.axis);
+            each(t, sample);
+            if !sample.followed.holding { released = Some(t); }
+        }
+        self.consumed_path(&saved.path);
+        (now, released)
+    }
+
+    /// Where the hand is shown (`held`): sure (`quick`), no more than a
+    /// cell from where it set off.
+    pub fn held_as(&self, sure: bool) -> (f64, f64) {
+        let held = self.held();
+        if sure { self.within_a_cell(held) } else { held }
+    }
+
+    /// Let go of at `now`, the hand `at`: judged sure (`quick::Judge`), a
+    /// cell its way from where it set off (`let_go_one`); else on the
+    /// latches (`let_go`). Returns the cell, and whether it was sure.
+    pub fn land(&mut self, judge: Option<&mut Judge>, now: f64, at: (f64, f64)) -> ((i32, i32), bool) {
+        let step = judge.and_then(|judge| {
+            judge.release(now);
+            (judge.mind == Mind::Sure).then(|| judge.step())
+        });
+        match step {
+            Some(step) => (self.let_go_one(now, at, step), true),
+            None => (self.let_go(now, at), false),
+        }
+    }
+
     /// Evaluate a frame without moving the real input timeline into the future.
     pub fn sampled(&self, now: f64, prediction: Option<((f64, f64), f64)>) -> Self {
         let mut frame = self.clone();
@@ -715,4 +768,28 @@ mod tests {
         }
     }
 
+    /// The normal view and the board take a hold in alike (`take`, `land`),
+    /// timed from the press: a short sharp flick goes one cell however
+    /// little the hand went; a slow drag lands where the latches are.
+    #[test]
+    fn a_hold_taken_in_lands_a_flick_one_cell_and_a_drag_on_the_latches() {
+        use crate::input::{Followed, Hand};
+        let began = Instant::now();
+        let land = |hand: &[(f64, f64)]| {
+            let samples = hand.iter().enumerate().map(|(i, &(t, x))| {
+                let at = began + std::time::Duration::from_secs_f64(t);
+                let followed = Followed { hold: 1, holding: i + 1 < hand.len(), ways: 3, x, y: 0.0 };
+                TimedHand { at, os_ms: 0, received: at, scan_time: None, hand: Hand::default(), followed, axis: 0 }
+            });
+            let saved = FollowHold { started: Some(began), samples: samples.collect(), ..FollowHold::default() };
+            let (mut follow, mut judge) = (Follow::new((0, 0), vec![(-3, 3)]), Judge::default());
+            let (_, released) = follow.take(Some(&mut judge), &saved, began, 0.0, |_, _| {});
+            let (at, x) = (released.unwrap(), hand.last().unwrap().1);
+            follow.land(Some(&mut judge), at, (x, 0.0))
+        };
+        let flick = [(0.0, 0.0), (0.03, 0.02), (0.05, 0.15), (0.07, 0.3), (0.08, 0.35)];
+        assert_eq!(land(&flick), ((1, 0), true));
+        let drag: Vec<(f64, f64)> = (0..=120).map(|i| (i as f64 * 0.01, i as f64 * 0.02)).collect();
+        assert_eq!(land(&drag), ((2, 0), false));
+    }
 }

@@ -248,7 +248,8 @@ impl Quick {
         Some(Quick { instant, judge: Judge::default(), along: [Spring::default(); 2], landing: false, from: None, still: false, ease: [Spring::default(); 2], edge: [false; 2], past: [0.0; 2], back: [Spring::default(); 2], rebound: false, depth: 0.0, last: None, cell: (0, 0), came: f64::NEG_INFINITY })
     }
 
-    /// Let go of at `now`.
+    /// Let go of at `now` (as `follow::Follow::land` lets its judge go).
+    #[cfg(test)]
     pub fn release(&mut self, now: f64) { self.judge.release(now); }
 
     /// How far past the end the hand shows (`Follow::past`) for the next
@@ -361,13 +362,11 @@ mod tests {
         let mut hand = crate::follow::Follow::new((0, 0), vec![cols]);
         let mut t = 0.0;
         while t <= end + 1e-9 {
-            hand.track_locked(t, (x(t), 0.0), 0);
-            quick.judge.feed(t, (x(t), 0.0), 0);
-            if quick.judge.mind == Mind::Sure { assert!(hand.within_a_cell(hand.held()).0.abs() <= 1.0 + EDGE); }
+            hand.feed(Some(&mut quick.judge), t, (x(t), 0.0), 0);
+            if quick.judge.mind == Mind::Sure { assert!(hand.held_as(true).0.abs() <= 1.0 + EDGE); }
             t += 0.001;
         }
-        quick.release(t);
-        let to = if quick.judge.mind == Mind::Sure { hand.let_go_one(t, (x(t), 0.0), quick.judge.step()) } else { hand.let_go(t, (x(t), 0.0)) };
+        let (to, _) = hand.land(Some(&mut quick.judge), t, (x(t), 0.0));
         (to, quick.judge.mind)
     }
 

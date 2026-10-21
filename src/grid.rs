@@ -182,6 +182,22 @@ impl Grid {
         Some(Pos { row: at, col })
     }
 
+    /// The rows a hold from `from` goes to, and each one's cells, as
+    /// `counted` counts them: only its own row, or its own cell of each,
+    /// the ways (`sideways`, `across`) it does not go.
+    pub fn reach(&self, from: Pos, sideways: bool, across: bool) -> ((i32, i32), Vec<(i32, i32)>) {
+        let last = self.rows.len() as i32 - 1;
+        let rows = if across { (-(from.row as i32), last - from.row as i32) } else { (0, 0) };
+        let cols = (rows.0..=rows.1)
+            .map(|row| {
+                let line = &self.rows[(from.row as i32 + row) as usize];
+                let reference = if row == 0 { from.col } else { line.anchor() } as i32;
+                if sideways { (-reference, line.cells.len() as i32 - 1 - reference) } else { (0, 0) }
+            })
+            .collect();
+        (rows, cols)
+    }
+
     /// The rows a hold from `from` turned stay turned, as a cube's do: each
     /// is left on the cell `turns` has for it, counted as `counted` does.
     /// True when one changed.

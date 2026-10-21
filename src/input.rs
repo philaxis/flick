@@ -148,8 +148,9 @@ const NO_ROOM: i32 = 0xFF;
 static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
 static ROW_FRACTION: AtomicU32 = AtomicU32::new(0);
 static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
-/// The board is open: a hold begun now goes from row to row as the hand
-/// goes, not by notches (`Plane::linear`), as it does with none set.
+/// The board is open: a hold begun now is followed both ways when its hand
+/// follows any (`press`); else it goes from row to row as the hand goes,
+/// not by notches (`Plane::linear`), as it does with none set.
 static BOARD_OPEN: AtomicBool = AtomicBool::new(false);
 /// The ways the screen follows the hand in the hold going on (`FOLLOW_X`,
 /// `FOLLOW_Y`, and `FOLLOW_TOUCHPAD` when three fingers began it). Those
@@ -297,9 +298,6 @@ pub struct TimedHand {
     pub hand: Hand,
     pub followed: Followed,
     pub axis: usize,
-    /// Cells rightwards and rows downwards from where the hold began, the
-    /// hand's own way, not held back at the latches as `hand` is.
-    pub cells: (f64, f64),
 }
 thread_local! {
     static SAMPLE_TIME: Cell<Option<(Instant, u32)>> = const { Cell::new(None) };
@@ -331,7 +329,7 @@ fn remember_follow() {
     let at = LAST_SAMPLE.replace(Some(at)).map_or(at, |last| last.max(at));
     LAST_SAMPLE.set(Some(at));
     let sample = TimedHand { at, received, scan_time: stamp.map(|s|s.1), os_ms,
-        hand: hand(), followed, axis: axis().unwrap_or(0), cells: HAND_CELLS.get() };
+        hand: hand(), followed, axis: axis().unwrap_or(0) };
     #[cfg(feature = "motion-probe")]
     PROBE_HAND.with(|v| v.borrow_mut().push(sample));
     if BOARD_OPEN.load(Ordering::SeqCst) {
@@ -674,7 +672,7 @@ thread_local! {
     /// is now, and the farthest it was.
     static STRAYED: Cell<((i32, i32), i32)> = const { Cell::new(((0, 0), 0)) };
     /// Cells rightwards and rows downwards the hand went since the hold
-    /// began, whatever the latches made of it (`TimedHand::cells`).
+    /// began, whatever the latches made of it (`FLICK` judges them).
     static HAND_CELLS: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     /// The hand judged as the screen judges it (`quick::Judge`), from when
     /// it first moved this hold, as the screen times it: a flick let go of
@@ -910,7 +908,9 @@ fn press(source: Source) {
         AXIS.store(0, Ordering::SeqCst);
         // Up and down by the notches of the hand that began the hold, the
         // mouse's for a button or key; on the board after the hand. The
-        // screen follows it the ways set for that hand, never on the board.
+        // screen follows it the ways set for that hand; on the board, a hand
+        // set to follow any way is followed both ways, the board reading it
+        // as the normal view does (`Board::hold`).
         let (notch, follow) = SETTINGS
             .with(|slot| {
                 let s = slot.try_borrow().ok()?;
@@ -922,7 +922,9 @@ fn press(source: Source) {
                 })
             })
             .unzip();
-        let follow = follow.filter(|ways| ways & (FOLLOW_X | FOLLOW_Y) != 0 && !BOARD_OPEN.load(Ordering::SeqCst));
+        let follow = follow
+            .filter(|ways| ways & (FOLLOW_X | FOLLOW_Y) != 0)
+            .map(|ways| if BOARD_OPEN.load(Ordering::SeqCst) { ways | FOLLOW_X | FOLLOW_Y } else { ways });
         FOLLOWING.store(follow.unwrap_or(0), Ordering::SeqCst);
         let (notch_x, notch_y) = notch.unwrap_or((crate::slide::notch::DEFAULT_X, crate::slide::FIRMEST));
         let mut plane = Plane::configured(notch_x, notch_y, BOARD_OPEN.load(Ordering::SeqCst));

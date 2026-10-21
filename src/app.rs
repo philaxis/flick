@@ -1189,19 +1189,12 @@ impl App {
     /// from `origin`: the desktops it can go to, and their windows.
     fn glide_scene(&self, desktops: &Desktops, origin: &str, hold: u32, ways: u32) -> Option<Scene> {
         let from = self.grid.find(origin)?;
-        let (sideways, across) = (ways & input::FOLLOW_X != 0, ways & input::FOLLOW_Y != 0);
-        let last = self.grid.rows.len() as i32 - 1;
-        let rows = if across { (-(from.row as i32), last - from.row as i32) } else { (0, 0) };
-        let mut cols = Vec::new();
+        let (rows, cols) = self.grid.reach(from, ways & input::FOLLOW_X != 0, ways & input::FOLLOW_Y != 0);
         let mut cells: HashMap<&str, (i32, i32)> = HashMap::new();
-        for row in rows.0..=rows.1 {
-            let line = &self.grid.rows[(from.row as i32 + row) as usize];
-            let reference = if row == 0 { from.col } else { line.anchor() } as i32;
-            let span = if sideways { (-reference, line.cells.len() as i32 - 1 - reference) } else { (0, 0) };
-            cols.push(span);
+        for (row, span) in (rows.0..=rows.1).zip(&cols) {
             for col in span.0..=span.1 {
-                if let Some(id) = line.cells.get((reference + col) as usize) {
-                    cells.insert(id, (row, col));
+                if let Some(id) = self.grid.counted(from, (col, row)).and_then(|at| self.grid.id_at(at)) {
+                    cells.insert(id.as_str(), (row, col));
                 }
             }
         }
@@ -1534,12 +1527,20 @@ impl App {
     }
 
     /// A hold over the board let go of: the selection lands where it was
-    /// judged to (`Board::let_go`).
+    /// judged to (`Board::let_go`), the rows it turned kept turned, as a
+    /// hold in the normal view lands (`Grid::land`).
     fn let_go_board(&mut self) {
-        let Some(id) = self.board.let_go() else { return };
-        self.grid.visit(&id);
-        self.save();
-        if id != self.board.selected() {
+        let Some((start, to, turns)) = self.board.let_go() else { return };
+        let Some(from) = self.grid.find(&start) else { return };
+        let (id, turned) = self.grid.land(from, to, &turns);
+        if let Some(id) = &id {
+            self.grid.visit(id);
+        }
+        if id.is_some() || turned {
+            self.save();
+        }
+        // The board takes the grid as landed, though it shows the cell already.
+        if let Some(id) = id {
             self.board.select(id, self.usage_grid());
         }
     }
@@ -2220,7 +2221,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             }
         }
         WM_PRESSED => {
-            let _ = with_app(|app| app.glide_prepare(lparam.0 as u32));
+            let _ = with_app(|app| {
+                app.board.hold(lparam.0 as u32);
+                app.glide_prepare(lparam.0 as u32);
+            });
         }
         WM_SLIDE | WM_DRAG => {
             let hold = lparam.0 as u32;
@@ -2278,17 +2282,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             debug_log!("app: rows {:?} in {:?}", on.flatten().map(|on| on.0), started.elapsed());
         }
         WM_CLICK => {
-            input::forget_hold(lparam.0 as u32);
             #[cfg(feature = "debug-log")]
             let started = Instant::now();
-            let taken = with_app(App::toggle_board);
+            // A hold over the board that went to another cell is a move,
+            // however little the hand strayed.
+            let taken = with_app(|app| {
+                if app.board.moved(lparam.0 as u32) {
+                    app.let_go_board();
+                    app.finish_gesture();
+                } else {
+                    app.toggle_board();
+                }
+            });
+            input::forget_hold(lparam.0 as u32);
             debug_log!("app: click {} in {:?}", if taken.is_some() { "taken" } else { "ignored, the app being busy (a menu or a question is up)" }, started.elapsed());
             let _ = taken;
         }
         WM_RELEASE => {
             let heard = with_app(|app| {
-                if !app.gliding.as_ref().is_some_and(|g| g.hold == lparam.0 as u32) { input::forget_hold(lparam.0 as u32); }
+                // The board reads the last of the hand before it is forgotten.
                 app.let_go_board();
+                if !app.gliding.as_ref().is_some_and(|g| g.hold == lparam.0 as u32) { input::forget_hold(lparam.0 as u32); }
                 app.finish_gesture();
                 app.minimap.hide_after(LINGER_RELEASE_MS);
             });

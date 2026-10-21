@@ -1275,23 +1275,14 @@ impl View {
                 if hand.hold == session.hold { session.hand = (hand.x, hand.y); }
                 let mut release_time = now;
                 if let Some(saved) = &saved {
-                    if saved.overflowed {
-                        // A blocked renderer keeps every semantic turn via the compact path.
-                        session.follow.track_path(now, &saved.path);
-                        session.input_samples.clear();
-                        if let (Some(quick), Some(&(x, y, axis))) = (&mut session.quick, saved.path.last()) { quick.judge.feed(now, (x, y), axis); }
-                    } else {
-                        for sample in &saved.samples {
-                            let t = sample.at.saturating_duration_since(session.began).as_secs_f64();
-                            now = now.max(t);
-                            session.follow.track_locked(t, (sample.followed.x, sample.followed.y), sample.axis);
-                            if let Some(quick) = &mut session.quick { quick.judge.feed(t, (sample.followed.x, sample.followed.y), sample.axis); }
-                            if session.input_samples.len() == 3 { session.input_samples.remove(0); }
-                            session.input_samples.push((t,sample.followed.x,sample.followed.y,sample.axis));
-                            if !sample.followed.holding { release_time = t; }
-                        }
-                        session.follow.consumed_path(&saved.path);
-                    }
+                    if saved.overflowed { session.input_samples.clear(); }
+                    let input_samples = &mut session.input_samples;
+                    let (latest, released) = session.follow.take(session.quick.as_mut().map(|quick| &mut quick.judge), saved, session.began, now, |t, sample| {
+                        if input_samples.len() == 3 { input_samples.remove(0); }
+                        input_samples.push((t, sample.followed.x, sample.followed.y, sample.axis));
+                    });
+                    now = latest;
+                    release_time = released.unwrap_or(release_time);
                 }
                 if session.stats.frames == 0 && !session.visible { session.follow.start_picture(); }
                 if hand.hold == session.hold && hand.holding {
@@ -1300,27 +1291,17 @@ impl View {
                     let result = ((frame.offset(frame.row), frame.sampled_vertical()), frame.depth(), false);
                     // Whole, the screen stays on the cell it set off from (`quick`), the hand
                     // resampled to the frame's time; sure, no more than a cell from there.
-                    let (held, past) = (frame.held(), frame.past());
                     let sure = session.quick.as_ref().is_some_and(|quick| quick.judge.mind == crate::quick::Mind::Sure);
-                    let held = if sure { frame.within_a_cell(held) } else { held };
+                    let (held, past) = (frame.held_as(sure), frame.past());
                     following_frame = Some(frame);
                     look = session.quick.as_mut().map(|quick| { quick.past_end(past); quick.look(now, session.follow.aim(), Some(held), session.follow.selected(), session.follow.axis()) });
                     result
                 } else {
                     // Let go of a flick, a cell its way from where it set off
                     // (`Judge::step`); unsure, to the latches'.
-                    let sure = session.quick.as_mut().is_some_and(|quick| {
-                        quick.release(release_time);
-                        quick.judge.mind == crate::quick::Mind::Sure
-                    });
-                    let (mut held, past) = (session.follow.held(), session.follow.past());
-                    let to = if sure {
-                        held = session.follow.within_a_cell(held);
-                        let step = session.quick.as_ref().map_or((0.0, 0.0), |quick| quick.judge.step());
-                        session.follow.let_go_one(release_time, session.hand, step)
-                    } else {
-                        session.follow.let_go(release_time, session.hand)
-                    };
+                    let (held, past) = (session.follow.held(), session.follow.past());
+                    let (to, sure) = session.follow.land(session.quick.as_mut().map(|quick| &mut quick.judge), release_time, session.hand);
+                    let held = if sure { session.follow.within_a_cell(held) } else { held };
                     if let Some(quick) = &mut session.quick {
                         quick.past_end(past);
                         look = Some(quick.look(now, session.follow.aim(), Some(held), to, session.follow.axis()));

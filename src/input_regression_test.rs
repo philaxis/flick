@@ -275,6 +275,31 @@ fn a_followed_way_comes_to_no_cell_and_keeps_where_the_hand_is() {
     release(&s, Source::XButton2);
 }
 
+/// On the board a hand set to follow any way is followed both ways, from the
+/// press, as the normal view follows it (`Board::hold`): it comes to no cell
+/// or row of its own.
+#[test]
+fn on_the_board_a_followed_hand_is_followed_both_ways_from_the_press() {
+    let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let posted = |message: u32| api::CALLS.with(|c| c.borrow().messages.iter().filter(|(m, _)| *m == message).count());
+    reset();
+    let s = Settings { mouse_follow: FOLLOW_X, ..settings() };
+    SETTINGS.with(|slot| *slot.borrow_mut() = Some(s.clone()));
+    set_board_open(true);
+    press(Source::XButton2);
+    let hold = followed().hold;
+    assert_eq!(followed().ways, FOLLOW_X | FOLLOW_Y);
+    assert!(follow_hold(hold).is_some_and(|saved| saved.started.is_some()));
+    for _ in 0..10 {
+        travel(&s, 0, 60);
+    }
+    assert!(followed().y > 0.5, "{:?}", followed());
+    assert_eq!((posted(WM_SLIDE), posted(WM_ROWS)), (0, 0));
+    release(&s, Source::XButton2);
+    set_board_open(false);
+    forget_hold(hold);
+}
+
 /// Three fingers lifted from the pad report no lean towards the next step: the
 /// screen following the hand must stay where the hand was, not go back to the last
 /// step (or where the hold began) as it is let go of, which flung it back.
