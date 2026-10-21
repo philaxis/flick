@@ -229,6 +229,12 @@ const TITLE_MS: u32 = 900;
 const PEEK_SCALE: f32 = 0.93;
 const PEEK_SHADE: f32 = 0.62;
 const PEEK_MS: f32 = 170.0;
+/// How long the cursor rests on a cell of the map before it is shown.
+/// Showing one lays the board out anew and registers every preview again;
+/// done for each cell passed, cell after cell, it made the cursor stick on
+/// its way across the map.
+const PEEK_TIMER_ID: usize = 5;
+const PEEK_WAIT_MS: u32 = 120;
 /// Under each preview: its app's icon and, on hover, its buttons and title.
 const FOOT: f32 = 30.0;
 /// While what moved eases into place, how often it is drawn again.
@@ -873,6 +879,9 @@ pub struct Board {
     peek: Option<CellId>,
     peek_shown: f32,
     peek_glide: (f32, f32, Instant),
+    /// The cell of the map the cursor came to and when, while it is not
+    /// yet shown (`PEEK_WAIT_MS`).
+    peek_wait: Option<(CellId, Instant)>,
     /// What the line at the bottom says is shown (the first time, or ?).
     hints: bool,
     /// The preview the cursor rests on, and since when.
@@ -1040,6 +1049,7 @@ impl Board {
                 peek: None,
                 peek_shown: 0.0,
                 peek_glide: (0.0, 0.0, Instant::now()),
+                peek_wait: None,
                 hints: false,
                 resting: None,
                 glows: None,
@@ -2089,6 +2099,20 @@ impl Board {
             _ if on_map => self.peek.clone(),
             _ => None,
         };
+        if let Some(id) = wanted.as_ref().filter(|id| self.peek.as_ref() != Some(*id) && self.press.is_none()) {
+            let since = match &self.peek_wait {
+                Some((waiting, at)) if waiting == id => *at,
+                _ => now,
+            };
+            if now.saturating_duration_since(since).as_millis() < PEEK_WAIT_MS as u128 {
+                self.peek_wait = Some((id.clone(), since));
+                unsafe { SetTimer(self.hwnd, PEEK_TIMER_ID, PEEK_WAIT_MS, None); }
+                return;
+            }
+        }
+        if self.peek_wait.take().is_some() {
+            unsafe { let _ = KillTimer(self.hwnd, PEEK_TIMER_ID); }
+        }
         let back = if wanted.is_some() && !self.peek.as_ref().is_some_and(pressed) { 1.0 } else { 0.0 };
         if wanted == self.peek && back == self.peek_glide.1 {
             return;
@@ -2523,6 +2547,11 @@ impl Board {
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
+            WM_TIMER if wparam.0 == PEEK_TIMER_ID => {
+                unsafe { let _ = KillTimer(self.hwnd, PEEK_TIMER_ID); }
+                self.update_peek(Instant::now());
+                Action::None
+            }
             WM_TIMER if wparam.0 == TITLE_TIMER_ID => {
                 unsafe { let _ = KillTimer(self.hwnd, TITLE_TIMER_ID); }
                 self.invalidate();

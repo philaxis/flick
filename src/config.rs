@@ -93,7 +93,7 @@ quick_flick = "slide"
 # one cell, however far it goes; held on longer it is a precise hold. The
 # picture starts to draw back gently from 60% of it, so that the one goes
 # into the other with no jump. Shorter makes flicks rarer. Also in Settings.
-flick_ms = 200
+flick_ms = 150
 "#;
 
 /// Keys of earlier versions, before each device had its own settings: the
@@ -143,7 +143,7 @@ impl Default for Experimental {
             quick_flick: QuickFlick::default(),
             // A flick is a click with a stroke in it: shorter than
             // `quick::QUICK_MOST`, which the judge's tests are made for.
-            flick_ms: 200,
+            flick_ms: 150,
         }
     }
 }
@@ -151,16 +151,10 @@ impl Default for Experimental {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuickFlick { Off, #[default] Slide, Instant }
-impl QuickFlick {
-    /// As written in config.toml.
-    pub fn name(self) -> &'static str { match self { Self::Off=>"off", Self::Slide=>"slide", Self::Instant=>"instant" } }
-}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CommitSpeed { #[default] Default, Gentle, Slow }
 impl CommitSpeed {
-    /// As written in config.toml.
-    pub fn name(self) -> &'static str { match self { Self::Default=>"default", Self::Gentle=>"gentle", Self::Slow=>"slow" } }
     pub fn omega(self, vertical: bool) -> f64 {
         match (self, vertical) { (Self::Default,false)=>35.0, (Self::Default,true)=>32.0,
             (Self::Gentle,false)=>28.0, (Self::Gentle,true)=>25.0, (Self::Slow,_)=>24.0 }

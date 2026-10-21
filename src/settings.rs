@@ -7,7 +7,7 @@
 //! the app, which answers with a new `View`.
 
 use crate::{
-    config::{CommitSpeed, Mouse, QuickFlick, Touchpad},
+    config::{Mouse, Touchpad},
     paint::{self, accent, rect, white, Canvas, Painter, Rect},
     vd,
     i18n::text as tr,
@@ -56,14 +56,11 @@ const ROWS: (f32, f32) = (14.0, 44.0);
 const EDGES: (f32, f32) = (28.0, 628.0);
 /// The tab's rows, the first with the tabs themselves above it, and the
 /// link to the file below them.
-const TAB_ROWS: (f32, f32) = (5.0, 13.0);
-const FILE_ROW: f32 = 21.0;
-/// The experiments' heading; their switch and choices follow, then a note.
-const EXPERIMENT_ROW: f32 = 14.0;
-/// The commit springs offered, as `config::CommitSpeed` names them.
-const SPEEDS: [CommitSpeed; 3] = [CommitSpeed::Default, CommitSpeed::Gentle, CommitSpeed::Slow];
-/// The quick flicks offered, as `config::QuickFlick` names them.
-const QUICKS: [QuickFlick; 3] = [QuickFlick::Off, QuickFlick::Slide, QuickFlick::Instant];
+const TAB_ROWS: (f32, f32) = (5.0, 12.0);
+const FILE_ROW: f32 = 16.0;
+/// The flick time's row, a note under it. What the window once also
+/// showed (following the hand, the experiments) is left to config.toml.
+const FLICK_ROW: f32 = 13.0;
 /// How far the tab's controls stand in from its edges, and the room
 /// between its two ways.
 const INSET: f32 = 16.0;
@@ -94,10 +91,7 @@ pub struct View {
     pub mouse: Mouse,
     pub touchpad: Touchpad,
     pub touchpad_status: crate::touchpad::Status,
-    /// See `config::Experimental`.
-    pub motion_blur: bool,
-    pub commit_speed: CommitSpeed,
-    pub quick_flick: QuickFlick,
+    /// See `config::Experimental::flick_ms`.
     pub flick_ms: u32,
 }
 
@@ -141,13 +135,9 @@ enum Hit {
     Tab(Tab),
     /// A way's distance and following the hand.
     Step(usize),
-    Follow(usize),
     Reverse,
     Touchpad,
     TouchpadSettings,
-    Blur,
-    Speed(usize),
-    Quick(usize),
     FlickMs,
     File,
 }
@@ -164,13 +154,9 @@ struct Layout {
     /// Each way's column, its sliders' tracks and its switch.
     columns: [Rect; 2],
     steps: [Rect; 2],
-    follows: [Rect; 2],
     reverse: Rect,
     touchpad: Rect,
     touchpad_settings: Rect,
-    blur: Rect,
-    speeds: [Rect; 3],
-    quicks: [Rect; 3],
     flick: Rect,
     file: Rect,
 }
@@ -202,14 +188,10 @@ impl Layout {
                 rect(left * s, row(TAB_ROWS.0) * s, (right - left) * s, ROWS.1 * s)
             }),
             steps: WAYS.map(|way| slider(way, TAB_ROWS.0 + 1.0)),
-            follows: WAYS.map(|way| at(column(way).1, TAB_ROWS.0 + 3.0, 44.0, 24.0)),
-            reverse: at(inner.1, TAB_ROWS.0 + 4.0, 44.0, 24.0),
-            touchpad: at(inner.1, TAB_ROWS.0 + 5.0, 44.0, 24.0),
-            touchpad_settings: rect(inner.0 * s, (row(TAB_ROWS.0 + 7.0) + 6.0) * s, 260.0 * s, 30.0 * s),
-            blur: right(EXPERIMENT_ROW + 1.0, 44.0, 24.0),
-            speeds: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 2.0, 90.0, 30.0)),
-            quicks: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 3.0, 90.0, 30.0)),
-            flick: rect((EDGES.0 + FLICK_LABEL) * s, row(EXPERIMENT_ROW + 4.0) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
+            reverse: at(inner.1, TAB_ROWS.0 + 3.0, 44.0, 24.0),
+            touchpad: at(inner.1, TAB_ROWS.0 + 4.0, 44.0, 24.0),
+            touchpad_settings: rect(inner.0 * s, (row(TAB_ROWS.0 + 6.0) + 6.0) * s, 260.0 * s, 30.0 * s),
+            flick: rect((EDGES.0 + FLICK_LABEL) * s, row(FLICK_ROW) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
             file: rect(EDGES.0 * s, (row(FILE_ROW) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
@@ -219,17 +201,13 @@ impl Layout {
             (self.trigger, Hit::Trigger), (self.autostart, Hit::Autostart),
             (self.minimap, Hit::Minimap), (self.admin, Hit::Admin),
             (self.tabs[0], Hit::Tab(Tab::Mouse)), (self.tabs[1], Hit::Tab(Tab::Touchpad)),
-            (self.steps[0], Hit::Step(0)), (self.follows[0], Hit::Follow(0)),
-            (self.steps[1], Hit::Step(1)), (self.follows[1], Hit::Follow(1)),
+            (self.steps[0], Hit::Step(0)), (self.steps[1], Hit::Step(1)),
             (self.reverse, Hit::Reverse),
         ];
         if tab == Tab::Touchpad {
             controls.push((self.touchpad, Hit::Touchpad));
             if conflict { controls.push((self.touchpad_settings, Hit::TouchpadSettings)); }
         }
-        controls.push((self.blur, Hit::Blur));
-        controls.extend(self.speeds.iter().enumerate().map(|(i, r)| (*r, Hit::Speed(i))));
-        controls.extend(self.quicks.iter().enumerate().map(|(i, r)| (*r, Hit::Quick(i))));
         controls.push((self.flick, Hit::FlickMs));
         controls.push((self.file, Hit::File));
         controls
@@ -298,14 +276,9 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
     Some(match hit {
         Hit::Step(0) => if mouse { "mouse.step_x" } else { "touchpad.step_x" },
         Hit::Step(_) => if mouse { "mouse.step_y" } else { "touchpad.step_y" },
-        Hit::Follow(0) => if mouse { "mouse.follow_x" } else { "touchpad.follow_x" },
-        Hit::Follow(_) => if mouse { "mouse.follow_y" } else { "touchpad.follow_y" },
         Hit::Reverse => if mouse { "mouse.reverse" } else { "touchpad.reverse" },
         Hit::Touchpad => "touchpad.three_finger",
         Hit::Minimap => "minimap",
-        Hit::Blur => "experimental.motion_blur",
-        Hit::Speed(_) => "experimental.commit_speed",
-        Hit::Quick(_) => "experimental.quick_flick",
         Hit::FlickMs => "experimental.flick_ms",
         _ => return None,
     })
@@ -589,11 +562,9 @@ impl Settings {
     fn toggle(&self, hit: Hit) -> Action {
         let hand = self.view.hand(self.tab);
         let on = match hit {
-            Hit::Follow(way) => hand.follows[way],
             Hit::Reverse => hand.reverse,
             Hit::Touchpad => self.view.touchpad.three_finger,
             Hit::Minimap => self.view.minimap,
-            Hit::Blur => self.view.motion_blur,
             _ => return Action::None,
         };
         match key(self.tab, hit) {
@@ -700,9 +671,7 @@ impl Settings {
             Hit::Autostart => Action::Autostart(!self.view.autostart),
             Hit::Admin => Action::Admin(!self.view.admin),
             Hit::Tab(tab) => self.show(tab),
-            Hit::Follow(_) | Hit::Reverse | Hit::Touchpad | Hit::Minimap | Hit::Blur => self.toggle(hit),
-            Hit::Speed(i) => Action::Set("experimental.commit_speed", format!("\"{}\"", SPEEDS[i].name())),
-            Hit::Quick(i) => Action::Set("experimental.quick_flick", format!("\"{}\"", QUICKS[i].name())),
+            Hit::Reverse | Hit::Touchpad | Hit::Minimap => self.toggle(hit),
             Hit::TouchpadSettings if self.view.touchpad_status == crate::touchpad::Status::Conflict => Action::TouchpadSettings,
             Hit::File => Action::OpenFile,
             _ => Action::None,
@@ -839,21 +808,19 @@ impl Settings {
             let words = distance_words(tab, hand.steps[way]);
             self.draw_slider(&p, fonts, &layout.steps[way], column.right, hand.steps[way], distances, &words, Hit::Step(way));
             p.text(tr("Movement needed to switch", "다음 칸으로 넘어가는 데 필요한 이동 거리", "切换到下一格所需的移动距离"), &fonts.notice, &line(TAB_ROWS.0 + 2.0), white(0.62));
-            p.text(tr("Follows the hand", "손 따라가기", "跟随手"), &fonts.label, &line(TAB_ROWS.0 + 3.0), white(0.62));
-            self.draw_switch(&p, &layout.follows[way], hand.follows[way], Hit::Follow(way));
         }
 
-        p.text(tr("Reverse direction (R)", "방향 반전 (R)", "反向 (R)"), &fonts.label, &inner(TAB_ROWS.0 + 4.0), white(0.62));
+        p.text(tr("Reverse direction (R)", "방향 반전 (R)", "反向 (R)"), &fonts.label, &inner(TAB_ROWS.0 + 3.0), white(0.62));
         self.draw_switch(&p, &layout.reverse, hand.reverse, Hit::Reverse);
 
         let notice = match tab {
             Tab::Mouse => {
-                tr("Hold the trigger and move between shelves (rows). Distance is raw mouse counts, not pixels; travel depends on mouse DPI. Follows the hand also animates keyboard shortcuts.",
+                tr("Hold the trigger and move between shelves (rows). Distance is raw mouse counts, not pixels; travel depends on mouse DPI.",
                     "트리거를 누르고 셸프(행) 사이로 움직이세요. 거리는 픽셀이 아닌 원시 마우스 카운트이며 이동량은 마우스 DPI에 따라 달라집니다. 손 따라가기는 키보드 전환 애니메이션에도 적용됩니다.",
                     "按住触发键在架子（行）间移动。距离是原始鼠标计数，并非像素；实际距离取决于鼠标 DPI。跟随手也控制键盘切换动画。")
             }
             Tab::Touchpad => {
-                p.text(tr("Three-finger touchpad (T)", "세 손가락 터치패드 (T)", "三指触摸板 (T)"), &fonts.label, &inner(TAB_ROWS.0 + 5.0), white(0.62));
+                p.text(tr("Three-finger touchpad (T)", "세 손가락 터치패드 (T)", "三指触摸板 (T)"), &fonts.label, &inner(TAB_ROWS.0 + 4.0), white(0.62));
                 self.draw_switch(&p, &layout.touchpad, view.touchpad.three_finger, Hit::Touchpad);
                 match view.touchpad_status {
                     crate::touchpad::Status::Absent => tr("No precision touchpad detected", "정밀 터치패드를 찾지 못했습니다", "未检测到精密触摸板"),
@@ -865,38 +832,20 @@ impl Settings {
             }
         };
         // A row of its own under the switches, the button in the next.
-        let area = inner(TAB_ROWS.0 + if tab == Tab::Mouse { 5.0 } else { 6.0 });
+        let area = inner(TAB_ROWS.0 + if tab == Tab::Mouse { 4.0 } else { 5.0 });
         let area = Rect { bottom: area.top + if tab == Tab::Mouse { 3.0 } else { 1.0 } * ROWS.1 * s, ..area };
         p.text(notice, &fonts.notice, &area, white(0.62));
         if tab == Tab::Touchpad && view.touchpad_status == crate::touchpad::Status::Conflict {
             self.draw_button(&p, fonts, &layout.touchpad_settings, tr("Open Windows touchpad settings (W)", "Windows 터치패드 설정 열기 (W)", "打开 Windows 触摸板设置 (W)"), Hit::TouchpadSettings);
         }
 
-        // Ways to make motion look smoother; both start off.
-        p.text(tr("Experimental · smoother-looking motion", "실험 · 더 부드럽게 보이는 움직임", "实验 · 看起来更顺滑的运动"), &fonts.title, &row(EXPERIMENT_ROW), white(0.92));
-        label(EXPERIMENT_ROW + 1.0, tr("Motion blur trails on fast moves", "빠른 이동에 모션 블러 잔상", "快速移动时的动态模糊残影"));
-        self.draw_switch(&p, &layout.blur, view.motion_blur, Hit::Blur);
-        label(EXPERIMENT_ROW + 2.0, tr("Commit spring", "커밋 스프링", "切换弹簧"));
-        let names = [tr("Default", "기본", "默认"), tr("Gentle", "부드럽게", "柔和"), tr("Slow", "느리게", "缓慢")];
-        for (i, area) in layout.speeds.iter().enumerate() {
-            if view.commit_speed == SPEEDS[i] { p.fill(area, 7.0 * s, accent(0.95)); }
-            else { self.draw_button(&p, fonts, area, names[i], Hit::Speed(i)); continue; }
-            p.text(names[i], &fonts.button, area, white(1.0));
-        }
-        label(EXPERIMENT_ROW + 3.0, tr("Quick flick", "빠른 넘김", "快速翻页"));
-        let names = [tr("Off", "끔", "关闭"), tr("Slide", "슬라이드", "滑动"), tr("Instant", "즉시", "即时")];
-        for (i, area) in layout.quicks.iter().enumerate() {
-            if view.quick_flick == QUICKS[i] { p.fill(area, 7.0 * s, accent(0.95)); }
-            else { self.draw_button(&p, fonts, area, names[i], Hit::Quick(i)); continue; }
-            p.text(names[i], &fonts.button, area, white(1.0));
-        }
-        label(EXPERIMENT_ROW + 4.0, tr("Flick time (shorter: fewer flicks)", "넘김 인정 시간 (짧을수록 섬세 이동)", "翻页判定时间（越短越精细）"));
+        label(FLICK_ROW, tr("Flick time (shorter: fewer flicks)", "넘김 인정 시간 (짧을수록 섬세 이동)", "翻页判定时间（越短越精细）"));
         let flick_words = format!("{} ms", view.flick_ms);
         self.draw_slider(&p, fonts, &layout.flick, EDGES.1 * s, view.flick_ms as i32, FLICK_MS, &flick_words, Hit::FlickMs);
-        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle. A quick, sure move let go of within the flick time goes one desktop, with the screen whole; held on, the screen starts to zoom out gently from 60% of that time and is all the way out as it turns into a precise move. Pause, hesitate or turn back and it zooms out at once. Off always zooms out; Instant adds a short fade.",
-            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다. 넘김 인정 시간 안에 빠르게 움직였다 놓으면 축소 없이 한 칸 넘어갑니다. 계속 누르고 있으면 그 시간의 60%부터 화면이 살살 축소되기 시작해, 섬세 이동으로 바뀌는 순간 끝까지 축소됩니다. 멈추거나 머뭇거리거나 되돌리면 바로 축소됩니다. 끔은 항상 축소, 즉시는 짧은 페이드를 더합니다.",
-            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。在翻页判定时间内快速移动并松开，会不缩小地切换一格；继续按住，画面从该时间的 60% 起缓缓缩小，转为精细移动时正好完全缩小。停顿、犹豫或折返时立即缩小。关闭时总是缩小；即时加一段短淡入。"),
-            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 5.0).top + 2.0 * ROWS.1 * s, ..row(EXPERIMENT_ROW + 5.0) }, white(0.62));
+        p.text(tr("A quick move let go of within this time goes one desktop, the screen staying whole. Held on, the screen zooms out gently from 60% of it, and you go as far as you move.",
+            "이 시간 안에 휙 움직였다 놓으면 화면 그대로 한 칸 넘어갑니다. 더 누르고 있으면 그 시간의 60%부터 화면이 살살 물러나며, 움직인 만큼 이동합니다.",
+            "在此时间内快速移动并松开，画面不缩小地切换一格。继续按住，画面从该时间的 60% 起缓缓后退，移动多少就走多远。"),
+            &fonts.notice, &Rect { bottom: row(FLICK_ROW + 1.0).top + 2.0 * ROWS.1 * s, ..row(FLICK_ROW + 1.0) }, white(0.62));
 
         let hot = self.hover == Hit::File;
         p.text(tr("More settings: config.toml", "추가 설정: config.toml", "更多设置：config.toml"), &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));

@@ -1941,9 +1941,6 @@ impl App {
             mouse: self.config.mouse,
             touchpad: self.config.touchpad,
             touchpad_status: crate::touchpad::status(),
-            motion_blur: self.config.experimental.motion_blur,
-            commit_speed: self.config.experimental.commit_speed,
-            quick_flick: self.config.experimental.quick_flick,
             flick_ms: self.config.experimental.flick_ms,
         }
     }
@@ -2983,9 +2980,6 @@ pub fn render_settings(path: &str, touchpad: bool) {
         mouse: config.mouse,
         touchpad: config.touchpad,
         touchpad_status: if touchpad { crate::touchpad::Status::Conflict } else { crate::touchpad::Status::Absent },
-        motion_blur: config.experimental.motion_blur,
-        commit_speed: config.experimental.commit_speed,
-        quick_flick: config.experimental.quick_flick,
         flick_ms: config.experimental.flick_ms,
     };
     let tab = if touchpad { settings::Tab::Touchpad } else { settings::Tab::Mouse };
