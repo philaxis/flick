@@ -63,7 +63,14 @@ static QUICK_MOST_MS: AtomicU32 = AtomicU32::new((QUICK_MOST * 1000.0) as u32);
 
 pub fn configure(mode: QuickFlick, flick_ms: u32) {
     MODE.store(mode as u8, Ordering::Relaxed);
-    QUICK_MOST_MS.store(flick_ms.clamp(100, 2000), Ordering::Relaxed);
+    QUICK_MOST_MS.store(flick_ms.clamp(80, 2000), Ordering::Relaxed);
+}
+
+/// Not set off this soon after the hold begins (s), the hand is unsure:
+/// `ONSET_LIMIT`, or less with a shorter flick time, a flick being a
+/// click with a stroke in it.
+fn onset_limit() -> f64 {
+    ONSET_LIMIT.min(quick_most())
 }
 
 /// How long after setting off a flick may be held on (s).
@@ -163,10 +170,10 @@ impl Judge {
         if self.released.is_some() || self.mind == Mind::Unsure { return; }
         let speed = self.speed(now);
         match (self.mind, self.onset.map(|(onset, ..)| onset)) {
-            (Mind::Deciding, None) => if now > ONSET_LIMIT { self.mind = Mind::Unsure; },
+            (Mind::Deciding, None) => if now > onset_limit() { self.mind = Mind::Unsure; },
             // Set off sharply, a flick; slow to set off, or not sharp soon, unsure.
             (Mind::Deciding, Some(onset)) => {
-                if onset > ONSET_LIMIT || (speed < PEAK && now - onset > DECIDE) { self.mind = Mind::Unsure; }
+                if onset > onset_limit() || (speed < PEAK && now - onset > DECIDE) { self.mind = Mind::Unsure; }
                 else if speed >= PEAK { self.mind = Mind::Sure; }
             }
             // Held on, it is no flick.

@@ -92,8 +92,8 @@ quick_flick = "slide"
 # How long after setting off (milliseconds) a move may still be a flick of
 # one cell, however far it goes; held on longer it is a precise hold. The
 # picture starts to draw back gently from 60% of it, so that the one goes
-# into the other with no jump. Shorter makes flicks rarer.
-flick_ms = 350
+# into the other with no jump. Shorter makes flicks rarer. Also in Settings.
+flick_ms = 200
 "#;
 
 /// Keys of earlier versions, before each device had its own settings: the
@@ -141,7 +141,9 @@ impl Default for Experimental {
             commit_speed: CommitSpeed::default(),
             motion_blur: false,
             quick_flick: QuickFlick::default(),
-            flick_ms: (crate::quick::QUICK_MOST * 1000.0) as u32,
+            // A flick is a click with a stroke in it: shorter than
+            // `quick::QUICK_MOST`, which the judge's tests are made for.
+            flick_ms: 200,
         }
     }
 }

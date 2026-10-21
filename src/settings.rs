@@ -57,7 +57,7 @@ const EDGES: (f32, f32) = (28.0, 628.0);
 /// The tab's rows, the first with the tabs themselves above it, and the
 /// link to the file below them.
 const TAB_ROWS: (f32, f32) = (5.0, 13.0);
-const FILE_ROW: f32 = 20.0;
+const FILE_ROW: f32 = 21.0;
 /// The experiments' heading; their switch and choices follow, then a note.
 const EXPERIMENT_ROW: f32 = 14.0;
 /// The commit springs offered, as `config::CommitSpeed` names them.
@@ -75,6 +75,10 @@ const VALUE: f32 = 90.0;
 /// in raw counts, the touchpad's in tenths of a mm.
 const COUNTS: (i32, i32, i32) = (20, 600, 10);
 const TENTHS_MM: (i32, i32, i32) = (10, 300, 5);
+/// How long a flick may take (`experimental.flick_ms`), in milliseconds.
+const FLICK_MS: (i32, i32, i32) = (80, 500, 10);
+/// The width of the flick time's label, before its slider.
+const FLICK_LABEL: f32 = 250.0;
 
 /// What the window shows.
 #[derive(Clone, Default)]
@@ -94,6 +98,7 @@ pub struct View {
     pub motion_blur: bool,
     pub commit_speed: CommitSpeed,
     pub quick_flick: QuickFlick,
+    pub flick_ms: u32,
 }
 
 /// What the user asked for; carried out by the app.
@@ -143,6 +148,7 @@ enum Hit {
     Blur,
     Speed(usize),
     Quick(usize),
+    FlickMs,
     File,
 }
 
@@ -165,6 +171,7 @@ struct Layout {
     blur: Rect,
     speeds: [Rect; 3],
     quicks: [Rect; 3],
+    flick: Rect,
     file: Rect,
 }
 
@@ -202,6 +209,7 @@ impl Layout {
             blur: right(EXPERIMENT_ROW + 1.0, 44.0, 24.0),
             speeds: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 2.0, 90.0, 30.0)),
             quicks: [0, 1, 2].map(|i| at(EDGES.1 - (2 - i) as f32 * 96.0, EXPERIMENT_ROW + 3.0, 90.0, 30.0)),
+            flick: rect((EDGES.0 + FLICK_LABEL) * s, row(EXPERIMENT_ROW + 4.0) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
             file: rect(EDGES.0 * s, (row(FILE_ROW) + 8.0) * s, 190.0 * s, 26.0 * s),
         }
     }
@@ -222,6 +230,7 @@ impl Layout {
         controls.push((self.blur, Hit::Blur));
         controls.extend(self.speeds.iter().enumerate().map(|(i, r)| (*r, Hit::Speed(i))));
         controls.extend(self.quicks.iter().enumerate().map(|(i, r)| (*r, Hit::Quick(i))));
+        controls.push((self.flick, Hit::FlickMs));
         controls.push((self.file, Hit::File));
         controls
     }
@@ -297,6 +306,7 @@ fn key(tab: Tab, hit: Hit) -> Option<&'static str> {
         Hit::Blur => "experimental.motion_blur",
         Hit::Speed(_) => "experimental.commit_speed",
         Hit::Quick(_) => "experimental.quick_flick",
+        Hit::FlickMs => "experimental.flick_ms",
         _ => return None,
     })
 }
@@ -599,6 +609,7 @@ impl Settings {
         let distances = if self.tab == Tab::Mouse { COUNTS } else { TENTHS_MM };
         match hit {
             Hit::Step(way) => Some((hand.steps[way], distances)),
+            Hit::FlickMs => Some((self.view.flick_ms as i32, FLICK_MS)),
             _ => None,
         }
     }
@@ -617,6 +628,12 @@ impl Settings {
         let mut hand = self.view.hand(self.tab);
         match hit {
             Hit::Step(way) => hand.steps[way] = along(&layout.steps[way]),
+            // Written when the drag ends, as the distances are.
+            Hit::FlickMs => {
+                self.view.flick_ms = along(&layout.flick) as u32;
+                self.invalidate();
+                return Action::None;
+            }
             _ => return Action::None,
         }
         self.view.set_hand(self.tab, hand);
@@ -873,10 +890,13 @@ impl Settings {
             else { self.draw_button(&p, fonts, area, names[i], Hit::Quick(i)); continue; }
             p.text(names[i], &fonts.button, area, white(1.0));
         }
-        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle. A quick, sure move goes straight to the next desktop and stays whole through short slowings; pause, hesitate or turn back and it zooms all the way out at once. Off always zooms out; Instant adds a short fade.",
-            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다. 빠르고 확실하게 움직이면 축소 없이 넘어가고 잠깐 느려져도 그대로입니다. 멈추거나 머뭇거리거나 되돌리면 바로 끝까지 축소됩니다. 끔은 항상 축소, 즉시는 짧은 페이드를 더합니다.",
-            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。快速果断地移动会直接切换且短暂放慢也不缩小；停顿、犹豫或折返时立即完全缩小。关闭时总是缩小；即时加一段短淡入。"),
-            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 4.0).top + 2.0 * ROWS.1 * s, ..row(EXPERIMENT_ROW + 4.0) }, white(0.62));
+        label(EXPERIMENT_ROW + 4.0, tr("Flick time (shorter: fewer flicks)", "넘김 인정 시간 (짧을수록 섬세 이동)", "翻页判定时间（越短越精细）"));
+        let flick_words = format!("{} ms", view.flick_ms);
+        self.draw_slider(&p, fonts, &layout.flick, EDGES.1 * s, view.flick_ms as i32, FLICK_MS, &flick_words, Hit::FlickMs);
+        p.text(tr("Applied from the next move. Trails show only on fast moves and use the public window pictures; slower springs take longer to settle. A quick, sure move let go of within the flick time goes one desktop, with the screen whole; held on, the screen starts to zoom out gently from 60% of that time and is all the way out as it turns into a precise move. Pause, hesitate or turn back and it zooms out at once. Off always zooms out; Instant adds a short fade.",
+            "다음 이동부터 적용됩니다. 잔상은 빠른 이동에만 생기고 공개 창 썸네일을 씁니다. 느린 스프링은 정착이 더 오래 걸립니다. 넘김 인정 시간 안에 빠르게 움직였다 놓으면 축소 없이 한 칸 넘어갑니다. 계속 누르고 있으면 그 시간의 60%부터 화면이 살살 축소되기 시작해, 섬세 이동으로 바뀌는 순간 끝까지 축소됩니다. 멈추거나 머뭇거리거나 되돌리면 바로 축소됩니다. 끔은 항상 축소, 즉시는 짧은 페이드를 더합니다.",
+            "从下一次移动开始生效。残影只在快速移动时出现，并使用公开的窗口缩略图；较慢的弹簧需要更久才停稳。在翻页判定时间内快速移动并松开，会不缩小地切换一格；继续按住，画面从该时间的 60% 起缓缓缩小，转为精细移动时正好完全缩小。停顿、犹豫或折返时立即缩小。关闭时总是缩小；即时加一段短淡入。"),
+            &fonts.notice, &Rect { bottom: row(EXPERIMENT_ROW + 5.0).top + 2.0 * ROWS.1 * s, ..row(EXPERIMENT_ROW + 5.0) }, white(0.62));
 
         let hot = self.hover == Hit::File;
         p.text(tr("More settings: config.toml", "추가 설정: config.toml", "更多设置：config.toml"), &fonts.label, &layout.file, white(if hot { 0.85 } else { 0.38 }));
