@@ -1298,6 +1298,12 @@ impl Board {
         self.show_selected(id, grid);
     }
 
+    /// As `select`, the strip sliding to it without receding: a flick's
+    /// cell, come to at once.
+    pub fn slide_to(&mut self, id: CellId, grid: Grid) {
+        self.show_selected_as(id, grid, false);
+    }
+
     /// Hold `id`, which the screen follows, began over the open board: its
     /// hand is read from now on as the normal view reads it (`Hold`), the
     /// latches given the rows and cells a picture of it would have.
@@ -1335,12 +1341,12 @@ impl Board {
     /// view's does (`Follow::land`): the cell it began on, the cell it
     /// lands on and the rows it turned, as `Grid::land` takes them. `None`
     /// when no hold the screen follows went on.
-    pub fn let_go(&mut self) -> Option<(CellId, (i32, i32), Vec<(i32, i32)>)> {
+    pub fn let_go(&mut self) -> Option<(CellId, (i32, i32), Vec<(i32, i32)>, bool)> {
         self.take_hold(Instant::now());
         let mut hold = self.hold.take()?;
         let at = hold.released.unwrap_or_else(|| hold.began.elapsed().as_secs_f64());
-        let (to, _) = hold.follow.land(hold.judge.as_mut(), at, hold.hand);
-        Some((hold.start, to, hold.follow.turns()))
+        let (to, sure) = hold.follow.land(hold.judge.as_mut(), at, hold.hand);
+        Some((hold.start, to, hold.follow.turns(), sure))
     }
 
     /// The hold over the board (`Hold`) brought up to `now`: the hand it
@@ -1386,6 +1392,11 @@ impl Board {
     }
 
     fn show_selected(&mut self, id: CellId, grid: Grid) {
+        self.show_selected_as(id, grid, true);
+    }
+
+    /// As `show_selected`, the strip receding as it moves (`Strip::moved`) or not.
+    fn show_selected_as(&mut self, id: CellId, grid: Grid, recede: bool) {
         let now = Instant::now();
         let before = self.marks();
         let (strip_before, from) = (self.strip_marks.clone(), self.grid.find(&self.selected));
@@ -1396,7 +1407,7 @@ impl Board {
         self.motion.moved(&before, &self.marks(), now);
         let t = self.strip_time(now);
         self.strip_frame = None;
-        self.strip.moved(&strip_before, &self.strip_marks, t);
+        self.strip.moved(&strip_before, &self.strip_marks, t, recede);
         self.strip_at = t;
         self.strip_on |= self.strip.active(t);
         if self.strip_on {
@@ -3670,7 +3681,7 @@ impl Board {
         self.strip_frame = None;
         self.strip_input = None;
         self.strip_samples.clear();
-            self.strip.moved(&strip_before, &self.strip_marks, 0.0);
+            self.strip.moved(&strip_before, &self.strip_marks, 0.0, true);
             self.strip_at = ms as f32 / 1000.0;
             self.strip_on = self.strip.active(self.strip_at);
             if self.strip_on {

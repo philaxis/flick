@@ -1530,7 +1530,7 @@ impl App {
     /// judged to (`Board::let_go`), the rows it turned kept turned, as a
     /// hold in the normal view lands (`Grid::land`).
     fn let_go_board(&mut self) {
-        let Some((start, to, turns)) = self.board.let_go() else { return };
+        let Some((start, to, turns, sure)) = self.board.let_go() else { return };
         let Some(from) = self.grid.find(&start) else { return };
         let (id, turned) = self.grid.land(from, to, &turns);
         if let Some(id) = &id {
@@ -1539,9 +1539,11 @@ impl App {
         if id.is_some() || turned {
             self.save();
         }
-        // The board takes the grid as landed, though it shows the cell already.
+        // The board takes the grid as landed, though it shows the cell
+        // already; a flick's cell it slides to, as the normal view comes to
+        // it at once.
         if let Some(id) = id {
-            self.board.select(id, self.usage_grid());
+            if sure { self.board.slide_to(id, self.usage_grid()) } else { self.board.select(id, self.usage_grid()) }
         }
     }
 

@@ -202,6 +202,8 @@ pub struct Strip {
     counted_from: Option<u64>,
     holding: bool,
     last_input: f32,
+    /// The last move only slides (`moved`): its sliding takes nothing back.
+    sliding_only: bool,
 }
 
 impl Strip {
@@ -214,10 +216,12 @@ impl Strip {
 
     /// The rows were at `before` and are now at `after` (`marks`): each is
     /// still drawn where it was and goes on from there. Unless the hand
-    /// holds the strip, the move recedes and comes forward again.
-    pub fn moved(&mut self, before: &[(f32, f32)], after: &[(f32, f32)], now: f32) {
+    /// holds the strip, the move recedes and comes forward again; not
+    /// `recede`, it only slides.
+    pub fn moved(&mut self, before: &[(f32, f32)], after: &[(f32, f32)], now: f32, recede: bool) {
         let now = now.max(self.last_input);
         self.last_input = now;
+        self.sliding_only = !recede;
         let slide = curve::SLIDE_END - curve::SLIDE_START;
         let mut end: Option<f32> = None;
         for (row, (was, is)) in before.iter().zip(after).enumerate() {
@@ -235,13 +239,13 @@ impl Strip {
             self.across.retarget(rows, now, slide);
             self.across.committed();
             end = Some(end.unwrap_or(0.0).max(self.across.end()));
-            if self.holding {
+            if recede && self.holding {
                 self.row_recede.hold(now);
-            } else {
+            } else if recede {
                 self.row_recede.step(now, self.across.end());
             }
         }
-        if let Some(end) = end {
+        if let Some(end) = end.filter(|_| recede) {
             if self.holding { self.recede.kick(now, 5.0); }
             else { self.recede.step(now, end); }
         }
@@ -254,6 +258,7 @@ impl Strip {
         let now = now.max(self.last_input);
         self.last_input = now;
         let hand = if holding { hand } else { (0.0, 0.0) };
+        self.sliding_only &= hand == (0.0, 0.0);
         if holding && hand != (0.0, 0.0) && self.recede.settled(now) { self.recede.hold(now); }
         if holding && hand.1.abs() > 0.02 {
             self.row_recede.hold(now);
@@ -279,8 +284,8 @@ impl Strip {
 
     /// Depth still settles on idle frames; translation targets only change on real input.
     pub fn advance_depth(&mut self, now: f32) {
-        let rows_moving = self.across.at(now).abs() > 0.01;
-        let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01);
+        let rows_moving = self.across.at(now).abs() > 0.01 && !self.sliding_only;
+        let moving = rows_moving || self.along.iter().any(|g| g.at(now).abs() > 0.01) && !self.sliding_only;
         self.recede.moving(now, moving || self.holding && (self.hand != (0.0, 0.0) || self.recede.depth(now) > 0.001));
         self.row_recede.moving(now, rows_moving || self.holding && self.hand.1.abs() > 0.01);
     }
@@ -428,13 +433,13 @@ mod tests {
         for axis in 0..2 {
             let mut strip = Strip::default();
             let marks = |n: f32| if axis == 0 { vec![(-n, 0.0)] } else { vec![(0.0, -n)] };
-            strip.moved(&marks(0.0), &marks(1.0), 0.0);
+            strip.moved(&marks(0.0), &marks(1.0), 0.0, true);
             let get = |s: &Strip, t| { let p = s.offset(0, t); if axis == 0 { p.0 } else { p.1 } };
             assert!((get(&strip, 0.0) - 1.0).abs() < 1e-6);
             assert!(get(&strip, 0.18) < 0.0 && get(&strip, 0.18) > -0.03, "arrival ticks at most three percent past the target");
             let before = get(&strip, 0.1);
             let velocity = (get(&strip, 0.10001) - before) / 0.00001;
-            strip.moved(&marks(1.0), &marks(2.0), 0.1);
+            strip.moved(&marks(1.0), &marks(2.0), 0.1, true);
             assert!((get(&strip, 0.1) - 1.0 - before).abs() < 1e-5);
             assert!(((get(&strip, 0.10001) - get(&strip, 0.1)) / 0.00001 - velocity).abs() < 0.05);
             assert!(strip.depth(0.1) > 0.5);
@@ -446,7 +451,7 @@ mod tests {
     fn board_and_desktop_keys_share_position_and_depth() {
         let mut strip = Strip::default();
         let mut desktop = crate::follow::Step::new(0.0, (1, 0));
-        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.0);
+        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.0, true);
         for i in 1..200 {
             let now = i as f32 / 120.0;
             strip.follow((0.0, 0.0), 0, 1, false, now);
@@ -454,6 +459,20 @@ mod tests {
             assert!((1.0 - strip.offset(0, now).0 as f64 - desktop.at().0.0).abs() < 1e-5);
             assert!((strip.depth(now) as f64 - desktop.at().1).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn a_move_that_only_slides_never_recedes() {
+        let mut strip = Strip::default();
+        strip.moved(&[(0.0, 0.0)], &[(-1.0, -1.0)], 0.0, false);
+        let mut slid = false;
+        for i in 1..240 {
+            let now = i as f32 / 120.0;
+            strip.follow((0.0, 0.0), 0, 1, false, now);
+            assert_eq!((strip.depth(now), strip.row_depth(now)), (0.0, 0.0), "{now}");
+            slid |= strip.offset(0, now).0.abs() > 0.01;
+        }
+        assert!(slid && strip.offset(0, 2.0).0.abs() < 0.001 && !strip.active(2.0));
     }
 
     #[test]
@@ -485,7 +504,7 @@ mod tests {
         strip.follow((0.0, 0.0), 0, 1, true, 0.0);
         strip.follow((0.12, 0.0), 0, 1, true, 0.1);
         let before = strip.offset(0, 0.15).0;
-        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.15);
+        strip.moved(&[(0.0, 0.0)], &[(-1.0, 0.0)], 0.15, true);
         strip.follow((-0.2, 0.0), 0, 2, true, 0.15);
         assert!((strip.offset(0, 0.15).0 - 1.0 - before).abs() < 1e-5);
         let before = strip.offset(0, 0.2).0;
