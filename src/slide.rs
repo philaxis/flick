@@ -37,6 +37,11 @@ impl Slide {
         self.cell
     }
 
+    /// How far the hand is from the cell it set out from.
+    pub fn x(&self) -> i32 {
+        self.x
+    }
+
     /// How far the hand is from the cell it has come to.
     pub fn rest(&self, step: i32) -> i32 {
         self.x - self.cell * step
@@ -186,6 +191,17 @@ impl Detent {
 pub struct Plane {
     pub cols: Slide,
     pub rows: Detent,
+    /// The part of a count left over by `travel_receding`.
+    carry: f32,
+}
+
+/// How far the view has drawn back, from 0 to 1, `held_ms` into a hold:
+/// nothing until `from_ms`, all of it at `full_ms`, and in between a curve
+/// that stays flat a good while before it rises, so that a hold not much
+/// longer than a flick feels as one, with nothing drawing back.
+pub fn recede(held_ms: f32, from_ms: f32, full_ms: f32) -> f32 {
+    let t = ((held_ms - from_ms) / (full_ms - from_ms).max(1.0)).clamp(0.0, 1.0);
+    t * t * t * (t * (6.0 * t - 15.0) + 10.0)
 }
 
 /// What one movement came to: another row, another cell along the row.
@@ -197,7 +213,27 @@ pub struct Moved {
 
 impl Plane {
     pub const fn new() -> Plane {
-        Plane { cols: Slide::new(), rows: Detent::new() }
+        Plane { cols: Slide::new(), rows: Detent::new(), carry: 0.0 }
+    }
+
+    /// `travel` with the view drawn back `recede` (`recede`): as far as the
+    /// first cell either way the hand goes as it is, and beyond it only
+    /// `recede` of what it goes away from the start counts. So a flick comes
+    /// to one cell however far it goes, and the longer the hold the more
+    /// cells the same travel comes to, until drawn back fully it is as
+    /// `travel` alone; with no hold length at which that changes in a step.
+    pub fn travel_receding(&mut self, dx: i32, dy: i32, steps: (i32, i32), recede: f32) -> Moved {
+        let x = self.cols.x();
+        // What lies beyond one cell from the start, the way the hand goes.
+        let beyond = if dx >= 0 {
+            (x + dx - steps.0.max(x)).clamp(0, dx)
+        } else {
+            -(-(x + dx) - steps.0.max(-x)).clamp(0, -dx)
+        };
+        let exact = beyond as f32 * recede + self.carry;
+        let taken = exact.trunc();
+        self.carry = exact - taken;
+        self.travel(dx - beyond + taken as i32, dy, steps)
     }
 
     /// The hand moved (`dx`, `dy`). Up and down is taken first, so that
@@ -323,5 +359,58 @@ mod tests {
             assert!(!across.travel(10, 0, steps).row);
         }
         assert_eq!((across.rows.cell(), across.cols.cell()), (0, 3));
+    }
+
+    /// A flick, held too short for the view to draw back, comes to one cell
+    /// however far and however the hand goes, either way; drawn back fully
+    /// the same travel goes as far as without; and in between, the longer
+    /// the hold the farther, a step at a time and never less.
+    #[test]
+    fn a_flick_is_one_cell_and_a_longer_hold_goes_on() {
+        let steps = (260, 400);
+        let after = |moves: &[i32], recede: f32| {
+            let mut plane = Plane::new();
+            for &dx in moves {
+                plane.travel_receding(dx, 0, steps, recede);
+            }
+            plane.cols.cell()
+        };
+        for far in [200, 2000, 20000] {
+            assert_eq!(after(&[far], 0.0), 1, "{far} in one flick");
+            assert_eq!(after(&vec![10; far as usize / 10], 0.0), 1, "{far} count by count");
+            assert_eq!(after(&[-far], 0.0), -1, "{far} leftwards");
+        }
+        assert_eq!(after(&[100], 0.0), 0, "short of the first cell is no cell");
+        // Back again from a flick goes back as it came.
+        assert_eq!(after(&[5000, -260], 0.0), 0);
+        for far in [300, 700, 1500] {
+            let mut plain = Plane::new();
+            plain.travel(far, 0, steps);
+            assert_eq!(after(&[far], 1.0), plain.cols.cell());
+        }
+        let mut last = 1;
+        for tenth in 0..=10 {
+            let cells = after(&vec![20; 100], tenth as f32 / 10.0);
+            assert!(cells >= last && cells <= last + 2, "{tenth}/10 drawn back goes {cells} after {last}");
+            last = cells;
+        }
+        assert_eq!(last, 8);
+    }
+
+    /// The view draws back not at all for a while, hardly at first, then
+    /// fully, never going back.
+    #[test]
+    fn the_view_draws_back_hardly_at_first() {
+        assert_eq!(recede(0.0, 250.0, 900.0), 0.0);
+        assert_eq!(recede(250.0, 250.0, 900.0), 0.0);
+        assert!(recede(380.0, 250.0, 900.0) < 0.06);
+        assert_eq!(recede(900.0, 250.0, 900.0), 1.0);
+        assert_eq!(recede(5000.0, 250.0, 900.0), 1.0);
+        let mut before = 0.0;
+        for ms in (0..1000).step_by(10) {
+            let now = recede(ms as f32, 250.0, 900.0);
+            assert!(now >= before);
+            before = now;
+        }
     }
 }

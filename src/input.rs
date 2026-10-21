@@ -13,13 +13,13 @@ use crate::{
     config::Config,
     grid::Dir,
     hold::{Chord, Held, Source},
-    slide::Plane,
+    slide::{self, Plane},
 };
 use std::{
     cell::{Cell, RefCell},
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
     time::Instant,
 };
@@ -130,6 +130,23 @@ const NO_ROOM: i32 = 0xFF;
 static ROW_ASKED: AtomicI32 = AtomicI32::new(0);
 static ROW_FRACTION: AtomicI32 = AtomicI32::new(0);
 static ROWS_SHOWN: AtomicU64 = AtomicU64::new(0);
+/// When the hold began, in milliseconds from `EPOCH`, and from how long into
+/// a hold and until when the view draws back (`slide::recede`), which the
+/// minimap reads on a thread of its own.
+static HOLD_BEGAN_MS: AtomicU64 = AtomicU64::new(0);
+static RECEDE_FROM_MS: AtomicU32 = AtomicU32::new(0);
+static RECEDE_FULL_MS: AtomicU32 = AtomicU32::new(0);
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn since_epoch_ms() -> u64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// How far the view has drawn back this far into the hold, 0 to 1.
+fn receded() -> f32 {
+    let held = since_epoch_ms().saturating_sub(HOLD_BEGAN_MS.load(Ordering::SeqCst)) as f32;
+    slide::recede(held, RECEDE_FROM_MS.load(Ordering::SeqCst) as f32, RECEDE_FULL_MS.load(Ordering::SeqCst) as f32)
+}
 
 /// The wparam of `WM_SLIDE` and `WM_DRAG`.
 fn slide_wparam(stretch: u32, cell: i32) -> usize {
@@ -206,6 +223,9 @@ pub struct Hand {
     /// new hold or stretch, the app getting to a cell or a row): they may
     /// jump then, with the hand itself still.
     pub counted_from: u64,
+    /// How far the view has drawn back, 0 to 1 (`slide::recede`); `None`
+    /// while no hold is going on.
+    pub recede: Option<f32>,
 }
 
 /// Where the hand is now; nothing while no hold is going on.
@@ -229,7 +249,11 @@ pub fn hand() -> Hand {
         for part in [shown_raw, rows_raw] {
             counted_from = counted_from.rotate_left(17) ^ part.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         }
-        return if holding { Hand { along, across, counted_from } } else { Hand { counted_from, ..Hand::default() } };
+        return if holding {
+            Hand { along, across, counted_from, recede: Some(receded()) }
+        } else {
+            Hand { counted_from, ..Hand::default() }
+        };
     }
 }
 
@@ -470,6 +494,8 @@ pub fn install(target: HWND, triggers: Vec<Trigger>, config: &Config) {
         step_x: config.step_x.max(20),
         step_y: config.step_y.max(20),
     });
+    RECEDE_FROM_MS.store(config.recede_from_ms, Ordering::SeqCst);
+    RECEDE_FULL_MS.store(config.recede_full_ms.max(config.recede_from_ms + 1), Ordering::SeqCst);
     match THREAD.load(Ordering::SeqCst) {
         0 => {
             std::thread::spawn(hook_thread);
@@ -630,6 +656,7 @@ fn press(source: Source) {
             ROW_FRACTION.store(0, Ordering::SeqCst);
         });
         PLANE.set(Plane::new());
+        HOLD_BEGAN_MS.store(since_epoch_ms(), Ordering::SeqCst);
         DRAGGING.set(false);
         HOLDING.store(true, Ordering::SeqCst);
         STEPPED.set(false);
@@ -944,7 +971,8 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
     if let Some((_, Some((left, right)))) = shown() {
         plane.cols.set_room(left, right, step);
     }
-    let moved = plane.travel(dx, dy, (step, step_y));
+    let recede = receded();
+    let moved = plane.travel_receding(dx, dy, (step, step_y), recede);
     PLANE.set(plane);
     let (rows, cols) = (plane.rows, plane.cols);
     // In one piece for `hand`: a new stretch and where the hand is in it.
@@ -974,7 +1002,7 @@ fn travel(s: &Settings, dx: i32, dy: i32) {
         DRAGGING.set(true);
         post(s, WM_DRAG, slide_wparam(stretch, 0));
     }
-    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}", cols.rest(step), rows.gathered());
+    debug_log!("move {dx} {dy}: sideways {} of {step} and up and down {} of {step_y}, drawn back {recede:.2}", cols.rest(step), rows.gathered());
 }
 
 /// Returns true when the event belongs to the gesture and must not reach apps.

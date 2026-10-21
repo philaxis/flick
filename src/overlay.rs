@@ -47,6 +47,10 @@ const TITLE_H: f32 = 26.0;
 /// the grid is drawn, and of the fading in and out.
 const SETTLE_TAU: f32 = 0.045;
 const FADE_TAU: f32 = 0.025;
+/// How much of the minimap shows in a hold that has not drawn back at all
+/// (a flick): little, so that a flick does not feel like the view drawing
+/// back; it comes up fully as the hold does (`slide::recede`).
+const FLICK_PRESENCE: f32 = 0.2;
 /// How far past the end of its row the highlight is pushed, in cells.
 const EDGE_GIVE: f32 = 0.16;
 /// Cells shown either side of the highlight at most, sideways and up and
@@ -241,6 +245,9 @@ pub struct Overlay {
     views: u64,
     camera: Camera,
     alpha: f32,
+    /// How much of the minimap shows at most (`FLICK_PRESENCE`): the most
+    /// the view drew back in this showing, which a hold let go of keeps.
+    presence: f32,
     visible: bool,
     /// When to start fading out; `None` keeps the minimap up.
     hide_at: Option<Instant>,
@@ -276,6 +283,7 @@ impl Overlay {
             views: 0,
             camera: Camera::default(),
             alpha: 0.0,
+            presence: 0.0,
             visible: false,
             hide_at: None,
             last_tick: Instant::now(),
@@ -296,6 +304,7 @@ impl Overlay {
         if !self.visible {
             self.place_on_monitors();
             self.camera = Camera::start(&view, from);
+            self.presence = 0.0;
             self.visible = true;
             self.last_tick = Instant::now();
         }
@@ -338,9 +347,15 @@ impl Overlay {
         self.last_tick = now;
 
         let hiding = self.hide_at.is_some_and(|at| now >= at);
-        let goal = if hiding { 0.0 } else { 1.0 };
-        self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
         let hand = crate::input::hand();
+        self.presence = match hand.recede {
+            Some(recede) => self.presence.max(FLICK_PRESENCE + (1.0 - FLICK_PRESENCE) * recede),
+            // Shown by a hotkey, with no hold: all of it.
+            None if self.presence == 0.0 => 1.0,
+            None => self.presence,
+        };
+        let goal = if hiding { 0.0 } else { self.presence };
+        self.alpha += (goal - self.alpha) * (1.0 - (-dt / FADE_TAU).exp());
         self.camera.advance(&self.view, (hand.along, hand.across), (self.views, hand.counted_from), dt);
         #[cfg(feature = "debug-log")]
         if hand.along != 0.0 || hand.across != 0.0 || self.camera.rest_y.abs() > 0.001 {

@@ -26,6 +26,12 @@ trigger = "xbutton2"
 step_x = 260
 step_y = 400
 
+# Sideways, a short hold is a flick: one cell, however far the hand goes. Held longer the view draws back,
+# and more and more cells can be gone to in one hold, the same travel going farther the longer it is held:
+# nothing before recede_from_ms (milliseconds into the hold), all of it at recede_full_ms.
+recede_from_ms = 250
+recede_full_ms = 900
+
 # Up and down, each quick flick goes one workspace (two flicks go two; slowly bringing the hand back is ignored).
 # With false it keeps going by the distance moved, like sideways.
 vertical_sticky = true
@@ -53,6 +59,10 @@ pub struct Config {
     pub step_x: i32,
     pub step_y: i32,
     pub vertical_sticky: bool,
+    /// From how long into a hold, and until when, the view draws back:
+    /// held shorter, sideways goes one cell at most (`slide::recede`).
+    pub recede_from_ms: u32,
+    pub recede_full_ms: u32,
     /// How long the cursor must rest on a cell of the board's map for the
     /// board to turn to that cell, in milliseconds; 0 for never.
     pub dwell_ms: u32,
@@ -68,6 +78,8 @@ impl Default for Config {
             step_x: 260,
             step_y: 400,
             vertical_sticky: true,
+            recede_from_ms: 250,
+            recede_full_ms: 900,
             // Long enough that a cell passed over on the way to another is
             // not taken, short enough not to feel like waiting: about what
             // Windows waits before showing a taskbar preview or a tooltip.

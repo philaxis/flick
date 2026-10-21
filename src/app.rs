@@ -1948,6 +1948,7 @@ pub fn render_minimap_strip(path: &str) {
                 + plane.cols.rest(steps.0) as f32 / steps.0 as f32,
             across: (plane.rows.cell() - told_row) as f32 + plane.rows.lean(steps.1),
             counted_from: stretch << 8 | (told_col as u64) << 4 | told_row as u64,
+            recede: Some(1.0),
         };
         let cur = if view_row == 2 { Pos { row: 2, col: 2 } } else { Pos { row: 1, col: view_col as usize } };
         let view = View {
