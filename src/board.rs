@@ -22,7 +22,7 @@ use windows::{
                 Common::{
                     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
                 },
-                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_BITMAP_PROPERTIES,
+                ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_PROPERTIES,
             },
             DirectWrite::{
                 IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -34,7 +34,7 @@ use windows::{
                 DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
             },
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
+            Gdi::{BitBlt, GetDC, GetUpdateRect, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -721,7 +721,7 @@ impl Board {
                 }
             }
         }
-        self.invalidate();
+        self.invalidate_maps();
     }
 
     /// How much of the time it takes has the cursor rested on this cell.
@@ -740,8 +740,10 @@ impl Board {
             self.rested_at = Some(self.cursor);
             self.select(id, false);
             self.hover = self.hit_test(self.cursor.0, self.cursor.1);
+            return;
         }
-        self.invalidate();
+        // Only the bar grows, some thirty times a second.
+        self.invalidate_cell(&id);
     }
 
     /// Puts the board back above a window that came up over it while it is
@@ -792,6 +794,42 @@ impl Board {
     fn invalidate(&self) {
         unsafe {
             InvalidateRect(self.hwnd, None, false);
+        }
+    }
+
+    /// Marks only `area` (in the window's coordinates) to be drawn again.
+    /// The board is drawn by the processor, so a change on the map no
+    /// longer costs a picture of every monitor: drawing all of it at each
+    /// step of the cursor made the cursor lag behind on the map.
+    fn invalidate_area(&self, area: &Rect) {
+        let r = RECT {
+            left: area.left.floor() as i32,
+            top: area.top.floor() as i32,
+            right: area.right.ceil() as i32,
+            bottom: area.bottom.ceil() as i32,
+        };
+        unsafe {
+            InvalidateRect(self.hwnd, Some(&r), false);
+        }
+    }
+
+    /// The bottom of every monitor, from just above its map: the map and,
+    /// on the home monitor, the line under it that tells what is hovered.
+    fn invalidate_maps(&self) {
+        for map in &self.maps {
+            let top = map.area.top + map.layout.top - 12.0 * self.scale;
+            self.invalidate_area(&Rect { top, ..map.area });
+        }
+    }
+
+    /// One cell on every map, with room for what is drawn around it.
+    fn invalidate_cell(&self, id: &str) {
+        for map in &self.maps {
+            let mut cells = map.layout.rows.iter().flat_map(|row| &row.cells);
+            if let Some(cell) = cells.find(|cell| cell.id == id) {
+                let at = grow(&cell.body, 8.0 * self.scale);
+                self.invalidate_area(&rect(at.left + map.area.left, at.top + map.area.top, size(&at).0, size(&at).1));
+            }
         }
     }
 
@@ -1361,8 +1399,15 @@ impl Board {
         }
         self.rest_on(resting);
         if hover != self.hover {
+            // Moving over the map changes only the map and the line under
+            // it; a tile under the cursor before or now needs the tiles too.
+            let on_tile = |hit: &Hit| matches!(hit, Hit::Window { .. } | Hit::Pin(_) | Hit::Top(_) | Hit::TileClose(_));
+            if on_tile(&hover) || on_tile(&self.hover) {
+                self.invalidate();
+            } else {
+                self.invalidate_maps();
+            }
             self.hover = hover;
-            self.invalidate();
         }
     }
 
@@ -1472,22 +1517,37 @@ impl Board {
         self.canvas.as_ref().map(|c| c.target.target.clone())
     }
 
-    /// Draws the board into the canvas; `None` when there is no canvas.
-    fn draw_to_canvas(&mut self) -> Option<Result<()>> {
+    /// Draws the board into the canvas, only within `dirty` when given;
+    /// `None` when there is no canvas.
+    fn draw_to_canvas(&mut self, dirty: Option<Rect>) -> Option<Result<()>> {
+        let fresh = !self.canvas.as_ref().is_some_and(|c| c.dib.size == self.size);
         let target = self.ensure_canvas()?;
         if self.fonts.is_none() {
             self.fonts = make_fonts(self.scale).map_err(|e| crate::app::log(&format!("board fonts failed: {e}"))).ok();
         }
         self.load_icons(&target);
+        // A new canvas holds nothing yet, so all of it is drawn.
+        let clip = dirty.filter(|_| !fresh);
         unsafe {
             target.BeginDraw();
+            if let Some(clip) = &clip {
+                target.PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            }
             let drawn = self.draw(&target);
+            if clip.is_some() {
+                target.PopAxisAlignedClip();
+            }
             Some(target.EndDraw(None, None).and(drawn))
         }
     }
 
     fn paint(&mut self) {
-        match self.draw_to_canvas() {
+        // What was marked to be drawn again; all of it when nothing was.
+        let mut update = RECT::default();
+        let dirty = unsafe { GetUpdateRect(self.hwnd, Some(&mut update), false) }
+            .as_bool()
+            .then(|| Rect { left: update.left as f32, top: update.top as f32, right: update.right as f32, bottom: update.bottom as f32 });
+        match self.draw_to_canvas(dirty) {
             Some(Ok(())) => {}
             Some(Err(e)) => {
                 crate::app::log(&format!("board draw failed: {e}"));
@@ -1499,9 +1559,13 @@ impl Board {
         }
         if let Some(canvas) = &self.canvas {
             let (w, h) = canvas.dib.size;
+            let (x, y, w, h) = match dirty {
+                Some(_) => (update.left, update.top, update.right - update.left, update.bottom - update.top),
+                None => (0, 0, w, h),
+            };
             unsafe {
                 let window = GetDC(self.hwnd);
-                let _ = BitBlt(window, 0, 0, w, h, canvas.dib.dc, 0, 0, SRCCOPY);
+                let _ = BitBlt(window, x, y, w, h, canvas.dib.dc, x, y, SRCCOPY);
                 ReleaseDC(self.hwnd, window);
             }
         }
@@ -1704,7 +1768,7 @@ impl Board {
         let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
 
         // The column vertical moves travel along.
-        p.fill(&layout.spine, 10.0 * s, white(0.035));
+        p.fill(&layout.spine, 8.0 * s, white(0.035));
         for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
             let in_selected_row = selected_row == Some(r);
             self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
@@ -1753,28 +1817,40 @@ impl Board {
         let dim = if self.dragged_cell() == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
         let is_selected = cell.id == self.selected;
         let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) if *id == cell.id);
+        // A line drawn inside the edge, half a pixel in, so it lands on whole
+        // pixels and the cell keeps its size whatever the line's width.
+        let ring = |width: f32, colour| {
+            let inset = width / 2.0;
+            p.stroke(&grow(&cell.body, -inset), radius - inset, width, colour);
+        };
+        let base = if in_selected_row { 0.09 } else { 0.055 } + if hovering { 0.04 } else { 0.0 };
+        p.fill(&cell.body, radius, white(base * dim));
         if is_selected {
-            for (by, a) in [(5.0, 0.08), (3.0, 0.14)] {
-                p.fill(&grow(&cell.body, by * s), radius + by * s, accent(a * dim));
-            }
+            p.fill(&cell.body, radius, accent(0.16 * dim));
         }
-        p.fill(&cell.body, radius, white(if in_selected_row { 0.14 } else { 0.07 } * dim));
         if cell.emphasised {
-            p.fill(&cell.body, radius, warm(0.26 * dim));
+            p.fill(&cell.body, radius, warm(0.22 * dim));
         }
+        // A light edge on every cell, a little brighter along the top, as
+        // on the cards of Windows itself.
+        ring(1.0, white(if hovering { 0.22 } else { 0.08 } * dim));
+        p.line(
+            (cell.body.left + radius, cell.body.top + 0.5),
+            (cell.body.right - radius, cell.body.top + 0.5),
+            1.0,
+            white(0.06 * dim),
+        );
         if drop_target {
-            p.stroke(&cell.body, radius, 2.5 * s, accent(1.0));
+            ring(2.0 * s, accent(1.0));
         } else if is_selected {
-            p.stroke(&cell.body, radius, 2.0 * s, accent(dim));
+            ring(2.0 * s, accent(0.95 * dim));
         } else if cell.emphasised {
-            p.stroke(&cell.body, radius, 1.5 * s, warm(0.95 * dim));
-        } else if hovering {
-            p.stroke(&cell.body, radius, 1.0, white(0.35 * dim));
+            ring(1.5 * s, warm(0.95 * dim));
         }
         if cell.emphasised && (is_selected || drop_target) {
             // The selection's frame took the place of the mark's: a second
             // one inside it, or marking the selected cell would show nothing.
-            p.stroke(&grow(&cell.body, -4.0 * s), (radius - 4.0 * s).max(1.0), 2.0 * s, warm(0.95 * dim));
+            p.stroke(&grow(&cell.body, -4.0 * s), (radius - 4.0 * s).max(1.0), 1.5 * s, warm(0.95 * dim));
         }
         if let Some(share) = self.rested(&cell.id) {
             // Filling up while the cursor rests here; full, the board turns to it.
@@ -1876,7 +1952,7 @@ impl Board {
         self.nav.visit(&selected);
         self.relayout();
         self.fonts = None;
-        let _ = self.draw_to_canvas()?;
+        let _ = self.draw_to_canvas(None)?;
         Some(self.canvas.as_ref()?.dib.pixels().to_vec())
     }
 }
@@ -2098,7 +2174,8 @@ fn layout_pins(row: &RowModel, header: &Rect, left: f32, room: f32, icon: f32, s
 /// column, the spine. `size` is the space above the footer; `s` the scale.
 fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> MapLayout {
     let (w, h) = size;
-    let (margin, header_w, gap) = (60.0 * s, 170.0 * s, 10.0 * s);
+    // Whole pixels throughout, so the edges of the cells are sharp.
+    let (margin, header_w, gap) = (60.0 * s, (170.0 * s).round(), (10.0 * s).round());
     /// Share of the monitor's height the map may take.
     const MAX_SHARE: f32 = 0.34;
 
@@ -2111,16 +2188,16 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     // Squares of a fixed look, shrunk only when the grid would not fit.
     let fit_w = (w - 2.0 * margin - header_w) / (columns + 1.2) - gap;
     let fit_h = (h * MAX_SHARE) / (rows + 1.2) - gap;
-    let cell_h = (62.0 * s).min(fit_h).min(fit_w * 0.62).max(22.0 * s);
-    let cell_w = cell_h / 0.62;
+    let cell_h = (62.0 * s).min(fit_h).min(fit_w * 0.62).max(22.0 * s).round();
+    let cell_w = (cell_h / 0.62).round();
     let pitch = cell_w + gap;
     let row_pitch = cell_h + gap;
-    let plus = cell_h * 0.6;
+    let plus = (cell_h * 0.6).round();
 
     let total_w = header_w + plus + gap + columns * pitch + plus;
     let total_h = plus + gap + rows * row_pitch + plus;
-    let x0 = ((w - total_w) / 2.0).max(margin);
-    let mut y = h - total_h - 10.0 * s;
+    let x0 = ((w - total_w) / 2.0).max(margin).round();
+    let mut y = (h - total_h - 10.0 * s).round();
     let cells_x = x0 + header_w + plus + gap;
     let spine_x = cells_x + lead as f32 * pitch;
     let icon = (cell_h * 0.36).min(22.0 * s);
@@ -2173,7 +2250,9 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
         });
         y += row_pitch;
     }
-    layout.spine = rect(spine_x - gap / 2.0, rows_top - gap / 2.0, pitch, (y - rows_top).max(0.0));
+    // Exactly as wide and as high as the column of cells: a plate standing
+    // out around them read as one drawn a size too large.
+    layout.spine = rect(spine_x, rows_top, cell_w, (y - rows_top - gap).max(0.0));
     layout.add_row = rect(spine_x + (cell_w - plus) / 2.0, y - gap / 2.0 + 2.0 * s, plus, plus);
     layout
 }
