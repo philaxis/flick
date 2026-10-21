@@ -32,7 +32,7 @@
 
 **Settings with the keyboard.** Tab / Shift+Tab move the visible focus, arrow keys adjust a focused slider, and Space / Enter activate a button or toggle. Ctrl+Tab switches device tabs; 1 / 2 still work. The window fits the monitor’s work area and scrolls vertically when needed, with the wheel, scrollbar or Page Up / Page Down; keyboard focus scrolls into view. Settings and the guide use the Windows UI language (Korean, Chinese, or English otherwise), and the guide names the current trigger.
 
-**Startup stays quiet.** Flick never asks for administrator rights on its own. The tray-location balloon appears only when the first guide is completed. A cell of the board's map shows its windows once the cursor rests on it a moment, so passing over the map does not stick; the obsolete `dwell_ms` key is ignored and can be removed from older config files.
+**Startup stays quiet.** Elevation is opt-in through *Run as administrator* in Settings, so declining or postponing it never triggers another UAC request on startup. The tray-location balloon appears only when the first guide is completed. A cell of the board's map shows its windows once the cursor rests on it a moment, so passing over the map does not stick; the obsolete `dwell_ms` key is ignored and can be removed from older config files.
 
 ## Get started
 

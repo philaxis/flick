@@ -1935,6 +1935,8 @@ impl App {
         settings::View {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
             capturing: self.capturing,
+            autostart: self.autostart,
+            admin: self.admin,
             flick_ms: self.config.experimental.flick_ms,
         }
     }
@@ -1945,6 +1947,16 @@ impl App {
     fn read_startup(&mut self) {
         self.admin = admin::enabled();
         self.autostart = if self.admin { admin::at_sign_in() } else { tray::autostart_enabled() };
+    }
+
+    fn set_autostart(&mut self, on: bool) {
+        if self.admin {
+            admin::set_at_sign_in(on);
+        } else {
+            tray::set_autostart(on);
+        }
+        self.read_startup();
+        self.refresh_settings();
     }
 
     fn open_settings(&mut self) {
@@ -2032,6 +2044,18 @@ impl App {
             settings::Action::None => {}
             settings::Action::Set(key, value) => self.set_config(key, &value),
             settings::Action::Capture(on) => self.capture_trigger(on),
+            settings::Action::Autostart(on) => self.set_autostart(on),
+            settings::Action::Admin(on) => {
+                if on {
+                    let taken_over = admin::turn_on(self.autostart);
+                    if admin::enabled() { tray::set_autostart(false); }
+                    if taken_over { unsafe { PostQuitMessage(0); } }
+                } else if admin::turn_off() {
+                    tray::set_autostart(self.autostart);
+                }
+                self.read_startup();
+                self.refresh_settings();
+            }
             settings::Action::Close => self.close_settings(),
         }
         Some(LRESULT(0))
@@ -2930,6 +2954,8 @@ pub fn render_settings(path: &str) {
     let view = settings::View {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
+        autostart: true,
+        admin: false,
         flick_ms: config.experimental.flick_ms,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {

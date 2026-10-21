@@ -1,5 +1,6 @@
-//! The settings window: the trigger, and how long a flick may take. All
-//! else is left as it is set, in config.toml.
+//! The settings window: the trigger, starting with Windows, running as
+//! administrator, and how long a flick may take. All else is left as it is
+//! set, in config.toml.
 //!
 //! It owns layout, hit-testing and drawing, in the look of the board. It
 //! changes nothing itself; what the user does is turned into an `Action` for
@@ -43,9 +44,11 @@ use windows::{
 /// (`TrackMouseEvent`).
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-/// Size of the window's inside, in unscaled units: the two rows, the note
-/// under the second and a margin.
-const SIZE: (f32, f32) = (560.0, ROWS.0 + 4.0 * ROWS.1 + 14.0);
+/// Size of the window's inside, in unscaled units: the rows, the note under
+/// the last and a margin.
+const SIZE: (f32, f32) = (560.0, ROWS.0 + (FLICK_ROW + 3.0) * ROWS.1 + 14.0);
+/// The flick time's row, under the trigger and the two switches.
+const FLICK_ROW: f32 = 3.0;
 /// Top of the first row and the height of each.
 const ROWS: (f32, f32) = (14.0, 44.0);
 /// Left edge of the labels and right edge of the controls.
@@ -65,6 +68,8 @@ pub struct View {
     pub trigger: String,
     /// Waiting for the user to press what the trigger should become.
     pub capturing: bool,
+    pub autostart: bool,
+    pub admin: bool,
     /// See `config::Experimental::flick_ms`.
     pub flick_ms: u32,
 }
@@ -76,6 +81,8 @@ pub enum Action {
     Set(&'static str, String),
     /// Start (or give up) waiting for a new trigger to be pressed.
     Capture(bool),
+    Autostart(bool),
+    Admin(bool),
     Close,
 }
 
@@ -84,12 +91,16 @@ enum Hit {
     #[default]
     Nothing,
     Trigger,
+    Autostart,
+    Admin,
     FlickMs,
 }
 
 /// Where the controls are, in pixels.
 struct Layout {
     trigger: Rect,
+    autostart: Rect,
+    admin: Rect,
     flick: Rect,
 }
 
@@ -98,12 +109,14 @@ impl Layout {
         let row = |i: f32| ROWS.0 + i * ROWS.1;
         Layout {
             trigger: rect((EDGES.1 - 64.0) * s, (row(0.0) + (ROWS.1 - 30.0) / 2.0) * s, 64.0 * s, 30.0 * s),
-            flick: rect((EDGES.0 + FLICK_LABEL) * s, row(1.0) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
+            autostart: rect((EDGES.1 - 44.0) * s, (row(1.0) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
+            admin: rect((EDGES.1 - 44.0) * s, (row(2.0) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
+            flick: rect((EDGES.0 + FLICK_LABEL) * s, row(FLICK_ROW) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
         }
     }
 
-    fn controls(&self) -> [(Rect, Hit); 2] {
-        [(self.trigger, Hit::Trigger), (self.flick, Hit::FlickMs)]
+    fn controls(&self) -> [(Rect, Hit); 4] {
+        [(self.trigger, Hit::Trigger), (self.autostart, Hit::Autostart), (self.admin, Hit::Admin), (self.flick, Hit::FlickMs)]
     }
 
     fn hit(&self, x: f32, y: f32) -> Hit {
@@ -389,6 +402,8 @@ impl Settings {
     fn activate(&mut self, hit: Hit) -> Action {
         match hit {
             Hit::Trigger => Action::Capture(!self.view.capturing),
+            Hit::Autostart => Action::Autostart(!self.view.autostart),
+            Hit::Admin => Action::Admin(!self.view.admin),
             _ => Action::None,
         }
     }
@@ -464,19 +479,32 @@ impl Settings {
         p.text(words, &fonts.value, &Rect { right: layout.trigger.left - 12.0 * s, ..row(0.0) }, colour);
         self.draw_button(&p, fonts, &layout.trigger, if view.capturing { tr("Cancel", "취소", "取消") } else { tr("Change", "변경", "更改") }, Hit::Trigger);
 
-        label(1.0, tr("Flick time", "넘김 인정 시간", "翻页判定时间"));
+        label(1.0, tr("Start with Windows", "Windows와 함께 시작", "随 Windows 启动"));
+        self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
+        label(2.0, tr("Run as administrator (off takes effect after restart)", "관리자 권한 실행 (끄기는 재시작 후 적용)", "以管理员身份运行（关闭后重启生效）"));
+        self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
+
+        label(FLICK_ROW, tr("Flick time", "넘김 인정 시간", "翻页判定时间"));
         let flick_words = format!("{} ms", view.flick_ms);
         self.draw_slider(&p, fonts, &layout.flick, EDGES.1 * s, view.flick_ms as i32, FLICK_MS, &flick_words, Hit::FlickMs);
         p.text(tr("A quick move let go of within this time goes one desktop, the screen staying whole. Held on, the screen zooms out gently from 60% of it, and you go as far as you move. Shorter: fewer flicks.",
             "이 시간 안에 휙 움직였다 놓으면 화면 그대로 한 칸 넘어갑니다. 더 누르고 있으면 그 시간의 60%부터 화면이 살살 물러나며, 움직인 만큼 이동합니다. 짧을수록 섬세 이동이 쉬워집니다.",
             "在此时间内快速移动并松开，画面不缩小地切换一格。继续按住，画面从该时间的 60% 起缓缓后退，移动多少就走多远。越短越容易精细移动。"),
-            &fonts.notice, &Rect { bottom: row(2.0).top + 2.0 * ROWS.1 * s, ..row(2.0) }, white(0.62));
+            &fonts.notice, &Rect { bottom: row(FLICK_ROW + 1.0).top + 2.0 * ROWS.1 * s, ..row(FLICK_ROW + 1.0) }, white(0.62));
 
         if let Some((area, _)) = layout.controls().into_iter().find(|(_, hit)| *hit == self.focus) {
             let ring = Rect { left: area.left - 3.0 * s, top: area.top - 3.0 * s, right: area.right + 3.0 * s, bottom: area.bottom + 3.0 * s };
             p.stroke(&ring, 5.0 * s, 2.0 * s, accent(1.0));
         }
         Ok(())
+    }
+
+    fn draw_switch(&self, p: &Painter, switch: &Rect, on: bool, hit: Hit) {
+        let h = switch.bottom - switch.top;
+        let hot = self.hover == hit;
+        p.fill(switch, h / 2.0, if on { accent(0.95) } else { white(if hot { 0.22 } else { 0.14 }) });
+        let knob = if on { switch.right - h / 2.0 } else { switch.left + h / 2.0 };
+        p.disc((knob, switch.top + h / 2.0), h / 2.0 - 3.0 * self.scale, white(0.95));
     }
 
     fn draw_button(&self, p: &Painter, fonts: &Fonts, area: &Rect, text: &str, hit: Hit) {
@@ -545,9 +573,10 @@ fn slider_step(value: i32, (low, high, step): (i32, i32, i32), direction: i32) -
 mod tests {
     use super::*;
     #[test]
-    fn focus_visits_both_controls_and_wraps_both_ways() {
+    fn focus_visits_every_control_and_wraps_both_ways() {
         let controls = Layout::new(1.0).controls();
-        assert_eq!(next_focus(&controls, Hit::Trigger, false), Hit::FlickMs);
+        assert_eq!(next_focus(&controls, Hit::Trigger, false), Hit::Autostart);
+        assert_eq!(next_focus(&controls, Hit::Admin, false), Hit::FlickMs);
         assert_eq!(next_focus(&controls, Hit::FlickMs, false), Hit::Trigger);
         assert_eq!(next_focus(&controls, Hit::Trigger, true), Hit::FlickMs);
     }

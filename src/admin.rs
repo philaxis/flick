@@ -97,6 +97,12 @@ fn escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Who is signed in, the way the task scheduler names users.
+fn user() -> String {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    format!("{}\\{}", var("USERDOMAIN"), var("USERNAME"))
+}
+
 /// Makes the task (or makes it anew): it runs this exe with the highest
 /// privileges for `user`, on demand and, with `at_sign_in`, when they sign
 /// in. Only an administrator can.
@@ -206,6 +212,41 @@ fn run_task() -> bool {
         std::thread::sleep(Duration::from_millis(100));
         unsafe { FindWindowW(crate::install::MAIN_CLASS, None) }.0 != 0
     })
+}
+
+/// Turns running as administrator on. Windows asks for permission once. `at_sign_in`:
+/// whether Flick is to start with Windows, which the task does from now on.
+/// Returns true when the caller must quit now, another Flick, run as
+/// administrator, being about to take over.
+pub fn turn_on(at_sign_in: bool) -> bool {
+    if elevated() {
+        // Already run as administrator by the user's own doing: only the
+        // task is missing.
+        write_task(&user(), at_sign_in);
+        return false;
+    }
+    let made = run_elevated(&format!("--admin on {} \"{}\"{}", at_sign_in as u8, user(), portable_flag()));
+    if !made || !enabled() {
+        crate::app::log("the task that runs the app as administrator was not made");
+        return false;
+    }
+    // The other one waits for this one to go (`main`).
+    schtasks(&["/Run", "/TN", &task_name()]).is_some()
+}
+
+/// Stop elevating future launches; the current process keeps its token until restart.
+pub fn turn_off() -> bool {
+    if elevated() { remove_task() } else { run_elevated(&format!("--admin off{}", portable_flag())) && !enabled() }
+}
+
+/// Sets whether the task starts Flick at sign-in, keeping whom it is for.
+pub fn set_at_sign_in(on: bool) {
+    let user = task()
+        .and_then(|task| Some(task.split_once("<UserId>")?.1.split_once("</UserId>")?.0.to_owned()))
+        .unwrap_or_else(user);
+    if !write_task(&user, on) {
+        crate::app::log("the task that runs the app as administrator could not be changed");
+    }
 }
 
 /// At the start: with the setting on and this process not run as
