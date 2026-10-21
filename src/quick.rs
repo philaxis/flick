@@ -27,12 +27,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// How far the hand goes before it counts as on its way, in cells.
 pub const START: f64 = 0.02;
 /// Not set off this soon after the hold begins (s), the hand is unsure.
-pub const ONSET_LIMIT: f64 = 0.15;
+pub const ONSET_LIMIT: f64 = 0.25;
 /// A stroke is a flick when, within `DECIDE` (s) of setting off, it gets
 /// as fast as `PEAK` (cells a second) for a moment: a sharp start, not a
 /// speed kept up. Not so, it is unsure.
-pub const DECIDE: f64 = 0.08;
-pub const PEAK: f64 = 5.0;
+pub const DECIDE: f64 = 0.12;
+pub const PEAK: f64 = 2.5;
 /// Sure and not let go of this long (s) after setting off, it is unsure.
 pub const QUICK_MOST: f64 = 0.35;
 /// Turning back this far (cells) from the farthest it went is unsure.
@@ -404,8 +404,8 @@ mod tests {
         let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
         assert!(unsure <= 0.25, "{unsure}");
         assert!(frames.iter().filter(|f| f.0 >= unsure).all(|f| f.2 == Mind::Unsure) && frames.last().unwrap().1 > 0.99);
-        // Three cells a second, steadily, and slower: in between only for a moment, then all the way.
-        for speed in [3.0, 1.5] {
+        // Two cells a second, steadily, and slower: in between only for a moment, then all the way.
+        for speed in [2.0, 1.0] {
             let mut quick = fresh();
             let frames = run(&mut quick, |t| speed * (t - 0.05).max(0.0), 0.001, 0.0, 1.0);
             let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
@@ -417,11 +417,11 @@ mod tests {
     }
 
     #[test]
-    fn held_still_it_is_precise_within_a_fifth_of_a_second() {
+    fn held_still_it_is_precise_within_a_third_of_a_second() {
         let mut quick = fresh();
         let frames = run(&mut quick, |_| 0.0, 0.001, 0.0, 1.0);
         let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
-        assert!(unsure <= 0.2, "{unsure}");
+        assert!(unsure <= 0.3, "{unsure}");
         // Whole until then, then all the way back at once, ease-out and without a jump.
         assert!(frames.iter().filter(|f| f.0 < unsure).all(|f| f.1 == 0.0));
         assert!(frames.iter().find(|f| f.0 >= unsure + 0.12).unwrap().1 > 0.93);
@@ -582,7 +582,7 @@ mod tests {
 
         // Let go past the end, flicked or not, back onto it as a latch's commit
         // comes back (`Spring::commit`), never past the end beyond.
-        for speed in [2.0, 18.0] {
+        for speed in [1.0, 18.0] {
             let mut quick = fresh();
             let mut hand = crate::follow::Follow::new((0, 0), vec![(-3, 0)]);
             let x = |t: f64| speed * t;
