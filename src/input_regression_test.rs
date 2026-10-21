@@ -658,3 +658,23 @@ fn frame_batches_preserve_precision_timestamps_and_the_release_path() {
     forget_hold(91);
     reset();
 }
+
+/// A hand flicking as it clicks is a flick however little it strayed: let
+/// go of, it is a move, not a click; staying as still, it is a click.
+#[test]
+fn a_flick_within_a_clicks_slack_is_no_click() {
+    let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let posted = |message: u32| api::CALLS.with(|c| c.borrow().messages.iter().filter(|(m, _)| *m == message).count());
+    for (by, click) in [(20, 0), (1, 1)] {
+        reset();
+        let s = settings();
+        press(Source::XButton2);
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            travel(&s, by, 0);
+        }
+        assert!(STRAYED.get().1 < s.step_x / 3);
+        release(&s, Source::XButton2);
+        assert_eq!((posted(WM_RELEASE), posted(WM_CLICK)), (1 - click, click), "{by}");
+    }
+}

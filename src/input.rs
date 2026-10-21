@@ -94,6 +94,13 @@ const CLICK_APART_MS: u128 = 300;
 /// Clicks following each other faster than this are a held button sending
 /// its key combination over and over, not a hand: none of them counts.
 const REPEAT_APART_MS: u128 = 120;
+/// A mouse hold let go of before it is clear whether it is a flick goes on
+/// being read this long (ms), the cursor still held: a hand flicking as it
+/// clicks goes on after letting go, and is a flick by then, not a click.
+#[cfg(not(test))]
+const GRACE_MS: u32 = 60;
+#[cfg(test)]
+const GRACE_MS: u32 = 0;
 /// While something is held, this often it is checked that letting go of it
 /// could still be seen (`blind`).
 const WATCH_MS: u32 = 100;
@@ -669,6 +676,13 @@ thread_local! {
     /// Cells rightwards and rows downwards the hand went since the hold
     /// began, whatever the latches made of it (`TimedHand::cells`).
     static HAND_CELLS: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+    /// The hand judged as the screen judges it (`quick::Judge`), from when
+    /// it first moved this hold, as the screen times it: a flick let go of
+    /// is a move, however little the mouse strayed, not a click.
+    static FLICK: RefCell<(Option<Instant>, crate::quick::Judge)> = RefCell::new((None, crate::quick::Judge::default()));
+    /// A hold let go of but still read (`GRACE_MS`): its timer, and how it
+    /// was let go of (`finish_release`).
+    static GRACE: Cell<Option<(usize, Option<bool>)>> = const { Cell::new(None) };
     /// When a click of the trigger was last taken, and when the trigger was
     /// last clicked at all.
     static LAST_CLICK: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -861,11 +875,19 @@ fn listen_raw(on: bool) {
     }
 }
 
+/// The hand still read: the trigger held, or let go of only just
+/// (`GRACE_MS`).
 fn held() -> bool {
+    pressed() || GRACE.get().is_some()
+}
+
+/// The trigger held.
+fn pressed() -> bool {
     HELD.with(|held| held.borrow().any())
 }
 
 fn press(source: Source) {
+    if !pressed() { end_grace(); }
     if source == Source::Touchpad && !HELD.with(|held| held.borrow().has(source)) {
         TOUCHPAD_BUTTONS.set(0);
     }
@@ -913,6 +935,7 @@ fn press(source: Source) {
         LAST_ABSOLUTE.set(None);
         STRAYED.set(((0, 0), 0));
         HAND_CELLS.set((0.0, 0.0));
+        FLICK.with(|flick| *flick.borrow_mut() = Default::default());
         // Process ids come round again: a process found run as administrator
         // in an earlier hold may be gone, and its id another's by now.
         LEVELS.with(|levels| levels.borrow_mut().1.clear());
@@ -1055,6 +1078,7 @@ unsafe extern "system" fn watch(_: HWND, _: u32, _: usize, _: u32) {
     if !held() {
         return stop_listening();
     }
+    if !pressed() { return; }
     if let Some(why) = blind() {
         end_hold(why);
     }
@@ -1069,43 +1093,80 @@ fn finish_release(s: &Settings, source: Source, tap: Option<bool>) {
     probe_flush();
     let ended = HELD.with(|held| held.borrow_mut().release(source));
     debug_log!("up {source:?}{}", if ended { ": hold ends" } else { "" });
-    if ended {
-        debug_log!(
-            "hold ended as a {}; cursor movements held back meanwhile: {}",
-            if STEPPED.get() { "move" } else { "click" },
-            crate::debuglog::take_held_back()
-        );
-        stop_listening();
-        // A click is the trigger pressed and let go of where it was. One
-        // that travelled, only not far enough for a step, is a move given
-        // up: it must not open the board.
-        let slack = s.step_x / 3;
-        let stayed = !STEPPED.get() && tap.unwrap_or(STRAYED.get().1 < slack);
-        if !stayed && !STEPPED.get() {
-            debug_log!("no click: the mouse had strayed {} (a click stays within {slack})", STRAYED.get().1);
-        }
-        // Nor is a click right upon a click one: nobody opens the board and
-        // answers it that fast, but a button set up to send a key combination
-        // may send it over and over while it is held. Only a click that was
-        // taken counts here: a hand clicking away quickly must not find
-        // every click after the first ignored for as long as it goes on.
-        let now = Instant::now();
-        let within = |last: Option<Instant>, ms: u128| last.is_some_and(|last| now.duration_since(last).as_millis() < ms);
-        // Even those are not ignored for longer than a second on end.
-        let again = stayed
-            && (within(LAST_CLICK.get(), CLICK_APART_MS) || (within(LAST_TAP.get(), REPEAT_APART_MS) && within(LAST_CLICK.get(), 1000)));
-        if again {
-            debug_log!("click ignored: one was taken less than {CLICK_APART_MS} ms ago, or they come faster than a hand clicks");
-        }
-        let click = stayed && !again;
-        if stayed {
-            LAST_TAP.set(Some(now));
-        }
-        if click {
-            LAST_CLICK.set(Some(now));
-        }
-        post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
+    if !ended { return; }
+    let unclear = || FLICK.with(|flick| flick.borrow().1.mind == crate::quick::Mind::Deciding);
+    if GRACE_MS > 0 && source != Source::Touchpad && !STEPPED.get() && crate::quick::mode() != crate::config::QuickFlick::Off && unclear() {
+        debug_log!("let go of before it is clear: read on for {GRACE_MS} ms");
+        GRACE.set(Some((unsafe { SetTimer(None, 0, GRACE_MS, Some(grace_over)) }, tap)));
+        return;
     }
+    conclude_release(s, tap);
+}
+
+unsafe extern "system" fn grace_over(_: HWND, _: u32, _: usize, _: u32) {
+    end_grace();
+}
+
+/// Ends the hold let go of only just, if there is one.
+fn end_grace() {
+    let Some((timer, tap)) = GRACE.take() else { return };
+    unsafe {
+        let _ = KillTimer(None, timer);
+    }
+    with_settings(|s| {
+        conclude_release(s, tap);
+        false
+    });
+}
+
+/// The hold let go of is over: a click or a move.
+fn conclude_release(s: &Settings, tap: Option<bool>) {
+    debug_log!(
+        "hold ended as a {}; cursor movements held back meanwhile: {}",
+        if STEPPED.get() { "move" } else { "click" },
+        crate::debuglog::take_held_back()
+    );
+    stop_listening();
+    // A click is the trigger pressed and let go of where it was. One
+    // that travelled, only not far enough for a step, is a move given
+    // up: it must not open the board.
+    let slack = s.step_x / 3;
+    let flicked = crate::quick::mode() != crate::config::QuickFlick::Off
+        && FLICK.with(|flick| {
+            let (began, judge) = &mut *flick.borrow_mut();
+            began.is_some_and(|began| {
+                judge.release(began.elapsed().as_secs_f64());
+                judge.mind == crate::quick::Mind::Sure
+            })
+        });
+    if flicked {
+        debug_log!("no click: a flick");
+    }
+    let stayed = !STEPPED.get() && !flicked && tap.unwrap_or(STRAYED.get().1 < slack);
+    if !stayed && !STEPPED.get() {
+        debug_log!("no click: the mouse had strayed {} (a click stays within {slack})", STRAYED.get().1);
+    }
+    // Nor is a click right upon a click one: nobody opens the board and
+    // answers it that fast, but a button set up to send a key combination
+    // may send it over and over while it is held. Only a click that was
+    // taken counts here: a hand clicking away quickly must not find
+    // every click after the first ignored for as long as it goes on.
+    let now = Instant::now();
+    let within = |last: Option<Instant>, ms: u128| last.is_some_and(|last| now.duration_since(last).as_millis() < ms);
+    // Even those are not ignored for longer than a second on end.
+    let again = stayed
+        && (within(LAST_CLICK.get(), CLICK_APART_MS) || (within(LAST_TAP.get(), REPEAT_APART_MS) && within(LAST_CLICK.get(), 1000)));
+    if again {
+        debug_log!("click ignored: one was taken less than {CLICK_APART_MS} ms ago, or they come faster than a hand clicks");
+    }
+    let click = stayed && !again;
+    if stayed {
+        LAST_TAP.set(Some(now));
+    }
+    if click {
+        LAST_CLICK.set(Some(now));
+    }
+    post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
 }
 
 /// A trigger seen let go of by raw input, which tells of it as well as the
@@ -1431,6 +1492,11 @@ fn advance(s: &Settings, dx: i32, dy: i32) {
     let (x, y) = (x + dx, y + dy);
     STRAYED.set(((x, y), farthest.max(x.abs()).max(y.abs())));
     HAND_CELLS.set((x as f64 / s.step_x.max(1) as f64, y as f64 / s.step_y.max(1) as f64));
+    FLICK.with(|flick| {
+        let (began, judge) = &mut *flick.borrow_mut();
+        let t = began.get_or_insert_with(Instant::now).elapsed().as_secs_f64();
+        judge.feed(t, HAND_CELLS.get(), axis().unwrap_or(0));
+    });
     let following = FOLLOWING.load(Ordering::SeqCst);
     let ((mut fx, mut fy), lean) = FOLLOWED.get();
     let dx = if following & FOLLOW_X != 0 { fx += dx as i64; 0 } else { dx };
