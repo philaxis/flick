@@ -1564,6 +1564,8 @@ impl Board {
         self.strip.keep_whole(whole);
         let dragging = self.press.as_ref().is_some_and(|press| press.dragging);
         let t = self.strip_time(now);
+        let lean = self.hold.as_ref().and_then(|hold| hold.judge.as_ref()).filter(|_| whole).map_or(0.0, |judge| judge.wanted() as f32);
+        self.strip.lean(lean, t);
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
         self.advance_peek(now);

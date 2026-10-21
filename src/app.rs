@@ -2100,7 +2100,7 @@ impl App {
         }
         crate::transition_curve::configure(config.experimental.commit_speed);
         crate::composition::configure_blur(config.experimental.motion_blur);
-        crate::quick::configure(config.experimental.quick_flick);
+        crate::quick::configure(config.experimental.quick_flick, config.experimental.flick_ms);
         crate::composition::configure(config.compositor);
         self.glide.warm();
         crate::touchpad::poll(config.touchpad.three_finger);

@@ -174,6 +174,13 @@ impl Recede {
     }
     pub fn step(&mut self, now: f32, end: f32) { self.kick(now, 6.0); self.fall = end.max(self.start); }
     pub fn hold(&mut self, now: f32) { self.kick(now, 0.0); self.fall = f32::INFINITY; }
+    /// At `now` at least `depth` back, going on from there as it was going.
+    pub fn at_least(&mut self, now: f32, depth: f64) {
+        let now = now.max(self.start);
+        self.state = self.sample(now);
+        self.start = now;
+        if self.state.p < depth { self.state.p = depth; self.state.v = self.state.v.max(0.0); }
+    }
     pub fn release(&mut self, now: f32, end: f32) { self.kick(now, 0.0); self.fall = end.max(self.start); }
 }
 

@@ -22,7 +22,7 @@
 //! is and the cells gone to are the hand's latches (`follow::Follow`),
 //! switched to once, on letting go.
 use crate::{config::QuickFlick, transition_curve::Spring};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 /// How far the hand goes before it counts as on its way, in cells.
 pub const START: f64 = 0.02;
@@ -33,8 +33,15 @@ pub const ONSET_LIMIT: f64 = 0.25;
 /// speed kept up. Not so, it is unsure.
 pub const DECIDE: f64 = 0.12;
 pub const PEAK: f64 = 2.5;
-/// Sure and not let go of this long (s) after setting off, it is unsure.
+/// Sure and not let go of this long (s) after setting off, it is unsure;
+/// `experimental.flick_ms` in config.toml sets it (`quick_most`).
 pub const QUICK_MOST: f64 = 0.35;
+/// Of `quick_most`, how much passes with the screen whole before it starts
+/// to recede towards the depth it has once unsure: none before, so that a
+/// flick does not see it, and in between more and more, slowly at first,
+/// so that a hand held on goes from a flick to a precise hold with no step
+/// in the picture.
+const LEAN_FROM: f64 = 0.6;
 /// Turning back this far (cells) from the farthest it went is unsure.
 pub const BACK: f64 = 0.15;
 /// The hand's speed is taken over this long (s).
@@ -52,9 +59,26 @@ const LAND: f64 = 75.0;
 const FLASH: (f64, f64) = (0.45, 0.12);
 
 static MODE: AtomicU8 = AtomicU8::new(QuickFlick::Slide as u8);
+static QUICK_MOST_MS: AtomicU32 = AtomicU32::new((QUICK_MOST * 1000.0) as u32);
 
-pub fn configure(mode: QuickFlick) {
+pub fn configure(mode: QuickFlick, flick_ms: u32) {
     MODE.store(mode as u8, Ordering::Relaxed);
+    QUICK_MOST_MS.store(flick_ms.clamp(100, 2000), Ordering::Relaxed);
+}
+
+/// How long after setting off a flick may be held on (s).
+pub fn quick_most() -> f64 {
+    QUICK_MOST_MS.load(Ordering::Relaxed) as f64 / 1000.0
+}
+
+/// How far a hand still taken for a flick `held` s after setting off wants
+/// the screen to recede: nothing until `LEAN_FROM` of `quick_most`, then
+/// rising flat at first and gently into all the way at `quick_most`, where
+/// it is unsure.
+fn lean(held: f64) -> f64 {
+    let most = quick_most();
+    let t = ((held - LEAN_FROM * most) / ((1.0 - LEAN_FROM) * most)).clamp(0.0, 1.0);
+    t * t * t * (t * (6.0 * t - 15.0) + 10.0)
 }
 
 pub fn mode() -> QuickFlick {
@@ -96,6 +120,8 @@ pub struct Judge {
     recent: Vec<(f64, f64)>,
     /// Let go of, and how far it wanted the screen to recede then.
     released: Option<f64>,
+    /// How far it wants the screen to recede while not yet unsure (`lean`).
+    lean: f64,
 }
 
 impl Judge {
@@ -144,8 +170,9 @@ impl Judge {
                 else if speed >= PEAK { self.mind = Mind::Sure; }
             }
             // Held on, it is no flick.
-            (_, onset) => if onset.is_some_and(|onset| now - onset > QUICK_MOST) { self.mind = Mind::Unsure; },
+            (_, onset) => if onset.is_some_and(|onset| now - onset > quick_most()) { self.mind = Mind::Unsure; },
         }
+        self.lean = self.onset.map_or(0.0, |(onset, ..)| lean(now - onset));
     }
 
     /// The hand's speed its way at `now`, falling off while it stays still.
@@ -160,7 +187,12 @@ impl Judge {
 
     /// How far the hand wants the screen to recede (as last `check`ed).
     pub fn wanted(&self) -> f64 {
-        if self.mind == Mind::Unsure { 1.0 } else { 0.0 }
+        match (self.mind, self.released) {
+            (Mind::Unsure, _) => 1.0,
+            // Let go of as a flick, the screen comes whole again as it lands.
+            (_, Some(_)) => 0.0,
+            _ => self.lean,
+        }
     }
 
     /// Let go of: as it is, from now on (not yet sure, the screen whole
@@ -445,7 +477,7 @@ mod tests {
         let mut quick = fresh();
         let frames = run(&mut quick, &x, 0.001, 0.0, 0.6);
         let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
-        assert!(frames.iter().any(|f| f.2 == Mind::Sure) && (0.05 + QUICK_MOST..=0.05 + QUICK_MOST + 0.01).contains(&unsure), "{unsure}");
+        assert!(frames.iter().any(|f| f.2 == Mind::Sure) && (0.05 + quick_most()..=0.05 + quick_most() + 0.01).contains(&unsure), "{unsure}");
         let mut hand = crate::follow::Follow::new((0, 0), vec![(-3, 3)]);
         let mut t = 0.0;
         while t <= 0.6 {
@@ -465,7 +497,7 @@ mod tests {
         let at = |t: f64| frames.iter().find(|f| f.0 >= t).unwrap();
         assert!(at(0.25).1 < 0.05);
         let unsure = frames.iter().find(|f| f.2 == Mind::Unsure).unwrap().0;
-        assert!((0.05 + QUICK_MOST..=0.07 + QUICK_MOST).contains(&unsure), "{unsure}");
+        assert!((0.05 + quick_most()..=0.07 + quick_most()).contains(&unsure), "{unsure}");
         assert!(at(unsure + 0.12).1 > 0.93, "{:?}", at(unsure + 0.12));
         // Receding begins at once and has no jump.
         assert!(frames.windows(2).all(|w| w[1].1 - w[0].1 < 0.21));

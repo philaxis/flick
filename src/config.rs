@@ -89,6 +89,11 @@ motion_blur = false
 # slides in), "instant" (comes at once, with a short fade), or "off" (always
 # zoomed out).
 quick_flick = "slide"
+# How long after setting off (milliseconds) a move may still be a flick of
+# one cell, however far it goes; held on longer it is a precise hold. The
+# picture starts to draw back gently from 60% of it, so that the one goes
+# into the other with no jump. Shorter makes flicks rarer.
+flick_ms = 350
 "#;
 
 /// Keys of earlier versions, before each device had its own settings: the
@@ -127,9 +132,19 @@ pub struct Config {
 pub enum Compositor { #[default] Auto, Off, All }
 
 /// Opt-in visual experiments never change the distance or commit rules.
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(default)]
-pub struct Experimental { pub commit_speed: CommitSpeed, pub motion_blur: bool, pub quick_flick: QuickFlick }
+pub struct Experimental { pub commit_speed: CommitSpeed, pub motion_blur: bool, pub quick_flick: QuickFlick, pub flick_ms: u32 }
+impl Default for Experimental {
+    fn default() -> Self {
+        Experimental {
+            commit_speed: CommitSpeed::default(),
+            motion_blur: false,
+            quick_flick: QuickFlick::default(),
+            flick_ms: (crate::quick::QUICK_MOST * 1000.0) as u32,
+        }
+    }
+}
 /// How a quick, sure move is shown (`quick`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]

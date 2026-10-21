@@ -259,6 +259,14 @@ impl Strip {
         self.whole = whole;
     }
 
+    /// A hold still taken for a flick but held on towards a precise one
+    /// draws the strip back this far (`quick::Judge::wanted`), so that it
+    /// is already on its way when the hold turns precise, and falls back
+    /// from it as it would from any depth when the hold lands as a flick.
+    pub fn lean(&mut self, depth: f32, now: f32) {
+        if depth > 0.0 { self.recede.at_least(now, depth as f64); }
+    }
+
     /// One frame at `now` with the hand pulling the selected `row` by `hand`
     /// (cells), counted from `counted_from`. A hold recedes the strip; let
     /// go, it settles on the committed cell without predicting a fling.
