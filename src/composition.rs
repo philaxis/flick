@@ -35,9 +35,11 @@ pub fn blur() -> bool { BLUR.load(std::sync::atomic::Ordering::Relaxed) }
 struct Trails { ids: [isize;2], last: Option<([f32;4], std::time::Instant)>, shown: bool }
 thread_local! { static TRAILS: RefCell<HashMap<isize, Trails>> = RefCell::default(); }
 /// Composed thumbnails keep fractional edges their rounded state cannot compare; trails fade each frame.
-pub fn needs_update(id: isize) -> bool {
-    SCENES.with(|s|s.borrow().thumbs.contains_key(&id)) || TRAILS.with(|t|t.borrow().contains_key(&id))
-}
+pub fn needs_update(id: isize) -> bool { composed(id) || trailing(id) }
+/// `id` is composed: placed exactly where asked, not on whole pixels.
+pub fn composed(id: isize) -> bool { SCENES.with(|s|s.borrow().thumbs.contains_key(&id)) }
+/// `id` has a trail, which an update with nothing moved clears.
+pub fn trailing(id: isize) -> bool { TRAILS.with(|t|t.borrow().contains_key(&id)) }
 /// A trail is still on screen: draw once more, even without movement, so it clears.
 pub fn trails_shown() -> bool { TRAILS.with(|t|t.borrow().values().any(|t|t.shown)) }
 
