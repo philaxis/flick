@@ -16,6 +16,8 @@
 
 **Tap to see everything.** Tap the trigger for the windows on this desktop and a small map of all of them. Drag a window onto the map to move it.
 
+**Shelves come back after a restart.** Each desktop remembers its apps. After a restart the overview shows them faintly; right-click a shelf's name to bring them back to their desktops.
+
 **Any button you like.** It starts as the mouse "forward" button. Click the tray icon for Settings → *Change* and press whatever you want instead, even several keys at once.
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
