@@ -352,9 +352,10 @@ pub fn warn(text: &str) {
     }
 }
 
-fn window_model(follows: bool, window: vd::WindowInfo) -> WindowModel {
+fn window_model(follows: bool, pin_from_app: bool, window: vd::WindowInfo) -> WindowModel {
     WindowModel {
         follows,
+        pin_from_app,
         app: vd::exe_name(window.pid).unwrap_or_default(),
         icon_key: crate::board::icon_key(window.hwnd),
         app_name: vd::app_label(window.pid),
@@ -712,10 +713,7 @@ impl App {
         let state = self.pin_state(window);
         let requested = crate::pin::Pin::from_flags(row, all);
         if state.window_change(requested).is_none() {
-            tray::notify(self.hwnd, "Flick", crate::i18n::text(
-                "This pin comes from the app. Change App in the pin menu (Ctrl+Alt+Win+P).",
-                "앱에서 상속된 고정입니다. 고정 메뉴(Ctrl+Alt+Win+P)에서 앱 항목을 바꾸세요.",
-                "此固定来自应用。请在固定菜单（Ctrl+Alt+Win+P）中更改应用选项。"));
+            self.app_pin_notice();
             return false;
         }
         // Tag first so failure cannot leave a shell pin removed without its replacement.
@@ -736,6 +734,14 @@ impl App {
         true
     }
 
+    /// Says that a window's pin comes from its app, so is not changed by it.
+    fn app_pin_notice(&self) {
+        tray::notify(self.hwnd, "Flick", crate::i18n::text(
+            "This pin comes from the app. Change App in the pin menu (Ctrl+Alt+Win+P).",
+            "앱에서 상속된 고정입니다. 고정 메뉴(Ctrl+Alt+Win+P)에서 앱 항목을 바꾸세요.",
+            "此固定来自应用。请在固定菜单（Ctrl+Alt+Win+P）中更改应用选项。"));
+    }
+
     /// A window dropped on the board: pinned as asked first, for a window
     /// no longer on every desktop can be moved to a cell, then moved.
     /// Dropped in a place of the pinned windows, it is put on top each
@@ -743,8 +749,9 @@ impl App {
     /// button takes it down.
     fn place_window(&mut self, window: HWND, pin: Option<crate::pin::Pin>, cell: Option<String>, monitor: Option<RECT>) {
         if let Some(pin) = pin {
+            // As it is pinned, by itself or by its app.
             let state = self.pin_state(window);
-            if crate::pin::Pin::from_flags(state.row_window, state.all_window) != pin {
+            if crate::pin::Pin::from_flags(state.row_window || state.row_app, state.all_window || state.all_app) != pin {
                 let (row, all) = pin.flags();
                 if !self.set_pin(window, row, all) {
                     return;
@@ -1590,7 +1597,7 @@ impl App {
                         let (here, rest): (Vec<_>, Vec<_>) = windows.drain(..).partition(|w| w.desktop == *id);
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
-                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
+                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), self.grid.follow_apps.contains(&vd::exe_name(w.pid).unwrap_or_default()), w)).collect();
                         CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now), windows }
                     })
                     .collect();
@@ -1602,7 +1609,7 @@ impl App {
                 }
             })
             .collect();
-        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, w)).collect();
+        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, vdapi::is_pinned_app(w.hwnd).unwrap_or(false), w)).collect();
         Model { rows, pinned, current: desktops.current.clone() }
     }
 
@@ -1757,6 +1764,10 @@ impl App {
             }
 
             Action::PlaceWindow { window, pin, cell, monitor } => self.place_window(window, pin, cell, monitor),
+            Action::AppPinned => {
+                self.app_pin_notice();
+                return;
+            }
             Action::MoveCell { id, row, index } => {
                 self.grid.move_cell(&id, row, index);
                 // The selection, carried to another shelf, turns that shelf to it.
@@ -2883,6 +2894,7 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             let (w, h): (i32, i32) = (w.parse().ok()?, h.parse().ok()?);
             Some(WindowModel {
                 follows: false,
+                pin_from_app: false,
                 app: format!("sample{i}"),
                 icon_key: 0,
                 app_name: String::new(),

@@ -95,6 +95,8 @@ pub struct WindowModel {
     pub app_name: String,
     /// Follows the user from cell to cell inside its row.
     pub follows: bool,
+    /// The app owns this pin; a window cannot be pinned otherwise or unpinned.
+    pub pin_from_app: bool,
     /// Kept above the other windows.
     pub topmost: bool,
 }
@@ -202,6 +204,9 @@ pub enum Action {
     /// coordinates), or both. Dropped in a place of the pinned windows, it
     /// is kept above the others.
     PlaceWindow { window: HWND, pin: Option<Pin>, cell: Option<CellId>, monitor: Option<RECT> },
+    /// A window was dropped where it would be pinned otherwise than its app
+    /// pins it: it stays, and the user is told why.
+    AppPinned,
     MoveCell { id: CellId, row: usize, index: usize },
     MoveCellToNewRow { id: CellId, at: usize },
     /// Add a desktop to a row, at its front or its end.
@@ -1952,8 +1957,11 @@ impl Board {
             return self.tile_hit(tile.hwnd);
         }
         let (map, x, y) = self.map_at(x, y);
-        // A window shown small, and its buttons while it is pointed at.
+        // A window shown small, and its buttons while it is pointed at,
+        // where they are drawn: those of the rows move with the names.
+        let names = self.motion.offset(&Part::Names(map.monitor));
         for (row, hwnd, r) in self.chips(map) {
+            let r = if row.is_some() { shifted_rect(&r, names.0, names.1) } else { r };
             if self.pointed(hwnd.0) && self.press.is_none() {
                 let (top, close) = self.chip_buttons(&r);
                 if contains(&grow(&top, 2.0 * self.scale), x, y) {
@@ -2745,6 +2753,8 @@ impl Board {
             WM_LBUTTONUP => self.mouse_up(x, y),
             WM_RBUTTONUP => match self.hit_test(x, y) {
                 Hit::Cell(id) | Hit::CellClose(id) => Action::ToggleEmphasis(id),
+                // A window shown small by a row's name is not the row.
+                Hit::Window { .. } | Hit::Top(_) | Hit::TileClose(_) => Action::None,
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
@@ -2988,7 +2998,8 @@ impl Board {
             if let Some((hwnd, from)) = flying {
                 // Into the cell it moved to, or back to its tile.
                 let into = match &action {
-                    Action::PlaceWindow { cell: Some(_), pin: None | Some(Pin::Off), .. } => self.cell_at(x, y).map(|(cell, m)| {
+                    // Unpinned on its own cell too, it goes into it.
+                    Action::PlaceWindow { pin: None | Some(Pin::Off), .. } => self.cell_at(x, y).map(|(cell, m)| {
                         let at = self.maps.iter().find(|map| map.monitor == m).map_or((0.0, 0.0), |map| (map.area.left, map.area.top));
                         shifted_rect(&cell.body, at.0, at.1)
                     }),
@@ -3078,13 +3089,14 @@ impl Board {
             board: matches!(target, Some(Target::Board)).then_some(self.selected.as_str()),
             other_monitor: monitor != self.monitor_of(window),
         };
-        (window_drop(from, Pin::of(window, everywhere), &spot), target, monitor)
+        (window_drop(from, Pin::of(window, everywhere), window.pin_from_app, &spot), target, monitor)
     }
 
     /// A window was dragged to a point (`window_drop`).
     fn drop_window(&self, hwnd: isize, x: f32, y: f32) -> Action {
         match self.window_drop_at(hwnd, x, y) {
             (WindowDrop::Nothing, ..) => Action::None,
+            (WindowDrop::FromApp, ..) => Action::AppPinned,
             (WindowDrop::Place { pin, cell, monitor }, _, m) => Action::PlaceWindow {
                 window: HWND(hwnd),
                 pin,
@@ -3099,7 +3111,7 @@ impl Board {
     fn drop_target(&self) -> Option<Target> {
         let hwnd = self.dragged_window()?;
         match self.window_drop_at(hwnd, self.cursor.0, self.cursor.1) {
-            (WindowDrop::Nothing, ..) => None,
+            (WindowDrop::Nothing | WindowDrop::FromApp, ..) => None,
             (_, target, _) => target,
         }
     }
@@ -3305,12 +3317,19 @@ impl Board {
         if self.editing.is_some() {
             return hint("Enter: save   ·   Esc: cancel");
         }
-        if self.dragged_window().is_some() {
-            return hint(if self.monitors.len() > 1 {
-                "Drop on the rail over the map to pin to all shelves, by a shelf's name to pin to it, on a cell to move it there, on the previews to unpin it, or on another monitor"
-            } else {
-                "Drop on the rail over the map to pin to all shelves, by a shelf's name to pin to it, on a cell to move it there, or on the previews to unpin it"
-            });
+        if let Some(hwnd) = self.dragged_window() {
+            // What dropping it does, where: on the previews only one pinned
+            // has anything to do.
+            let pinned = self.model.window(hwnd).is_some_and(|(window, everywhere)| everywhere || window.follows);
+            let t = crate::i18n::text;
+            let places = [
+                Some(t("Rail over the map: all shelves", "지도 위 레일: 모든 셸프", "地图上方细轨：所有架子")),
+                Some(t("By a shelf's name: that shelf", "셸프 이름 옆: 그 셸프", "架子名称旁：该架子")),
+                Some(t("On a cell: move there", "셀: 그 셀로 이동", "格子：移到该格")),
+                pinned.then(|| t("On the previews: unpin", "위 미리보기: 고정 해제", "上方预览：取消固定")),
+                (self.monitors.len() > 1).then(|| t("Another monitor: move there", "다른 모니터: 그 모니터로", "其他显示器：移到该显示器")),
+            ];
+            return hint(&places.into_iter().flatten().collect::<Vec<_>>().join("   ·   "));
         }
         if self.press.is_some() {
             return None;
@@ -3892,15 +3911,15 @@ impl Board {
         };
         let dragged = self.dragged_row() == Some(r);
         let hot = (self.hover == Hit::RowName(r) && self.press.is_none()) || dragged;
+        // Clear of the place of its pinned windows, typed into or not.
+        let right = row.pins.left - 6.0 * s;
         if editing.is_some() || hot {
             // While typing the box follows the text being typed.
             let width = text_width(&name, 12.0 * s) + 4.0 * s;
-            let area = grow(&Rect { right: row.name.left + width.max(size(&row.name).0), ..row.name }, 4.0 * s);
+            let area = grow(&Rect { right: (row.name.left + width.max(size(&row.name).0)).min(right - 4.0 * s), ..row.name }, 4.0 * s);
             p.fill(&area, 6.0 * s, white(if editing.is_some() { 0.09 } else { 0.045 }));
             p.sheen(&area, 6.0 * s, 0.05);
         }
-        // Clear of the place of its pinned windows, unless typed into.
-        let right = if editing.is_some() { row.header.right } else { row.pins.left - 6.0 * s };
         let wide = Rect { right, ..row.name };
         p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 }));
     }
@@ -4660,6 +4679,8 @@ struct DropSpot<'a> {
 #[derive(Debug, PartialEq)]
 enum WindowDrop {
     Nothing,
+    /// Nothing, for its app pins it otherwise than it would be.
+    FromApp,
     /// Pinned so (or no longer, or left as it is), to another cell, and to
     /// the monitor it was dropped on.
     Place { pin: Option<Pin>, cell: Option<CellId>, monitor: bool },
@@ -4671,15 +4692,22 @@ enum WindowDrop {
 /// pinned to that row (going to one of its cells first), on a cell it is
 /// that cell's own, pinned no longer; one pinned, dropped on the previews,
 /// is the selected cell's own. Dropped back where it is, or anywhere else,
-/// it only changes monitor, if dropped on another.
-fn window_drop(from: &str, pin: Pin, spot: &DropSpot) -> WindowDrop {
-    let monitor = spot.other_monitor;
+/// it only changes monitor, if dropped on another. One whose pin is its
+/// app's (`from_app`) keeps it: it is only moved where that is all it
+/// takes, and stays otherwise.
+fn window_drop(from: &str, pin: Pin, from_app: bool, spot: &DropSpot) -> WindowDrop {
+    let (monitor, was) = (spot.other_monitor, pin);
     let (pin, cell) = match (&spot.slot, spot.cell.or(spot.board.filter(|_| pin != Pin::Off))) {
         (Some(PinSlot::All), _) => ((pin != Pin::Everywhere).then_some(Pin::Everywhere), None),
         // Not in that row, it goes to one of its cells: pinned anew.
         (Some(PinSlot::Row(cell)), _) => ((pin != Pin::Row || cell.is_some()).then_some(Pin::Row), cell.clone()),
         (None, Some(id)) => ((pin != Pin::Off).then_some(Pin::Off), (id != from).then(|| id.to_owned())),
         (None, None) => (None, None),
+    };
+    let pin = match pin {
+        Some(Pin::Row) if from_app && was == Pin::Row => None,
+        Some(_) if from_app => return WindowDrop::FromApp,
+        pin => pin,
     };
     if pin.is_none() && cell.is_none() && !monitor {
         WindowDrop::Nothing
@@ -4695,7 +4723,7 @@ mod tests {
 
     fn window(hwnd: isize, follows: bool) -> WindowModel {
         WindowModel { hwnd: HWND(hwnd), rect: RECT { right: 1280, bottom: 720, ..Default::default() },
-            follows, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
+            follows, pin_from_app: false, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
             icon_key: 0, app_name: String::new(), topmost: false }
     }
 
@@ -4835,6 +4863,7 @@ mod tests {
                     icon_key,
                     app_name: String::new(),
                     follows: false,
+                    pin_from_app: false,
                     topmost: false,
                 })
                 .collect();
@@ -5151,36 +5180,44 @@ mod tests {
         // On the rail it goes on every desktop, from wherever it was; on
         // every desktop already, it goes back where it was.
         for pin in [Pin::Off, Pin::Row] {
-            assert_eq!(window_drop("a", pin, &at(Some(PinSlot::All), None)), place(Some(Pin::Everywhere), None));
+            assert_eq!(window_drop("a", pin, false, &at(Some(PinSlot::All), None)), place(Some(Pin::Everywhere), None));
         }
-        assert_eq!(window_drop("", Pin::Everywhere, &at(Some(PinSlot::All), None)), WindowDrop::Nothing);
+        assert_eq!(window_drop("", Pin::Everywhere, false, &at(Some(PinSlot::All), None)), WindowDrop::Nothing);
         // By a row's name it is pinned to that row, going to one of its
         // cells first when it is not in it; pinned to it already, nothing.
-        assert_eq!(window_drop("a", Pin::Off, &at(Some(PinSlot::Row(None)), None)), place(Some(Pin::Row), None));
-        assert_eq!(window_drop("a", Pin::Everywhere, &at(Some(PinSlot::Row(Some("c".into()))), None)), place(Some(Pin::Row), Some("c")));
-        assert_eq!(window_drop("a", Pin::Row, &at(Some(PinSlot::Row(Some("c".into()))), None)), place(Some(Pin::Row), Some("c")));
-        assert_eq!(window_drop("a", Pin::Row, &at(Some(PinSlot::Row(None)), None)), WindowDrop::Nothing);
+        assert_eq!(window_drop("a", Pin::Off, false, &at(Some(PinSlot::Row(None)), None)), place(Some(Pin::Row), None));
+        assert_eq!(window_drop("a", Pin::Everywhere, false, &at(Some(PinSlot::Row(Some("c".into()))), None)), place(Some(Pin::Row), Some("c")));
+        assert_eq!(window_drop("a", Pin::Row, false, &at(Some(PinSlot::Row(Some("c".into()))), None)), place(Some(Pin::Row), Some("c")));
+        assert_eq!(window_drop("a", Pin::Row, false, &at(Some(PinSlot::Row(None)), None)), WindowDrop::Nothing);
         // On a cell it is that cell's own: moved there, and pinned no longer.
-        assert_eq!(window_drop("a", Pin::Off, &at(None, Some("b"))), place(None, Some("b")));
-        assert_eq!(window_drop("a", Pin::Row, &at(None, Some("b"))), place(Some(Pin::Off), Some("b")));
-        assert_eq!(window_drop("a", Pin::Row, &at(None, Some("a"))), place(Some(Pin::Off), None));
-        assert_eq!(window_drop("", Pin::Everywhere, &at(None, Some("b"))), place(Some(Pin::Off), Some("b")));
-        assert_eq!(window_drop("a", Pin::Off, &at(None, Some("a"))), WindowDrop::Nothing);
+        assert_eq!(window_drop("a", Pin::Off, false, &at(None, Some("b"))), place(None, Some("b")));
+        assert_eq!(window_drop("a", Pin::Row, false, &at(None, Some("b"))), place(Some(Pin::Off), Some("b")));
+        assert_eq!(window_drop("a", Pin::Row, false, &at(None, Some("a"))), place(Some(Pin::Off), None));
+        assert_eq!(window_drop("", Pin::Everywhere, false, &at(None, Some("b"))), place(Some(Pin::Off), Some("b")));
+        assert_eq!(window_drop("a", Pin::Off, false, &at(None, Some("a"))), WindowDrop::Nothing);
         // On the previews one pinned is the selected cell's own; one that
         // is a cell's own already stays as it is.
-        assert_eq!(window_drop("a", Pin::Row, &on_board), place(Some(Pin::Off), Some("s")));
-        assert_eq!(window_drop("s", Pin::Row, &on_board), place(Some(Pin::Off), None));
-        assert_eq!(window_drop("", Pin::Everywhere, &on_board), place(Some(Pin::Off), Some("s")));
-        assert_eq!(window_drop("a", Pin::Off, &on_board), WindowDrop::Nothing);
+        assert_eq!(window_drop("a", Pin::Row, false, &on_board), place(Some(Pin::Off), Some("s")));
+        assert_eq!(window_drop("s", Pin::Row, false, &on_board), place(Some(Pin::Off), None));
+        assert_eq!(window_drop("", Pin::Everywhere, false, &on_board), place(Some(Pin::Off), Some("s")));
+        assert_eq!(window_drop("a", Pin::Off, false, &on_board), WindowDrop::Nothing);
         // Anywhere else nothing happens, pinned or not.
         for pin in [Pin::Off, Pin::Row, Pin::Everywhere] {
-            assert_eq!(window_drop("a", pin, &at(None, None)), WindowDrop::Nothing);
+            assert_eq!(window_drop("a", pin, false, &at(None, None)), WindowDrop::Nothing);
         }
+        // Pinned by its app, it is never pinned otherwise nor unpinned by a
+        // drop: it stays, said why; pinned to rows, it may go to another.
+        assert_eq!(window_drop("a", Pin::Row, true, &at(Some(PinSlot::Row(Some("c".into()))), None)), place(None, Some("c")));
+        assert_eq!(window_drop("a", Pin::Row, true, &at(Some(PinSlot::Row(None)), None)), WindowDrop::Nothing);
+        assert_eq!(window_drop("a", Pin::Row, true, &at(Some(PinSlot::All), None)), WindowDrop::FromApp);
+        assert_eq!(window_drop("a", Pin::Row, true, &at(None, Some("b"))), WindowDrop::FromApp);
+        assert_eq!(window_drop("", Pin::Everywhere, true, &on_board), WindowDrop::FromApp);
+        assert_eq!(window_drop("", Pin::Everywhere, true, &at(Some(PinSlot::All), None)), WindowDrop::Nothing);
         // On another monitor it goes there too; dropped nowhere else, only there.
         let other = |slot, cell| DropSpot { other_monitor: true, ..at(slot, cell) };
-        assert_eq!(window_drop("a", Pin::Off, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
-        assert_eq!(window_drop("a", Pin::Everywhere, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
-        assert_eq!(window_drop("a", Pin::Off, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: Some(Pin::Everywhere), cell: None, monitor: true });
-        assert_eq!(window_drop("", Pin::Everywhere, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
+        assert_eq!(window_drop("a", Pin::Off, false, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
+        assert_eq!(window_drop("a", Pin::Everywhere, false, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
+        assert_eq!(window_drop("a", Pin::Off, false, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: Some(Pin::Everywhere), cell: None, monitor: true });
+        assert_eq!(window_drop("", Pin::Everywhere, false, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
     }
 }
