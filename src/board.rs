@@ -95,8 +95,6 @@ pub struct WindowModel {
     pub app_name: String,
     /// Follows the user from cell to cell inside its row.
     pub follows: bool,
-    /// The app owns this pin; a window button cannot remove it.
-    pub pin_from_app: bool,
     /// Kept above the other windows.
     pub topmost: bool,
 }
@@ -136,14 +134,29 @@ impl Model {
         self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == id)
     }
 
+    /// The cell a window is on; `None` for one on every desktop.
+    fn cell_of(&self, hwnd: isize) -> Option<&CellModel> {
+        self.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.windows.iter().any(|w| w.hwnd.0 == hwnd))
+    }
+
+    /// The row a cell is in.
+    fn row_of(&self, id: &str) -> Option<usize> {
+        self.rows.iter().position(|row| row.cells.iter().any(|cell| cell.id == id))
+    }
+
+    /// The windows pinned to row `row`, which no cell of the map shows.
+    fn row_pinned(&self, row: usize) -> impl Iterator<Item = &WindowModel> {
+        self.rows.get(row).into_iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.windows).filter(|w| w.follows)
+    }
+
     /// The desktop has no windows of its own, only those pinned, as known
     /// from the model rather than from previews still on their way.
     fn has_no_own_windows(&self, id: &str) -> bool {
         self.cell(id).is_some_and(|cell| cell.windows.iter().all(|w| w.follows))
     }
 
-    /// Normalize across the whole cell, before splitting monitors or pinned
-    /// sections, so a window has the same weight wherever it is shown.
+    /// Normalize across the whole cell, before splitting monitors, so a
+    /// window has the same weight wherever it is shown.
     fn window_weights(&self, id: &str, grid: &Grid) -> HashMap<isize, f32> {
         let now = usage::now();
         let scores: Vec<_> = self.tile_windows(id).into_iter().map(|(w, _)| {
@@ -188,9 +201,12 @@ pub enum Action {
     /// Switch to a cell and close; optionally focus one of its windows. An
     /// empty id (a window shown on every desktop) stays on the current cell.
     Go(CellId, Option<HWND>),
-    /// Move a window to another cell, another monitor (given in screen
-    /// coordinates), or both.
-    MoveWindow { window: HWND, cell: Option<CellId>, monitor: Option<RECT> },
+    /// Put a dropped window where it was dropped: pinned as `pin` says (to
+    /// its row, to every desktop, or no longer; `None` leaves it), then
+    /// moved to another cell, another monitor (given in screen
+    /// coordinates), or both. Dropped in a place of the pinned windows, it
+    /// is kept above the others.
+    PlaceWindow { window: HWND, pin: Option<Pin>, cell: Option<CellId>, monitor: Option<RECT> },
     MoveCell { id: CellId, row: usize, index: usize },
     MoveCellToNewRow { id: CellId, at: usize },
     /// Add a desktop to a row, at its front or its end.
@@ -200,9 +216,6 @@ pub enum Action {
     RemoveCell(CellId),
     /// Ask a window to close.
     CloseWindow(HWND),
-    /// Set how one window is pinned: following within its row, shown on
-    /// every desktop, or neither (never both).
-    SetPin { window: HWND, row: bool, all: bool },
     /// Keep a window above the others, or stop doing so.
     SetTop { window: HWND, on: bool },
     /// Show the menu of a shelf (close its windows, remove it).
@@ -250,6 +263,18 @@ const MOTION_OMEGA: f32 = std::f32::consts::TAU / MOTION_RESPONSE;
 const SETTLED: f32 = 0.5;
 /// A near-target spring must also be this slow (px/s) before its tail is cut.
 const SETTLED_SPEED: f32 = SETTLED * MOTION_OMEGA;
+/// A window picked up off its preview: how long the board takes to make
+/// way for it (the rest of the previews going down, the cells of the map
+/// up, the places of the pinned windows opening), and back once dropped.
+const GRAB_MS: f32 = 180.0;
+/// How far the rest of the previews go down meanwhile: this much darker,
+/// and this much smaller.
+const GRAB_SINK: f32 = 0.15;
+const GRAB_SHRINK: f32 = 0.02;
+/// How large a dragged window gets over the map: its longer side, unscaled.
+const DRAGGED_SMALL: f32 = 64.0;
+/// How near the cursor a place to drop on starts to come to it, unscaled.
+const MAGNET_REACH: f32 = 110.0;
 /// The longest name a shelf can be given, in characters.
 const NAME_LENGTH: usize = 24;
 /// Sent after the cursor leaves a window that called `TrackMouseEvent`.
@@ -425,21 +450,11 @@ impl Trace {
     }
 }
 
-/// A cell's windows laid out as when it is the one selected: their tiles
-/// and the parts they are in.
+/// A cell's windows laid out as when it is the one selected, those pinned
+/// among its own.
 #[derive(Default)]
 struct CellTiles {
     tiles: Vec<TileLayout>,
-    sections: Vec<Section>,
-}
-
-/// A part of the preview area: the cell's own windows, or one of the
-/// places of the pinned ones, with, when they did not all fit, the cell
-/// that stands for the rest (a few of their windows, and how many).
-struct Section {
-    part: Rect,
-    carried: Carried,
-    more: Option<(Rect, Vec<HWND>, usize)>,
 }
 
 /// A cell beside the selection, shown while the strip moves.
@@ -492,26 +507,10 @@ fn centre(r: &Rect) -> (f32, f32) {
     ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0)
 }
 
-/// The colour of what is pinned to all rows, on its pin and its place
-/// (`paint::PIN_ALL`).
-fn everywhere(a: f32) -> D2D1_COLOR_F {
-    paint::pinned(true, a)
-}
-
-/// The colour of what is pinned to its row (`paint::PIN_ROW`).
-fn on_row(a: f32) -> D2D1_COLOR_F {
-    paint::pinned(false, a)
-}
-
 /// The shadows and the glows the board is drawn with, made for its target.
 struct Glows {
     shadow: Glow,
     light: Glow,
-    /// The light of what is pinned to every shelf, and to its own.
-    all: Glow,
-    row: Glow,
-    /// The glow of the mark of a row pinned to.
-    row_mark: Glow,
     accent: Glow,
     warm: Glow,
 }
@@ -521,30 +520,15 @@ impl Glows {
         Some(Glows {
             shadow: Glow::new(target, rgba(0.0, 0.0, 0.0, 1.0))?,
             light: Glow::new(target, rgba(0.80, 0.86, 1.0, 1.0))?,
-            all: Glow::new(target, paint::lit(true, 1.0))?,
-            row: Glow::new(target, paint::lit(false, 1.0))?,
-            row_mark: Glow::new(target, on_row(1.0))?,
             accent: Glow::new(target, accent(1.0))?,
             warm: Glow::new(target, warm(1.0))?,
         })
     }
-
-    fn of(&self, pin: Pin) -> Option<&Glow> {
-        match pin {
-            Pin::Everywhere => Some(&self.all),
-            Pin::Row => Some(&self.row),
-            Pin::Off => None,
-        }
-    }
 }
 
-/// What a pin is shown in.
-fn pin_colour(pin: Pin, a: f32) -> D2D1_COLOR_F {
-    match pin {
-        Pin::Everywhere => everywhere(a),
-        Pin::Row => on_row(a),
-        Pin::Off => white(0.70 * a),
-    }
+/// `then` done after `first`.
+fn after(then: Place, first: Place) -> Place {
+    Place { s: then.s * first.s, dx: then.s * first.dx + then.dx, dy: then.s * first.dy + then.dy }
 }
 
 fn shifted_rect(r: &Rect, dx: f32, dy: f32) -> Rect {
@@ -574,6 +558,8 @@ impl Pin {
 struct AppBadge {
     /// A window of the app, whose icon is shown.
     hwnd: HWND,
+    /// All its windows there.
+    hwnds: Vec<isize>,
     icon: Rect,
     count: usize,
     /// Where the count is written (only when above one).
@@ -604,9 +590,10 @@ struct RowLayout {
     /// The "add a cell" buttons after and before the row.
     plus: Rect,
     plus_left: Rect,
-    /// Some windows are pinned to the row: they are in whichever of its
-    /// cells the user is, so no cell shows them, and a dot by its name says so.
-    pinned: bool,
+    /// By its name, the place of the windows pinned to the row: they are
+    /// in whichever of its cells the user is, so no cell shows them, but
+    /// their icons sit here. A window dropped on it is pinned to the row.
+    pins: Rect,
 }
 
 /// One window of the selected cell, shown large: its live preview with its
@@ -620,10 +607,9 @@ struct TileLayout {
     /// Where its title is written, after resting on it a while.
     title: Rect,
     thumb: Rect,
-    /// The "above the others", pin and close buttons at the right of the
-    /// line under the preview, shown under the cursor.
+    /// The "above the others" and close buttons at the right of the line
+    /// under the preview, shown under the cursor.
     top: Rect,
-    pin: Rect,
     close: Rect,
     /// Shown by its icon: there was no room for a preview.
     icon_only: bool,
@@ -800,6 +786,10 @@ struct MapLayout {
     /// The "add a row" buttons below and above the rows.
     add_row: Rect,
     add_row_top: Rect,
+    /// Over it all, as wide, the rail of the windows on every desktop:
+    /// their icons sit on it, and a window dropped on it goes there. `y`
+    /// is its line.
+    rail: Rect,
     /// From one cell to the next, and from one row to the next.
     pitch: f32,
     row_pitch: f32,
@@ -822,8 +812,7 @@ enum Hit {
     Window { cell: CellId, hwnd: isize },
     /// A cell of the map; also the handle for dragging it.
     Cell(CellId),
-    /// A tile's pin button and its close button.
-    Pin(isize),
+    /// A tile's "above the others" button and its close button.
     Top(isize),
     TileClose(isize),
     CellClose(CellId),
@@ -869,6 +858,42 @@ struct Fonts {
 
 #[derive(Clone, Copy)]
 struct ThumbnailSource { full: (f32, f32), frame: Rect }
+
+/// A place on a map a dragged window can be dropped on.
+#[derive(Clone, PartialEq, Debug)]
+enum Target {
+    /// The rail of the windows on every desktop.
+    Rail,
+    /// The place of the windows pinned to a row, by its name.
+    Row(usize),
+    Cell(CellId),
+}
+
+/// A window let go of: its picture going from where it was dropped back
+/// to its tile (where it was picked up, when it has none any more), or
+/// into the cell of the map it was moved to, fading as it goes.
+struct Flight {
+    hwnd: isize,
+    /// Its own live picture, apart from the tiles' and over them.
+    thumb: isize,
+    from: Rect,
+    back: Rect,
+    into: Option<Rect>,
+    began: Instant,
+}
+
+impl Flight {
+    /// How far it has gone, from 0 to 1, as a critically damped spring
+    /// would (`Spring`): fast at first, coming to rest without a bounce.
+    fn progress(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.began).as_secs_f32();
+        1.0 - Spring { offset: 1.0, velocity: 0.0 }.sample(t).offset
+    }
+
+    fn done(&self, now: Instant) -> bool {
+        self.progress(now) > 0.995
+    }
+}
 
 pub struct Board {
     hwnd: HWND,
@@ -977,38 +1002,30 @@ pub struct Board {
     /// did moves other things under the cursor, and a second click made in
     /// the same breath must not land on those.
     changed_at: Option<(Instant, f32, f32)>,
-    /// The parts the tiles are placed in: the places of the pinned windows
-    /// and the rest.
-    sections: Vec<Section>,
-    /// Per monitor (as `monitors`), the places of the windows pinned to
-    /// every desktop and to the row, where it has them.
-    columns: Vec<Option<(Rect, Rect)>>,
+    /// The window being dragged off its preview, and where its picture was
+    /// as it was picked up.
+    picked: Option<(isize, Rect)>,
+    /// How far the board has made way for a window picked up (`GRAB_MS`),
+    /// from 0 to 1, in the frame being drawn, and where that eases from
+    /// and to, since when.
+    grab_shown: f32,
+    grab_glide: (f32, f32, Instant),
+    /// How far the dragged window is drawn pulled towards the place it is
+    /// over, relative to the pull wanted, easing as a spring, and since when.
+    drag_pull: [Spring; 2],
+    drag_pull_wanted: (f32, f32),
+    drag_last: Option<Instant>,
+    flight: Option<Flight>,
+    /// Tiles shown before and after the selection moved, easing from where
+    /// they were drawn to where they are laid out now: left, top and width,
+    /// in pixels (`ease_tiles`); and since when.
+    tile_ease: HashMap<isize, [Spring; 3]>,
+    tile_ease_last: Option<Instant>,
+    /// The windows whose icons on the map the cursor is on.
+    pointed_marks: Vec<isize>,
     /// Shell windows put out of the way while the board is open
     /// (`keep_on_top`), to be given back when it closes.
     pushed_aside: Vec<HWND>,
-}
-
-/// The parts of `area` the tiles go into: all in one, or with the column
-/// of the places of the pinned windows at the left (`tiles::pin_column`),
-/// of one size whatever is in them, where they stay whichever cell is
-/// looked at.
-fn split_area<'a>(
-    here: &[(&'a WindowModel, bool)],
-    column: bool,
-    area: &Rect,
-    s: f32,
-) -> Vec<(Rect, Carried, Vec<(&'a WindowModel, bool)>)> {
-    if !column {
-        return vec![(*area, Carried::Own, here.to_vec())];
-    }
-    let pick = |carried: Carried| -> Vec<(&'a WindowModel, bool)> { here.iter().filter(|(w, e)| Carried::of(w, *e) == carried).copied().collect() };
-    let parts = tiles::pin_column(size(area), 28.0 * s, (210.0 * s, 400.0 * s));
-    let place = |(x, y, w, h): tiles::Part| rect(area.left + x, area.top + y, w, h);
-    vec![
-        (place(parts.all), Carried::Fixed, pick(Carried::Fixed)),
-        (place(parts.row), Carried::Row, pick(Carried::Row)),
-        (place(parts.rest), Carried::Own, pick(Carried::Own)),
-    ]
 }
 
 impl Board {
@@ -1107,8 +1124,16 @@ impl Board {
                 composing: String::new(),
                 refused: None,
                 changed_at: None,
-                sections: Vec::new(),
-                columns: Vec::new(),
+                picked: None,
+                grab_shown: 0.0,
+                grab_glide: (0.0, 0.0, Instant::now()),
+                drag_pull: [Spring::default(); 2],
+                drag_pull_wanted: (0.0, 0.0),
+                drag_last: None,
+                flight: None,
+                tile_ease: HashMap::new(),
+                tile_ease_last: None,
+                pointed_marks: Vec::new(),
                 pushed_aside: Vec::new(),
             })
         }
@@ -1236,6 +1261,10 @@ impl Board {
             self.selected = self.model.current.clone();
         }
         self.press = None;
+        self.tile_ease.clear();
+        if self.picked.take().is_some() {
+            self.set_grab(false, Instant::now());
+        }
         self.end_peek();
         // What changed is not a move: it is shown as it is. A strip that
         // moves goes on (a hold may be under way), with its cells anew.
@@ -1278,6 +1307,10 @@ impl Board {
         self.hold = None;
         crate::input::set_board_open(false);
         self.end_peek();
+        self.end_flight();
+        self.picked = None;
+        (self.grab_shown, self.grab_glide) = (0.0, (0.0, 0.0, Instant::now()));
+        self.pointed_marks.clear();
         self.stop_motion();
         self.settle_strip(Instant::now());
         self.clear_thumbnails();
@@ -1412,10 +1445,13 @@ impl Board {
         let now = Instant::now();
         let before = self.marks();
         let (strip_before, from) = (self.strip_marks.clone(), self.grid.find(&self.selected));
+        self.advance_tile_ease(now);
+        let tiles_before: HashMap<isize, Rect> = self.tiles.iter().map(|tile| (tile.hwnd.0, self.tile_eased(tile).rect(&tile.thumb))).collect();
         self.grid = grid;
         self.selected = id;
         self.end_peek();
         self.relayout();
+        self.ease_tiles(&tiles_before);
         self.motion.moved(&before, &self.marks(), now);
         let t = self.strip_time(now);
         self.strip_frame = None;
@@ -1435,6 +1471,42 @@ impl Board {
             self.update_peek(now);
             self.invalidate();
         }
+    }
+
+    /// The windows pinned are laid out among each cell's own, so a tile
+    /// shown before and after the selection moved (on every desktop, or
+    /// pinned to the row it stays in) may be laid out elsewhere: it eases
+    /// there from where it was drawn (`before`), never jumping.
+    fn ease_tiles(&mut self, before: &HashMap<isize, Rect>) {
+        let mut ease = HashMap::new();
+        for tile in &self.tiles {
+            let Some(was) = before.get(&tile.hwnd.0) else { continue };
+            let going = self.tile_ease.get(&tile.hwnd.0).copied().unwrap_or_default();
+            let jump = [was.left - tile.thumb.left, was.top - tile.thumb.top, size(was).0 - size(&tile.thumb).0];
+            let springs: [Spring; 3] = std::array::from_fn(|i| Spring { offset: jump[i], velocity: going[i].velocity });
+            if !springs.iter().all(|spring| spring.settled()) {
+                ease.insert(tile.hwnd.0, springs);
+            }
+        }
+        self.tile_ease = ease;
+    }
+
+    fn advance_tile_ease(&mut self, now: Instant) {
+        let step = self.tile_ease_last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32());
+        self.tile_ease_last = Some(now);
+        self.tile_ease.retain(|_, springs| {
+            *springs = springs.map(|spring| spring.sample(step));
+            !springs.iter().all(|spring| spring.settled())
+        });
+    }
+
+    /// How a tile of the cell shown is moved from where it is laid out
+    /// while it eases there (`ease_tiles`).
+    fn tile_eased(&self, tile: &TileLayout) -> Place {
+        let Some([x, y, w]) = self.tile_ease.get(&tile.hwnd.0) else { return Place::SAME };
+        let r = tile.thumb;
+        let k = (size(&r).0 + w.offset).max(1.0) / size(&r).0.max(1.0);
+        Place { s: k, dx: r.left + x.offset - r.left * k, dy: r.top + y.offset - r.top * k }
     }
 
     /// Seconds into the strip's motion.
@@ -1579,6 +1651,14 @@ impl Board {
         let row = self.grid.find(&self.selected).map_or(0, |at| at.row);
         let was_strip = self.strip_on;
         self.advance_peek(now);
+        self.advance_grab(now);
+        self.advance_tile_ease(now);
+        if dragging {
+            self.advance_drag(now);
+        }
+        if self.flight.as_ref().is_some_and(|flight| flight.done(now)) {
+            self.end_flight();
+        }
         let changed_origin = self.strip_input.is_none_or(|(last, _)| last.counted_from != hand.counted_from);
         if changed_origin { self.strip_samples.clear(); }
         for sample in &samples {
@@ -1613,7 +1693,7 @@ impl Board {
             self.register_thumbnails();
         }
         let moving = self.motion.advance(self.hand_parts((hand.along, hand.across)), hand.counted_from, now) || strip_moving
-            || self.peek_shown != self.peek_glide.1;
+            || self.peek_shown != self.peek_glide.1 || self.grab_shown != self.grab_glide.1 || self.flight.is_some() || !self.tile_ease.is_empty();
         if holding { if let Some(axis) = axis { self.motion.lock_axis(axis); } }
         {
             // Also submit the final frame after a drag or hold stops.
@@ -1792,12 +1872,13 @@ impl Board {
             let is_home = *monitor == self.home;
             let (w, h) = size(monitor);
             let layout = layout_map(&self.model, &anchors, (w, h - FOOTER * s), s);
-            // The home monitor has the shelf's name above its tiles.
+            // The home monitor has the shelf's name above its tiles; the
+            // rail of the map is under them.
             areas.push(Rect {
                 left: monitor.left + margin,
                 top: monitor.top + if is_home { 62.0 * s } else { margin },
                 right: monitor.right - margin,
-                bottom: monitor.top + layout.top - 26.0 * s,
+                bottom: monitor.top + layout.rail.top - 12.0 * s,
             });
             maps.push(Map { monitor: m, area: *monitor, layout });
         }
@@ -1805,20 +1886,7 @@ impl Board {
         self.plates = areas.clone();
         self.areas = areas;
         let shown = self.shown().clone();
-        let CellTiles { tiles, sections } = self.lay_out_cell(&shown);
-        // The strip moves in what is left of the area beside the places of
-        // the pinned windows: those of every desktop never move, and those
-        // of the row move in their own place.
-        self.columns = vec![None; self.monitors.len()];
-        for (m, plate) in self.plates.iter_mut().enumerate() {
-            let monitor = self.monitors[m];
-            let on_m = |section: &&Section| contains(&monitor, centre(&section.part).0, centre(&section.part).1);
-            let place = |carried| sections.iter().filter(on_m).find(|section| section.carried == carried).map(|section| section.part);
-            if let (Some(all), Some(row)) = (place(Carried::Fixed), place(Carried::Row)) {
-                plate.left = plate.left.max(all.right.max(row.right) + 28.0 * s);
-                self.columns[m] = Some((all, row));
-            }
-        }
+        let CellTiles { tiles } = self.lay_out_cell(&shown);
         self.strip_marks = self.grid.find(&self.selected).map_or_else(Vec::new, |at| strip::marks(&self.grid, at));
         self.label = rect(margin, 18.0 * s, size(&self.home).0 - 2.0 * margin, 30.0 * s);
         #[cfg(feature = "debug-log")]
@@ -1833,36 +1901,26 @@ impl Board {
             }).collect();
             debug_log!("board: layout addrowtop {} addrow {} rows {}", at(&home.layout.add_row_top, home), at(&home.layout.add_row, home), rows.join(" | "));
             for tile in &tiles {
-                debug_log!("board: tile {:x} top {} pin {} close {}", tile.hwnd.0, at(&tile.top, &flat), at(&tile.pin, &flat), at(&tile.close, &flat));
+                debug_log!("board: tile {:x} top {} close {}", tile.hwnd.0, at(&tile.top, &flat), at(&tile.close, &flat));
             }
         }
         self.tiles = tiles;
-        self.sections = sections;
         self.maps = maps;
     }
 
     /// The windows of cell `id` laid out as when it is selected, in the
-    /// areas `relayout` found for each monitor. The home monitor always has
-    /// the places of the pinned windows, to drop windows into; the others
-    /// when windows are pinned there.
+    /// areas `relayout` found for each monitor: each on the monitor it is
+    /// on, those pinned among the cell's own, for they are on that desktop
+    /// as much as its own are.
     fn lay_out_cell(&self, id: &str) -> CellTiles {
         let s = self.scale;
         let windows = self.model.tile_windows(id);
         let weights = self.model.window_weights(id, &self.grid);
         let mut out = CellTiles::default();
-        for (m, monitor) in self.monitors.iter().enumerate() {
+        for m in 0..self.monitors.len() {
             let Some(area) = self.areas.get(m) else { continue };
             let here: Vec<(&WindowModel, bool)> = windows.iter().filter(|(w, _)| self.monitor_of(w) == m).copied().collect();
-            let pinned_here = self.model.pinned.iter().any(|w| self.monitor_of(w) == m)
-                || self.model.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.windows).any(|w| w.follows && self.monitor_of(w) == m);
-            for (part, carried, group) in split_area(&here, *monitor == self.home || pinned_here, area, s) {
-                let (tiles, more) = match carried {
-                    Carried::Own => (layout_tiles(&group, &part, s, &weights), None),
-                    _ => layout_slot(&group, &part, s),
-                };
-                out.tiles.extend(tiles);
-                out.sections.push(Section { part, carried, more });
-            }
+            out.tiles.extend(layout_tiles(&here, area, s, &weights));
         }
         out
     }
@@ -1896,12 +1954,11 @@ impl Board {
         strip::shade((mark.0 + pos.col as f32 + x).hypot(mark.1 + y))
     }
 
-    /// How the windows pinned to row `row` are drawn on monitor `m`: in
-    /// their own place, still while the selection moves in the selected row,
-    /// going back and up or down with it to another.
+    /// How the windows pinned to row `row` are drawn on monitor `m`: still
+    /// while the selection moves in the selected row, going back and up or
+    /// down with it to another.
     fn row_place(&self, row: usize, m: usize) -> Place {
-        let zone = self.columns.get(m).copied().flatten().map(|(_, row)| row);
-        let Some(plate) = zone.or(self.plates.get(m).copied()) else { return Place::SAME };
+        let Some(plate) = self.plates.get(m).copied() else { return Place::SAME };
         if !self.strip_on {
             return self.peek_place(&plate);
         }
@@ -1935,21 +1992,32 @@ impl Board {
         if !middle && !carried.beside(selected.is_some_and(|at| at.row == pos.row)) {
             return None;
         }
-        let (place, clip) = match carried {
-            Carried::Fixed => (Place::SAME, self.plates[m]),
-            Carried::Row => (self.row_place(pos.row, m), self.columns.get(m).copied().flatten().map_or(self.plates[m], |(_, row)| row)),
-            Carried::Own => (self.picture_place(pos, m), self.plates[m]),
+        let place = match carried {
+            Carried::Fixed => Place::SAME,
+            Carried::Row => self.row_place(pos.row, m),
+            Carried::Own => self.picture_place(pos, m),
         };
-        Some((place, (!place.is_same()).then_some(clip)))
+        let place = self.sunk(place, m);
+        Some((place, (!place.is_same()).then_some(self.plates[m])))
+    }
+
+    /// `place` with the previews of monitor `m` gone down as far as they
+    /// have for a window picked up (`GRAB_SHRINK`).
+    fn sunk(&self, place: Place, m: usize) -> Place {
+        let Some(plate) = self.plates.get(m).filter(|_| self.grab_shown > 0.0) else { return place };
+        let k = 1.0 - GRAB_SHRINK * self.grab_shown;
+        let (cx, cy) = centre(plate);
+        Place { s: place.s * k, dx: place.dx * k + cx * (1.0 - k), dy: place.dy * k + cy * (1.0 - k) }
     }
 
     /// How bright the live preview of a tile moving as `carried` is.
     fn tile_shade(&self, pos: Pos, carried: Carried) -> f32 {
-        match carried {
+        let shade = match carried {
             Carried::Own => self.picture_shade(pos),
             Carried::Row if !self.strip_on => self.peek_shade(),
             _ => 1.0,
-        }
+        };
+        shade * (1.0 - GRAB_SINK * self.grab_shown)
     }
 
     /// The selected cell's picture on monitor `m` and its plate.
@@ -1974,9 +2042,6 @@ impl Board {
 
     fn hit_test(&self, x: f32, y: f32) -> Hit {
         if let Some(tile) = self.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
-            if contains(&tile.pin, x, y) {
-                return Hit::Pin(tile.hwnd.0);
-            }
             if contains(&tile.top, x, y) {
                 return Hit::Top(tile.hwnd.0);
             }
@@ -2179,8 +2244,18 @@ impl Board {
             }
         }
         self.register_badges();
+        // A flight goes on over the new pictures, which stack over it otherwise.
+        let mut old_flight = None;
+        if let Some(flight) = &mut self.flight {
+            if let Ok(thumb) = unsafe { crate::composition::register(self.hwnd, HWND(flight.hwnd), crate::composition::board_enabled()) } {
+                old_flight = Some(std::mem::replace(&mut flight.thumb, thumb));
+            }
+        }
         self.update_thumbnails();
         // Keep the old pictures until their replacements are visible.
+        if let Some(old) = old_flight {
+            unsafe { let _ = crate::composition::unregister(old); }
+        }
         unregister_badges(&mut old_badges);
         unregister_strip_thumbnails(&mut old_strip);
         unregister_thumbnails(&mut old);
@@ -2282,10 +2357,12 @@ impl Board {
         let placing = |hwnd: isize| {
             let (window, everywhere) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd)?;
             let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd)?;
-            let Some(at) = at else { return Some((Place::SAME, None, 1.0)) };
+            let eased = self.tile_eased(tile);
+            let Some(at) = at else { return Some((eased, None, 1.0)) };
             let carried = Carried::of(window, *everywhere);
             let (place, clip) = self.tile_place(at, carried, &tile.frame)?;
-            Some((place, clip, self.tile_shade(at, carried)))
+            let place = after(place, eased);
+            Some((place, clip.or_else(|| (!place.is_same()).then(|| self.plates[self.monitor_at(&tile.frame)])), self.tile_shade(at, carried)))
         };
         #[cfg(feature = "debug-log")]
         let mut placed = Vec::new();
@@ -2293,7 +2370,8 @@ impl Board {
             // A window shown by its icon has no preview.
             let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd).filter(|tile| !tile.icon_only);
             let minimized = windows.iter().any(|(w, _)| w.hwnd.0 == hwnd && w.minimized);
-            let place = placing(hwnd);
+            // A window let go of is shown by its flight until it lands.
+            let place = placing(hwnd).filter(|_| !self.flight.as_ref().is_some_and(|flight| flight.hwnd == hwnd));
             let dragged = self.dragged_window() == Some(hwnd);
             let _shown = self.put_thumbnail(thumb, tile, minimized, (0.0, 0.0), dragged, 1.0, place);
             self.put_badge(thumb, tile, minimized, _shown.is_some() && !dragged, place);
@@ -2321,8 +2399,137 @@ impl Board {
             let shown = self.put_thumbnail(*thumb, tile, minimized, (0.0, 0.0), false, 1.0, placing);
             self.put_badge(*thumb, tile, minimized, shown.is_some(), placing);
         }
+        self.put_flight(Instant::now());
         debug_log!("board: thumbnails {}", placed.join(" "));
         geometry
+    }
+
+    /// Where the live picture of the tile of `hwnd` is shown while the
+    /// board is still.
+    fn tile_picture(&self, hwnd: isize) -> Option<Rect> {
+        let tile = self.tiles.iter().find(|tile| tile.hwnd.0 == hwnd)?;
+        let &(_, thumb) = self.thumbs.iter().find(|(h, _)| *h == hwnd)?;
+        let fitted = self.source_rect(thumb, tile.hwnd).map_or(tile.thumb, |source| strip::fit_source(&tile.thumb, &source.frame, source.full));
+        let at = self.grid.find(self.shown());
+        let windows = self.tile_windows();
+        let carried = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd).map_or(Carried::Own, |(w, everywhere)| Carried::of(w, *everywhere));
+        Some(at.and_then(|at| self.tile_place(at, carried, &tile.frame)).map_or(fitted, |(place, _)| place.rect(&fitted)))
+    }
+
+    /// Where the picture of the dragged window `hwnd` is shown: held at the
+    /// point it was picked up by, as large as its preview was; the nearer
+    /// the cursor comes to the map, the smaller, down to `DRAGGED_SMALL`,
+    /// and the more it hangs over the cursor, leaving what is under it to
+    /// be seen; and pulled a little towards the place it is over.
+    fn dragged_picture(&self, hwnd: isize) -> Option<Rect> {
+        let (_, from) = self.picked.filter(|(picked, _)| *picked == hwnd)?;
+        let press = self.press.as_ref()?;
+        let s = self.scale;
+        let (w, h) = size(&from);
+        let held = (((press.x - from.left) / w.max(1.0)).clamp(0.0, 1.0), ((press.y - from.top) / h.max(1.0)).clamp(0.0, 1.0));
+        let (map, ..) = self.map_at(self.cursor.0, self.cursor.1);
+        let top = map.area.top + map.layout.rail.top;
+        let near = ((self.cursor.1 - press.y) / (top - press.y).max(40.0 * s)).clamp(0.0, 1.0);
+        let near = near * near * (3.0 - 2.0 * near);
+        let small = (DRAGGED_SMALL * s / w.max(h).max(1.0)).min(1.0);
+        let k = 1.0 + (small - 1.0) * near;
+        let (w, h) = (w * k, h * k);
+        let hang = (0.5, 1.0 + 12.0 * s / h.max(1.0));
+        let (ax, ay) = (held.0 + (hang.0 - held.0) * near, held.1 + (hang.1 - held.1) * near);
+        let x = self.cursor.0 + self.drag_pull_wanted.0 + self.drag_pull[0].offset;
+        let y = self.cursor.1 + self.drag_pull_wanted.1 + self.drag_pull[1].offset;
+        Some(rect(x - ax * w, y - ay * h, w, h))
+    }
+
+    /// The pull on the dragged window towards the place it is over, eased
+    /// to as a spring from wherever it was drawn, up to `now`.
+    fn advance_drag(&mut self, now: Instant) {
+        let s = self.scale;
+        let wanted = match self.drop_target().and_then(|target| self.target_area(&target)) {
+            Some(area) => {
+                let (tx, ty) = centre(&area);
+                let (dx, dy) = (if matches!(self.drop_target(), Some(Target::Rail)) { 0.0 } else { tx - self.cursor.0 }, ty - self.cursor.1);
+                let length = dx.hypot(dy).max(1.0);
+                let pull = (length * 0.25).min(12.0 * s);
+                (dx / length * pull, dy / length * pull)
+            }
+            None => (0.0, 0.0),
+        };
+        let step = self.drag_last.map_or(0.0, |last| now.saturating_duration_since(last).as_secs_f32());
+        self.drag_last = Some(now);
+        for (spring, (was, is)) in self.drag_pull.iter_mut().zip([(self.drag_pull_wanted.0, wanted.0), (self.drag_pull_wanted.1, wanted.1)]) {
+            spring.offset += was - is;
+            *spring = spring.sample(step);
+        }
+        self.drag_pull_wanted = wanted;
+    }
+
+    /// A window picked up (`on`) or let go of: the board makes way for it,
+    /// or comes back, from where it is in that at `now`.
+    fn set_grab(&mut self, on: bool, now: Instant) {
+        self.advance_grab(now);
+        self.grab_glide = (self.grab_shown, if on { 1.0 } else { 0.0 }, now);
+    }
+
+    fn advance_grab(&mut self, now: Instant) {
+        let (from, to, since) = self.grab_glide;
+        let t = (now.saturating_duration_since(since).as_secs_f32() * 1000.0 / GRAB_MS).min(1.0);
+        let ease = 1.0 - (1.0 - t).powi(3);
+        self.grab_shown = if t >= 1.0 { to } else { from + (to - from) * ease };
+    }
+
+    /// The picture of window `hwnd`, let go of at `from`, flies back to its
+    /// tile, or `into` a cell of the map.
+    fn start_flight(&mut self, hwnd: isize, from: Rect, into: Option<Rect>) {
+        self.end_flight();
+        let back = self.picked.filter(|(picked, _)| *picked == hwnd).map_or(from, |(_, back)| back);
+        let Ok(thumb) = (unsafe { crate::composition::register(self.hwnd, HWND(hwnd), crate::composition::board_enabled()) }) else { return };
+        self.flight = Some(Flight { hwnd, thumb, from, back, into, began: Instant::now() });
+    }
+
+    fn end_flight(&mut self) {
+        if let Some(flight) = self.flight.take() {
+            unsafe { let _ = crate::composition::unregister(flight.thumb); }
+            self.thumbnail_state.borrow_mut().remove(&flight.thumb);
+        }
+    }
+
+    /// Shows the flight where it is at `now`: going back, it grows into
+    /// where its tile is now (it may have moved); going into a cell, it
+    /// shrinks into the cell's middle and fades.
+    fn put_flight(&self, now: Instant) {
+        let Some(flight) = &self.flight else { return };
+        let t = flight.progress(now);
+        let s = self.scale;
+        let to = match flight.into {
+            Some(cell) => {
+                let (cx, cy) = centre(&cell);
+                let (w, h) = size(&flight.from);
+                let k = 12.0 * s / w.max(h).max(1.0);
+                rect(cx - w * k / 2.0, cy - h * k / 2.0, w * k, h * k)
+            }
+            None => self.tile_picture(flight.hwnd).unwrap_or(flight.back),
+        };
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        let dest = Rect { left: mix(flight.from.left, to.left), top: mix(flight.from.top, to.top), right: mix(flight.from.right, to.right), bottom: mix(flight.from.bottom, to.bottom) };
+        let opacity = if flight.into.is_some() { 215.0 * (1.0 - t) } else { mix(215.0, 255.0) };
+        let mut props = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+            opacity: opacity.round().clamp(0.0, 255.0) as u8,
+            fVisible: true.into(),
+            fSourceClientAreaOnly: false.into(),
+            rcDestination: RECT { left: dest.left.round() as i32, top: dest.top.round() as i32, right: dest.right.round() as i32, bottom: dest.bottom.round() as i32 },
+            ..Default::default()
+        };
+        if let Some(source) = self.source_rect(flight.thumb, HWND(flight.hwnd)) {
+            props.rcSource = RECT { left: 0, top: 0, right: source.full.0.round() as i32, bottom: source.full.1.round() as i32 };
+            props.dwFlags |= DWM_TNP_RECTSOURCE;
+        }
+        unsafe {
+            if crate::composition::update(flight.thumb, &props, [dest.left, dest.top, dest.right, dest.bottom]).is_ok() {
+                self.thumbnail_updates.set(self.thumbnail_updates.get() + 1);
+            }
+        }
     }
 
     /// Shows the live picture `thumb` of a tile's window where the tile is
@@ -2352,17 +2559,17 @@ impl Board {
             props.dwFlags |= DWM_TNP_RECTSOURCE;
         }
         let fitted = |slot: &Rect| source_frame.map_or(*slot, |source| strip::fit_source(slot, &source.frame, source.full));
+        let held = tile.filter(|_| dragged).and_then(|tile| self.dragged_picture(tile.hwnd.0));
         match (tile, placing) {
-            (Some(tile), _) if dragged => {
-                // Follows the cursor, small enough to see the map under it.
-                let (tw, th) = size(&tile.thumb);
-                let (cx, cy) = self.cursor;
-                let w = tw.min(200.0 * self.scale);
-                let dest = fitted(&rect(cx - w / 2.0, cy - th / 2.0, w, th));
-                precise = [dest.left-offset.0,dest.top-offset.1,dest.right-offset.0,dest.bottom-offset.1];
-                props.rcDestination = to_rect(&dest);
-                props.opacity = 215;
-            }
+            (Some(_), _) if dragged => match held {
+                // Follows the cursor, of its own shape, smaller near the map.
+                Some(dest) => {
+                    precise = [dest.left-offset.0,dest.top-offset.1,dest.right-offset.0,dest.bottom-offset.1];
+                    props.rcDestination = to_rect(&dest);
+                    props.opacity = 215;
+                }
+                None => props.fVisible = false.into(),
+            },
             (Some(tile), Some((place, clip, bright))) => {
                 // A tile has the shape of its window and the picture
                 // fills it; in one that had to be made wider or higher
@@ -2537,6 +2744,7 @@ impl Board {
                 self.hover = Hit::Nothing;
                 self.cursor = (-1.0e6, -1.0e6);
                 self.resting = None;
+                self.pointed_marks.clear();
                 self.update_peek(Instant::now());
                 self.invalidate();
                 Action::None
@@ -2715,12 +2923,24 @@ impl Board {
             }
             if press.dragging {
                 if let Some(hwnd) = raise {
+                    // Where its picture was, to go back to if it stays.
+                    let from = self.tile_picture(hwnd).unwrap_or_else(|| rect(x - 1.0, y - 1.0, 2.0, 2.0));
+                    self.end_flight();
+                    self.picked = Some((hwnd, from));
+                    self.drag_pull = [Spring::default(); 2];
+                    (self.drag_pull_wanted, self.drag_last) = ((0.0, 0.0), None);
+                    self.set_grab(true, Instant::now());
                     self.raise_thumbnail(hwnd);
                 }
                 self.start_motion();
                 self.update_peek(Instant::now());
             }
             return;
+        }
+        let marks = self.marks_at(x, y);
+        if marks != self.pointed_marks {
+            self.pointed_marks = marks;
+            self.invalidate();
         }
         let hover = self.hit_test(x, y);
         #[cfg(feature = "debug-log")]
@@ -2732,7 +2952,7 @@ impl Board {
             self.invalidate();
             // Resting on a preview a while brings its title.
             let tile = match &self.hover {
-                Hit::Window { hwnd, .. } | Hit::Pin(hwnd) | Hit::Top(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
+                Hit::Window { hwnd, .. } | Hit::Top(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
                 _ => None,
             };
             if tile != self.resting.map(|(hwnd, _)| hwnd) {
@@ -2752,11 +2972,13 @@ impl Board {
         unsafe {
             let _ = ReleaseCapture();
         }
+        // Let go of, a dragged window's picture flies from under the cursor.
+        let flying = self.dragged_window().and_then(|hwnd| Some((hwnd, self.dragged_picture(hwnd)?)));
         let Some(press) = self.press.take() else { return Action::None };
         // Where a drag ends is judged by the board as it was dragged over,
         // before the cell released on is peeked at and its windows shown.
         let dropped = press.dragging.then(|| match &press.hit {
-            Hit::Window { cell, hwnd } => self.drop_window(cell, *hwnd, x, y),
+            Hit::Window { hwnd, .. } => self.drop_window(*hwnd, x, y),
             Hit::Cell(id) => match self.slot_at(id, x, y) {
                 Some(Slot::Row { row, index, .. }) => Action::MoveCell { id: id.clone(), row, index },
                 Some(Slot::NewRow { at, .. }) => Action::MoveCellToNewRow { id: id.clone(), at },
@@ -2775,6 +2997,20 @@ impl Board {
         }
         self.invalidate();
         if let Some(action) = dropped {
+            if let Some((hwnd, from)) = flying {
+                // Into the cell it moved to, or back to its tile.
+                let into = match &action {
+                    Action::PlaceWindow { cell: Some(_), pin: None | Some(Pin::Off), .. } => self.cell_at(x, y).map(|(cell, m)| {
+                        let at = self.maps.iter().find(|map| map.monitor == m).map_or((0.0, 0.0), |map| (map.area.left, map.area.top));
+                        shifted_rect(&cell.body, at.0, at.1)
+                    }),
+                    _ => None,
+                };
+                self.start_flight(hwnd, from, into);
+            }
+            self.picked = None;
+            self.set_grab(false, Instant::now());
+            self.start_motion();
             // Put the thumbnail back; a successful move replaces the model anyway.
             self.update_thumbnails();
             return action;
@@ -2802,46 +3038,78 @@ impl Board {
         }
     }
 
-    /// The place of the pinned windows a point is in: how a window dropped
-    /// there is pinned.
-    fn zone_at(&self, x: f32, y: f32) -> Option<Pin> {
-        self.columns.iter().flatten().find_map(|(all, row)| {
-            if contains(&grow(all, 14.0 * self.scale), x, y) { Some(Pin::Everywhere) }
-            else if contains(&grow(row, 14.0 * self.scale), x, y) { Some(Pin::Row) }
-            else { None }
-        })
+    /// The place on the map a dragged window would be dropped on at a
+    /// point, and the monitor whose map it is. Each is a little larger than
+    /// it looks, so that a window dropped roughly lands in it.
+    fn target_at(&self, x: f32, y: f32) -> Option<(Target, usize)> {
+        let (map, mx, my) = self.map_at(x, y);
+        let layout = &map.layout;
+        if contains(&rail_zone(layout, self.scale), mx, my) {
+            return Some((Target::Rail, map.monitor));
+        }
+        if let Some(r) = layout.rows.iter().position(|row| contains(&pins_zone(row, self.scale), mx, my)) {
+            return Some((Target::Row(r), map.monitor));
+        }
+        self.cell_at(x, y).map(|(cell, m)| (Target::Cell(cell.id.clone()), m))
     }
 
-    /// A window of cell `from` was dragged to a point (`window_drop`).
-    fn drop_window(&self, from: &str, hwnd: isize, x: f32, y: f32) -> Action {
+    /// The cell a window on cell `from` goes to to be pinned to row `row`:
+    /// none while it is in that row; else the one the user is on, in that
+    /// row, else the one a move into the row lands on.
+    fn row_cell(&self, row: usize, from: &str) -> Option<CellId> {
+        if self.model.row_of(from) == Some(row) {
+            return None;
+        }
+        if self.model.row_of(&self.model.current) == Some(row) {
+            return Some(self.model.current.clone());
+        }
+        self.grid.rows.get(row).and_then(|r| r.cells.get(r.anchor())).cloned()
+    }
+
+    /// What dropping window `hwnd` at a point would do (`window_drop`),
+    /// with the place it would be dropped on and the monitor there.
+    fn window_drop_at(&self, hwnd: isize, x: f32, y: f32) -> (WindowDrop, Option<Target>, usize) {
+        let monitor = self.map_at(x, y).0.monitor;
         let windows = self.tile_windows();
-        let Some(&(window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
-        let on_map = self.cell_at(x, y).is_some() || {
-            let (map, mx, my) = self.map_at(x, y);
-            contains(&map.layout.bounds, mx, my)
-        };
-        let (to_cell, to_monitor) = match self.cell_at(x, y) {
-            Some((target, m)) => (Some(target.id.as_str()), m),
-            None => (None, self.map_at(x, y).0.monitor),
-        };
+        let Some(&(window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return (WindowDrop::Nothing, None, monitor) };
+        // Where it really is: one pinned to its row is shown in every cell of it.
+        let from = if everywhere { "" } else { self.model.cell_of(hwnd).map_or("", |cell| cell.id.as_str()) };
+        let target = self.target_at(x, y).map(|(target, _)| target);
         let spot = DropSpot {
-            zone: self.zone_at(x, y),
-            on_map,
-            on_plate: self.plates.iter().any(|plate| contains(plate, x, y)),
-            cell: to_cell,
-            other_monitor: to_monitor != self.monitor_of(window),
-        };
-        match window_drop(from, Pin::of(window, everywhere), &spot) {
-            WindowDrop::Nothing => Action::None,
-            WindowDrop::Pin(to) => {
-                let (row, all) = to.flags();
-                Action::SetPin { window: HWND(hwnd), row, all }
-            }
-            WindowDrop::Move { cell, monitor } => Action::MoveWindow {
-                window: HWND(hwnd),
-                cell,
-                monitor: if monitor { self.monitor_on_screen(to_monitor) } else { None },
+            slot: match &target {
+                Some(Target::Rail) => Some(PinSlot::All),
+                Some(Target::Row(r)) => Some(PinSlot::Row(self.row_cell(*r, from))),
+                _ => None,
             },
+            cell: match &target {
+                Some(Target::Cell(id)) => Some(id.as_str()),
+                _ => None,
+            },
+            other_monitor: monitor != self.monitor_of(window),
+        };
+        (window_drop(from, Pin::of(window, everywhere), &spot), target, monitor)
+    }
+
+    /// A window was dragged to a point (`window_drop`).
+    fn drop_window(&self, hwnd: isize, x: f32, y: f32) -> Action {
+        match self.window_drop_at(hwnd, x, y) {
+            (WindowDrop::Nothing, ..) => Action::None,
+            (WindowDrop::Place { pin, cell, monitor }, _, m) => Action::PlaceWindow {
+                window: HWND(hwnd),
+                pin,
+                cell,
+                monitor: if monitor { self.monitor_on_screen(m) } else { None },
+            },
+        }
+    }
+
+    /// The place the dragged window is over, when dropping it there would
+    /// do something.
+    fn drop_target(&self) -> Option<Target> {
+        let hwnd = self.dragged_window()?;
+        match self.window_drop_at(hwnd, self.cursor.0, self.cursor.1) {
+            (WindowDrop::Nothing, ..) => None,
+            (_, target, _) => target,
         }
     }
 
@@ -2850,12 +3118,6 @@ impl Board {
         match hit {
             Hit::Window { cell, hwnd } => Action::Go(cell, Some(HWND(hwnd))),
             Hit::Cell(id) => Action::Go(id, None),
-            Hit::Pin(hwnd) => {
-                let windows = self.tile_windows();
-                let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
-                let (row, all) = Pin::of(window, *everywhere).next().flags();
-                Action::SetPin { window: HWND(hwnd), row, all }
-            }
             Hit::Top(hwnd) => {
                 let windows = self.tile_windows();
                 let Some((window, _)) = windows.iter().find(|(w, _)| w.hwnd.0 == hwnd) else { return Action::None };
@@ -2953,6 +3215,7 @@ impl Board {
 
     fn paint(&mut self) {
         self.advance_peek(Instant::now());
+        self.advance_grab(Instant::now());
         match self.draw_to_canvas() {
             Some(Ok(())) => {}
             Some(Err(e)) => {
@@ -3054,9 +3317,9 @@ impl Board {
         }
         if self.dragged_window().is_some() {
             return hint(if self.monitors.len() > 1 {
-                "Drop up left to pin to all shelves, below that to this shelf, among the previews to unpin, on a cell to move it there, or on another monitor"
+                "Drop on the rail over the map to pin to all shelves, by a shelf's name to pin to it, on a cell to move it there, or on another monitor"
             } else {
-                "Drop up left to pin to all shelves, below that to this shelf, among the previews to unpin, or on a cell to move it there"
+                "Drop on the rail over the map to pin to all shelves, by a shelf's name to pin to it, or on a cell to move it there"
             });
         }
         if self.press.is_some() {
@@ -3067,16 +3330,15 @@ impl Board {
                 let on = self.tile_windows().iter().any(|(w, _)| w.hwnd.0 == *hwnd && w.topmost);
                 hint(if on { "Always on top: on   ·   Click: turn off" } else { "Click: keep above other windows" })
             }
-            Hit::Pin(_) => hint("Click: pin to this shelf, then to all shelves, then unpin"),
             Hit::TileClose(_) => hint("Click: close the window"),
-            Hit::Window { .. } => hint("Click: go to it   ·   Drag: to a cell, or up left to pin it"),
+            Hit::Window { .. } => hint("Click: go to it   ·   Drag: to a cell, or onto the rail or by a shelf's name to pin it"),
             Hit::Cell(_) | Hit::CellClose(_) => {
                 hint("Hover: show windows   ·   Click: go   ·   Drag: move   ·   Right-click: highlight")
             }
             Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
             Hit::AddRow | Hit::AddRowTop => hint("Add a shelf"),
-            Hit::Nothing => hint("Point at a cell to see its windows   ·   Drag windows up left to pin them   ·   ?: hide these hints"),
+            Hit::Nothing => hint("Point at a cell to see its windows   ·   Drag windows onto the map to move or pin them   ·   ?: hide these hints"),
         }
     }
 
@@ -3110,17 +3372,14 @@ impl Board {
         }
     }
 
-    /// The selected cell's windows as large previews, those pinned in their
-    /// places at the left. While the selection moves, the preview area is a
-    /// strip of desktops: a faint well round it, the cells beside at its
-    /// edges, darker, all moving as `tile_place` has it.
+    /// The selected cell's windows as large previews, those pinned among
+    /// them. While the selection moves, the preview area is a strip of
+    /// desktops: a faint well round it, the cells beside at its edges,
+    /// darker, all moving as `tile_place` has it.
     fn draw_tiles(&self, p: &Painter, fonts: &Fonts) {
         let s = self.scale;
         let depth = if self.strip_on { self.drawn_strip().depth(self.strip_at) } else { 0.0 };
         let at = self.grid.find(self.shown());
-        for section in self.sections.iter().filter(|section| section.carried != Carried::Own) {
-            self.draw_zone(p, section);
-        }
         if depth > 0.001 {
             for plate in &self.plates {
                 let frame = grow(plate, 10.0 * s);
@@ -3130,10 +3389,9 @@ impl Board {
         }
         let selected = CellTiles::default();
         for m in 0..self.plates.len() {
-            // Each cell's own windows in the plate, those pinned to the rows
-            // in their own place.
-            let zone = self.columns.get(m).copied().flatten().map(|(_, row)| grow(&row, 12.0 * s));
-            for (which, clip) in [(Carried::Own, self.plates[m]), (Carried::Row, zone.unwrap_or(self.plates[m]))] {
+            // Each cell's own windows, then those pinned to the rows.
+            let clip = self.plates[m];
+            for which in [Carried::Own, Carried::Row] {
                 if self.strip_on {
                     unsafe {
                         p.target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
@@ -3154,9 +3412,16 @@ impl Board {
         }
         // What is on every desktop never moves, and is over all that does.
         let shown = self.shown();
-        self.draw_group(p, fonts, shown, &self.sections, &self.tiles, |carried, _| (carried == Carried::Fixed).then_some(Place::SAME));
+        let still = |r: &Rect| self.sunk(Place::SAME, self.monitor_at(r));
+        self.draw_group(p, fonts, shown, &self.tiles, |carried, r| (carried == Carried::Fixed).then(|| still(r)));
         if at.is_none() {
-            self.draw_group(p, fonts, shown, &self.sections, &self.tiles, |carried, _| (carried != Carried::Fixed).then_some(Place::SAME));
+            self.draw_group(p, fonts, shown, &self.tiles, |carried, r| (carried != Carried::Fixed).then(|| still(r)));
+        }
+        // Gone down for a window picked up, as their live pictures have.
+        if self.grab_shown > 0.0 {
+            for plate in &self.plates {
+                p.fill(&grow(plate, 24.0 * s), 18.0 * s, rgba(0.0, 0.0, 0.0, GRAB_SINK * self.grab_shown));
+            }
         }
     }
 
@@ -3167,8 +3432,8 @@ impl Board {
     fn draw_picture(&self, p: &Painter, fonts: &Fonts, m: usize, pos: Pos, id: &str, cell: &CellTiles, depth: f32, which: Carried) {
         let s = self.scale;
         let middle = id == self.shown();
-        let (tiles, sections) = if middle { (&self.tiles, &self.sections) } else { (&cell.tiles, &cell.sections) };
-        let place = self.picture_place(pos, m);
+        let tiles = if middle { &self.tiles } else { &cell.tiles };
+        let place = self.sunk(self.picture_place(pos, m), m);
         let plate = self.plates[m];
         let on_m = |r: &Rect| self.monitor_at(r) == m;
         let own = which == Carried::Own;
@@ -3182,7 +3447,7 @@ impl Board {
             });
         }
         if own {
-            self.draw_empty(p, fonts, m, id, sections, place);
+            self.draw_empty(p, fonts, m, id, place);
         }
         let shows = |carried: Carried, r: &Rect| {
             if carried != which || !on_m(r) {
@@ -3190,7 +3455,7 @@ impl Board {
             }
             self.tile_place(pos, carried, r).map(|(place, _)| place)
         };
-        self.draw_group(p, fonts, id, sections, tiles, shows);
+        self.draw_group(p, fonts, id, tiles, shows);
         if own && depth > 0.001 {
             self.placed(p, place, || p.fill(&plate, 16.0 * s / place.s, rgba(0.0, 0.0, 0.0, 1.0 - self.picture_shade(pos))));
         }
@@ -3200,13 +3465,12 @@ impl Board {
     /// windows of its own, on the home monitor, under any pinned there; so
     /// that it does not look like one whose previews are late. Left out
     /// where the picture is drawn too small for it.
-    fn draw_empty(&self, p: &Painter, fonts: &Fonts, m: usize, id: &str, sections: &[Section], place: Place) {
+    fn draw_empty(&self, p: &Painter, fonts: &Fonts, m: usize, id: &str, place: Place) {
         let s = self.scale;
         if m != self.home_index() || !self.model.has_no_own_windows(id) {
             return;
         }
-        let on_m = |r: &Rect| self.monitor_at(r) == m;
-        let part = sections.iter().find(|section| section.carried == Carried::Own && on_m(&section.part)).map_or(self.plates[m], |section| section.part);
+        let part = self.plates[m];
         let (w, h) = size(&part);
         if w * place.s < 160.0 * s || h * place.s < 60.0 * s {
             return;
@@ -3216,21 +3480,21 @@ impl Board {
         self.placed(p, place, || p.text(crate::i18n::text("No windows", "창 없음", "无窗口"), &fonts.empty, &line, white(0.40)));
     }
 
-    /// The tiles of cell `id`, and the cells standing for the windows that
-    /// did not fit in their place, for which `place` says how they are drawn.
-    fn draw_group(&self, p: &Painter, fonts: &Fonts, id: &str, sections: &[Section], tiles: &[TileLayout], place: impl Fn(Carried, &Rect) -> Option<Place>) {
+    /// The tiles of cell `id`, for which `place` says how they are drawn.
+    fn draw_group(&self, p: &Painter, fonts: &Fonts, id: &str, tiles: &[TileLayout], place: impl Fn(Carried, &Rect) -> Option<Place>) {
         let windows = self.model.tile_windows(id);
         let middle = id == self.shown();
         for tile in tiles {
             if let Some((window, everywhere)) = windows.iter().find(|(w, _)| w.hwnd == tile.hwnd) {
                 if let Some(at) = place(Carried::of(window, *everywhere), &tile.frame) {
+                    let at = if middle { after(at, self.tile_eased(tile)) } else { at };
                     let preview = if tile.icon_only { None } else if middle {
                         self.thumbs.iter().find(|&&(hwnd, _)| hwnd == tile.hwnd.0).map(|&(_, thumb)| thumb)
                     } else {
                         self.strip_thumbs.iter().find(|(cell, hwnd, _)| cell == id && *hwnd == tile.hwnd.0).map(|&(_, _, thumb)| thumb)
                     };
                     let badged = preview.is_some_and(|thumb| self.badges.contains_key(&thumb));
-                    self.placed(p, at, || self.draw_tile(p, fonts, tile, window, Pin::of(window, *everywhere), preview.is_some(), badged));
+                    self.placed(p, at, || self.draw_tile(p, fonts, tile, window, preview.is_some(), badged));
                     #[cfg(feature = "motion-probe")]
                     if window.title == "F motion 0" {
                         let dest = at.rect(&tile.thumb);
@@ -3239,39 +3503,6 @@ impl Board {
                     }
                 }
             }
-        }
-        for section in sections {
-            if let Some((r, hwnds, count)) = &section.more {
-                if let Some(at) = place(section.carried, r) {
-                    self.placed(p, at, || self.draw_more(p, fonts, r, hwnds, *count));
-                }
-            }
-        }
-    }
-
-    /// A place of the pinned windows: a faint pool of its light on its
-    /// floor, brighter while a window is dragged, and most under it, and
-    /// over it a tint of its colour while one is.
-    fn draw_zone(&self, p: &Painter, section: &Section) {
-        let s = self.scale;
-        let Some(glows) = &self.glows else { return };
-        let (glow, colour, reach): (&Glow, fn(f32) -> D2D1_COLOR_F, f32) = match section.carried {
-            Carried::Fixed => (&glows.all, everywhere, paint::PIN_ALL_REACH),
-            _ => (&glows.row, on_row, paint::PIN_ROW_REACH),
-        };
-        let dragging = self.dragged_window().is_some();
-        let over = dragging && contains(&grow(&section.part, 14.0 * s), self.cursor.0, self.cursor.1);
-        let part = section.part;
-        let (w, _) = size(&part);
-        // Its windows have their own glow; an empty place has a pool of it.
-        let empty = !self.tiles.iter().any(|tile| contains(&part, centre(&tile.frame).0, centre(&tile.frame).1)) && section.more.is_none();
-        if empty || dragging {
-            let floor = rect(part.left + w * 0.12, part.bottom - 10.0 * s, w * 0.76, 6.0 * s);
-            p.glow(glow, &floor, 90.0 * reach * s, if over { 0.70 } else if dragging { 0.40 } else { 0.22 });
-        }
-        if dragging {
-            p.fill(&part, 16.0 * s, colour(if over { 0.075 } else { 0.035 }));
-            p.sheen(&part, 16.0 * s, if over { 0.05 } else { 0.02 });
         }
     }
 
@@ -3290,45 +3521,27 @@ impl Board {
         }
     }
 
-    /// One window: what is under its live preview (its shadow, the glow of
-    /// its pin, a face for when there is nothing live to show), its app's
+    /// One window: what is under its live preview (its shadow, a face for
+    /// when there is nothing live to show), its app's
     /// icon unless one is put over the preview (`put_badge`): large in the
     /// middle of a preview that tells little, on its lower left corner
     /// otherwise, and under the cursor its buttons and, after a while, its
-    /// title. Kept above the others, it stands higher.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_tile(&self, p: &Painter, fonts: &Fonts, tile: &TileLayout, window: &WindowModel, pin: Pin, live: bool, badged: bool) {
+    /// title. Kept above the others, it stands higher. Its icon pointed at
+    /// on the map, it is lit a little.
+    fn draw_tile(&self, p: &Painter, fonts: &Fonts, tile: &TileLayout, window: &WindowModel, live: bool, badged: bool) {
         let s = self.scale;
         let hot = self.hover == self.tile_hit(tile.hwnd);
         // The cursor is on the tile or on one of its buttons.
-        let pointed = hot || matches!(&self.hover, Hit::Pin(hwnd) | Hit::Top(hwnd) | Hit::TileClose(hwnd) if *hwnd == tile.hwnd.0);
-        let dragged = self.dragged_window() == Some(tile.hwnd.0);
+        let pointed = hot || matches!(&self.hover, Hit::Top(hwnd) | Hit::TileClose(hwnd) if *hwnd == tile.hwnd.0);
+        let marked = self.pointed_marks.contains(&tile.hwnd.0);
+        let dragged = self.dragged_window() == Some(tile.hwnd.0) || self.flight.as_ref().is_some_and(|flight| flight.hwnd == tile.hwnd.0);
         let dim = if dragged { 0.35 } else { 1.0 };
         let body = if tile.icon_only { tile.frame } else { tile.thumb };
         let (bw, _) = size(&body);
-        // What of its window shows, where its light is cast (`visible`).
-        let shown = match pin {
-            Pin::Off => None,
-            _ if tile.icon_only => None,
-            _ => crate::visible::shown(tile.hwnd),
-        }
-        .map_or(body, |shown| {
-            let [left, top, right, bottom] = crate::visible::within([body.left, body.top, body.right, body.bottom].map(f64::from), shown).map(|v| v as f32);
-            Rect { left, top, right, bottom }
-        });
         let lift = if window.topmost { 1.0 } else if pointed { 0.4 } else { 0.0 };
         if let Some(glows) = &self.glows {
-            // Pinned: a glow of its place's colour under it.
-            if let Some(glow) = glows.of(pin) {
-                // None within it, which would show through a window seen through.
-                p.outside(&shown, paint::PIN_FRAME * s, || {
-                    for (area, corner, opacity) in paint::pin_glows(&shown, s, pin == Pin::Everywhere) {
-                        p.glow(glow, &area, corner, opacity * dim);
-                    }
-                });
-            }
-            if pointed && !dragged {
-                p.glow(&glows.light, &body, 30.0 * s, 0.16);
+            if (pointed || marked) && !dragged {
+                p.glow(&glows.light, &body, 30.0 * s, if pointed { 0.16 } else { 0.12 });
             }
         }
         self.surface(p, &body, if tile.icon_only { 10.0 * s } else { 8.0 * s }, if pointed { 0.12 } else { 0.085 }, dim, lift);
@@ -3361,7 +3574,7 @@ impl Board {
             p.text(&text, &fonts.small, &line, white(0.46));
         }
         if pointed && !dragged {
-            self.draw_tile_buttons(p, tile, window, pin);
+            self.draw_tile_buttons(p, tile, window);
         }
         if self.refused.is_some_and(|(hwnd, at)| hwnd == tile.hwnd.0 && at.elapsed().as_millis() < REFUSAL_MS) {
             // Under the picture: the live picture of the window covers the rest.
@@ -3371,13 +3584,14 @@ impl Board {
         }
     }
 
-    /// A tile's three buttons, as small signs: kept above the others (two
-    /// cards, one over the other), its pin in its place's colour, and close.
-    fn draw_tile_buttons(&self, p: &Painter, tile: &TileLayout, window: &WindowModel, pin: Pin) {
+    /// A tile's two buttons, as small signs: kept above the others (two
+    /// cards, one over the other), and close. Where it is pinned is said by
+    /// where it is dropped on the map, not here.
+    fn draw_tile_buttons(&self, p: &Painter, tile: &TileLayout, window: &WindowModel) {
         let s = self.scale;
         let h = tile.hwnd.0;
         let hot = |hit: Hit| self.hover == hit;
-        for (area, hit) in [(tile.top, Hit::Top(h)), (tile.pin, Hit::Pin(h)), (tile.close, Hit::TileClose(h))] {
+        for (area, hit) in [(tile.top, Hit::Top(h)), (tile.close, Hit::TileClose(h))] {
             p.disc(centre(&area), size(&area).0 / 2.0, white(if hot(hit) { 0.13 } else { 0.055 }));
         }
         let (cx, cy) = centre(&tile.top);
@@ -3388,44 +3602,11 @@ impl Board {
         p.fill(&front, 1.5 * s, if window.topmost { white(lit) } else { rgba(0.13, 0.14, 0.16, 1.0) });
         p.stroke(&front, 1.5 * s, 1.2 * s, white(lit));
 
-        let (cx, cy) = centre(&tile.pin);
-        let ink = pin_colour(pin, if hot(Hit::Pin(h)) { 1.0 } else { 0.85 });
-        // A pushpin: needle, flange, body and head end to end (none drawn
-        // over another), leaning while it pins nothing, upright once it does.
-        let (ux, uy) = if pin == Pin::Off { (0.71, -0.71) } else { (0.0, -1.0) };
-        let at = |v: f32, w: f32| (cx + (ux * (v + 0.9) - uy * w) * s, cy + (uy * (v + 0.9) + ux * w) * s);
-        let along = |from: f32, to: f32, width: f32| p.line(at(from, 0.0), at(to, 0.0), width * s, ink);
-        let across = |v: f32, half: f32, width: f32| p.line(at(v, -half), at(v, half), width * s, ink);
-        along(-6.0, -2.1, 1.2);
-        across(-1.5, 3.5, 1.2);
-        along(-0.9, 2.6, 3.4);
-        across(3.4, 3.0, 1.6);
-        if window.pin_from_app {
-            // The app's pin, which a window cannot take off.
-            p.disc((cx + 5.5 * s, cy + 4.0 * s), 1.4 * s, ink);
-        }
-
         let (cx, cy) = centre(&tile.close);
         let arm = 3.2 * s;
         let ink = if hot(Hit::TileClose(h)) { danger(1.0) } else { white(0.60) };
         p.line((cx - arm, cy - arm), (cx + arm, cy + arm), 1.4 * s, ink);
         p.line((cx - arm, cy + arm), (cx + arm, cy - arm), 1.4 * s, ink);
-    }
-
-    /// The cell standing for the windows that did not fit in a place: a
-    /// few of their icons one over another, and how many there are.
-    fn draw_more(&self, p: &Painter, fonts: &Fonts, r: &Rect, hwnds: &[HWND], count: usize) {
-        let (w, h) = size(r);
-        self.surface(p, r, 8.0 * self.scale, 0.085, 1.0, 0.0);
-        let k = w.min(h) * 0.46;
-        for (i, hwnd) in hwnds.iter().take(3).enumerate().rev() {
-            let off = i as f32 * k * 0.24;
-            if let Some(bitmap) = self.icons.get(&hwnd.0).and_then(Option::as_ref) {
-                p.bitmap(bitmap, &rect(r.left + w * 0.12 + off, r.top + h * 0.10 + off, k, k), 0.9 - 0.2 * i as f32);
-            }
-        }
-        let label = Rect { left: r.left + w * 0.30, top: r.top + h * 0.55, ..*r };
-        p.text(&format!("+{count}"), &fonts.tiny, &label, white(0.80));
     }
 
     /// Draws with everything moved by `by`, the target's translation being
@@ -3450,8 +3631,6 @@ impl Board {
         let s = self.scale;
         let layout = &map.layout;
         let selected_row = self.grid.find(&self.selected).map(|pos| pos.row);
-        // The cell a dragged window would be dropped on.
-        let drop_cell = self.dragged_window().and_then(|_| self.cell_at(self.cursor.0, self.cursor.1)).map(|(c, _)| c.id.as_str());
         let (cx, cy) = (self.cursor.0 - map.area.left, self.cursor.1 - map.area.top);
         let on_map = contains(&grow(&layout.bounds, 12.0 * s), cx, cy) && self.press.is_none();
 
@@ -3462,12 +3641,7 @@ impl Board {
         let (spine, names, selection) = (at(Part::Spine(map.monitor)), at(Part::Names(map.monitor)), at(Part::Selection(map.monitor)));
         let selected = layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected);
 
-        // Windows on every desktop: a thin white line over the map, under
-        // the previews.
-        if !self.model.pinned.is_empty() {
-            let y = layout.top - 6.0 * s;
-            p.fading_line((layout.bounds.left, y), (layout.bounds.right, y), 1.2 * s, white(0.65));
-        }
+        self.draw_rail(p, map);
         // The column vertical moves travel along.
         self.shifted(p, base, spine, || {
             p.fill(&layout.spine, 12.0 * s, rgba(0.0, 0.0, 0.0, 0.16));
@@ -3478,7 +3652,10 @@ impl Board {
         }
         for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
             let in_selected_row = selected_row == Some(r);
-            self.shifted(p, base, names, || self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row));
+            self.shifted(p, base, names, || {
+                self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
+                self.draw_row_pins(p, map, r, row);
+            });
             let shift = row.cells.first().map_or((0.0, 0.0), |first| at(Part::Row(map.monitor, first.id.clone())));
             // How far the selected cell is drawn from its frame, in cells:
             // away from it, it is filled as the others are.
@@ -3486,7 +3663,8 @@ impl Board {
             let near = on_map && cy >= row.top && cy < row.bottom;
             self.shifted(p, base, shift, || {
                 for cell in &row.cells {
-                    self.draw_cell(p, fonts, cell, in_selected_row, drop_cell == Some(cell.id.as_str()), apart.min(1.0));
+                    let near = self.magnet(map, &cell.body);
+                    self.draw_cell(p, fonts, cell, in_selected_row, near, apart.min(1.0));
                 }
                 self.draw_plus(p, &row.plus, Hit::Plus(r), near);
                 self.draw_plus(p, &row.plus_left, Hit::PlusLeft(r), near);
@@ -3502,12 +3680,223 @@ impl Board {
 
         // What is being dragged is drawn only on the monitor the cursor is on.
         if contains(&map.area, self.cursor.0, self.cursor.1) {
+            self.draw_drop_hint(p, fonts, map);
             self.draw_drag(p, map);
         }
     }
 
+    /// The window the cursor is on above, by its preview or its buttons.
+    fn hovered_window(&self) -> Option<isize> {
+        match &self.hover {
+            Hit::Window { hwnd, .. } | Hit::Top(hwnd) | Hit::TileClose(hwnd) => Some(*hwnd),
+            _ => None,
+        }
+    }
+
+    /// How near the cursor is to `area` of `map` (in its coordinates),
+    /// from 0 to 1, while a window is dragged and the board has made way
+    /// for it: places to drop on come to it (`MAGNET_REACH`).
+    fn magnet(&self, map: &Map, area: &Rect) -> f32 {
+        if self.dragged_window().is_none() || !contains(&map.area, self.cursor.0, self.cursor.1) {
+            return 0.0;
+        }
+        let (x, y) = (self.cursor.0 - map.area.left, self.cursor.1 - map.area.top);
+        let dx = (area.left - x).max(x - area.right).max(0.0);
+        let dy = (area.top - y).max(y - area.bottom).max(0.0);
+        (1.0 - dx.hypot(dy) / (MAGNET_REACH * self.scale)).clamp(0.0, 1.0) * self.grab_shown
+    }
+
+    /// The rail as drawn: open as a groove, as deep as the cursor is near.
+    fn rail_groove(&self, map: &Map) -> Rect {
+        let rail = map.layout.rail;
+        let near = self.magnet(map, &rail);
+        let (_, cy) = centre(&rail);
+        let half = (size(&rail).1 / 2.0) * (0.8 + 0.3 * near);
+        Rect { top: cy - half, bottom: cy + half, ..rail }
+    }
+
+    /// A row's place of its pinned windows as drawn: wider and higher, as
+    /// a groove, the nearer the cursor is.
+    fn pins_groove(&self, map: &Map, row: &RowLayout) -> Rect {
+        let near = self.magnet(map, &row.pins);
+        Rect { left: row.pins.left - 4.0 * self.scale * near, top: row.pins.top - 2.0 * self.scale * near, bottom: row.pins.bottom + 2.0 * self.scale * near, ..row.pins }
+    }
+
+    /// The icons of the windows on every desktop on the rail of `map`, in
+    /// its coordinates: small, side by side, in the middle of it.
+    fn rail_icons(&self, map: &Map) -> Vec<(isize, Rect)> {
+        let s = self.scale;
+        let rail = &map.layout.rail;
+        let (side, n) = (14.0 * s, self.model.pinned.len());
+        let step = if n > 1 { (18.0 * s).min((size(rail).0 - side) / (n - 1) as f32) } else { 0.0 };
+        let width = side + step * n.saturating_sub(1) as f32;
+        let (cx, cy) = centre(rail);
+        self.model.pinned.iter().enumerate()
+            .map(|(i, w)| (w.hwnd.0, rect(cx - width / 2.0 + i as f32 * step, cy - side / 2.0, side, side)))
+            .collect()
+    }
+
+    /// The icons of the windows pinned to row `r` in its place on `map`, in
+    /// its coordinates. As the cursor comes near with a window, they part
+    /// round it as a dock's do, making room for it.
+    fn pin_icons(&self, map: &Map, r: usize) -> Vec<(isize, Rect)> {
+        let s = self.scale;
+        let Some(row) = map.layout.rows.get(r) else { return Vec::new() };
+        let windows: Vec<&WindowModel> = self.model.row_pinned(r).collect();
+        let pins = self.pins_groove(map, row);
+        let (side, n) = (14.0 * s, windows.len());
+        let step = if n > 1 { (17.0 * s).min((size(&pins).0 - 4.0 * s - side) / (n - 1) as f32) } else { 0.0 };
+        let room = side * self.magnet(map, &row.pins);
+        let x = self.cursor.0 - map.area.left;
+        let cy = centre(&pins).1;
+        windows.iter().enumerate().map(|(i, w)| {
+            let left = pins.left + 2.0 * s + i as f32 * step;
+            let part = room / 2.0 * ((left + side / 2.0 - x) / side).tanh();
+            (w.hwnd.0, rect(left + part, cy - side / 2.0, side, side))
+        }).collect()
+    }
+
+    /// The windows whose icons on the map are at a point: in a cell, on the
+    /// rail, or in a row's place of its pinned windows. Only marks: they
+    /// light their previews, but cannot be dragged.
+    fn marks_at(&self, x: f32, y: f32) -> Vec<isize> {
+        let (map, x, y) = self.map_at(x, y);
+        let on = |r: &Rect| contains(&grow(r, 2.0 * self.scale), x, y);
+        if let Some((hwnd, _)) = self.rail_icons(map).into_iter().find(|(_, r)| on(r)) {
+            return vec![hwnd];
+        }
+        for r in 0..map.layout.rows.len() {
+            if let Some((hwnd, _)) = self.pin_icons(map, r).into_iter().find(|(_, r)| on(r)) {
+                return vec![hwnd];
+            }
+        }
+        map.layout.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.apps)
+            .find(|badge| on(&badge.icon)).map_or_else(Vec::new, |badge| badge.hwnds.clone())
+    }
+
+    /// Where a place to drop on is drawn, on the map the cursor is on, in
+    /// the board's coordinates.
+    fn target_area(&self, target: &Target) -> Option<Rect> {
+        let (map, ..) = self.map_at(self.cursor.0, self.cursor.1);
+        let area = match target {
+            Target::Rail => self.rail_groove(map),
+            Target::Row(r) => self.pins_groove(map, map.layout.rows.get(*r)?),
+            Target::Cell(id) => map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == *id)?.body,
+        };
+        Some(shifted_rect(&area, map.area.left, map.area.top))
+    }
+
+    /// A small icon on the map standing for window `hwnd`: on a dab of the
+    /// dark that cuts the line it sits on, lit a little while its preview
+    /// is pointed at.
+    fn draw_mark(&self, p: &Painter, hwnd: isize, r: &Rect, cut: f32) {
+        let s = self.scale;
+        if cut > 0.0 {
+            let mut dark = paint::backdrop();
+            dark.a = cut;
+            p.fill(&grow(r, 2.5 * s), 4.0 * s, dark);
+        }
+        if self.hovered_window() == Some(hwnd) {
+            if let Some(glows) = &self.glows {
+                p.glow(&glows.light, r, 12.0 * s, 0.30);
+            }
+        }
+        match self.icons.get(&hwnd).and_then(Option::as_ref) {
+            Some(bitmap) => p.bitmap(bitmap, r, if self.hovered_window() == Some(hwnd) { 1.0 } else { 0.85 }),
+            None => p.fill(r, 3.0 * s, white(0.18)),
+        }
+    }
+
+    /// A place to drop on, sunk into the map as a window is picked up
+    /// (`a`, from 0 to 1): a dark well, its upper inner edge in shadow, a
+    /// thin line round it. What can be dropped on stands up (the cells),
+    /// what pins is sunk; neither is coloured.
+    fn draw_groove(&self, p: &Painter, r: &Rect, a: f32) {
+        let s = self.scale;
+        let radius = (size(r).1 / 2.0).min(8.0 * s);
+        let inset = radius.max(2.0 * s);
+        p.fill(r, radius, rgba(0.0, 0.0, 0.0, 0.30 * a));
+        if size(r).0 > 2.0 * inset {
+            p.line((r.left + inset, r.top + 1.5 * s), (r.right - inset, r.top + 1.5 * s), 2.0 * s, rgba(0.0, 0.0, 0.0, 0.35 * a));
+            p.line((r.left + inset, r.bottom - 0.5 * s), (r.right - inset, r.bottom - 0.5 * s), 1.0 * s, white(0.05 * a));
+        }
+        p.stroke(r, radius, 1.0 * s, white(0.08 * a));
+    }
+
+    /// The rail of the windows on every desktop over the map: a thin line
+    /// with their icons on it, no surface and no words, so that it is not
+    /// taken for a row; a groove while a window is dragged.
+    fn draw_rail(&self, p: &Painter, map: &Map) {
+        let s = self.scale;
+        let rail = map.layout.rail;
+        let y = centre(&rail).1;
+        let open = self.grab_shown;
+        if open > 0.0 {
+            self.draw_groove(p, &self.rail_groove(map), open);
+        }
+        if self.model.pinned.is_empty() {
+            return;
+        }
+        p.fading_line((rail.left, y), (rail.right, y), 1.2 * s, white(0.65 * (1.0 - 0.5 * open)));
+        for (hwnd, r) in self.rail_icons(map) {
+            self.draw_mark(p, hwnd, &r, 1.0 - open);
+        }
+    }
+
+    /// The place of the windows pinned to row `r`, by its name: like the
+    /// rail, their icons on a short line; nothing while it has none, but a
+    /// groove while a window is dragged.
+    fn draw_row_pins(&self, p: &Painter, map: &Map, r: usize, row: &RowLayout) {
+        let s = self.scale;
+        let open = self.grab_shown;
+        if open > 0.0 {
+            self.draw_groove(p, &self.pins_groove(map, row), open);
+        }
+        let icons = self.pin_icons(map, r);
+        let (Some((_, first)), Some((_, last))) = (icons.first(), icons.last()) else { return };
+        let y = centre(&row.pins).1;
+        p.fading_line((first.left - 6.0 * s, y), (last.right + 6.0 * s, y), 1.0 * s, white(0.40 * (1.0 - 0.5 * open)));
+        for (hwnd, icon) in &icons {
+            self.draw_mark(p, *hwnd, icon, 1.0 - open);
+        }
+    }
+
+    /// The place on `map` the dragged window is over, when dropping it
+    /// there would do something: the same light for all of them, a faint
+    /// fill and a slightly brighter line, and under it, very small, what
+    /// dropping there does.
+    fn draw_drop_hint(&self, p: &Painter, fonts: &Fonts, map: &Map) {
+        let s = self.scale;
+        let Some(target) = self.drop_target() else { return };
+        let Some(area) = self.target_area(&target) else { return };
+        let area = shifted_rect(&area, -map.area.left, -map.area.top);
+        let (area, radius) = match &target {
+            Target::Cell(_) => {
+                let k = 1.0 + 0.015 * self.grab_shown + 0.015 * self.magnet(map, &area);
+                let (cx, cy) = centre(&area);
+                let (w, h) = size(&area);
+                (rect(cx - w * k / 2.0, cy - h * k / 2.0, w * k, h * k), 9.0 * s)
+            }
+            _ => (area, (size(&area).1 / 2.0).min(8.0 * s)),
+        };
+        p.fill(&area, radius, white(0.06));
+        p.stroke(&area, radius, 1.0 * s, white(0.22));
+        let name = |r: usize| grid::row_title(self.model.rows.get(r).map_or("", |row| &row.name), r);
+        let label = match &target {
+            Target::Rail => crate::i18n::text("All desktops", "모든 데스크톱", "所有桌面").to_owned(),
+            Target::Row(r) => crate::i18n::text("Pin to {}", "{}에 고정", "固定到{}").replace("{}", &name(*r)),
+            Target::Cell(_) => crate::i18n::text("Move to cell", "셀로 이동", "移到此格").to_owned(),
+        };
+        let x = match target {
+            Target::Rail => self.cursor.0 - map.area.left,
+            _ => centre(&area).0,
+        };
+        let line = rect(x - 90.0 * s, area.bottom + 2.0 * s, 180.0 * s, 14.0 * s);
+        p.text(&label, &fonts.tiny, &line, white(0.72));
+    }
+
     /// A row's name, on a faint surface as wide as its text while hovered or
-    /// edited; a dot of their colour after it when windows are pinned to the row.
+    /// edited.
     fn draw_row_name(&self, p: &Painter, fonts: &Fonts, r: usize, row: &RowLayout, name: &str, in_selected_row: bool) {
         let s = self.scale;
         let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
@@ -3524,15 +3913,10 @@ impl Board {
             p.fill(&area, 6.0 * s, white(if editing.is_some() { 0.09 } else { 0.045 }));
             p.sheen(&area, 6.0 * s, 0.05);
         }
-        let wide = Rect { right: row.header.right, ..row.name };
+        // Clear of the place of its pinned windows, unless typed into.
+        let right = if editing.is_some() { row.header.right } else { row.pins.left - 6.0 * s };
+        let wide = Rect { right, ..row.name };
         p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 }));
-        if row.pinned && editing.is_none() {
-            let (x, y) = ((row.name.right + 8.0 * s).min(row.header.right - 4.0 * s), centre(&row.name).1);
-            if let Some(glows) = &self.glows {
-                p.glow(&glows.row_mark, &rect(x - 1.5 * s, y - 1.5 * s, 3.0 * s, 3.0 * s), 10.0 * s, 0.45);
-            }
-            p.disc((x, y), 2.6 * s, on_row(0.95));
-        }
     }
 
     /// The frame of the selected cell: a brighter surface, a little larger
@@ -3557,7 +3941,9 @@ impl Board {
     /// A cell of the map, brighter the more it is used. The selected one is
     /// shown by its frame (`draw_selection`), and as the others are only
     /// where it is drawn `apart` from that frame, in cells (up to one).
-    fn draw_cell(&self, p: &Painter, fonts: &Fonts, cell: &CellLayout, in_selected_row: bool, drop_target: bool, apart: f32) {
+    /// While a window is dragged it stands up a little, with its shadow,
+    /// and the more the `near`er the cursor (from 0 to 1).
+    fn draw_cell(&self, p: &Painter, fonts: &Fonts, cell: &CellLayout, in_selected_row: bool, near: f32, apart: f32) {
         let s = self.scale;
         let radius = 9.0 * s;
         let dim = if self.dragged_cell() == Some(cell.id.as_str()) { 0.35 } else { 1.0 };
@@ -3565,22 +3951,24 @@ impl Board {
         let hovering = matches!(&self.hover, Hit::Cell(id) | Hit::CellClose(id) if *id == cell.id);
         let face = 0.10 + 0.075 * cell.usage
             + if in_selected_row { 0.012 } else { 0.0 }
-            + if hovering { 0.035 } else { 0.0 }
-            + if drop_target { 0.04 } else { 0.0 };
+            + if hovering { 0.035 } else { 0.0 };
         let alpha = if is_selected { apart } else { 1.0 } * dim;
+        // Up to 3% larger, about its middle.
+        let k = 1.0 + 0.015 * self.grab_shown + 0.015 * near;
+        let (cx, cy) = centre(&cell.body);
+        let zoom = |r: &Rect| Rect { left: cx + (r.left - cx) * k, top: cy + (r.top - cy) * k, right: cx + (r.right - cx) * k, bottom: cy + (r.bottom - cy) * k };
+        let body = zoom(&cell.body);
+        let lift = 0.6 * self.grab_shown + 0.4 * near;
         if let Some(glows) = &self.glows {
-            if drop_target {
-                p.glow(&glows.accent, &cell.body, 26.0 * s, 0.55);
-            }
             if cell.emphasised {
                 p.glow(&glows.warm, &shifted_rect(&cell.body, 0.0, 3.0 * s), 22.0 * s, 0.40 * dim);
             }
         }
         if alpha > 0.0 {
-            self.surface(p, &cell.body, radius, face, alpha, 0.0);
+            self.surface(p, &body, radius, face, alpha, lift);
         }
         if cell.emphasised {
-            p.fill(&cell.body, radius, warm(0.11 * dim));
+            p.fill(&body, radius, warm(0.11 * dim));
         }
         if cell.id == self.model.current {
             // Where the user actually is, as opposed to what is selected.
@@ -3590,9 +3978,9 @@ impl Board {
             }
             p.disc(dot, 2.6 * s, accent(dim));
         }
-        self.draw_badges(p, fonts, &cell.apps, dim);
+        self.draw_badges(p, fonts, &cell.apps, dim, zoom);
         if cell.more > 0 {
-            p.text(&format!("+{}", cell.more), &fonts.centered, &cell.more_label, white(0.50 * dim));
+            p.text(&format!("+{}", cell.more), &fonts.centered, &zoom(&cell.more_label), white(0.50 * dim));
         }
         if hovering && self.model.cell_count() > 1 && self.press.is_none() {
             let hot = self.hover == Hit::CellClose(cell.id.clone());
@@ -3606,15 +3994,24 @@ impl Board {
         }
     }
 
-    /// App icons, each with how many windows it has when more than one.
-    fn draw_badges(&self, p: &Painter, fonts: &Fonts, badges: &[AppBadge], dim: f32) {
+    /// App icons, each with how many windows it has when more than one,
+    /// placed as `zoom` has them; one lit a little while a preview of its
+    /// windows is pointed at.
+    fn draw_badges(&self, p: &Painter, fonts: &Fonts, badges: &[AppBadge], dim: f32, zoom: impl Fn(&Rect) -> Rect) {
+        let pointed = self.hovered_window();
         for badge in badges {
+            let icon = zoom(&badge.icon);
+            if pointed.is_some_and(|hwnd| badge.hwnds.contains(&hwnd)) {
+                if let Some(glows) = &self.glows {
+                    p.glow(&glows.light, &icon, 12.0 * self.scale, 0.30 * dim);
+                }
+            }
             match self.icons.get(&badge.hwnd.0).and_then(Option::as_ref) {
-                Some(bitmap) => p.bitmap(bitmap, &badge.icon, dim),
-                None => p.fill(&badge.icon, 4.0 * self.scale, white(0.18 * dim)),
+                Some(bitmap) => p.bitmap(bitmap, &icon, dim),
+                None => p.fill(&icon, 4.0 * self.scale, white(0.18 * dim)),
             }
             if badge.count > 1 {
-                p.text(&badge.count.to_string(), &fonts.small, &badge.label, white(0.75 * dim));
+                p.text(&badge.count.to_string(), &fonts.small, &zoom(&badge.label), white(0.75 * dim));
             }
         }
     }
@@ -3944,8 +4341,7 @@ fn tile_at(window: &WindowModel, x: f32, y: f32, w: f32, h: f32, s: f32) -> Tile
     let bottom = y + h;
     let by = bottom + (foot - button) / 2.0;
     let close = rect(x + w - button, by, button, button);
-    let pin = rect(close.left - 4.0 * s - button, by, button, button);
-    let top = rect(pin.left - 4.0 * s - button, by, button, button);
+    let top = rect(close.left - 4.0 * s - button, by, button, button);
     let icon = corner_icon(&rect(x, y, w, h), s);
     TileLayout {
         hwnd: window.hwnd,
@@ -3954,7 +4350,6 @@ fn tile_at(window: &WindowModel, x: f32, y: f32, w: f32, h: f32, s: f32) -> Tile
         icon,
         thumb: rect(x, y, w, h),
         top,
-        pin,
         close,
         icon_only: false,
     }
@@ -3990,41 +4385,13 @@ fn aspect(window: &WindowModel) -> f32 {
     (window.rect.right - window.rect.left).max(1) as f32 / (window.rect.bottom - window.rect.top).max(1) as f32
 }
 
-/// The windows of a place of the pinned ones, which is of one size
-/// (`tiles::fill_slot`): previews while they come out large enough, the
-/// apps' icons where they would not, and when even those do not fit, the
-/// last cell standing for the rest.
-fn layout_slot(windows: &[(&WindowModel, bool)], part: &Rect, s: f32) -> (Vec<TileLayout>, Option<(Rect, Vec<HWND>, usize)>) {
-    let rules = tiles::SlotRules { gap: 16.0 * s, foot: FOOT * s, least: (110.0 * s, 62.0 * s), icon: (24.0 * s, 56.0 * s) };
-    let fill = tiles::fill_slot(windows.len(), size(part), &rules);
-    let at = |(x, y, w, h): tiles::Part| rect(part.left + x, part.top + y, w, h);
-    let shown = fill.cells.len() - if fill.more > 0 { 1 } else { 0 };
-    let tiles = fill.cells.iter().zip(windows).take(shown).map(|(cell, (window, _))| {
-        let cell = at(*cell);
-        if fill.previews {
-            // As large as fits in the cell above its line, of its own shape.
-            let (cw, ch) = (size(&cell).0, size(&cell).1 - FOOT * s);
-            let w = cw.min(ch * aspect(window));
-            let h = w / aspect(window);
-            tile_at(window, cell.left + (cw - w) / 2.0, cell.top + (ch - h) / 2.0, w, h, s)
-        } else {
-            let none = Rect::default();
-            TileLayout { hwnd: window.hwnd, frame: cell, icon: cell, title: none, thumb: none, top: none, pin: none, close: none, icon_only: true }
-        }
-    }).collect();
-    let more = (fill.more > 0).then(|| {
-        let rest: Vec<HWND> = windows[shown..].iter().take(3).map(|(w, _)| w.hwnd).collect();
-        (at(fill.cells[shown]), rest, fill.more)
-    });
-    (tiles, more)
-}
-
 /// The badges of one map cell (`body`, of size `cell_w` by `cell_h`), one per
 /// app in the order its windows are stacked, centred in the cell: as many as
 /// fit, and how many did not.
 fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32) -> (Vec<AppBadge>, usize) {
-    // Windows pinned to the row are shown by the row (`layout_pins`).
-    let apps = group_apps(cell.windows.iter().filter(|w| !w.follows));
+    // Windows pinned to the row are shown by the row (`RowLayout::pins`).
+    let own = || cell.windows.iter().filter(|w| !w.follows);
+    let apps = group_apps(own());
     let room = cell_w - 16.0 * s;
     let line_gap = 3.0 * s;
     let count_w = |size: f32| (size * 0.62).max(8.0 * s);
@@ -4083,7 +4450,8 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
     for (n, used) in &packed {
         let mut x = body.left + (cell_w - used) / 2.0;
         for &(window, count) in &apps[i..i + n] {
-            badges.push(AppBadge { hwnd: window.hwnd, icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
+            let hwnds = own().filter(|w| same_app(window, w)).map(|w| w.hwnd.0).collect();
+            badges.push(AppBadge { hwnd: window.hwnd, hwnds, icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
             x += width(size, count) + between(size);
         }
         i += n;
@@ -4096,18 +4464,21 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
 fn group_apps<'a>(windows: impl Iterator<Item = &'a WindowModel>) -> Vec<(&'a WindowModel, usize)> {
     let mut apps: Vec<(&WindowModel, usize)> = Vec::new();
     for window in windows {
-        match apps.iter_mut().find(|(first, _)| {
-            if window.icon_key != 0 {
-                first.icon_key == window.icon_key
-            } else {
-                first.icon_key == 0 && !window.app.is_empty() && first.app == window.app
-            }
-        }) {
+        match apps.iter_mut().find(|(first, _)| same_app(first, window)) {
             Some(entry) => entry.1 += 1,
             None => apps.push((window, 1)),
         }
     }
     apps
+}
+
+/// Whether `window` is grouped with `first` (`group_apps`).
+fn same_app(first: &WindowModel, window: &WindowModel) -> bool {
+    if window.icon_key != 0 {
+        first.icon_key == window.icon_key
+    } else {
+        first.icon_key == 0 && !window.app.is_empty() && first.app == window.app
+    }
 }
 
 /// Lays out the map at the bottom of a monitor: rows top to bottom, each
@@ -4132,7 +4503,9 @@ fn map_anchors(grid: &Grid, selected: &str) -> Vec<usize> {
 
 fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> MapLayout {
     let (w, h) = size;
-    let (margin, header_w, gap) = (60.0 * s, 170.0 * s, 10.0 * s);
+    let (margin, header_w, gap) = (60.0 * s, 190.0 * s, 10.0 * s);
+    // At the right of each row's label, the place of its pinned windows.
+    let pins_w = 56.0 * s;
     /// Share of the monitor's height the map may take.
     const MAX_SHARE: f32 = 0.34;
 
@@ -4167,6 +4540,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     let name_x = x0;
 
     let mut layout = MapLayout { top: y, bounds: rect(x0, y, total_w, total_h), ..MapLayout::default() };
+    layout.rail = rect(x0, y - 23.0 * s, total_w, 18.0 * s);
     layout.add_row_top = rect(spine_x + (cell_w - plus) / 2.0, y, plus, plus);
     y += plus + gap;
     let rows_top = y;
@@ -4190,8 +4564,8 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
             x += pitch;
         }
         let header = rect(x0, y, header_w, cell_h);
-        // Room after the name for the dot of the windows pinned to the row.
-        let name_room = header.right - name_x - 22.0 * s;
+        // Room after the name for the place of the windows pinned to the row.
+        let name_room = header.right - name_x - pins_w - 14.0 * s;
         // As wide as the name itself, so the clickable box matches what is read.
         let name_w = (text_width(&grid::row_title(&row.name, r), 12.0 * s) + 4.0 * s).min(name_room);
         layout.rows.push(RowLayout {
@@ -4202,7 +4576,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
             cells,
             plus: rect(x, y + (cell_h - plus) / 2.0, plus, plus),
             plus_left: rect(first_x - gap - plus, y + (cell_h - plus) / 2.0, plus, plus),
-            pinned: row.cells.iter().flat_map(|c| &c.windows).any(|w| w.follows),
+            pins: rect(header.right - pins_w - 6.0 * s, y + (cell_h - 18.0 * s) / 2.0, pins_w, 18.0 * s),
         });
         y += row_pitch;
     }
@@ -4212,14 +4586,41 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32) -> Map
     layout
 }
 
+/// Where on a map a dragged window is dropped to pin it, as a little more
+/// than the rail (`MapLayout::rail`) and a row's place of its pinned
+/// windows (`RowLayout::pins`) show.
+fn rail_zone(layout: &MapLayout, s: f32) -> Rect {
+    Rect {
+        left: layout.bounds.left - 24.0 * s,
+        top: layout.rail.top - 20.0 * s,
+        right: layout.bounds.right + 24.0 * s,
+        bottom: layout.top + size(&layout.add_row_top).1 * 0.5,
+    }
+}
+
+fn pins_zone(row: &RowLayout, s: f32) -> Rect {
+    Rect {
+        left: row.pins.left - 30.0 * s,
+        top: row.top,
+        right: row.header.right + size(&row.plus).0 * 0.5,
+        bottom: row.bottom,
+    }
+}
+
+/// A place of the pinned windows a window is dropped on.
+#[derive(Clone, Debug, PartialEq)]
+enum PinSlot {
+    /// The rail of the windows on every desktop.
+    All,
+    /// A row's, with the cell of that row the window goes to first when it
+    /// is not in it.
+    Row(Option<CellId>),
+}
+
 /// Where a dragged window was released, as `window_drop` judges it.
 struct DropSpot<'a> {
-    /// The place of the pinned windows it is in.
-    zone: Option<Pin>,
-    /// Over a map (on a cell or not).
-    on_map: bool,
-    /// Among the previews.
-    on_plate: bool,
+    /// The place of the pinned windows it is on.
+    slot: Option<PinSlot>,
     /// The map cell under it.
     cell: Option<&'a str>,
     /// On another monitor than the window's.
@@ -4229,32 +4630,33 @@ struct DropSpot<'a> {
 #[derive(Debug, PartialEq)]
 enum WindowDrop {
     Nothing,
-    Pin(Pin),
-    /// To another cell, and to the monitor it was dropped on.
-    Move { cell: Option<CellId>, monitor: bool },
+    /// Pinned so (or no longer, or left as it is), to another cell, and to
+    /// the monitor it was dropped on.
+    Place { pin: Option<Pin>, cell: Option<CellId>, monitor: bool },
 }
 
-/// What becomes of a window of cell `from`, pinned `pin`, released at
-/// `spot`: in a place of the pinned windows it is pinned so; on a map cell
-/// it goes to that cell, on the monitor whose map that was; elsewhere
-/// among the previews it is no longer pinned, or only changes monitor.
+/// What becomes of a window of cell `from` (empty for one on every
+/// desktop), pinned `pin`, released at `spot`. Where it is dropped says
+/// what it is: on the rail it goes on every desktop, by a row's name it is
+/// pinned to that row (going to one of its cells first), on a cell it is
+/// that cell's own, pinned no longer. Kept on top as it is pinned, it is
+/// pinned again even where it is so. Anywhere else, the previews
+/// included, it only changes monitor, if dropped on another.
 fn window_drop(from: &str, pin: Pin, spot: &DropSpot) -> WindowDrop {
-    let set = |to: Pin| if to == pin { WindowDrop::Nothing } else { WindowDrop::Pin(to) };
-    if let Some(to) = spot.zone {
-        return set(to);
+    let monitor = spot.other_monitor;
+    match &spot.slot {
+        Some(PinSlot::All) => return WindowDrop::Place { pin: Some(Pin::Everywhere), cell: None, monitor },
+        Some(PinSlot::Row(cell)) => return WindowDrop::Place { pin: Some(Pin::Row), cell: cell.clone(), monitor },
+        None => {}
     }
-    // On every desktop it has no cell to go to.
-    if pin == Pin::Everywhere {
-        return if spot.on_map { WindowDrop::Nothing } else { set(Pin::Off) };
-    }
-    if pin == Pin::Row && !spot.on_map && spot.on_plate {
-        return set(Pin::Off);
-    }
-    let cell = spot.cell.filter(|id| *id != from).map(CellId::from);
-    if cell.is_none() && !spot.other_monitor {
+    let (pin, cell) = match spot.cell {
+        Some(id) => ((pin != Pin::Off).then_some(Pin::Off), (id != from).then(|| id.to_owned())),
+        None => (None, None),
+    };
+    if pin.is_none() && cell.is_none() && !monitor {
         WindowDrop::Nothing
     } else {
-        WindowDrop::Move { cell, monitor: spot.other_monitor }
+        WindowDrop::Place { pin, cell, monitor }
     }
 }
 
@@ -4265,8 +4667,20 @@ mod tests {
 
     fn window(hwnd: isize, follows: bool) -> WindowModel {
         WindowModel { hwnd: HWND(hwnd), rect: RECT { right: 1280, bottom: 720, ..Default::default() },
-            follows, pin_from_app: false, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
+            follows, minimized: false, title: format!("Window {hwnd}"), app: String::new(),
             icon_key: 0, app_name: String::new(), topmost: false }
+    }
+
+    #[test]
+    fn a_window_is_found_in_its_cell_and_row() {
+        let mut rows = vec![row(&["a", "b"]), row(&["c"])];
+        rows[0].cells[1].windows = vec![window(1, true), window(2, false)];
+        rows[1].cells[0].windows = vec![window(3, true)];
+        let model = Model { rows, pinned: vec![window(4, false)], current: "a".into() };
+        assert_eq!([1, 2, 3, 4].map(|hwnd| model.cell_of(hwnd).map(|cell| cell.id.as_str())), [Some("b"), Some("b"), Some("c"), None]);
+        assert_eq!(["a", "b", "c", "gone"].map(|id| model.row_of(id)), [Some(0), Some(0), Some(1), None]);
+        assert_eq!(model.row_pinned(0).map(|w| w.hwnd.0).collect::<Vec<_>>(), [1]);
+        assert_eq!(model.row_pinned(1).map(|w| w.hwnd.0).collect::<Vec<_>>(), [3]);
     }
 
     #[test]
@@ -4391,7 +4805,6 @@ mod tests {
                     icon_key,
                     app_name: String::new(),
                     follows: false,
-                    pin_from_app: false,
                     topmost: false,
                 })
                 .collect();
@@ -4655,47 +5068,59 @@ mod tests {
         assert_eq!(hand_pull(&grid, Pos { row: 0, col: 1 }, (-0.125, 0.0)), (-0.125, 0.0));
     }
 
-    /// Going to a row with more or fewer windows pinned to it, or none, the
-    /// places of the pinned windows stay as they are, and so do the tiles of
-    /// the windows on every desktop.
+    /// The rail of the windows on every desktop is over the rows, as wide
+    /// as the map, and each row's place of its pinned windows is in its
+    /// label, clear of its name: neither is on a cell, a + or another.
     #[test]
-    fn windows_on_every_desktop_stay_whichever_row() {
-        let everywhere = window(1, false);
-        let (followers, own) = ([window(2, true), window(3, true)], window(4, false));
-        let area = rect(40.0, 64.0, 1840.0, 640.0);
-        let parts = |row: &[WindowModel]| {
-            let here: Vec<(&WindowModel, bool)> = [(&everywhere, true), (&own, false)].into_iter().chain(row.iter().map(|w| (w, false))).collect();
-            let parts = split_area(&here, true, &area, 1.0);
-            let part = |carried| parts.iter().find(|(_, c, _)| *c == carried).map(|(part, _, group)| (*part, group.len())).unwrap();
-            let (all, row_part) = (part(Carried::Fixed), part(Carried::Row));
-            let tiles = layout_slot(&[(&everywhere, true)], &all.0, 1.0).0;
-            (all.0, row_part.0, tiles[0].frame, row_part.1)
-        };
-        let (none, one, two) = (parts(&[]), parts(&followers[..1]), parts(&followers));
-        assert_eq!((none.0, none.1, none.2), (two.0, two.1, two.2));
-        assert_eq!((one.0, one.1, one.2), (two.0, two.1, two.2));
-        assert_eq!((none.3, one.3, two.3), (0, 1, 2));
+    fn the_places_of_pinned_windows_are_clear_of_the_rest_of_the_map() {
+        let rows = vec![row(&["a", "b"]), row(&["c", "d", "e"]), row(&["f"])];
+        let model = Model { rows, pinned: Vec::new(), current: "a".into() };
+        for (size, s) in [((1920.0, 1080.0 - FOOTER), 1.0), ((1280.0, 720.0 - FOOTER), 1.0), ((2560.0, 1440.0 - FOOTER * 1.5), 1.5)] {
+            let layout = layout_map(&model, &[0, 1, 0], size, s);
+            let cells: Vec<&Rect> = layout.rows.iter().flat_map(|r| &r.cells).map(|c| &c.body).collect();
+            let pluses: Vec<&Rect> = layout.rows.iter().flat_map(|r| [&r.plus, &r.plus_left]).chain([&layout.add_row, &layout.add_row_top]).collect();
+            let rail = rail_zone(&layout, s);
+            assert!(layout.rail.bottom <= layout.top && layout.rail.left == layout.bounds.left && layout.rail.right == layout.bounds.right);
+            assert!(cells.iter().all(|c| !overlaps(c, &rail)), "the rail on a cell at {size:?}");
+            for (r, row) in layout.rows.iter().enumerate() {
+                assert!(row.pins.left >= row.name.right && row.pins.right <= row.header.right, "row {r} at {size:?}");
+                let zone = pins_zone(row, s);
+                assert!(cells.iter().chain(&pluses).filter(|r| **r != &row.plus_left).all(|c| !overlaps(c, &zone)), "row {r}'s place on the map at {size:?}");
+                assert!(!overlaps(&zone, &rail));
+                for other in layout.rows.iter().skip(r + 1) {
+                    assert!(!overlaps(&zone, &pins_zone(other, s)));
+                }
+            }
+        }
     }
 
     #[test]
-    fn a_dropped_window_goes_to_the_cell_or_the_pin_it_was_released_on() {
-        let at = |zone, on_map, on_plate, cell| DropSpot { zone, on_map, on_plate, cell, other_monitor: false };
-        let moved = |cell: &str| WindowDrop::Move { cell: Some(cell.to_string()), monitor: false };
-        // On another cell of the map it goes there; on its own, nowhere.
-        assert_eq!(window_drop("a", Pin::Off, &at(None, true, false, Some("b"))), moved("b"));
-        assert_eq!(window_drop("a", Pin::Row, &at(None, true, false, Some("b"))), moved("b"));
-        assert_eq!(window_drop("a", Pin::Off, &at(None, true, false, Some("a"))), WindowDrop::Nothing);
-        // In a place of the pinned windows it is pinned so.
-        assert_eq!(window_drop("a", Pin::Off, &at(Some(Pin::Everywhere), false, false, None)), WindowDrop::Pin(Pin::Everywhere));
-        assert_eq!(window_drop("a", Pin::Off, &at(Some(Pin::Row), false, false, None)), WindowDrop::Pin(Pin::Row));
-        assert_eq!(window_drop("a", Pin::Row, &at(Some(Pin::Row), false, false, None)), WindowDrop::Nothing);
-        // Anywhere else nothing happens, but a pinned one is let go among the previews.
-        assert_eq!(window_drop("a", Pin::Off, &at(None, false, true, None)), WindowDrop::Nothing);
-        assert_eq!(window_drop("a", Pin::Off, &at(None, false, false, None)), WindowDrop::Nothing);
-        assert_eq!(window_drop("a", Pin::Row, &at(None, false, true, None)), WindowDrop::Pin(Pin::Off));
-        assert_eq!(window_drop("a", Pin::Everywhere, &at(None, true, false, Some("b"))), WindowDrop::Nothing);
-        // Over another monitor's map, it only changes monitor.
-        let other = DropSpot { other_monitor: true, ..at(None, true, false, None) };
-        assert_eq!(window_drop("a", Pin::Off, &other), WindowDrop::Move { cell: None, monitor: true });
+    fn a_dropped_window_is_what_its_place_says() {
+        let at = |slot: Option<PinSlot>, cell: Option<&'static str>| DropSpot { slot, cell, other_monitor: false };
+        let place = |pin: Option<Pin>, cell: Option<&str>| WindowDrop::Place { pin, cell: cell.map(str::to_owned), monitor: false };
+        // On the rail it goes on every desktop, from wherever it was, and is
+        // pinned again where it is so (to be put on top again).
+        for pin in [Pin::Off, Pin::Row, Pin::Everywhere] {
+            assert_eq!(window_drop("a", pin, &at(Some(PinSlot::All), None)), place(Some(Pin::Everywhere), None));
+        }
+        // By a row's name it is pinned to that row, going to one of its
+        // cells first when it is not in it.
+        assert_eq!(window_drop("a", Pin::Off, &at(Some(PinSlot::Row(None)), None)), place(Some(Pin::Row), None));
+        assert_eq!(window_drop("a", Pin::Everywhere, &at(Some(PinSlot::Row(Some("c".into()))), None)), place(Some(Pin::Row), Some("c")));
+        // On a cell it is that cell's own: moved there, and pinned no longer.
+        assert_eq!(window_drop("a", Pin::Off, &at(None, Some("b"))), place(None, Some("b")));
+        assert_eq!(window_drop("a", Pin::Row, &at(None, Some("b"))), place(Some(Pin::Off), Some("b")));
+        assert_eq!(window_drop("a", Pin::Row, &at(None, Some("a"))), place(Some(Pin::Off), None));
+        assert_eq!(window_drop("", Pin::Everywhere, &at(None, Some("b"))), place(Some(Pin::Off), Some("b")));
+        assert_eq!(window_drop("a", Pin::Off, &at(None, Some("a"))), WindowDrop::Nothing);
+        // Among the previews, or anywhere else, nothing happens, pinned or not.
+        for pin in [Pin::Off, Pin::Row, Pin::Everywhere] {
+            assert_eq!(window_drop("a", pin, &at(None, None)), WindowDrop::Nothing);
+        }
+        // On another monitor it goes there too; dropped nowhere else, only there.
+        let other = |slot, cell| DropSpot { other_monitor: true, ..at(slot, cell) };
+        assert_eq!(window_drop("a", Pin::Off, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
+        assert_eq!(window_drop("a", Pin::Everywhere, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
+        assert_eq!(window_drop("a", Pin::Off, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: Some(Pin::Everywhere), cell: None, monitor: true });
     }
 }

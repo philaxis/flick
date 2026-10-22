@@ -5,19 +5,17 @@
 use std::{cell::{Cell, OnceCell, RefCell}, collections::HashMap, ffi::c_void};
 use windows::{
     core::{w, ComInterface, Interface, Result},
-    Foundation::Numerics::Matrix3x2,
     Win32::{
         Foundation::RECT,
         Graphics::{
             Direct2D::{
-                Common::{D2D1_FILL_MODE_ALTERNATE, D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U},
+                Common::{D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U},
                 D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1LinearGradientBrush, ID2D1RenderTarget,
                 ID2D1SolidColorBrush, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_GRADIENT_STOP, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
                 D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT, ID2D1Geometry,
-                D2D1_LAYER_PARAMETERS, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_LAYER_OPTIONS_NONE,
+                D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT,
             },
             DirectWrite::{
                 DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED,
@@ -57,11 +55,6 @@ pub fn accent(a: f32) -> D2D1_COLOR_F {
     rgba(0.34, 0.62, 1.0, a)
 }
 
-/// The colour of what is pinned on the board (its pin, its place), and
-/// how strongly: Flick's blue, full to every shelf, fainter to its own
-/// shelf.
-pub const PIN_ALL: ([f32; 3], f32) = ([0.34, 0.62, 1.0], 1.0);
-pub const PIN_ROW: ([f32; 3], f32) = ([0.34, 0.62, 1.0], 0.6);
 /// The light about a pinned window, wherever it shows (the board, while
 /// the screen follows the hand, whole or receded), and how strongly:
 /// white, and no stronger than it takes to be seen over a light window,
@@ -78,19 +71,6 @@ pub const PIN_ROW_REACH: f32 = 0.55;
 /// pinned to every shelf, or to its own).
 pub fn pin_light(all: bool) -> (f32, f32) {
     if all { (PIN_ALL_LIGHT.1, PIN_ALL_REACH) } else { (PIN_ROW_LIGHT.1, PIN_ROW_REACH) }
-}
-
-/// The colour of the light about a window pinned to every shelf (`all`)
-/// or to its own, at `a`, as strong as it is.
-pub fn lit(all: bool, a: f32) -> D2D1_COLOR_F {
-    let ([r, g, b], strength) = if all { PIN_ALL_LIGHT } else { PIN_ROW_LIGHT };
-    rgba(r, g, b, a * strength)
-}
-
-/// `PIN_ALL` or `PIN_ROW` (`all`) at `a`, as strong as it is.
-pub fn pinned(all: bool, a: f32) -> D2D1_COLOR_F {
-    let ([r, g, b], strength) = if all { PIN_ALL } else { PIN_ROW };
-    rgba(r, g, b, a * strength)
 }
 
 /// The colour of a cell the user marked to stand out. Warm, so that it is
@@ -393,37 +373,6 @@ impl<'a> Painter<'a> {
             if let Ok(brush) = self.target.CreateLinearGradientBrush(&line, None, &stops) {
                 self.target.DrawLine(point(from), point(to), &brush, width, None);
             }
-        }
-    }
-
-    /// Draws with nothing of it shown within `hole`, a rectangle with
-    /// corners of `radius`: light about something that shows through.
-    pub fn outside(&self, hole: &Rect, radius: f32, draw: impl FnOnce()) {
-        let far = 1.0e6;
-        let masked = unsafe {
-            self.target.GetFactory().ok().and_then(|factory: ID2D1Factory| {
-                let all: ID2D1Geometry = factory.CreateRectangleGeometry(&Rect { left: -far, top: -far, right: far, bottom: far }).ok()?.cast().ok()?;
-                let within: ID2D1Geometry = factory.CreateRoundedRectangleGeometry(&rounded(hole, radius)).ok()?.cast().ok()?;
-                let group = factory.CreateGeometryGroup(D2D1_FILL_MODE_ALTERNATE, &[Some(all), Some(within)]).ok()?;
-                let parameters = D2D1_LAYER_PARAMETERS {
-                    contentBounds: Rect { left: -far, top: -far, right: far, bottom: far },
-                    geometricMask: std::mem::ManuallyDrop::new(Some(group.cast().ok()?)),
-                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                    maskTransform: Matrix3x2::identity(),
-                    opacity: 1.0,
-                    opacityBrush: std::mem::ManuallyDrop::new(None),
-                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
-                };
-                self.target.PushLayer(&parameters, None);
-                let D2D1_LAYER_PARAMETERS { geometricMask, opacityBrush, .. } = parameters;
-                drop(std::mem::ManuallyDrop::into_inner(geometricMask));
-                drop(std::mem::ManuallyDrop::into_inner(opacityBrush));
-                Some(())
-            })
-        };
-        draw();
-        if masked.is_some() {
-            unsafe { self.target.PopLayer() };
         }
     }
 

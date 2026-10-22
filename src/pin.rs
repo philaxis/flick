@@ -6,9 +6,6 @@ impl Pin {
     pub fn from_flags(row: bool, all: bool) -> Self {
         if all { Self::Everywhere } else if row { Self::Row } else { Self::Off }
     }
-    pub fn next(self) -> Self {
-        match self { Self::Off => Self::Row, Self::Row => Self::Everywhere, Self::Everywhere => Self::Off }
-    }
     pub fn choose(self, choice: Self) -> Self {
         if self == choice { Self::Off } else { choice }
     }
@@ -84,10 +81,7 @@ mod tests {
     use super::*;
     #[test]
     fn board_and_menu_use_one_exclusive_cycle() {
-        let mut pin = Pin::Off;
-        for expected in [Pin::Row, Pin::Everywhere, Pin::Off] {
-            pin = pin.next();
-            assert_eq!(pin, expected);
+        for pin in [Pin::Row, Pin::Everywhere, Pin::Off] {
             let (row, all) = pin.flags();
             assert!(!(row && all));
             assert_eq!(Pin::from_flags(row, all), pin);

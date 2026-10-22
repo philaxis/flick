@@ -352,10 +352,9 @@ pub fn warn(text: &str) {
     }
 }
 
-fn window_model(follows: bool, pin_from_app: bool, window: vd::WindowInfo) -> WindowModel {
+fn window_model(follows: bool, window: vd::WindowInfo) -> WindowModel {
     WindowModel {
         follows,
-        pin_from_app,
         app: vd::exe_name(window.pid).unwrap_or_default(),
         icon_key: crate::board::icon_key(window.hwnd),
         app_name: vd::app_label(window.pid),
@@ -687,7 +686,7 @@ impl App {
                 let current = crate::pin::Pin::from_flags(state.row_window, state.all_window);
                 let choice = if command == PinCommand::RowWindow { crate::pin::Pin::Row } else { crate::pin::Pin::Everywhere };
                 let (row, all) = current.choose(choice).flags();
-                self.set_pin(hwnd, row, all);
+                let _ = self.set_pin(hwnd, row, all);
             }
             PinCommand::RowApp | PinCommand::AllApp => {
                 let Some(exe) = vd::exe_of_window(hwnd) else { return };
@@ -707,8 +706,9 @@ impl App {
         self.refresh_board();
     }
 
-    /// Window scope never changes an app-wide pin or the separate topmost setting.
-    fn set_pin(&mut self, window: HWND, row: bool, all: bool) {
+    /// Window scope never changes an app-wide pin or the separate topmost
+    /// setting. False when the pin could not be changed.
+    fn set_pin(&mut self, window: HWND, row: bool, all: bool) -> bool {
         let state = self.pin_state(window);
         let requested = crate::pin::Pin::from_flags(row, all);
         if state.window_change(requested).is_none() {
@@ -716,23 +716,48 @@ impl App {
                 "This pin comes from the app. Change App in the pin menu (Ctrl+Alt+Win+P).",
                 "앱에서 상속된 고정입니다. 고정 메뉴(Ctrl+Alt+Win+P)에서 앱 항목을 바꾸세요.",
                 "此固定来自应用。请在固定菜单（Ctrl+Alt+Win+P）中更改应用选项。"));
-            return;
+            return false;
         }
         // Tag first so failure cannot leave a shell pin removed without its replacement.
         if row && !self.following.insert(window.0) {
             log("could not identify the window for its shelf pin");
-            return;
+            return false;
         }
         let result = if all { vdapi::pin_window(window) }
             else if state.all_window { vdapi::unpin_window(window) } else { Ok(()) };
         if let Err(e) = result {
             if row && !state.row_window { self.following.remove(&window.0); }
             log(&format!("pin change failed: {e:?}"));
-            return;
+            return false;
         }
         if !row { self.following.remove(&window.0); }
         self.pin_changed(window, crate::pin::Pin::from_flags(state.row_window, state.all_window), requested);
         self.restack();
+        true
+    }
+
+    /// A window dropped on the board: pinned as asked first, for a window
+    /// no longer on every desktop can be moved to a cell, then moved.
+    /// Dropped in a place of the pinned windows, it is put on top each
+    /// time, even if it was taken down before (`pin::PinTop`); its tile's
+    /// button takes it down.
+    fn place_window(&mut self, window: HWND, pin: Option<crate::pin::Pin>, cell: Option<String>, monitor: Option<RECT>) {
+        if let Some(pin) = pin {
+            let state = self.pin_state(window);
+            if crate::pin::Pin::from_flags(state.row_window, state.all_window) != pin {
+                let (row, all) = pin.flags();
+                if !self.set_pin(window, row, all) {
+                    return;
+                }
+            }
+            if pin != crate::pin::Pin::Off {
+                self.grid.pin_top.declined.retain(|w| *w != window.0);
+                if !vd::is_topmost(window) && self.put_top(window, true) {
+                    self.grid.pin_top.put_up(window.0);
+                }
+            }
+        }
+        self.move_window(window, cell, monitor);
     }
 
     /// `window`'s pin went from `was` to `now`. Pinned, or pinned another
@@ -1565,7 +1590,7 @@ impl App {
                         let (here, rest): (Vec<_>, Vec<_>) = windows.drain(..).partition(|w| w.desktop == *id);
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
-                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), self.grid.follow_apps.contains(&vd::exe_name(w.pid).unwrap_or_default()), w)).collect();
+                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), w)).collect();
                         CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now), windows }
                     })
                     .collect();
@@ -1577,7 +1602,7 @@ impl App {
                 }
             })
             .collect();
-        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, vdapi::is_pinned_app(w.hwnd).unwrap_or(false), w)).collect();
+        let pinned = vd::pinned_windows().into_iter().map(|w| window_model(false, w)).collect();
         Model { rows, pinned, current: desktops.current.clone() }
     }
 
@@ -1679,8 +1704,8 @@ impl App {
             Action::CloseWindow(hwnd) => {
                 debug_log!("app: asked window {:x} to close", hwnd.0);
             }
-            Action::SetPin { window, row, all } => {
-                debug_log!("app: pin of {:x}: row {row}, everywhere {all}", window.0);
+            Action::PlaceWindow { window, pin, cell, monitor } => {
+                debug_log!("app: window {:x} placed: pin {pin:?}, to a cell {}, to a monitor {}", window.0, cell.is_some(), monitor.is_some());
             }
             Action::SetTop { window, on } => {
                 debug_log!("app: above the others {:x}: {on}", window.0);
@@ -1731,7 +1756,7 @@ impl App {
                 return;
             }
 
-            Action::MoveWindow { window, cell, monitor } => self.move_window(window, cell, monitor),
+            Action::PlaceWindow { window, pin, cell, monitor } => self.place_window(window, pin, cell, monitor),
             Action::MoveCell { id, row, index } => {
                 self.grid.move_cell(&id, row, index);
                 // The selection, carried to another shelf, turns that shelf to it.
@@ -1754,7 +1779,6 @@ impl App {
                 self.board_settling = Instant::now() + Duration::from_millis(BOARD_SETTLES_MS);
                 self.remove_cell(&id)
             }
-            Action::SetPin { window, row, all } => self.set_pin(window, row, all),
             Action::SetTop { window, on } => self.set_top(window, on),
             Action::Rename(row, name) => {
                 if let Some(row) = self.grid.rows.get_mut(row) {
@@ -2859,7 +2883,6 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             let (w, h): (i32, i32) = (w.parse().ok()?, h.parse().ok()?);
             Some(WindowModel {
                 follows: false,
-                pin_from_app: false,
                 app: format!("sample{i}"),
                 icon_key: 0,
                 app_name: String::new(),

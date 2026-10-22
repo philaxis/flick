@@ -1222,7 +1222,9 @@ fn on_raw_touchpad_input(handle: HRAWINPUT) {
             // Mouse releases still end other triggers; only contact movement counts.
             if raw.header.dwType == RIM_TYPEMOUSE.0 {
                 let mut buttons = *raw;
-                unsafe { buttons.data.mouse.lLastX = 0; buttons.data.mouse.lLastY = 0; buttons.data.mouse.usFlags = 0; }
+                buttons.data.mouse.lLastX = 0;
+                buttons.data.mouse.lLastY = 0;
+                buttons.data.mouse.usFlags = 0;
                 return raw_mouse_input(&buttons);
             }
         }
