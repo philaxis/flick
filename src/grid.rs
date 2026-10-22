@@ -6,9 +6,98 @@
 
 use crate::usage::{self, CellUsage};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub type CellId = String;
+
+/// How many windows of a cell are remembered.
+pub const MEMORY_MOST: usize = 12;
+/// How long the memory of a cell no longer in the grid is kept (a week).
+pub const MEMORY_KEEP_SECS: u64 = 7 * 24 * 3600;
+/// Windows of these are not remembered: started again, Explorer opens only
+/// its home folder, and a store app needs its own id (`remembered`).
+const NOT_REMEMBERED: [&str; 2] = ["explorer.exe", "applicationframehost.exe"];
+
+/// A window that was in a cell: enough to start its app again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppMemory {
+    /// Full path of the executable.
+    pub exe: String,
+    /// Command line beyond the exe; empty for now.
+    #[serde(default)]
+    pub args: String,
+    /// For the hint line; may be empty.
+    #[serde(default)]
+    pub title: String,
+    /// The app's name as people know it.
+    #[serde(default)]
+    pub name: String,
+}
+
+impl AppMemory {
+    /// The executable's file name, lower case ("chrome.exe"), as
+    /// `vd::exe_name` has it.
+    pub fn app(&self) -> String {
+        exe_file(&self.exe)
+    }
+}
+
+/// The file name of an executable's path, lower case.
+pub fn exe_file(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or_default().to_lowercase()
+}
+
+/// The windows a cell had, to bring back after a restart.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CellMemory {
+    /// Unix seconds when the cell last had live windows.
+    pub taken: u64,
+    /// One entry per window, topmost first, at most `MEMORY_MOST`.
+    pub apps: Vec<AppMemory>,
+}
+
+/// A live window as remembering sees it.
+pub struct Seen {
+    /// Full path of its executable, when it could be read.
+    pub exe: Option<String>,
+    pub title: String,
+    pub name: String,
+    /// Pinned to every shelf or to its own: not a cell's.
+    pub pinned: bool,
+}
+
+/// What of a cell's windows (topmost first) is remembered: those of an app
+/// that can be started again by its executable, not pinned ones.
+pub fn remembered(windows: impl IntoIterator<Item = Seen>) -> Vec<AppMemory> {
+    windows
+        .into_iter()
+        .filter(|w| !w.pinned)
+        .filter_map(|w| {
+            let exe = w.exe?;
+            (!NOT_REMEMBERED.contains(&exe_file(&exe).as_str())).then(|| AppMemory { exe, args: String::new(), title: w.title, name: w.name })
+        })
+        .collect()
+}
+
+/// The remembered apps not alive again: `memory`'s windows less, app by
+/// app, as many as `live` (executable file names) has of each.
+pub fn ghosts<'a>(memory: &'a CellMemory, live: &[String]) -> Vec<&'a AppMemory> {
+    let mut left: Vec<&String> = live.iter().collect();
+    memory
+        .apps
+        .iter()
+        .filter(|app| {
+            let name = app.app();
+            match left.iter().position(|l| l.eq_ignore_ascii_case(&name)) {
+                Some(at) => {
+                    left.remove(at);
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
@@ -102,6 +191,10 @@ pub struct Grid {
     /// said at its bottom unless asked for (?).
     #[serde(default)]
     pub board_hints_seen: bool,
+    /// What was in each cell, to bring back after a restart. Kept for
+    /// cells that went (`sync` leaves it) until `prune_memory`.
+    #[serde(default)]
+    pub memory: BTreeMap<CellId, CellMemory>,
 }
 
 impl Grid {
@@ -116,6 +209,56 @@ impl Grid {
             self.rows.iter().any(|row| row.cells.contains(id))
                 && usage.visits.value(now, usage::CELL_HALF_LIFE) > 0.0
         });
+    }
+
+    /// Takes `apps` (topmost first) as what cell `id` holds. Says whether
+    /// that is other than it was.
+    pub fn remember(&mut self, id: &str, mut apps: Vec<AppMemory>, now: u64) -> bool {
+        apps.truncate(MEMORY_MOST);
+        let memory = self.memory.entry(id.to_owned()).or_default();
+        memory.taken = now;
+        let changed = memory.apps != apps;
+        memory.apps = apps;
+        changed
+    }
+
+    pub fn forget(&mut self, ids: &[CellId]) {
+        for id in ids {
+            self.memory.remove(id);
+        }
+    }
+
+    /// Drops the memory of cells no longer in the grid once a week old.
+    pub fn prune_memory(&mut self, now: u64) {
+        let rows = &self.rows;
+        self.memory.retain(|id, memory| {
+            rows.iter().any(|row| row.cells.contains(id)) || now.saturating_sub(memory.taken) <= MEMORY_KEEP_SECS
+        });
+    }
+
+    /// Brings the memory up to what the cells hold now (`live`, each cell's
+    /// remembered windows): a cell with windows is remembered as it is,
+    /// one without keeps what it had. A cell still waiting for its apps to
+    /// come back (`ghosting`) keeps its memory until every one has, and
+    /// then waits no more. Says whether any memory changed.
+    pub fn update_memory(&mut self, live: &BTreeMap<CellId, Vec<AppMemory>>, ghosting: &mut HashSet<CellId>, now: u64) -> bool {
+        let mut changed = false;
+        let ids: Vec<CellId> = self.rows.iter().flat_map(|row| row.cells.iter().cloned()).collect();
+        for id in ids {
+            let apps = live.get(&id).cloned().unwrap_or_default();
+            if ghosting.contains(&id) {
+                let names: Vec<String> = apps.iter().map(AppMemory::app).collect();
+                if self.memory.get(&id).is_some_and(|memory| !ghosts(memory, &names).is_empty()) {
+                    continue;
+                }
+                ghosting.remove(&id);
+            }
+            if !apps.is_empty() {
+                changed |= self.remember(&id, apps, now);
+            }
+        }
+        self.prune_memory(now);
+        changed
     }
 
     /// Brightness uses the square root of the share of the highest score.
@@ -437,6 +580,99 @@ mod tests {
             assert_eq!(id.as_deref(), Some(cell));
             assert_eq!(g.rows[1].anchor(), g.find(cell).unwrap().col);
         }
+    }
+
+    fn app(exe: &str) -> AppMemory {
+        AppMemory { exe: format!("C:\\Apps\\{exe}"), args: String::new(), title: String::new(), name: String::new() }
+    }
+
+    fn names(apps: &[&AppMemory]) -> Vec<String> {
+        apps.iter().map(|a| a.app()).collect()
+    }
+
+    #[test]
+    fn ghosts_are_the_remembered_apps_not_alive_counted_per_exe() {
+        let memory = CellMemory { taken: 1, apps: vec![app("chrome.exe"), app("Code.exe"), app("chrome.exe"), app("chrome.exe")] };
+        let live = vec!["chrome.exe".to_owned()];
+        assert_eq!(names(&ghosts(&memory, &live)), ["code.exe", "chrome.exe", "chrome.exe"]);
+        let all = vec!["chrome.exe".to_owned(), "code.exe".into(), "chrome.exe".into(), "chrome.exe".into(), "other.exe".into()];
+        assert!(ghosts(&memory, &all).is_empty());
+        assert_eq!(ghosts(&memory, &[]).len(), 4);
+    }
+
+    #[test]
+    fn state_without_memory_still_loads_and_saves_memory_back() {
+        let old = r#"{"rows":[{"name":"Work","cells":["a"]}],"guide_seen":true}"#;
+        let mut g: Grid = serde_json::from_str(old).unwrap();
+        assert!(g.memory.is_empty());
+        g.remember("a", vec![app("code.exe")], 5);
+        let saved = serde_json::to_string(&g).unwrap();
+        assert!(saved.contains("\"memory\""));
+        let back: Grid = serde_json::from_str(&saved).unwrap();
+        assert_eq!(back.memory["a"].apps, [app("code.exe")]);
+        assert_eq!(back.memory["a"].taken, 5);
+    }
+
+    #[test]
+    fn memory_of_vanished_cells_is_kept_a_week() {
+        let mut g = grid(&[&["a", "b"]]);
+        g.remember("a", vec![app("code.exe")], 100);
+        g.remember("b", vec![app("code.exe")], 100);
+        g.sync(&["a".into()], "a");
+        assert!(g.memory.contains_key("b"), "sync leaves the memory of a cell that went");
+        let day = 24 * 3600;
+        let mut later = g.clone();
+        later.prune_memory(100 + 6 * day);
+        assert!(later.memory.contains_key("b"));
+        g.prune_memory(100 + 8 * day);
+        assert!(!g.memory.contains_key("b"));
+        assert!(g.memory.contains_key("a"), "a cell still in the grid keeps its memory");
+    }
+
+    #[test]
+    fn remember_caps_a_cell_at_twelve_windows_topmost_first() {
+        let mut g = grid(&[&["a"]]);
+        let apps: Vec<AppMemory> = (0..15).map(|i| app(&format!("app{i}.exe"))).collect();
+        assert!(g.remember("a", apps, 1));
+        let kept = &g.memory["a"].apps;
+        assert_eq!(kept.len(), MEMORY_MOST);
+        assert_eq!(kept[0].app(), "app0.exe");
+        assert_eq!(kept[11].app(), "app11.exe");
+        assert!(!g.remember("a", (0..15).map(|i| app(&format!("app{i}.exe"))).collect(), 2), "the same windows again change nothing");
+        assert_eq!(g.memory["a"].taken, 2);
+    }
+
+    #[test]
+    fn a_ghosting_cell_keeps_its_memory_until_every_ghost_is_back() {
+        let mut g = grid(&[&["a", "b", "c"]]);
+        g.remember("a", vec![app("code.exe"), app("wt.exe")], 1);
+        g.remember("c", vec![app("chrome.exe")], 1);
+        let mut ghosting: HashSet<CellId> = ["a".to_owned(), "c".to_owned()].into();
+        // Started with Windows, a messenger comes up in cell a before the rest.
+        let mut live = BTreeMap::from([("a".to_owned(), vec![app("chat.exe"), app("code.exe")]), ("b".to_owned(), vec![app("notes.exe")])]);
+        assert!(g.update_memory(&live, &mut ghosting, 2));
+        assert_eq!(g.memory["a"].apps, [app("code.exe"), app("wt.exe")], "not taken over while apps are still to come back");
+        assert_eq!(g.memory["b"].apps, [app("notes.exe")], "a cell not waiting is remembered as it is");
+        assert_eq!(g.memory["c"].apps, [app("chrome.exe")], "an empty cell keeps what it had");
+        assert!(ghosting.contains("a") && ghosting.contains("c"));
+        live.insert("a".into(), vec![app("chat.exe"), app("wt.exe"), app("code.exe")]);
+        g.update_memory(&live, &mut ghosting, 3);
+        assert!(!ghosting.contains("a"), "every app back, the cell waits no more");
+        assert_eq!(g.memory["a"].apps, live["a"]);
+        assert!(ghosting.contains("c"));
+    }
+
+    #[test]
+    fn remembering_skips_pinned_explorer_and_store_hosts() {
+        let seen = |exe: Option<&str>, pinned: bool| Seen { exe: exe.map(str::to_owned), title: "t".into(), name: "n".into(), pinned };
+        let kept = remembered([
+            seen(Some("C:\\Windows\\Explorer.EXE"), false),
+            seen(Some("C:\\Windows\\System32\\ApplicationFrameHost.exe"), false),
+            seen(Some("C:\\Apps\\code.exe"), true),
+            seen(None, false),
+            seen(Some("C:\\Apps\\wt.exe"), false),
+        ]);
+        assert_eq!(kept, [AppMemory { exe: "C:\\Apps\\wt.exe".into(), args: String::new(), title: "t".into(), name: "n".into() }]);
     }
 
     fn grid(rows: &[&[&str]]) -> Grid {
