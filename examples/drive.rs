@@ -12,7 +12,10 @@
 //!   drive desk | mkdesk | rmdesk <desktop id prefix>
 //!   drive hold <r> <g> <b> <title> <x> <y> <w> <h> <seconds>  (w and h 0: maximized)
 //!   drive holds <hold arguments>...  (several windows in one process)
-//!   drive navigation shelves|cube|rowmove|recede|onset <out dir> <flick exe>
+//!   drive navigation shelves|cube|rowmove|recede|onset|ghosts <out dir> <flick exe>
+//!   drive restore <row>  (brings back the apps the shelf remembers, as its menu does)
+//!   probe-<name>.exe, a copy of this driver started with no arguments, shows
+//!   a window titled <name> for a minute (an app to bring back).
 //!   drive pinprobe <flick exe> <out dir>
 //!   drive boardshot <flick exe> <out dir>
 //! The message numbers are the app's `WM_STEP`, `WM_CLICK`, `WM_RELEASE`
@@ -34,6 +37,9 @@ mod drive_pacing;
 #[cfg(windows)]
 #[path = "support/shelves.rs"]
 mod drive_shelves;
+#[cfg(windows)]
+#[path = "support/ghosts.rs"]
+mod drive_ghosts;
 #[path = "support/display.rs"]
 mod drive_display;
 
@@ -57,6 +63,14 @@ fn main() {
         },
     };
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 1 {
+        let me = std::env::current_exe().unwrap_or_default();
+        let stem = me.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+        if stem.starts_with("probe-") {
+            let window = ["0", "128", "255", stem, "200", "200", "480", "320", "60"];
+            return hold(&window.map(str::to_owned));
+        }
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let app = FindWindowW(w!("flick.main"), None);
@@ -432,6 +446,10 @@ fn main() {
                 vdapi::select(false);
                 println!("foreground on current desktop: {:?} title: {}", vdapi::is_window_on_current_desktop(fg), String::from_utf16_lossy(&title[..n]).chars().take(30).collect::<String>());
                 println!("board {:?} rect {:?} visible {:?} cloaked {} style {:x} ex {:x} fg {:?}", board, r, IsWindowVisible(board), cloaked, GetWindowLongW(board, GWL_STYLE), GetWindowLongW(board, GWL_EXSTYLE), GetForegroundWindow());
+            }
+            Some("restore") => {
+                // restore <row>: the app's WM_RESTORE_ROW.
+                post(WM_APP + 15, args[2].parse().unwrap());
             }
             Some("desk") => {
                 // desk: prints the current desktop's id.
