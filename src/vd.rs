@@ -287,7 +287,7 @@ pub fn pinned_windows() -> Vec<WindowInfo> {
 }
 
 /// Full path of a process's executable.
-fn exe_path(pid: u32) -> Option<String> {
+pub fn exe_path(pid: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buffer = [0u16; 520];

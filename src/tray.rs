@@ -208,20 +208,35 @@ pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
 pub enum RowCommand {
     CloseWindows = 1,
     Remove,
+    /// Starts the apps the shelf's cells remember and do not have.
+    Restore,
+    /// Forgets what the shelf's cells remember.
+    Forget,
 }
 
 /// The menu of a shelf in the board, at the cursor, headed by `summary`
 /// (which shelf it is and what closing would close). `removable` is
-/// false for the only shelf.
-pub fn row_menu(owner: HWND, summary: &str, removable: bool) -> Option<RowCommand> {
+/// false for the only shelf. `ghosts` apps can be brought back; with
+/// `fold`, closing the windows leaves them remembered, to bring back.
+pub fn row_menu(owner: HWND, summary: &str, removable: bool, ghosts: usize, fold: bool) -> Option<RowCommand> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     add_note(menu, summary);
     add_separator(menu);
-    add_item(menu, RowCommand::CloseWindows as usize, PCWSTR(HSTRING::from(tr("Close all windows…", "모든 창 닫기…", "关闭所有窗口…")).as_ptr()), false);
+    if ghosts > 0 {
+        let restore = match ghosts {
+            1 => tr("Bring back 1 app", "되살리기 (앱 1개)", "恢复 1 个应用").to_owned(),
+            n => tr("Bring back {n} apps", "되살리기 (앱 {n}개)", "恢复 {n} 个应用").replace("{n}", &n.to_string()),
+        };
+        add_item(menu, RowCommand::Restore as usize, PCWSTR(HSTRING::from(restore).as_ptr()), false);
+        add_item(menu, RowCommand::Forget as usize, PCWSTR(HSTRING::from(tr("Forget yesterday's apps", "기억 지우기", "忘记昨天的应用")).as_ptr()), false);
+        add_separator(menu);
+    }
+    let close = if fold { tr("Fold the shelf…", "셸프 접기…", "折叠架子…") } else { tr("Close all windows…", "모든 창 닫기…", "关闭所有窗口…") };
+    add_item(menu, RowCommand::CloseWindows as usize, PCWSTR(HSTRING::from(close).as_ptr()), false);
     if removable {
         // Its windows are not closed; they go to the nearest cell that stays.
         add_item(menu, RowCommand::Remove as usize, PCWSTR(HSTRING::from(tr("Remove the shelf only", "셸프만 제거", "仅删除架子")).as_ptr()), false);
     }
     let picked = pick(menu, owner);
-    [RowCommand::CloseWindows, RowCommand::Remove].into_iter().find(|c| *c as usize == picked)
+    [RowCommand::CloseWindows, RowCommand::Remove, RowCommand::Restore, RowCommand::Forget].into_iter().find(|c| *c as usize == picked)
 }

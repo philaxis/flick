@@ -30,7 +30,7 @@ use std::{
 };
 use strip::{Place, Strip};
 use windows::{
-    core::{w, ComInterface, Error, Result},
+    core::{w, ComInterface, Error, Result, HSTRING},
     Foundation::Numerics::Matrix3x2,
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -58,6 +58,7 @@ use windows::{
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
+            Shell::SHDefExtractIconW,
             Input::{
                 Ime::{
                     ImmGetCompositionStringW, ImmGetContext, ImmNotifyIME, ImmReleaseContext, CPS_CANCEL, GCS_COMPSTR,
@@ -69,7 +70,7 @@ use windows::{
                 },
             },
             WindowsAndMessaging::{
-                CreateWindowExW, PostMessageW, WM_APP, DrawIconEx, GetClassLongPtrW, GetWindowRect, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
+                CreateWindowExW, DestroyIcon, PostMessageW, WM_APP, DrawIconEx, GetClassLongPtrW, GetWindowRect, LoadCursorW, RegisterClassW, SendMessageTimeoutW,
                 KillTimer, SetTimer, SetWindowPos, ShowWindow, CS_DBLCLKS, DI_NORMAL, GCLP_HICON, HICON, HWND_TOPMOST,
                 GetCursorPos, GetAncestor, GetClassNameW, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT, SW_SHOWMINNOACTIVE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, ICON_BIG, IDC_ARROW, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SW_HIDE, WM_ACTIVATE, WM_CHAR, WM_ERASEBKGND,
                 WM_GETICON, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
@@ -109,6 +110,18 @@ pub struct CellModel {
     pub usage: f32,
     /// Topmost first.
     pub windows: Vec<WindowModel>,
+    /// The apps the cell had and has not again (after a restart), shown
+    /// faintly after its windows; one per app.
+    pub ghosts: Vec<GhostModel>,
+}
+
+/// An app a cell remembers, not running there now.
+#[derive(Clone)]
+pub struct GhostModel {
+    /// Full path of its executable, whose icon is shown.
+    pub exe: String,
+    /// How many windows of it the cell had.
+    pub count: usize,
 }
 
 pub struct RowModel {
@@ -230,6 +243,8 @@ pub enum Action {
 /// Height of the line at the bottom that says what the thing under the
 /// cursor is or does (shown the first time, and with ?), in unscaled units.
 const FOOTER: f32 = 44.0;
+/// How faintly the apps a cell remembers and does not have are drawn.
+const GHOST_DIM: f32 = 0.35;
 
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
@@ -527,6 +542,8 @@ impl Pin {
 struct AppBadge {
     /// A window of the app, whose icon is shown.
     hwnd: HWND,
+    /// Instead, an app the cell remembers (its executable): drawn faintly.
+    ghost: Option<String>,
     icon: Rect,
     count: usize,
     /// Where the count is written (only when above one).
@@ -958,6 +975,12 @@ pub struct Board {
     /// (source window, thumbnail handle) of every tile, in stacking order.
     thumbs: Vec<(isize, isize)>,
     icons: HashMap<isize, Option<ID2D1Bitmap>>,
+    /// The icons of the apps the cells remember, by executable.
+    ghost_icons: HashMap<String, Option<ID2D1Bitmap>>,
+    /// The line at the bottom tells of the apps remembered, on its own:
+    /// the first time the board shows any since Flick started.
+    ghost_hint: bool,
+    ghost_hint_shown: bool,
     /// The icons again, for thumbnails over the previews (`sheet`).
     sheet: Option<sheet::IconSheet>,
     /// The thumbnail of a preview's icon by the preview's own thumbnail.
@@ -1093,6 +1116,9 @@ impl Board {
                 scale: 1.0,
                 thumbs: Vec::new(),
                 icons: HashMap::new(),
+                ghost_icons: HashMap::new(),
+                ghost_hint: false,
+                ghost_hint_shown: false,
                 sheet: sheet::IconSheet::new().map_err(|e| crate::app::log(&format!("board icon sheet failed: {e}"))).ok(),
                 badges: HashMap::new(),
                 hover: Hit::Nothing,
@@ -1184,6 +1210,9 @@ impl Board {
         self.press = None;
         self.end_peek();
         self.hints = !grid.board_hints_seen;
+        let ghosts = model.rows.iter().flat_map(|row| &row.cells).any(|cell| !cell.ghosts.is_empty());
+        self.ghost_hint = ghosts && !self.ghost_hint_shown;
+        self.ghost_hint_shown |= ghosts;
         self.resting = None;
         self.motion.stop();
         self.settle_strip(Instant::now());
@@ -1295,6 +1324,7 @@ impl Board {
         self.settle_strip(Instant::now());
         self.clear_thumbnails();
         self.icons.clear();
+        self.ghost_icons.clear();
         if let Some(sheet) = &mut self.sheet {
             sheet.clear();
         }
@@ -3225,6 +3255,7 @@ impl Board {
             }
             if self.window_target.is_none() {
                 self.icons.clear();
+                self.ghost_icons.clear();
                 self.glows = None;
                 let made = unsafe { self.factory.CreateHwndRenderTarget(
                     &D2D1_RENDER_TARGET_PROPERTIES {
@@ -3242,6 +3273,7 @@ impl Board {
         }
         if !self.canvas.as_ref().is_some_and(|c| c.dib.size == self.size) {
             self.icons.clear();
+            self.ghost_icons.clear();
             self.glows = None;
             self.canvas = Canvas::new(&self.factory, self.size)
                 .map_err(|e| crate::app::log(&format!("board canvas failed: {e}"))).ok();
@@ -3253,6 +3285,7 @@ impl Board {
         self.window_target = None;
         self.canvas = None;
         self.icons.clear();
+        self.ghost_icons.clear();
         self.glows = None;
     }
 
@@ -3335,6 +3368,12 @@ impl Board {
             }
             self.icons.insert(window.hwnd.0, pixels.and_then(|pixels| icon_bitmap(target, &pixels, size)));
         }
+        for ghost in self.model.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.ghosts) {
+            if !self.ghost_icons.contains_key(&ghost.exe) {
+                let bitmap = exe_icon_pixels(&ghost.exe, size).and_then(|pixels| icon_bitmap(target, &pixels, size));
+                self.ghost_icons.insert(ghost.exe.clone(), bitmap);
+            }
+        }
         if let Some(sheet) = &mut self.sheet {
             if let Err(e) = sheet.update() {
                 crate::app::log(&format!("board icon sheet: {e}"));
@@ -3384,10 +3423,18 @@ impl Board {
     /// What the line at the bottom says, shown the first time and when ?
     /// is pressed: what can be done with the thing under the cursor.
     fn footer(&self) -> Option<(String, f32)> {
-        if !self.hints {
-            return None;
-        }
         let hint = |text: &str| Some((text.to_owned(), 0.46));
+        let ghosts = || {
+            hint(crate::i18n::text(
+                "Yesterday's apps — right-click the shelf name to bring them back",
+                "어제 있던 앱 — 셸프 이름을 오른쪽 클릭해 되살리기",
+                "昨天的应用 — 右键点击架子名称即可恢复",
+            ))
+        };
+        let on_ghosts = matches!(&self.hover, Hit::Cell(id) if self.model.cell(id).is_some_and(|cell| !cell.ghosts.is_empty()));
+        if !self.hints {
+            return if self.ghost_hint && self.press.is_none() && (on_ghosts || self.hover == Hit::Nothing) { ghosts() } else { None };
+        }
         if self.editing.is_some() {
             return hint("Enter: save   ·   Esc: cancel");
         }
@@ -3415,12 +3462,14 @@ impl Board {
             }
             Hit::TileClose(_) => hint("Click: close the window"),
             Hit::Window { .. } => hint("Click: go to it   ·   Drag: to a cell, or onto the rail or by a shelf's name to pin it"),
+            Hit::Cell(_) if on_ghosts => ghosts(),
             Hit::Cell(_) | Hit::CellClose(_) => {
                 hint("Hover: show windows   ·   Click: go   ·   Drag: move   ·   Right-click: highlight")
             }
-            Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
+            Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: bring back, fold, remove"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
             Hit::AddRow | Hit::AddRowTop => hint("Add a shelf"),
+            Hit::Nothing if self.ghost_hint => ghosts(),
             Hit::Nothing => hint("Point at a cell to see its windows   ·   Drag windows onto the map to move or pin them   ·   ?: hide these hints"),
         }
     }
@@ -3543,7 +3592,24 @@ impl Board {
         if w * place.s < 160.0 * s || h * place.s < 60.0 * s {
             return;
         }
-        let (_, cy) = centre(&part);
+        let (cx, cy) = centre(&part);
+        // The apps it had, faintly, where it had any: what was there says
+        // more than that nothing is.
+        let ghosts = self.model.cell(id).map_or(&[][..], |cell| &cell.ghosts[..]);
+        if !ghosts.is_empty() {
+            let (size, gap) = (48.0 * s, 20.0 * s);
+            let shown = &ghosts[..ghosts.len().min(6)];
+            let width = shown.len() as f32 * size + (shown.len() - 1) as f32 * gap;
+            return self.placed(p, place, || {
+                for (i, ghost) in shown.iter().enumerate() {
+                    let icon = rect(cx - width / 2.0 + i as f32 * (size + gap), cy - size / 2.0, size, size);
+                    match self.ghost_icons.get(&ghost.exe).and_then(Option::as_ref) {
+                        Some(bitmap) => p.bitmap(bitmap, &icon, GHOST_DIM),
+                        None => p.fill(&icon, 8.0 * s, white(0.18 * GHOST_DIM)),
+                    }
+                }
+            });
+        }
         let line = rect(part.left, cy - 12.0 * s, w, 24.0 * s);
         self.placed(p, place, || p.text(crate::i18n::text("No windows", "창 없음", "无窗口"), &fonts.empty, &line, white(0.40)));
     }
@@ -4129,7 +4195,11 @@ impl Board {
     fn draw_badges(&self, p: &Painter, fonts: &Fonts, badges: &[AppBadge], dim: f32, zoom: impl Fn(&Rect) -> Rect) {
         for badge in badges {
             let icon = zoom(&badge.icon);
-            match self.icons.get(&badge.hwnd.0).and_then(Option::as_ref) {
+            let (bitmap, dim) = match &badge.ghost {
+                Some(exe) => (self.ghost_icons.get(exe), dim * GHOST_DIM),
+                None => (self.icons.get(&badge.hwnd.0), dim),
+            };
+            match bitmap.and_then(Option::as_ref) {
                 Some(bitmap) => p.bitmap(bitmap, &icon, dim),
                 None => p.fill(&icon, 4.0 * self.scale, white(0.18 * dim)),
             }
@@ -4358,7 +4428,22 @@ pub fn icon_key(hwnd: HWND) -> u64 {
 
 /// The window's icon, `size` pixels square, premultiplied.
 pub(crate) fn icon_pixels(hwnd: HWND, size: i32) -> Option<Vec<u8>> {
-    let icon = window_icon(hwnd)?;
+    hicon_pixels(window_icon(hwnd)?, size)
+}
+
+/// The icon of an executable, `size` pixels square, premultiplied.
+fn exe_icon_pixels(path: &str, size: i32) -> Option<Vec<u8>> {
+    let mut icon = HICON::default();
+    unsafe {
+        SHDefExtractIconW(&HSTRING::from(path), 0, 0, Some(&mut icon), None, size as u32).ok()?;
+        let pixels = hicon_pixels(icon, size);
+        let _ = DestroyIcon(icon);
+        pixels
+    }
+}
+
+/// `icon` drawn `size` pixels square, premultiplied.
+fn hicon_pixels(icon: HICON, size: i32) -> Option<Vec<u8>> {
     unsafe {
         let mut dib = Dib::new((size, size)).ok()?;
         DrawIconEx(dib.dc, 0, 0, icon, size, size, 0, None, DI_NORMAL).ok()?;
@@ -4516,7 +4601,12 @@ fn aspect(window: &WindowModel) -> f32 {
 fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32) -> (Vec<AppBadge>, usize) {
     // Windows pinned to the row are shown by the row (`RowLayout::pins`).
     let own = || cell.windows.iter().filter(|w| !w.follows);
-    let apps = group_apps(own());
+    // The apps it remembers and does not have come after, drawn faintly.
+    let apps: Vec<(HWND, Option<&String>, usize)> = group_apps(own())
+        .into_iter()
+        .map(|(window, count)| (window.hwnd, None, count))
+        .chain(cell.ghosts.iter().map(|ghost| (HWND(0), Some(&ghost.exe), ghost.count)))
+        .collect();
     let room = cell_w - 16.0 * s;
     let line_gap = 3.0 * s;
     let count_w = |size: f32| (size * 0.62).max(8.0 * s);
@@ -4531,7 +4621,7 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
             let last = line + 1 == lines;
             let (mut n, mut used) = (0, 0.0);
             while i + n < apps.len() {
-                let next = used + width(size, apps[i + n].1) + if n > 0 { between(size) } else { 0.0 };
+                let next = used + width(size, apps[i + n].2) + if n > 0 { between(size) } else { 0.0 };
                 let room = if last && i + n + 1 < apps.len() { room - 26.0 * s } else { room };
                 if next > room {
                     break;
@@ -4574,8 +4664,8 @@ fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), ic
     let mut i = 0;
     for (n, used) in &packed {
         let mut x = body.left + (cell_w - used) / 2.0;
-        for &(window, count) in &apps[i..i + n] {
-            badges.push(AppBadge { hwnd: window.hwnd, icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
+        for &(hwnd, ghost, count) in &apps[i..i + n] {
+            badges.push(AppBadge { hwnd, ghost: ghost.cloned(), icon: rect(x, y, size, size), count, label: rect(x + size + 1.0 * s, y, count_w(size), size) });
             x += width(size, count) + between(size);
         }
         i += n;
@@ -5033,7 +5123,7 @@ mod tests {
             name: String::new(),
             memory: 0,
             asleep: false,
-            cells: cells.iter().map(|id| CellModel { id: id.to_string(), emphasised: false, usage: 0.0, windows: Vec::new() }).collect(),
+            cells: cells.iter().map(|id| CellModel { id: id.to_string(), emphasised: false, usage: 0.0, windows: Vec::new(), ghosts: Vec::new() }).collect(),
         }
     }
 

@@ -47,6 +47,10 @@ compositor = "auto"
 # Coming back may stutter for a moment. 0 turns it off.
 sleep_after_minutes = 0
 
+# Remember the apps in each cell, show them faintly in the overview after a restart, and bring a
+# shelf's back from the menu of its name. false turns all of it off; what was remembered is kept.
+remember = true
+
 # Each device on its own. _x is sideways (along a shelf), _y is up and down (from shelf to shelf).
 #   step: movement needed to commit the next cell, after the axis dead zone; the full Distance is the threshold.
 #   follow: variant F commits after the full Distance, pulls at most 20%, and springs into the next cell.
@@ -118,6 +122,8 @@ pub struct Config {
     pub carry_modifier: String,
     pub hotkeys: bool,
     pub sleep_after_minutes: u32,
+    /// Cells remember their apps, to bring them back (`grid::CellMemory`).
+    pub remember: bool,
     /// The minimap while moving (`overlay`).
     pub minimap: bool,
     /// Which views place window pictures through `composition`.
@@ -203,6 +209,7 @@ impl Default for Config {
             carry_modifier: "shift".into(),
             hotkeys: true,
             sleep_after_minutes: 0,
+            remember: true,
             minimap: false,
             compositor: Compositor::Auto,
             mouse: Mouse::default(),

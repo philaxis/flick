@@ -69,6 +69,11 @@ impl Restore {
         Some(self.claims.remove(at).cell)
     }
 
+    /// Whether the window was there as the restore began, or already seen.
+    pub fn is_known(&self, hwnd: isize) -> bool {
+        self.known.contains(&hwnd)
+    }
+
     /// The claims given up on.
     pub fn expire(&mut self, now_ms: u64) -> Vec<Claim> {
         let (old, kept) = self.claims.drain(..).partition(|claim| now_ms >= claim.since_ms + CLAIM_MS);

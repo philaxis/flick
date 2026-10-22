@@ -3,7 +3,7 @@
 
 use crate::{
     admin,
-    board::{Action, Board, CellModel, Model, RowModel, WindowModel},
+    board::{Action, Board, CellModel, GhostModel, Model, RowModel, WindowModel},
     config::{self, Config},
     follow,
     glide::{self, Glide, Place, Scene, Shot, WM_GLIDE_SETTLED, WM_GLIDE_TARGET},
@@ -12,6 +12,7 @@ use crate::{
     input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_PRESSED, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
     overlay::{CellView, Minimap, Overlay, View},
     raised,
+    restore::{self, Restore},
     settings::{self, Settings},
     stack::{self, Kind},
     tray::{self, Command, PinCommand, PinState, RowCommand},
@@ -21,7 +22,7 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{atomic::{AtomicU32, Ordering}, mpsc},
     time::{Duration, Instant, SystemTime},
 };
@@ -42,7 +43,7 @@ use windows::{
                 GetAsyncKeyState, GetLastInputInfo, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, LASTINPUTINFO,
                 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_UP,
             },
-            Shell::ShellExecuteW,
+            Shell::{ShellExecuteExW, ShellExecuteW, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW},
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
                 GetWindowThreadProcessId, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
@@ -50,7 +51,7 @@ use windows::{
                 RegisterWindowMessageW, SendMessageTimeoutW, SetTimer, ShowWindow, TranslateMessage, SMTO_ABORTIFHUNG, SMTO_BLOCK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
                 MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
                 WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_POWERBROADCAST,
-                WM_NULL, WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+                WM_NULL, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
@@ -68,6 +69,9 @@ const WM_OPEN_SETTINGS: u32 = WM_APP + 12;
 const WM_RESTACK: u32 = WM_APP + 13;
 /// Opens the window showing how Flick is used; sent by a second start.
 const WM_OPEN_GUIDE: u32 = WM_APP + 14;
+/// Brings back the apps of shelf `wparam`, as its menu does; for the test
+/// driver (examples/drive.rs).
+const WM_RESTORE_ROW: u32 = WM_APP + 15;
 
 /// How long the minimap stays after the trigger is released and after a
 /// hotkey (which has no release to wait for).
@@ -101,6 +105,10 @@ const ONWARD_TIMER_ID: usize = 10;
 /// How long Windows goes on showing a cell after telling it is there
 /// (250 was not always enough on a 23H2 PC with a busy CPU, 400 was).
 const ONWARD_MS: u32 = 400;
+/// While a shelf's apps are brought back: starts the next and sends the
+/// windows come up to their cells (`App::restore_tick`).
+const RESTORE_TIMER_ID: usize = 11;
+const RESTORE_TICK_MS: u32 = 250;
 
 /// Whether a window of desktop `id` has the keyboard.
 fn keyboard_held_on(id: &str) -> bool {
@@ -214,6 +222,16 @@ struct App {
     _listener: Option<vdapi::DesktopEventThread>,
     /// The message Explorer broadcasts when the taskbar is (re)created.
     taskbar_created: u32,
+    /// Cells' apps are remembered and can be brought back: the config's
+    /// `remember`, once the config has been read.
+    remember: bool,
+    /// The cells whose remembered apps are shown as ghosts, waiting for
+    /// them to come back: all remembered ones as Flick starts, before any
+    /// window is looked at, so that apps started with Windows ahead of the
+    /// others do not take the memory over (`Grid::update_memory`).
+    ghosting: HashSet<String>,
+    /// The apps of a shelf being brought back.
+    restore: Restore,
 }
 
 /// A hold the screen follows (`input::followed`).
@@ -379,6 +397,7 @@ impl App {
         if let Some(error) = error {
             log(&format!("state.json could not be read, starting from the desktops as they are: {error}"));
         }
+        let ghosting = grid.memory.keys().cloned().collect();
         App {
             hwnd,
             config: Config::default(),
@@ -420,6 +439,9 @@ impl App {
             events,
             _listener: listener,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            remember: false,
+            ghosting,
+            restore: Restore::default(),
         }
     }
 
@@ -438,6 +460,7 @@ impl App {
 
     fn save(&mut self) {
         let now = usage::now();
+        self.remember_cells();
         self.grid.prune_usage(now);
         self.grid.window_usage.retain(|hwnd, score| {
             unsafe { IsWindow(HWND(*hwnd)) }.as_bool() && score.value(now, usage::WINDOW_HALF_LIFE) > 0.0
@@ -449,6 +472,144 @@ impl App {
             }
             Err(e) => log(&format!("saving the grid failed: {e}")),
         }
+    }
+
+    // ---- remembering the apps of the cells ----------------------------------
+
+    /// Each cell's windows as they are remembered, topmost first: not those
+    /// pinned to every shelf or to their own.
+    fn live_apps(&self, windows: &[vd::WindowInfo]) -> BTreeMap<String, Vec<grid::AppMemory>> {
+        let mut cells: BTreeMap<String, Vec<grid::Seen>> = BTreeMap::new();
+        for window in windows {
+            let seen = grid::Seen {
+                exe: vd::exe_path(window.pid),
+                title: window.title.clone(),
+                name: vd::app_label(window.pid),
+                pinned: self.follows(window),
+            };
+            cells.entry(window.desktop.clone()).or_default().push(seen);
+        }
+        cells.into_iter().map(|(id, seen)| (id, grid::remembered(seen))).collect()
+    }
+
+    /// Brings what the cells remember up to what they hold. Says whether
+    /// any memory changed.
+    fn remember_cells(&mut self) -> bool {
+        if !self.remember {
+            return false;
+        }
+        let Some(current) = vdapi::get_current_desktop().ok().map(|d| d.id()) else { return false };
+        let live = self.live_apps(&vd::windows(&current));
+        self.grid.update_memory(&live, &mut self.ghosting, usage::now())
+    }
+
+    /// The remembered apps of cell `id` not alive again, as the board shows
+    /// them: one per app, with how many windows it had.
+    fn ghosts_of(&self, id: &str, live: &[String]) -> Vec<GhostModel> {
+        if !self.remember || !self.ghosting.contains(id) {
+            return Vec::new();
+        }
+        let Some(memory) = self.grid.memory.get(id) else { return Vec::new() };
+        let mut ghosts: Vec<GhostModel> = Vec::new();
+        for app in grid::ghosts(memory, live) {
+            match ghosts.iter_mut().find(|g| grid::exe_file(&g.exe) == app.app()) {
+                Some(ghost) => ghost.count += 1,
+                None => ghosts.push(GhostModel { exe: app.exe.clone(), count: 1 }),
+            }
+        }
+        ghosts
+    }
+
+    /// What bringing back shelf `row` starts: in the order of its cells,
+    /// each app of a cell once however many windows it had.
+    fn row_launches(&self, row: usize) -> Vec<restore::Launch> {
+        let Some(cells) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return Vec::new() };
+        let Some(current) = vdapi::get_current_desktop().ok().map(|d| d.id()) else { return Vec::new() };
+        let windows = vd::windows(&current);
+        cells
+            .iter()
+            .flat_map(|id| {
+                let live: Vec<String> = windows.iter().filter(|w| w.desktop == *id && !self.follows(w)).filter_map(|w| vd::exe_name(w.pid)).collect();
+                self.ghosts_of(id, &live).into_iter().map(|ghost| restore::Launch { cell: id.clone(), exe: ghost.exe, args: String::new() })
+            })
+            .collect()
+    }
+
+    /// Starts the apps shelf `row` remembers and does not have, sending
+    /// each window to its cell; goes to the shelf first, closing the board.
+    fn restore_row(&mut self, row: usize) {
+        let launches = self.row_launches(row);
+        if launches.is_empty() {
+            return;
+        }
+        let Some(desktops) = self.sync() else { return };
+        let Some(shelf) = self.grid.rows.get(row) else { return };
+        let to = if shelf.cells.contains(&desktops.current) { desktops.current.clone() } else { shelf.cells[shelf.anchor()].clone() };
+        if self.board.is_open() {
+            self.leave_board(&to, None);
+        } else if to != desktops.current {
+            if let Some(target) = desktops.get(&to) {
+                if self.switch(target) {
+                    self.visit(&to);
+                }
+            }
+        }
+        let known: Vec<isize> = vd::app_windows().into_iter().map(|hwnd| hwnd.0).collect();
+        debug_log!("restore: {} apps for shelf {row}", launches.len());
+        self.restore.queue(launches, known);
+        self.restore_tick();
+        unsafe {
+            SetTimer(self.hwnd, RESTORE_TIMER_ID, RESTORE_TICK_MS, None);
+        }
+    }
+
+    /// Starts the next app, gives up on those that never came up, and sends
+    /// the windows that did to their cells.
+    fn restore_tick(&mut self) {
+        let now = self.started.elapsed().as_millis() as u64;
+        for claim in self.restore.expire(now) {
+            log(&format!("restore: {} did not come up in time", claim.app));
+        }
+        if let Some(launch) = self.restore.next_launch(now) {
+            start_app(&launch.exe, &launch.args);
+        }
+        for hwnd in vd::app_windows() {
+            if self.restore.is_known(hwnd.0) {
+                continue;
+            }
+            let app = vd::exe_of_window(hwnd).unwrap_or_default();
+            let Some(cell) = self.restore.claim(hwnd.0, &app) else { continue };
+            // Not given the keyboard: the user stays where they are.
+            if vdapi::get_desktop_by_window(hwnd).is_ok_and(|desktop| desktop.id() != cell) {
+                self.move_window(hwnd, Some(cell), None);
+            }
+        }
+        if self.restore.is_done() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, RESTORE_TIMER_ID);
+            }
+            self.restore.reset();
+        }
+    }
+
+    /// Forgets what shelf `row`'s cells remember.
+    fn forget_row(&mut self, row: usize) {
+        let Some(cells) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
+        self.grid.forget(&cells);
+        for id in &cells {
+            self.ghosting.remove(id);
+        }
+        self.save();
+        self.refresh_board();
+    }
+
+    /// Closes every window of shelf `row`, leaving them remembered: its
+    /// cells show them as ghosts, to bring back.
+    fn fold_row(&mut self, row: usize) {
+        self.save();
+        let Some(cells) = self.grid.rows.get(row).map(|r| r.cells.clone()) else { return };
+        self.ghosting.extend(cells.into_iter().filter(|id| self.grid.memory.contains_key(id)));
+        self.close_row_windows(row);
     }
 
     /// Includes ongoing stays in a snapshot, leaving completed history alone
@@ -1597,8 +1758,10 @@ impl App {
                         let (here, rest): (Vec<_>, Vec<_>) = windows.drain(..).partition(|w| w.desktop == *id);
                         windows = rest;
                         pids.extend(here.iter().map(|w| w.pid));
-                        let windows = here.into_iter().map(|w| window_model(self.follows(&w), self.grid.follow_apps.contains(&vd::exe_name(w.pid).unwrap_or_default()), w)).collect();
-                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now), windows }
+                        let windows: Vec<WindowModel> = here.into_iter().map(|w| window_model(self.follows(&w), self.grid.follow_apps.contains(&vd::exe_name(w.pid).unwrap_or_default()), w)).collect();
+                        let live: Vec<String> = windows.iter().filter(|w| !w.follows).map(|w| w.app.clone()).collect();
+                        let ghosts = self.ghosts_of(id, &live);
+                        CellModel { id: id.clone(), emphasised: self.grid.is_emphasised(id), usage: grid.cell_usage(id, now), windows, ghosts }
                     })
                     .collect();
                 RowModel {
@@ -2130,6 +2293,7 @@ impl App {
             }
         }
         self.minimap.set_enabled(config.minimap);
+        self.remember = config.remember;
         self.config = config;
         let trigger = self.settings_view().trigger;
         if let Some(guide) = &mut self.guide { guide.set_trigger(trigger); }
@@ -2406,6 +2570,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             let _ = KillTimer(hwnd, REFRESH_TIMER_ID);
             with_app(App::refresh_board);
         }
+        WM_TIMER if wparam.0 == RESTORE_TIMER_ID => {
+            with_app(App::restore_tick);
+        }
+        WM_RESTORE_ROW => {
+            with_app(|app| app.restore_row(wparam.0));
+        }
+        WM_QUERYENDSESSION => {
+            // Windows is shutting down or restarting: what the cells hold
+            // now is what is brought back.
+            with_app(App::save);
+            return LRESULT(1);
+        }
         WM_TIMER if wparam.0 == SLEEP_TIMER_ID => {
             with_app(App::sleep_idle_rows);
         }
@@ -2418,8 +2594,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     app.refresh_settings();
                 }
                 app.usage_tick();
-                // Piggyback on the existing timer, at most once per half minute.
-                if app.usage_dirty && app.usage_saved.elapsed() >= Duration::from_secs(30) {
+                // Piggyback on the existing timer, at most once per half minute;
+                // what the cells hold, as soon as it changed.
+                if app.remember_cells() || (app.usage_dirty && app.usage_saved.elapsed() >= Duration::from_secs(30)) {
                     app.save();
                 }
             });
@@ -2477,6 +2654,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
     LRESULT(0)
 }
 
+/// Starts an app by its executable, as Explorer would: in its own folder,
+/// the shell asking for elevation or resolving an app alias where needed.
+fn start_app(exe: &str, args: &str) {
+    let (file, parameters) = (HSTRING::from(exe), HSTRING::from(args));
+    let folder = HSTRING::from(exe.rsplit_once(['\\', '/']).map_or("", |(folder, _)| folder));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_FLAG_NO_UI,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: if args.is_empty() { PCWSTR::null() } else { PCWSTR(parameters.as_ptr()) },
+        lpDirectory: if folder.is_empty() { PCWSTR::null() } else { PCWSTR(folder.as_ptr()) },
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
+        log(&format!("restore: {} could not be started: {e}", grid::exe_file(exe)));
+    }
+}
+
 /// Shows the menus a handler asked for. They run after the handler returned
 /// because a menu pumps messages, which must be able to reach the app.
 fn run_pending_menus(owner: HWND) {
@@ -2492,16 +2689,17 @@ fn run_pending_menus(owner: HWND) {
 fn run_row_menu(owner: HWND) {
     let pending = with_app(|app| {
         let row = app.pending_row_menu.take()?;
-        Some((row, app.board.row_summary(row)?, app.grid.rows.len() > 1))
+        Some((row, app.board.row_summary(row)?, app.grid.rows.len() > 1, app.row_launches(row).len(), app.remember))
     })
     .flatten();
-    let Some((row, summary, removable)) = pending else { return };
-    match tray::row_menu(owner, &summary, removable) {
+    let Some((row, summary, removable, ghosts, fold)) = pending else { return };
+    match tray::row_menu(owner, &summary, removable, ghosts, fold) {
         Some(RowCommand::CloseWindows) => {
             // Closing windows can lose work, so it is asked about in earnest,
             // with "No" as the default answer.
+            let kept = if fold { "\nThe windows close and the shelf is left as it was, to bring back." } else { "" };
             let text = format!(
-                "{summary}\n\nThis closes every window in this shelf.\nUnsaved work can be lost, and this cannot be undone.\n\nClose them all?"
+                "{summary}\n\nThis closes every window in this shelf.\nUnsaved work can be lost, and this cannot be undone.{kept}\n\nClose them all?"
             );
             with_app(|app| app.board.set_modal(true));
             let answer = unsafe {
@@ -2509,8 +2707,14 @@ fn run_row_menu(owner: HWND) {
             };
             with_app(|app| app.board.set_modal(false));
             if answer == IDYES {
-                with_app(|app| app.close_row_windows(row));
+                with_app(|app| if fold { app.fold_row(row) } else { app.close_row_windows(row) });
             }
+        }
+        Some(RowCommand::Restore) => {
+            with_app(|app| app.restore_row(row));
+        }
+        Some(RowCommand::Forget) => {
+            with_app(|app| app.forget_row(row));
         }
         Some(RowCommand::Remove) => {
             with_app(|app| app.remove_row(row));
@@ -2888,7 +3092,29 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
             app.grid.usage.entry(id.clone()).or_default().visits.record(now, SAMPLE_USAGE[i % SAMPLE_USAGE.len()], usage::CELL_HALF_LIFE);
         }
     }
+    // What the cells remember is shown as after a restart. FLICK_GHOSTS=<exe>,<exe>
+    // gives the current cell those apps, shown in place of its windows.
+    app.remember = true;
+    let ghosts = std::env::var("FLICK_GHOSTS").ok().map(|exes| {
+        exes.split(',').filter(|exe| !exe.trim().is_empty()).map(|exe| grid::AppMemory {
+            exe: exe.trim().to_owned(),
+            args: String::new(),
+            title: String::new(),
+            name: String::new(),
+        }).collect::<Vec<_>>()
+    });
+    if let Some(apps) = ghosts.clone() {
+        app.grid.remember(&desktops.current, apps, usage::now());
+        app.ghosting.insert(desktops.current.clone());
+    }
     let mut model = app.model(&desktops);
+    if ghosts.is_some() {
+        let ghosts = app.ghosts_of(&desktops.current, &[]);
+        if let Some(cell) = model.rows.iter_mut().flat_map(|row| &mut row.cells).find(|cell| cell.id == desktops.current) {
+            cell.windows.clear();
+            cell.ghosts = ghosts;
+        }
+    }
     if let Some(sizes) = sizes {
         let made_up = sizes.split(',').filter_map(|size| size.trim().split_once('x')).enumerate().filter_map(|(i, (w, h))| {
             let (w, h): (i32, i32) = (w.parse().ok()?, h.parse().ok()?);
