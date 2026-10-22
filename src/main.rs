@@ -47,6 +47,8 @@ mod settings;
 #[cfg(any(windows, test))]
 mod raised;
 #[cfg(any(windows, test))]
+mod restore;
+#[cfg(any(windows, test))]
 mod slide;
 #[cfg(any(windows, test))]
 mod stack;
