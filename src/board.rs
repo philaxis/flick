@@ -989,6 +989,9 @@ pub struct Board {
     /// and to, since when.
     grab_shown: f32,
     grab_glide: (f32, f32, Instant),
+    /// The places on the maps, by monitor, where dropping the window
+    /// picked up would do something, as judged when it was picked up.
+    open_targets: Vec<(usize, Target)>,
     /// How far the dragged window is drawn pulled towards the place it is
     /// over, relative to the pull wanted, easing as a spring, and since when.
     drag_pull: [Spring; 2],
@@ -1102,6 +1105,7 @@ impl Board {
                 picked: None,
                 grab_shown: 0.0,
                 grab_glide: (0.0, 0.0, Instant::now()),
+                open_targets: Vec::new(),
                 drag_pull: [Spring::default(); 2],
                 drag_pull_wanted: (0.0, 0.0),
                 drag_last: None,
@@ -1282,6 +1286,7 @@ impl Board {
         self.end_flight();
         self.picked = None;
         (self.grab_shown, self.grab_glide) = (0.0, (0.0, 0.0, Instant::now()));
+        self.open_targets.clear();
         self.stop_motion();
         self.settle_strip(Instant::now());
         self.clear_thumbnails();
@@ -2930,6 +2935,7 @@ impl Board {
                     let from = self.picture(hwnd).unwrap_or_else(|| rect(x - 1.0, y - 1.0, 2.0, 2.0));
                     self.end_flight();
                     self.picked = Some((hwnd, from));
+                    self.open_targets = self.targets_for(hwnd);
                     self.drag_pull = [Spring::default(); 2];
                     (self.drag_pull_wanted, self.drag_last) = ((0.0, 0.0), None);
                     self.set_grab(true, Instant::now());
@@ -3103,15 +3109,26 @@ impl Board {
         self.dragged_window().or_else(|| self.flight.as_ref().map(|flight| flight.hwnd))
     }
 
+    /// The places on every map where dropping window `hwnd` would do
+    /// something (`window_drop`).
+    fn targets_for(&self, hwnd: isize) -> Vec<(usize, Target)> {
+        self.maps.iter().flat_map(|map| {
+            let layout = &map.layout;
+            let rows = (0..layout.rows.len()).map(Target::Row);
+            let cells = layout.rows.iter().flat_map(|row| &row.cells).map(|cell| Target::Cell(cell.id.clone()));
+            std::iter::once(Target::Rail).chain(rows).chain(cells)
+                .filter(|target| matches!(self.window_drop_on(hwnd, Some(target), map.monitor), WindowDrop::Place { .. }))
+                .map(|target| (map.monitor, target))
+                .collect::<Vec<_>>()
+        }).collect()
+    }
+
     /// How plainly `target` of `map` is shown as a place to drop the window
     /// picked up on: as far as the board has made way for it, where
-    /// dropping it there would do something (`window_drop`); not at all
+    /// dropping it there would do something (`open_targets`); not at all
     /// elsewhere, however near the cursor.
     fn openness(&self, map: &Map, target: &Target) -> f32 {
-        match self.lifted_window().map(|hwnd| self.window_drop_on(hwnd, Some(target), map.monitor)) {
-            Some(WindowDrop::Place { .. }) => self.grab_shown,
-            _ => 0.0,
-        }
+        if self.open_targets.iter().any(|(m, t)| *m == map.monitor && t == target) { self.grab_shown } else { 0.0 }
     }
 
     /// Where on `map` the window picked up was shown small, left open as
@@ -3818,9 +3835,10 @@ impl Board {
     fn draw_chip(&self, p: &Painter, hwnd: HWND, r: &Rect) {
         let s = self.scale;
         let Some((window, _)) = self.model.window(hwnd.0) else { return };
-        // Picked up, it leaves an empty socket of its size, to be put back in.
+        // Picked up, it leaves an empty socket of its size, to be put back
+        // in, opening as the others do and open till it is back.
         if self.lifted_window() == Some(hwnd.0) {
-            self.draw_groove(p, r, 1.0);
+            self.draw_groove(p, r, if self.dragged_window().is_some() { self.grab_shown } else { 1.0 });
             return;
         }
         let pointed = self.pointed(hwnd.0) && self.press.is_none();
