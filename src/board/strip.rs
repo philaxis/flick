@@ -320,6 +320,7 @@ impl Strip {
         self.recede.depth(t)
     }
 
+    #[cfg(test)]
     pub fn row_depth(&self, t: f32) -> f32 {
         self.row_recede.depth(t)
     }
