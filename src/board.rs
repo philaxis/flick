@@ -1628,6 +1628,8 @@ impl Board {
         let strip_moving = self.strip.active(t);
         if strip_moving && !self.strip_on {
             self.strip_on = true;
+            // Sizes kept from a drag may be old by now.
+            self.source_sizes.borrow_mut().clear();
             self.lay_out_strip(None);
             self.register_thumbnails();
         }
@@ -2469,6 +2471,8 @@ impl Board {
         if let Some(flight) = self.flight.take() {
             unsafe { let _ = crate::composition::unregister(flight.thumb); }
             self.thumbnail_state.borrow_mut().remove(&flight.thumb);
+            // Down, the sizes are asked anew (`keeps_sizes`).
+            self.source_sizes.borrow_mut().clear();
         }
     }
 
@@ -2687,8 +2691,10 @@ impl Board {
                 // Its icon stays under it; a dragged window shows none.
                 if let Some(badge) = self.badges.remove(&old) {
                     let _ = crate::composition::unregister(badge);
+                    self.thumbnail_state.borrow_mut().remove(&badge);
                 }
                 let _ = crate::composition::unregister(old);
+                self.thumbnail_state.borrow_mut().remove(&old);
                 if let Ok(thumb) = crate::composition::register(self.hwnd, HWND(hwnd), crate::composition::board_enabled()) {
                     self.thumbs.push((hwnd, thumb));
                 }
@@ -3023,6 +3029,7 @@ impl Board {
                 self.start_flight(hwnd, from, into);
             }
             self.picked = None;
+            self.source_sizes.borrow_mut().clear();
             self.set_grab(false, Instant::now());
             self.start_motion();
             // Put the thumbnail back; a successful move replaces the model anyway.
@@ -3712,7 +3719,7 @@ impl Board {
         for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
             let in_selected_row = selected_row == Some(r);
             self.shifted(p, base, names, || {
-                self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row);
+                self.draw_row_name(p, fonts, r, row, &model.name, in_selected_row, self.openness(map, &Target::Row(r)));
                 self.draw_row_pins(p, fonts, map, r, row, &chips);
             });
             let shift = row.cells.first().map_or((0.0, 0.0), |first| at(Part::Row(map.monitor, first.id.clone())));
@@ -3775,7 +3782,9 @@ impl Board {
         let s = self.scale;
         let near = self.magnet(map, &row.pins);
         let wide = (4.0 * s + DOCK_PART * s / 2.0) * near;
-        Rect { left: row.pins.left - wide, top: row.pins.top - 2.0 * s * near, right: row.pins.right + wide, bottom: row.pins.bottom + 2.0 * s * near }
+        // Never over the name, which it is right before.
+        let right = (row.pins.right + wide).min(row.name.left - 2.0 * s);
+        Rect { left: row.pins.left - wide, top: row.pins.top - 2.0 * s * near, right, bottom: row.pins.bottom + 2.0 * s * near }
     }
 
     /// The windows pinned shown small on `map`, in its coordinates as laid
@@ -4002,7 +4011,8 @@ impl Board {
 
     /// A row's name, on a faint surface as wide as its text while hovered or
     /// edited.
-    fn draw_row_name(&self, p: &Painter, fonts: &Fonts, r: usize, row: &RowLayout, name: &str, in_selected_row: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_row_name(&self, p: &Painter, fonts: &Fonts, r: usize, row: &RowLayout, name: &str, in_selected_row: bool, open: f32) {
         let s = self.scale;
         let editing = self.editing.as_ref().filter(|(row, _)| *row == r);
         let name = match editing {
@@ -4021,8 +4031,10 @@ impl Board {
             p.sheen(&area, 6.0 * s, 0.05);
         }
         let wide = Rect { right, ..row.name };
-        // Nothing to drop on, it sinks as a window is picked up.
-        let sunk = 1.0 - 0.5 * self.grab_shown;
+        // Dropped on, it pins to the row as its place does (`pins_zone`):
+        // it sinks as a window is picked up only where that place is not
+        // open (`open`).
+        let sunk = 1.0 - 0.5 * (self.grab_shown - open).max(0.0);
         p.text(&name, &fonts.small, &wide, white(if in_selected_row || hot { 0.90 } else { 0.45 } * sunk));
     }
 
@@ -4138,15 +4150,17 @@ impl Board {
         let s = self.scale;
         let (cx, cy) = centre(area);
         let half = size(area).0.min(size(area).1) / 2.0;
+        // Nothing to drop on, it sinks as a window is picked up.
+        let sunk = 1.0 - 0.5 * self.grab_shown;
         if hot {
             let arm = half * 0.30;
-            p.disc((cx, cy), half * 0.72, white(0.12));
-            p.line((cx - arm, cy), (cx + arm, cy), 1.6 * s, white(0.92));
-            p.line((cx, cy - arm), (cx, cy + arm), 1.6 * s, white(0.92));
+            p.disc((cx, cy), half * 0.72, white(0.12 * sunk));
+            p.line((cx - arm, cy), (cx + arm, cy), 1.6 * s, white(0.92 * sunk));
+            p.line((cx, cy - arm), (cx, cy + arm), 1.6 * s, white(0.92 * sunk));
         } else {
             let arm = half * 0.20;
-            p.line((cx - arm, cy), (cx + arm, cy), 1.2 * s, white(0.24));
-            p.line((cx, cy - arm), (cx, cy + arm), 1.2 * s, white(0.24));
+            p.line((cx - arm, cy), (cx + arm, cy), 1.2 * s, white(0.24 * sunk));
+            p.line((cx, cy - arm), (cx, cy + arm), 1.2 * s, white(0.24 * sunk));
         }
     }
 
@@ -4637,7 +4651,8 @@ fn layout_chips(windows: &[&WindowModel], h: f32, room: f32, s: f32) -> (Vec<Chi
     let mut left = 0.0;
     for (i, (window, w)) in windows.iter().zip(widths).enumerate() {
         let last = i + 1 == windows.len();
-        if left + w > room - if last { 0.0 } else { more } {
+        // A little slack, for the same windows laid out again to fit again.
+        if left + w > room - if last { 0.0 } else { more } + 0.01 * s {
             break;
         }
         chips.push(Chip { hwnd: window.hwnd, rect: rect(left, 0.0, w, h) });
