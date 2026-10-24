@@ -4731,8 +4731,13 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32, here: 
     let mut layout = MapLayout { top: y, bounds: rect(x0, y, total_w, total_h), chip: chip_h, ..MapLayout::default() };
     let everywhere: Vec<&WindowModel> = model.pinned.iter().filter(|w| here(w)).collect();
     let rail_h = if everywhere.is_empty() { 18.0 * s } else { chip_h + 2.0 * pad_v };
-    layout.rail = rect(x0, y - 5.0 * s - rail_h, total_w, rail_h);
-    let (chips, more) = layout_chips(&everywhere, chip_h, total_w - 16.0 * s, s);
+    // The rail is as wide as the map on either side of the spine, so that
+    // its middle is the spine's, but no wider than the monitor allows.
+    let middle = spine_x + cell_w / 2.0;
+    let half = (middle - x0).max(x0 + total_w - middle);
+    let (rail_left, rail_right) = ((middle - half).max(margin.min(x0)), (middle + half).min((w - margin).max(x0 + total_w)));
+    layout.rail = rect(rail_left, y - 5.0 * s - rail_h, rail_right - rail_left, rail_h);
+    let (chips, more) = layout_chips(&everywhere, chip_h, rail_right - rail_left - 16.0 * s, s);
     let (cx, chips_w) = (centre(&layout.rail).0, chips_width(&chips, more, s));
     let chip_top = layout.rail.top + (rail_h - chip_h) / 2.0;
     layout.rail_chips = chips.into_iter().map(|chip| Chip { rect: shifted_rect(&chip.rect, cx - chips_w / 2.0, chip_top), ..chip }).collect();
@@ -5087,6 +5092,8 @@ mod tests {
             // short of it, the names are at the margin.
             let middle = (centre(&first.spine).0 - size.0 / 2.0).abs() < 0.01;
             assert!(middle || (size.0 < 1920.0 && first.bounds.left == 60.0 * s), "the spine off the middle at {size:?}");
+            // The rail over it is centred on the spine too.
+            assert!(!middle || (centre(&first.rail).0 - size.0 / 2.0).abs() < 0.01, "the rail off the middle at {size:?}");
         }
     }
 
@@ -5304,7 +5311,7 @@ mod tests {
                 let cells: Vec<&Rect> = layout.rows.iter().flat_map(|r| &r.cells).map(|c| &c.body).collect();
                 let pluses: Vec<&Rect> = layout.rows.iter().flat_map(|r| [&r.plus, &r.plus_left]).chain([&layout.add_row, &layout.add_row_top]).collect();
                 let rail = rail_zone(&layout, s);
-                assert!(layout.rail.bottom <= layout.top && layout.rail.left == layout.bounds.left && layout.rail.right == layout.bounds.right);
+                assert!(layout.rail.bottom <= layout.top && layout.rail.left <= layout.bounds.left && layout.rail.right >= layout.bounds.right && layout.rail.left >= 0.0 && layout.rail.right <= area.0);
                 assert!(layout.rail.top >= 0.0 && layout.bounds.bottom <= area.1, "the map off the screen at {area:?}");
                 assert!(cells.iter().all(|c| !overlaps(c, &rail)), "the rail on a cell at {area:?}");
                 assert_eq!(layout.rail_chips.len() + layout.rail_more, everywhere as usize);
