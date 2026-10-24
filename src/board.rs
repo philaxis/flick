@@ -2377,13 +2377,13 @@ impl Board {
         self.tile_picture(hwnd).or_else(|| self.chip_picture(hwnd)).or_else(|| self.chip_place(hwnd))
     }
 
-    /// Where the picture of the dragged window `hwnd` is shown: held at the
-    /// point it was picked up by, as large as its preview was; the nearer
-    /// the cursor comes to the map, the smaller, down to `DRAGGED_SMALL`,
-    /// and the more it hangs over the cursor, leaving what is under it to
-    /// be seen; and pulled a little towards the place it is over. One
-    /// pinned, picked up small on the map, grows the other way: the
-    /// farther above the map, the larger, up to a preview's size.
+    /// Where the picture of the dragged window `hwnd` is shown: as large as
+    /// its preview was, the nearer the cursor comes to the map the smaller,
+    /// down to `DRAGGED_SMALL`, and pulled a little towards the place it is
+    /// over. One pinned, picked up small on the map, grows the other way:
+    /// the farther above the map, the larger, up to a preview's size. Of
+    /// whatever size, it is held under the cursor by the point of it that
+    /// was picked up, as a share of its width and height.
     fn dragged_picture(&self, hwnd: isize) -> Option<Rect> {
         let (_, from) = self.picked.filter(|(picked, _)| *picked == hwnd)?;
         let press = self.press.as_ref()?;
@@ -2394,23 +2394,20 @@ impl Board {
         let top = map.area.top + map.layout.rail.top;
         let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
         let pinned = self.model.window(hwnd).is_some_and(|(window, everywhere)| everywhere || window.follows);
-        let (k, near) = match self.plates.get(map.monitor).filter(|_| pinned) {
+        let k = match self.plates.get(map.monitor).filter(|_| pinned) {
             Some(plate) => {
                 let far = smooth(((top - self.cursor.1) / ((top - plate.top) * 0.5).max(160.0 * s)).clamp(0.0, 1.0));
                 let large = ((size(plate).1 * 0.4).min(TILE_MAX.1 * s) / h.max(1.0)).min(size(plate).0 * 0.5 / w.max(1.0)).max(1.0);
-                // It comes off the point it was picked up by as it leaves.
-                let moved = ((self.cursor.0 - press.x).hypot(self.cursor.1 - press.y) / (40.0 * s)).clamp(0.0, 1.0);
-                (1.0 + (large - 1.0) * far, (1.0 - far) * moved)
+                1.0 + (large - 1.0) * far
             }
             None => {
                 let near = smooth(((self.cursor.1 - press.y) / (top - press.y).max(40.0 * s)).clamp(0.0, 1.0));
                 let small = (DRAGGED_SMALL * s / w.max(h).max(1.0)).min(1.0);
-                (1.0 + (small - 1.0) * near, near)
+                1.0 + (small - 1.0) * near
             }
         };
         let (w, h) = (w * k, h * k);
-        let hang = (0.5, 1.0 + 12.0 * s / h.max(1.0));
-        let (ax, ay) = (held.0 + (hang.0 - held.0) * near, held.1 + (hang.1 - held.1) * near);
+        let (ax, ay) = held;
         let x = self.cursor.0 + self.drag_pull_wanted.0 + self.drag_pull[0].offset;
         let y = self.cursor.1 + self.drag_pull_wanted.1 + self.drag_pull[1].offset;
         Some(rect(x - ax * w, y - ay * h, w, h))
@@ -4721,7 +4718,10 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32, here: 
 
     let total_w = header_w + plus + gap + columns * pitch + plus;
     let total_h = plus + gap + rows * row_pitch + plus;
-    let x0 = ((w - total_w) / 2.0).max(margin);
+    // The spine down the middle of the monitor, the names left of it as far
+    // as they need; only where there is no room for that is it pushed right.
+    let to_spine = header_w + plus + gap + lead as f32 * pitch + cell_w / 2.0;
+    let x0 = (w / 2.0 - to_spine).min(w - margin - total_w).max(margin);
     let mut y = h - total_h - 10.0 * s;
     let cells_x = x0 + header_w + plus + gap;
     let spine_x = cells_x + lead as f32 * pitch;
@@ -5083,6 +5083,10 @@ mod tests {
             assert_eq!(after.rows[0].cells[0].body.left, before.rows[0].cells[0].body.left - before.pitch);
             assert_eq!(after.rows[0].cells[1].body.left, before.rows[0].cells[0].body.left);
             assert!(after.rows[0].cells[1].body.left >= after.spine.left);
+            // With room enough, the spine is down the middle of the monitor;
+            // short of it, the names are at the margin.
+            let middle = (centre(&first.spine).0 - size.0 / 2.0).abs() < 0.01;
+            assert!(middle || (size.0 < 1920.0 && first.bounds.left == 60.0 * s), "the spine off the middle at {size:?}");
         }
     }
 
