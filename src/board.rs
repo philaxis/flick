@@ -330,7 +330,7 @@ impl FrameClock {
         self.shared.posted.store(false, Ordering::SeqCst);
     }
 
-    /// The board took the wake-up out of its queue.
+    /// The board drew the frame it was woken for.
     fn frame_taken(&self) {
         self.shared.posted.store(false, Ordering::SeqCst);
     }
@@ -2792,12 +2792,16 @@ impl Board {
                 Action::None
             }
             WM_BOARD_FRAME => {
-                self.clock.frame_taken();
                 if self.motion_timer {
                     let now = Instant::now();
                     self.vblank_frame = Some(now);
                     self.tick_motion(now, wparam.0 != 0);
                 }
+                // Only once the frame is drawn: posted messages are taken
+                // before the mouse's, so a wake-up queued while a frame
+                // longer than a refresh was drawn would keep the mouse out
+                // for as long as the motion goes on.
+                self.clock.frame_taken();
                 Action::None
             }
             WM_TIMER if wparam.0 == ON_TOP_TIMER_ID => {
