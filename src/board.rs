@@ -1810,7 +1810,7 @@ impl Board {
         for (m, monitor) in self.monitors.iter().enumerate() {
             let is_home = *monitor == self.home;
             let (w, h) = size(monitor);
-            // A window pinned is shown small on the map of the monitor it is on.
+            // Each monitor's map shows only the windows on that monitor.
             let layout = layout_map(&self.model, &anchors, (w, h - FOOTER * s), s, &|window| self.monitor_of(window) == m);
             // The home monitor has the shelf's name above its tiles; the
             // rail of the map is under them.
@@ -4512,11 +4512,11 @@ fn aspect(window: &WindowModel) -> f32 {
 }
 
 /// The badges of one map cell (`body`, of size `cell_w` by `cell_h`), one per
-/// app in the order its windows are stacked, centred in the cell: as many as
-/// fit, and how many did not.
-fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32) -> (Vec<AppBadge>, usize) {
+/// app of its windows `here` (on the map's monitor) in the order they are
+/// stacked, centred in the cell: as many as fit, and how many did not.
+fn layout_badges(cell: &CellModel, body: &Rect, (cell_w, cell_h): (f32, f32), icon: f32, s: f32, here: &dyn Fn(&WindowModel) -> bool) -> (Vec<AppBadge>, usize) {
     // Windows pinned to the row are shown by the row (`RowLayout::pins`).
-    let own = || cell.windows.iter().filter(|w| !w.follows);
+    let own = || cell.windows.iter().filter(|w| !w.follows && here(w));
     let apps = group_apps(own());
     let room = cell_w - 16.0 * s;
     let line_gap = 3.0 * s;
@@ -4755,7 +4755,7 @@ fn layout_map(model: &Model, anchors: &[usize], size: (f32, f32), s: f32, here: 
         let mut cells = Vec::new();
         for cell in &row.cells {
             let body = rect(x, y, cell_w, cell_h);
-            let (apps, more) = layout_badges(cell, &body, (cell_w, cell_h), icon, s);
+            let (apps, more) = layout_badges(cell, &body, (cell_w, cell_h), icon, s, here);
             cells.push(CellLayout {
                 id: cell.id.clone(),
                 emphasised: cell.emphasised,
