@@ -10,6 +10,7 @@ use crate::{
     guide::{self, Guide},
     grid::{self, Dir, Grid, Pos, Row},
     input::{self, Hand, Trigger, WM_CAPTURED, WM_CLICK, WM_DRAG, WM_PRESSED, WM_RELEASE, WM_ROWS, WM_SLIDE, WM_STEP},
+    newwin,
     overlay::{CellView, Minimap, Overlay, View},
     raised,
     settings::{self, Settings},
@@ -45,7 +46,7 @@ use windows::{
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow, GetMessageW,
-                GetWindowThreadProcessId, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT,
+                GetWindowThreadProcessId, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
                 IsIconic, IsWindow, KillTimer, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
                 RegisterWindowMessageW, SendMessageTimeoutW, SetTimer, ShowWindow, TranslateMessage, SMTO_ABORTIFHUNG, SMTO_BLOCK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING,
                 MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, PM_NOREMOVE, PM_REMOVE, SW_HIDE, SW_RESTORE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
@@ -68,6 +69,9 @@ const WM_OPEN_SETTINGS: u32 = WM_APP + 12;
 const WM_RESTACK: u32 = WM_APP + 13;
 /// Opens the window showing how Flick is used; sent by a second start.
 const WM_OPEN_GUIDE: u32 = WM_APP + 14;
+/// A top-level window was shown: a rule may say where it goes
+/// (`App::new_window_shown`).
+const WM_NEW_WINDOW: u32 = WM_APP + 15;
 
 /// How long the minimap stays after the trigger is released and after a
 /// hotkey (which has no release to wait for).
@@ -98,6 +102,12 @@ const FLIGHT_TIMER_ID: usize = 9;
 const FLIGHT_MS: u32 = 1000;
 /// One-shot timer that goes on from a cell passed by (`App::go_on`).
 const ONWARD_TIMER_ID: usize = 10;
+/// One-shot timer that moves the new windows shown just now
+/// (`App::apply_new_windows`).
+const NEW_WINDOW_TIMER_ID: usize = 11;
+/// Apps position their own windows right after showing them: the move waits
+/// this long and then looks again.
+const NEW_WINDOW_MOVE_MS: u32 = 150;
 /// How long Windows goes on showing a cell after telling it is there
 /// (250 was not always enough on a 23H2 PC with a busy CPU, 400 was).
 const ONWARD_MS: u32 = 400;
@@ -106,6 +116,11 @@ const ONWARD_MS: u32 = 400;
 fn keyboard_held_on(id: &str) -> bool {
     let window = unsafe { GetForegroundWindow() };
     vdapi::get_desktop_by_window(window).is_ok_and(|desktop| desktop.id() == id)
+}
+
+/// Whether two screen rectangles are the same monitor.
+fn same_screen(a: RECT, b: RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
 }
 
 fn onward_ms() -> u32 {
@@ -214,6 +229,32 @@ struct App {
     _listener: Option<vdapi::DesktopEventThread>,
     /// The message Explorer broadcasts when the taskbar is (re)created.
     taskbar_created: u32,
+    /// Foreground app windows recently, oldest first, for finding where a new
+    /// window came from (`newwin::source_window`).
+    front_history: Vec<newwin::FrontWindow>,
+    /// New windows waiting for the move their rule asks for, and whether the
+    /// one-shot timer that makes it is set.
+    pending_windows: Vec<PendingWindow>,
+    new_window_timer: bool,
+    /// Window handles already looked at when shown, so that a second showing
+    /// of the same window does not count as a new one.
+    seen_windows: HashSet<isize>,
+}
+
+/// A window just shown, with where its rule says it goes.
+struct PendingWindow {
+    window: HWND,
+    /// The window it came from; the keyboard goes back to it unless the rule
+    /// follows.
+    source: HWND,
+    /// The destination cell and monitor (by device id), and whether the user
+    /// goes there with the window.
+    desktop: String,
+    monitor: String,
+    follow: bool,
+    /// The desktop the user was on when the window appeared, to go back to
+    /// if Windows follows the window by itself.
+    before: String,
 }
 
 /// A hold the screen follows (`input::followed`).
@@ -275,6 +316,22 @@ unsafe extern "system" fn foreground_changed(
     _time: u32,
 ) {
     let _ = PostMessageW(HWND(MAIN_HWND.get()), WM_RESTACK, WPARAM(hwnd.0 as usize), LPARAM(0));
+}
+
+/// Told by Windows of each top-level window that is shown. The app decides
+/// there whether a rule fits it (`App::new_window_shown`).
+unsafe extern "system" fn window_shown(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    object: i32,
+    child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if object == OBJID_WINDOW.0 && child == 0 && hwnd.0 != 0 {
+        let _ = PostMessageW(HWND(MAIN_HWND.get()), WM_NEW_WINDOW, WPARAM(hwnd.0 as usize), LPARAM(0));
+    }
 }
 
 /// Runs `f` on the app unless it is already borrowed, which happens when a
@@ -420,6 +477,10 @@ impl App {
             events,
             _listener: listener,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            front_history: Vec::new(),
+            pending_windows: Vec::new(),
+            new_window_timer: false,
+            seen_windows: HashSet::new(),
         }
     }
 
@@ -631,6 +692,252 @@ impl App {
         if !flicks {
             self.raised.brought(hwnd);
         }
+    }
+
+    // ---- where new windows go ------------------------------------------------
+
+    /// Notes a window that came to the front, for finding where a new one came
+    /// from: app windows only, never Flick's own.
+    fn note_foreground(&mut self, hwnd: HWND) {
+        if hwnd.0 == 0 || !vd::is_app_window(hwnd) {
+            return;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid == unsafe { GetCurrentProcessId() } {
+            return;
+        }
+        if self.front_history.last().is_some_and(|entry| entry.hwnd == hwnd.0) {
+            return;
+        }
+        const KEEP: usize = 8;
+        self.front_history.push(newwin::FrontWindow { hwnd: hwnd.0, since: Instant::now() });
+        if self.front_history.len() > KEEP {
+            self.front_history.remove(0);
+        }
+    }
+
+    /// Windows already there when Flick starts are not new windows.
+    fn seed_seen_windows(&mut self) {
+        self.seen_windows.extend(vd::app_windows().into_iter().map(|hwnd| hwnd.0));
+    }
+
+    /// The window a new window came from, by the foreground history.
+    fn source_for_new_window(&self, new: HWND) -> Option<HWND> {
+        let foreground = unsafe { GetForegroundWindow() };
+        newwin::source_window(&self.front_history, new.0, foreground.0, Instant::now()).map(|entry| HWND(entry.hwnd))
+    }
+
+    /// Whether a window is pinned to every desktop or follows the user: such a
+    /// window is not moved anywhere (`restack_clicked` tells them apart).
+    fn follows_or_pinned(&self, hwnd: HWND) -> bool {
+        if vd::pinned_everywhere(hwnd) {
+            return true;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        self.follows_window(hwnd, pid)
+    }
+
+    /// The cell and monitor a rule sends a window from `source` to. None while
+    /// either is gone: the rule sleeps.
+    fn rule_destination(&self, rule: &newwin::NewWindowRule, source: HWND, desktops: &Desktops) -> Option<(String, RECT)> {
+        let cell = match &rule.cell {
+            newwin::RuleCell::Source => vdapi::get_desktop_by_window(source).ok().map(|desktop| desktop.id()),
+            newwin::RuleCell::Fixed(id) => desktops.get(id).map(|desktop| desktop.id()),
+        }?;
+        let monitor = vd::monitor_bounds(&rule.monitor)?;
+        Some((cell, monitor))
+    }
+
+    /// A top-level window was shown. A rule that fits the window it came from
+    /// puts it on a cell and monitor, a moment after the app has placed it.
+    fn new_window_shown(&mut self, window: HWND) {
+        if window.0 == 0 || self.seen_windows.contains(&window.0) {
+            return;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        if pid == unsafe { GetCurrentProcessId() } || !vd::is_app_window(window) {
+            return;
+        }
+        self.seen_windows.insert(window.0);
+        if self.seen_windows.len() > 512 {
+            self.seen_windows.retain(|&hwnd| unsafe { IsWindow(HWND(hwnd)) }.as_bool());
+        }
+        if self.follows_or_pinned(window) {
+            debug_log!("newwin: {:x} is pinned or follows, left alone", window.0);
+            return;
+        }
+        let Some(desktops) = Desktops::read() else { return };
+        let Some(source) = self.source_for_new_window(window) else {
+            debug_log!("newwin: {:x} has no source window", window.0);
+            return;
+        };
+        let (Some(source_exe), Some(new_exe)) = (vd::exe_of_window(source), vd::exe_of_window(window)) else { return };
+        let source_title = vd::window_title(source);
+        let Some(rule) = newwin::find(&self.grid.new_window_rules, &source_exe, &source_title, &new_exe) else {
+            debug_log!("newwin: {:x} ({new_exe}) from {source_exe} has no rule", window.0);
+            return;
+        };
+        let Some((desktop, _)) = self.rule_destination(rule, source, &desktops) else {
+            debug_log!("newwin: the rule for {:x} sleeps (cell or monitor gone)", window.0);
+            return;
+        };
+        debug_log!(
+            "newwin: {:x} ({new_exe}) from {source_exe} ({source_title:?}) goes to {} on {}",
+            window.0,
+            &desktop[..4.min(desktop.len())],
+            rule.monitor
+        );
+        self.pending_windows.push(PendingWindow {
+            window,
+            source,
+            desktop,
+            monitor: rule.monitor.clone(),
+            follow: rule.follow,
+            before: desktops.current,
+        });
+        if !self.new_window_timer {
+            self.new_window_timer = true;
+            unsafe { SetTimer(self.hwnd, NEW_WINDOW_TIMER_ID, NEW_WINDOW_MOVE_MS, None); }
+        }
+    }
+
+    /// The moment given to apps to place their windows has passed: move those
+    /// that are still here.
+    fn apply_new_windows(&mut self) {
+        let pending = std::mem::take(&mut self.pending_windows);
+        for item in pending {
+            if !unsafe { IsWindow(item.window) }.as_bool() || !vd::is_app_window(item.window) {
+                continue;
+            }
+            self.send_window(item.window, item.source, &item.desktop, &item.monitor, item.follow, &item.before);
+        }
+        self.seen_windows.retain(|&hwnd| unsafe { IsWindow(HWND(hwnd)) }.as_bool());
+    }
+
+    /// Moves `window` to `desktop` and the monitor `monitor` names, then puts
+    /// the keyboard where the rule says: on the new window when the user
+    /// follows it, otherwise back on the source window.
+    fn send_window(&mut self, window: HWND, source: HWND, desktop: &str, monitor: &str, follow: bool, before: &str) {
+        if self.follows_or_pinned(window) {
+            debug_log!("newwin: {:x} is pinned or follows, left alone", window.0);
+            return;
+        }
+        let Some(desktops) = Desktops::read() else { return };
+        let Some(target) = desktops.get(desktop) else {
+            debug_log!("newwin: cell {} is gone, the rule sleeps", &desktop[..4.min(desktop.len())]);
+            return;
+        };
+        let Some(bounds) = vd::monitor_bounds(monitor) else {
+            debug_log!("newwin: monitor {monitor} is gone, the rule sleeps");
+            return;
+        };
+        if let Err(e) = vdapi::move_window_to_desktop(target, window) {
+            log(&format!("moving new window {:x} to {desktop} failed: {e:?}", window.0));
+            return;
+        }
+        vd::move_to_monitor(window, bounds);
+        debug_log!("newwin: {:x} to {} on {monitor}", window.0, &desktop[..4.min(desktop.len())]);
+        if follow {
+            if desktop == desktops.current {
+                return;
+            }
+            if self.switch(target) {
+                self.visit(desktop);
+                self.going = Some((desktop.to_owned(), Instant::now()));
+                vd::force_foreground(window);
+            }
+            return;
+        }
+        // The user stays where they were. Windows may have followed a window
+        // of another cell by itself (the new one, or a tab's): go back, then
+        // hand the keyboard to the source.
+        let now = Desktops::read().map_or_else(|| desktops.current.clone(), |d| d.current);
+        let returned = now != before;
+        if returned {
+            let Some(back) = Desktops::read().and_then(|d| d.get(before)) else { return };
+            if !self.switch(back) {
+                return;
+            }
+            self.visit(before);
+            self.going = Some((before.to_owned(), Instant::now()));
+        } else if desktop != before {
+            // Windows may yet follow the new window by itself; `desktop_changed`
+            // brings the user back when it does (`going`).
+            self.going = Some((before.to_owned(), Instant::now()));
+        }
+        if unsafe { IsWindow(source) }.as_bool()
+            && (vd::pinned_everywhere(source) || vdapi::get_desktop_by_window(source).is_ok_and(|d| d.id() == before))
+        {
+            vd::force_foreground(source);
+        } else if returned {
+            // The source is gone: give the keyboard to a window of the cell,
+            // or Windows would follow the window left behind.
+            vd::focus_top_window_of(before);
+        }
+    }
+
+    /// A click on a link opened a tab in a window already there: the foreground
+    /// changed from the window a rule fits to that window, without the user
+    /// asking. It is moved as a new window would be.
+    fn tab_followed(&mut self, window: HWND) {
+        if self.board.is_open()
+            || self.in_flight.is_some()
+            || self.gliding.is_some()
+            || self.going.as_ref().is_some_and(|(_, when)| when.elapsed() < Duration::from_millis(GOING_SETTLES_MS))
+        {
+            return;
+        }
+        if window.0 == 0 || vd::was_forced(window) || !vd::is_app_window(window) {
+            return;
+        }
+        if vd::cursor_over(window) || vd::cursor_over_shell() {
+            return;
+        }
+        if self.pending_windows.iter().any(|pending| pending.window == window) {
+            return;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+        if pid == unsafe { GetCurrentProcessId() } || unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0 {
+            return;
+        }
+        let now = Instant::now();
+        let Some(current) = self.front_history.iter().rev().find(|entry| entry.hwnd == window.0) else { return };
+        if now.saturating_duration_since(current.since) > newwin::SOURCE_WINDOW {
+            return;
+        }
+        let Some(previous) = newwin::previous_window(&self.front_history, window.0) else { return };
+        let source = HWND(previous.hwnd);
+        if source == window || !unsafe { IsWindow(source) }.as_bool() {
+            return;
+        }
+        let (Some(source_exe), Some(new_exe)) = (vd::exe_of_window(source), vd::exe_of_window(window)) else { return };
+        let source_title = vd::window_title(source);
+        let Some(rule) = newwin::find(&self.grid.new_window_rules, &source_exe, &source_title, &new_exe) else { return };
+        let Some(desktops) = Desktops::read() else { return };
+        let Some((desktop, bounds)) = self.rule_destination(rule, source, &desktops) else {
+            debug_log!("newwin: the tab rule for {:x} sleeps (cell or monitor gone)", window.0);
+            return;
+        };
+        if vdapi::get_desktop_by_window(window).ok().is_some_and(|d| d.id() == desktop)
+            && vd::monitor_of_window(window).is_some_and(|here| same_screen(here, bounds))
+        {
+            debug_log!("newwin: tab window {:x} is already at its destination", window.0);
+            return;
+        }
+        debug_log!(
+            "newwin: tab {:x} ({new_exe}) from {source_exe} goes to {} on {}",
+            window.0,
+            &desktop[..4.min(desktop.len())],
+            rule.monitor
+        );
+        let follow = rule.follow;
+        let monitor = rule.monitor.clone();
+        let before = vdapi::get_desktop_by_window(source).ok().map(|d| d.id()).unwrap_or_else(|| desktops.current.clone());
+        self.send_window(window, source, &desktop, &monitor, follow, &before);
     }
 
     /// Puts the pinned windows on cell `id`, come to, where they go among its
@@ -2431,11 +2738,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(|app| {
                 let window = HWND(wparam.0 as _);
                 app.record_foreground(window);
+                app.note_foreground(window);
+                app.tab_followed(window);
                 app.came_to_front(window);
                 app.restack_clicked(window);
             });
             admin_in_front(HWND(wparam.0 as _));
             let _ = SetTimer(hwnd, RESTACK_TIMER_ID, 120, None);
+        }
+        WM_NEW_WINDOW => {
+            with_app(|app| app.new_window_shown(HWND(wparam.0 as _)));
+        }
+        WM_TIMER if wparam.0 == NEW_WINDOW_TIMER_ID => {
+            with_app(|app| {
+                let _ = KillTimer(app.hwnd, NEW_WINDOW_TIMER_ID);
+                app.new_window_timer = false;
+                app.apply_new_windows();
+            });
         }
         WM_TIMER if wparam.0 == RESTACK_TIMER_ID => {
             let _ = KillTimer(hwnd, RESTACK_TIMER_ID);
@@ -2623,6 +2942,7 @@ pub fn run(first_run: bool) {
             0,
             WINEVENT_OUTOFCONTEXT,
         );
+        SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(window_shown), 0, 0, WINEVENT_OUTOFCONTEXT);
     }
     let mut app = App::new(hwnd, board, settings, events, listener);
     app.guide = Some(guide);
@@ -2639,6 +2959,8 @@ pub fn run(first_run: bool) {
         app.commit();
     }
     app.record_foreground(unsafe { GetForegroundWindow() });
+    app.note_foreground(unsafe { GetForegroundWindow() });
+    app.seed_seen_windows();
     app.apply_config();
     unsafe {
         SetTimer(hwnd, CONFIG_TIMER_ID, CONFIG_CHECK_MS, None);
