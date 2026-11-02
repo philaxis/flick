@@ -204,16 +204,23 @@ pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
         .find(|c| *c as usize == picked)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum NewWindowCommand {
+    App = 1,
+    Window,
+}
+
 /// The menu of a window tile on the board, where rules for the new windows
 /// it opens are made from. `source` is what the tile shows; `rules` are the
-/// ones that already apply to it, shown as notes under the item.
-pub fn new_window_menu(owner: HWND, source: &str, rules: &[String]) -> bool {
-    let menu = unsafe { CreatePopupMenu() }.ok();
-    let Some(menu) = menu else { return false };
+/// ones that already apply to it, shown as notes under the items.
+pub fn new_window_menu(owner: HWND, source: &str, rules: &[String]) -> Option<NewWindowCommand> {
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
     add_note(menu, source);
     add_separator(menu);
-    let label = tr("New windows it opens go…", "이 창이 여는 새 창은…", "此窗口打开的新窗口…");
-    add_item(menu, 1, PCWSTR(HSTRING::from(label).as_ptr()), false);
+    let app = tr("New windows this app opens go…", "이 앱이 여는 새 창은…", "此应用打开的新窗口…");
+    add_item(menu, NewWindowCommand::App as usize, PCWSTR(HSTRING::from(app).as_ptr()), false);
+    let window = tr("New windows this window opens go…", "이 창이 여는 새 창은…", "此窗口打开的新窗口…");
+    add_item(menu, NewWindowCommand::Window as usize, PCWSTR(HSTRING::from(window).as_ptr()), false);
     if !rules.is_empty() {
         add_separator(menu);
         for rule in rules {
@@ -223,7 +230,8 @@ pub fn new_window_menu(owner: HWND, source: &str, rules: &[String]) -> bool {
     unsafe {
         let _ = SetForegroundWindow(owner);
     }
-    pick(menu, owner) == 1
+    let picked = pick(menu, owner);
+    [NewWindowCommand::App, NewWindowCommand::Window].into_iter().find(|c| *c as usize == picked)
 }
 
 #[derive(Clone, Copy, PartialEq)]

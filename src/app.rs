@@ -2125,6 +2125,11 @@ impl App {
                     self.grid.new_window_rules.remove(index);
                 }
             }
+            Action::SetNewWindowRuleFollow(index, on) => {
+                if let Some(rule) = self.grid.new_window_rules.get_mut(index) {
+                    rule.follow = on;
+                }
+            }
         }
         self.commit();
         self.refresh_board();
