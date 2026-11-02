@@ -41,7 +41,7 @@ use windows::{
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, GetLastInputInfo, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, LASTINPUTINFO,
-                MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_MENU, VK_RIGHT, VK_SHIFT, VK_UP,
+                MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_DOWN, VK_LEFT, VK_LWIN, VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
@@ -241,6 +241,9 @@ struct App {
     seen_windows: HashSet<isize>,
     /// Windows shown without a title yet, to look at again with the timer.
     untitled_windows: Vec<isize>,
+    /// When Flick last switched the desktop. The window Windows then brings
+    /// to the front is not one a link opened (`tab_followed`).
+    switched_at: Cell<Option<Instant>>,
 }
 
 /// A window just shown, with where its rule says it goes.
@@ -484,6 +487,7 @@ impl App {
             new_window_timer: false,
             seen_windows: HashSet::new(),
             untitled_windows: Vec::new(),
+            switched_at: Cell::new(None),
         }
     }
 
@@ -613,6 +617,7 @@ impl App {
     /// Switches to a desktop without Windows' own name label popping up.
     /// Returns whether that worked.
     fn switch(&self, target: vdapi::Desktop) -> bool {
+        self.switched_at.set(Some(Instant::now()));
         vd::set_switch_label_hidden(true);
         unsafe {
             SetTimer(self.hwnd, LABEL_TIMER_ID, LABEL_HIDE_MS, None);
@@ -907,6 +912,14 @@ impl App {
             return;
         }
         if window.0 == 0 || vd::was_forced(window) || !vd::is_app_window(window) {
+            return;
+        }
+        // Going to another cell brings a window of it to the front, after
+        // the switch: Flick's own, or Windows' with the Win key held.
+        if self.switched_at.get().is_some_and(|at| at.elapsed() < newwin::SOURCE_WINDOW)
+            || crate::input::holding()
+            || [VK_LWIN, VK_RWIN].iter().any(|key| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+        {
             return;
         }
         if vd::cursor_over(window) || vd::cursor_over_shell() {
