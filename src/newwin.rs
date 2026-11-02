@@ -62,13 +62,16 @@ pub struct FrontWindow {
     pub since: Instant,
 }
 
-/// The window a new window `new` came from: the one just before it in
-/// `history`, while that one is the foreground window still or came there no
-/// longer than `SOURCE_WINDOW` ago. `foreground` is the window with the
-/// keyboard now, 0 for none.
+/// The window a new window `new` came from: the last one in `history`
+/// other than `new`, while it is the foreground window still or left the
+/// front (when the next one came there) no longer than `SOURCE_WINDOW` ago.
+/// A window in front for an hour before a link in it was clicked counts.
+/// `foreground` is the window with the keyboard now, 0 for none.
 pub fn source_window(history: &[FrontWindow], new: isize, foreground: isize, now: Instant) -> Option<FrontWindow> {
-    let entry = history.iter().rev().find(|entry| entry.hwnd != new)?;
-    (entry.hwnd == foreground || now.saturating_duration_since(entry.since) <= SOURCE_WINDOW).then_some(*entry)
+    let at = history.iter().rposition(|entry| entry.hwnd != new)?;
+    let entry = history[at];
+    let left = history.get(at + 1).map(|next| next.since);
+    (entry.hwnd == foreground || left.is_some_and(|left| now.saturating_duration_since(left) <= SOURCE_WINDOW)).then_some(entry)
 }
 
 /// The window in front just before `hwnd` last came to the front, skipping
@@ -104,13 +107,12 @@ mod tests {
         let now = std::time::Instant::now();
         let recent = now.checked_sub(Duration::from_millis(500)).unwrap();
         let old = now.checked_sub(Duration::from_secs(5)).unwrap();
-        let history = [entry(1, old), entry(2, recent), entry(3, recent)];
-        // The new window itself is skipped.
-        assert_eq!(source_window(&history, 3, 3, now).map(|entry| entry.hwnd), Some(2));
+        // In front long before, the new window came to the front just now.
+        assert_eq!(source_window(&[entry(1, old), entry(2, recent)], 2, 2, now).map(|entry| entry.hwnd), Some(1));
         // Still in front is enough however long ago it came there.
-        assert_eq!(source_window(&history, 4, 2, now).map(|entry| entry.hwnd), Some(3));
-        // Too old and not in front: there is no source.
-        assert_eq!(source_window(&[entry(1, old)], 4, 0, now), None);
+        assert_eq!(source_window(&[entry(1, old)], 4, 1, now).map(|entry| entry.hwnd), Some(1));
+        // Left the front long ago: there is no source.
+        assert_eq!(source_window(&[entry(1, old), entry(2, old)], 2, 2, now), None);
     }
 
     #[test]

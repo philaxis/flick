@@ -79,6 +79,11 @@ impl Desktops {
 
 /// A window the user would think of as "a window": visible, unowned, titled,
 /// and not a tool window (which also excludes our own overlay).
+/// Whether a window is top-level (not a control inside another window).
+pub fn is_top_level(hwnd: HWND) -> bool {
+    unsafe { GetAncestor(hwnd, GA_ROOT) == hwnd }
+}
+
 pub fn is_app_window(hwnd: HWND) -> bool {
     unsafe {
         hwnd.0 != 0

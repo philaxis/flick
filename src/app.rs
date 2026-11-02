@@ -239,6 +239,8 @@ struct App {
     /// Window handles already looked at when shown, so that a second showing
     /// of the same window does not count as a new one.
     seen_windows: HashSet<isize>,
+    /// Windows shown without a title yet, to look at again with the timer.
+    untitled_windows: Vec<isize>,
 }
 
 /// A window just shown, with where its rule says it goes.
@@ -481,6 +483,7 @@ impl App {
             pending_windows: Vec::new(),
             new_window_timer: false,
             seen_windows: HashSet::new(),
+            untitled_windows: Vec::new(),
         }
     }
 
@@ -752,13 +755,26 @@ impl App {
 
     /// A top-level window was shown. A rule that fits the window it came from
     /// puts it on a cell and monitor, a moment after the app has placed it.
-    fn new_window_shown(&mut self, window: HWND) {
-        if window.0 == 0 || self.seen_windows.contains(&window.0) {
+    /// A window that has no title yet when shown is looked at once more a
+    /// moment later (`retry`).
+    fn new_window_shown(&mut self, window: HWND, retry: bool) {
+        // Controls inside windows are shown too: only top-level windows count.
+        if window.0 == 0 || self.seen_windows.contains(&window.0) || !vd::is_top_level(window) {
             return;
         }
         let mut pid = 0;
         unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
-        if pid == unsafe { GetCurrentProcessId() } || !vd::is_app_window(window) {
+        if pid == unsafe { GetCurrentProcessId() } {
+            return;
+        }
+        if !vd::is_app_window(window) {
+            if !retry && vd::window_title(window).is_empty() && !self.untitled_windows.contains(&window.0) {
+                self.untitled_windows.push(window.0);
+                if !self.new_window_timer {
+                    self.new_window_timer = true;
+                    unsafe { SetTimer(self.hwnd, NEW_WINDOW_TIMER_ID, NEW_WINDOW_MOVE_MS, None); }
+                }
+            }
             return;
         }
         self.seen_windows.insert(window.0);
@@ -2747,13 +2763,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             let _ = SetTimer(hwnd, RESTACK_TIMER_ID, 120, None);
         }
         WM_NEW_WINDOW => {
-            with_app(|app| app.new_window_shown(HWND(wparam.0 as _)));
+            with_app(|app| app.new_window_shown(HWND(wparam.0 as _), false));
         }
         WM_TIMER if wparam.0 == NEW_WINDOW_TIMER_ID => {
             with_app(|app| {
                 let _ = KillTimer(app.hwnd, NEW_WINDOW_TIMER_ID);
                 app.new_window_timer = false;
                 app.apply_new_windows();
+                for window in std::mem::take(&mut app.untitled_windows) {
+                    app.new_window_shown(HWND(window), true);
+                }
             });
         }
         WM_TIMER if wparam.0 == RESTACK_TIMER_ID => {
