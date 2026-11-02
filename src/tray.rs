@@ -204,6 +204,28 @@ pub fn pin_menu(owner: HWND, state: PinState) -> Option<PinCommand> {
         .find(|c| *c as usize == picked)
 }
 
+/// The menu of a window tile on the board, where rules for the new windows
+/// it opens are made from. `source` is what the tile shows; `rules` are the
+/// ones that already apply to it, shown as notes under the item.
+pub fn new_window_menu(owner: HWND, source: &str, rules: &[String]) -> bool {
+    let menu = unsafe { CreatePopupMenu() }.ok();
+    let Some(menu) = menu else { return false };
+    add_note(menu, source);
+    add_separator(menu);
+    let label = tr("New windows it opens go…", "이 창이 여는 새 창은…", "此窗口打开的新窗口…");
+    add_item(menu, 1, PCWSTR(HSTRING::from(label).as_ptr()), false);
+    if !rules.is_empty() {
+        add_separator(menu);
+        for rule in rules {
+            add_note(menu, rule);
+        }
+    }
+    unsafe {
+        let _ = SetForegroundWindow(owner);
+    }
+    pick(menu, owner) == 1
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum RowCommand {
     CloseWindows = 1,
