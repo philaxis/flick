@@ -11,6 +11,7 @@ mod strip;
 
 use crate::{
     grid::{self, CellId, Dir, Grid, Pos},
+    newwin::{NewWindowRule, RuleCell},
     pin::Pin,
     paint::{self, accent, rect, rgba, warm, white, Canvas, Dib, Glow, Painter, Rect},
     tiles::{self, Space},
@@ -225,11 +226,62 @@ pub enum Action {
     /// Move a shelf to before row `at`, counted without the moved one.
     MoveRow { from: usize, at: usize },
     Rename(usize, String),
+    /// Keep a rule for where the new windows of a window's program go.
+    AddNewWindowRule(NewWindowRule),
+    /// Forget a rule, by its place in the grid's list (oldest first).
+    RemoveNewWindowRule(usize),
+}
+
+/// The window a rule is being made for: what the tile shows and the cell it
+/// is on.
+#[derive(Clone)]
+struct RuleSource {
+    exe: String,
+    title: String,
+    cell: CellId,
+}
+
+/// The steps of making a rule from a window tile: which word its title must
+/// hold, where the new windows go, and, for a fixed cell, whether the user
+/// goes there too.
+enum RuleFlow {
+    Words { source: RuleSource },
+    Destination { source: RuleSource, title_word: String },
+    Follow { source: RuleSource, title_word: String, cell: CellId, monitor: String },
+}
+
+/// Why a rule does nothing now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleSleep {
+    MonitorGone,
+    CellGone,
+}
+
+/// The chips shown while a rule is being made, in the home monitor's
+/// coordinates.
+struct RuleChoiceLayout {
+    panel: Rect,
+    prompt: String,
+    sub: String,
+    chips: Vec<(Rect, String)>,
+}
+
+/// The open list of rules, in the home monitor's coordinates.
+struct RulePanelLayout {
+    panel: Rect,
+    /// One line per rule, newest first.
+    lines: Vec<Rect>,
+    /// The × at the right of each line.
+    deletes: Vec<Rect>,
 }
 
 /// Height of the line at the bottom that says what the thing under the
 /// cursor is or does (shown the first time, and with ?), in unscaled units.
 const FOOTER: f32 = 44.0;
+
+/// How long a note about a rule that could not be made stays up.
+const RULE_NOTICE_MS: u32 = 4000;
+const RULE_NOTICE_TIMER_ID: usize = 6;
 
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
@@ -803,6 +855,15 @@ enum Hit {
     AddRow,
     AddRowTop,
     RowName(usize),
+    /// The "Rules (n)" toggle of the board, and a blank part of the list it
+    /// opens: the latter takes the click so that it does not close the board.
+    RulesToggle,
+    RulePanel,
+    /// The × of a rule, by its place in the list as shown (newest first).
+    RuleDelete(usize),
+    /// A chip of the rule being made: a word of the title, "any title", or
+    /// one of the two choices about following.
+    RuleChoice(usize),
 }
 
 /// Where a dragged cell would be dropped.
@@ -1008,6 +1069,12 @@ pub struct Board {
     /// Shell windows put out of the way while the board is open
     /// (`keep_on_top`), to be given back when it closes.
     pushed_aside: Vec<HWND>,
+    /// The rule being made from a tile, while the board shows its steps.
+    rule_flow: Option<RuleFlow>,
+    /// The list of rules is open. Kept in memory only, not saved.
+    rules_open: bool,
+    /// Why a rule could not be made, and when that was found.
+    rule_notice: Option<(String, Instant)>,
 }
 
 impl Board {
@@ -1116,6 +1183,9 @@ impl Board {
                 flight: None,
                 chip_thumbs: Vec::new(),
                 pushed_aside: Vec::new(),
+                rule_flow: None,
+                rules_open: false,
+                rule_notice: None,
             })
         }
     }
@@ -1189,6 +1259,8 @@ impl Board {
         self.settle_strip(Instant::now());
         self.clock.refresh();
         self.refused = None;
+        self.rule_flow = None;
+        self.rule_notice = None;
         self.stop_editing();
         self.open = true;
         self.window_failed = false;
@@ -1300,10 +1372,13 @@ impl Board {
         }
         // Keep the D2D target for repeated trigger presses; ensure_canvas handles resizing.
         self.press = None;
+        self.rule_flow = None;
+        self.rule_notice = None;
         self.stop_motion();
         unsafe {
             let _ = ReleaseCapture();
             let _ = KillTimer(self.hwnd, ON_TOP_TIMER_ID);
+            let _ = KillTimer(self.hwnd, RULE_NOTICE_TIMER_ID);
             ShowWindow(self.hwnd, SW_HIDE);
             for window in self.pushed_aside.drain(..) {
                 crate::vd::put_notice_away(window);
@@ -1957,7 +2032,251 @@ impl Board {
         Hit::Window { cell, hwnd }
     }
 
+    /// What the "Rules (n)" toggle says.
+    fn rules_label(&self) -> String {
+        let label = crate::i18n::text("Rules", "규칙", "规则");
+        format!("{label} ({})", self.grid.new_window_rules.len())
+    }
+
+    /// Where the rules toggle is drawn, at the upper right of the home
+    /// monitor, clear of the shelf's name.
+    fn rules_toggle_area(&self) -> Rect {
+        let s = self.scale;
+        let label = self.rules_label();
+        let width = (text_width(&label, 12.0 * s) + 20.0 * s).max(54.0 * s);
+        rect(self.home.right - 40.0 * s - width, self.home.top + 18.0 * s, width, 22.0 * s)
+    }
+
+    /// The open list of rules, newest first, under the toggle.
+    fn rules_panel_layout(&self) -> Option<RulePanelLayout> {
+        if !self.rules_open || self.rule_flow.is_some() {
+            return None;
+        }
+        let count = self.grid.new_window_rules.len();
+        if count == 0 {
+            return None;
+        }
+        let s = self.scale;
+        let (home_w, _) = size(&self.home);
+        let width = (home_w - 80.0 * s).min(640.0 * s).max(280.0 * s);
+        let pad = 12.0 * s;
+        let line_h = 24.0 * s;
+        let toggle = self.rules_toggle_area();
+        let panel = rect(self.home.right - 40.0 * s - width, toggle.bottom + 6.0 * s, width, 2.0 * pad + count as f32 * line_h);
+        let lines: Vec<Rect> = (0..count)
+            .map(|i| rect(panel.left + pad, panel.top + pad + i as f32 * line_h, width - 2.0 * pad, line_h))
+            .collect();
+        let deletes: Vec<Rect> = lines
+            .iter()
+            .map(|line| rect(line.right - 20.0 * s, line.top + 2.0 * s, 20.0 * s, 20.0 * s))
+            .collect();
+        Some(RulePanelLayout { panel, lines, deletes })
+    }
+
+    /// The chips of the rule being made: its title's words and "any title",
+    /// or the two choices about following it to a fixed cell.
+    fn rule_choice_layout(&self) -> Option<RuleChoiceLayout> {
+        let (prompt, sub, labels) = match self.rule_flow.as_ref()? {
+            RuleFlow::Words { source } => {
+                let mut labels = title_words(&source.title);
+                labels.push(crate::i18n::text("Any title", "제목 상관없음", "任意标题").to_owned());
+                let prompt = crate::i18n::text("Which word in its title?", "제목에서 어떤 단어?", "标题中的哪个词？");
+                let sub = if source.title.trim().is_empty() { source.exe.clone() } else { format!("{} · {}", source.exe, source.title) };
+                (prompt.to_owned(), sub, labels)
+            }
+            RuleFlow::Follow { source, title_word, cell, .. } => {
+                let word = if title_word.is_empty() {
+                    crate::i18n::text("any title", "제목 상관없음", "任意标题").to_owned()
+                } else {
+                    format!("'{title_word}'")
+                };
+                let dest = cell_display(&self.grid, cell).unwrap_or_else(|| cell.clone());
+                let prompt = crate::i18n::text("Where should they be?", "새 창이 갈 곳은?", "新窗口去哪里？");
+                let sub = format!("{} · {} → {}", source.exe, word, dest);
+                let labels = vec![
+                    crate::i18n::text("Go there too", "나도 따라가기", "我也过去").to_owned(),
+                    crate::i18n::text("Leave it there", "여기 두기", "留在此处").to_owned(),
+                ];
+                (prompt.to_owned(), sub, labels)
+            }
+            RuleFlow::Destination { .. } => return None,
+        };
+        let s = self.scale;
+        let (home_w, _) = size(&self.home);
+        let width = (home_w - 80.0 * s).min(760.0 * s).max(320.0 * s);
+        let pad = 16.0 * s;
+        let inner = width - 2.0 * pad;
+        let chip_h = 30.0 * s;
+        let gap = 8.0 * s;
+        let mut placed: Vec<(f32, f32, f32, String)> = Vec::new();
+        let (mut x, mut y) = (0.0, 0.0);
+        for label in labels {
+            let chip_w = (text_width(&label, 12.0 * s) + 22.0 * s).min(inner);
+            if x > 0.0 && x + chip_w > inner {
+                x = 0.0;
+                y += chip_h + gap;
+            }
+            placed.push((x, y, chip_w, label));
+            x += chip_w + gap;
+        }
+        let header_h = 42.0 * s;
+        let rows_h = if placed.is_empty() { 0.0 } else { y + chip_h };
+        let panel = rect(
+            self.home.left + (home_w - width) / 2.0,
+            self.home.top + 82.0 * s,
+            width,
+            2.0 * pad + header_h + if placed.is_empty() { 0.0 } else { gap + rows_h },
+        );
+        let chips = placed
+            .into_iter()
+            .map(|(dx, dy, w, label)| (rect(panel.left + pad + dx, panel.top + pad + header_h + gap + dy, w, chip_h), label))
+            .collect();
+        Some(RuleChoiceLayout { panel, prompt, sub, chips })
+    }
+
+    /// Which monitor (as `monitors` counts them) has the device id `id`.
+    fn monitor_number(&self, id: &str) -> Option<usize> {
+        (0..self.monitors.len()).find(|&m| self.monitor_on_screen(m).and_then(vd::monitor_id).as_deref() == Some(id))
+    }
+
+    /// The part of a rule's UI at a point, if any. While a rule is being
+    /// made only its chips answer; the rest of the board is its own again
+    /// once the destination is being picked.
+    fn rule_hit(&self, x: f32, y: f32) -> Option<Hit> {
+        if self.rule_flow.is_some() {
+            let choice = self.rule_choice_layout()?;
+            for (i, (area, _)) in choice.chips.iter().enumerate() {
+                if contains(area, x, y) {
+                    return Some(Hit::RuleChoice(i));
+                }
+            }
+            return contains(&choice.panel, x, y).then_some(Hit::RulePanel);
+        }
+        if contains(&self.rules_toggle_area(), x, y) {
+            return Some(Hit::RulesToggle);
+        }
+        let panel = self.rules_panel_layout()?;
+        if !contains(&panel.panel, x, y) {
+            return None;
+        }
+        for (i, area) in panel.deletes.iter().enumerate() {
+            if contains(area, x, y) {
+                return Some(Hit::RuleDelete(i));
+            }
+        }
+        Some(Hit::RulePanel)
+    }
+
+    /// Opens the menu of a window tile, from which a rule for the new
+    /// windows it opens is made. The rules that already fit it are shown
+    /// under the item.
+    fn new_window_menu(&mut self, hwnd: isize) -> Action {
+        let Some((window, _)) = self.model.window(hwnd) else { return Action::None };
+        let source = RuleSource {
+            exe: window.app.clone(),
+            title: window.title.clone(),
+            cell: self.model.cell_of(hwnd).map_or_else(|| self.selected.clone(), |cell| cell.id.clone()),
+        };
+        let notes: Vec<String> = rules_for_window(&self.grid.new_window_rules, &source.exe, &source.title)
+            .into_iter()
+            .map(|rule| rule_summary(rule, &self.grid, self.monitor_number(&rule.monitor)))
+            .collect();
+        let header = if source.title.trim().is_empty() {
+            source.exe.clone()
+        } else {
+            format!("{} · {}", source.exe, source.title)
+        };
+        if crate::tray::new_window_menu(self.hwnd, &header, &notes) {
+            self.rule_notice = None;
+            self.rule_flow = Some(RuleFlow::Words { source });
+            self.invalidate();
+        }
+        Action::None
+    }
+
+    /// Handles a click on the rule UI. `None` when the hit is not part of it.
+    fn rule_click(&mut self, hit: &Hit) -> Option<Action> {
+        match hit {
+            Hit::RulesToggle => {
+                self.rules_open = !self.rules_open;
+                self.invalidate();
+                Some(Action::None)
+            }
+            Hit::RuleDelete(shown) => {
+                let count = self.grid.new_window_rules.len();
+                Some(if *shown < count { Action::RemoveNewWindowRule(count - 1 - *shown) } else { Action::None })
+            }
+            Hit::RuleChoice(index) => Some(self.rule_choice_clicked(*index)),
+            _ => None,
+        }
+    }
+
+    /// One of the chips of the rule being made was picked.
+    fn rule_choice_clicked(&mut self, index: usize) -> Action {
+        match self.rule_flow.take() {
+            Some(RuleFlow::Words { source }) => {
+                // The last chip is "any title", with no word to look for.
+                let title_word = title_words(&source.title).into_iter().nth(index).unwrap_or_default();
+                self.rule_flow = Some(RuleFlow::Destination { source, title_word });
+                self.invalidate();
+                Action::None
+            }
+            Some(RuleFlow::Follow { source, title_word, cell, monitor }) => {
+                let follow = index == 0;
+                Action::AddNewWindowRule(NewWindowRule { exe: source.exe, title_word, cell: RuleCell::Fixed(cell), monitor, follow })
+            }
+            flow => {
+                self.rule_flow = flow;
+                Action::None
+            }
+        }
+    }
+
+    /// A cell of a map was picked as where the new windows go. The source
+    /// window's own cell means wherever it is; another cell asks once more
+    /// whether the user goes there too.
+    fn rule_destination(&mut self, cell: CellId, x: f32, y: f32) -> Action {
+        let Some(RuleFlow::Destination { source, title_word }) = self.rule_flow.take() else { return Action::None };
+        let Some((_, monitor)) = self.cell_at(x, y) else { return Action::None };
+        let Some(bounds) = self.monitor_on_screen(monitor) else { return Action::None };
+        let Some(monitor_id) = vd::monitor_id(bounds) else {
+            let note = crate::i18n::text(
+                "No rule was made: that monitor has no id",
+                "규칙을 만들지 못했습니다: 그 모니터에 id가 없습니다",
+                "未能创建规则：该显示器没有 id",
+            );
+            self.show_rule_notice(note);
+            return Action::None;
+        };
+        if cell == source.cell {
+            Action::AddNewWindowRule(NewWindowRule {
+                exe: source.exe,
+                title_word,
+                cell: RuleCell::Source,
+                monitor: monitor_id,
+                follow: false,
+            })
+        } else {
+            self.rule_flow = Some(RuleFlow::Follow { source, title_word, cell, monitor: monitor_id });
+            self.invalidate();
+            Action::None
+        }
+    }
+
+    /// A rule could not be made: the board says why for a moment and the
+    /// step is dropped.
+    fn show_rule_notice(&mut self, note: &str) {
+        self.rule_notice = Some((note.to_owned(), Instant::now()));
+        unsafe {
+            SetTimer(self.hwnd, RULE_NOTICE_TIMER_ID, RULE_NOTICE_MS, None);
+        }
+        self.invalidate();
+    }
+
     fn hit_test(&self, x: f32, y: f32) -> Hit {
+        if let Some(hit) = self.rule_hit(x, y) {
+            return hit;
+        }
         if let Some(tile) = self.tiles.iter().find(|tile| contains(&tile.frame, x, y)) {
             if contains(&tile.top, x, y) {
                 return Hit::Top(tile.hwnd.0);
@@ -2086,7 +2405,7 @@ impl Board {
     /// back, and the selected cell's again, easing forward, once the cursor
     /// is off the map. Pressed, it comes forward as it is gone to.
     fn update_peek(&mut self, now: Instant) {
-        if self.strip_on || self.motion.is_moving() || crate::input::holding() {
+        if self.rule_flow.is_some() || self.strip_on || self.motion.is_moving() || crate::input::holding() {
             return;
         }
         let (map, x, y) = self.map_at(self.cursor.0, self.cursor.1);
@@ -2767,11 +3086,20 @@ impl Board {
             }
             WM_LBUTTONUP => self.mouse_up(x, y),
             WM_RBUTTONUP => match self.hit_test(x, y) {
+                Hit::Window { hwnd, .. } if self.rule_flow.is_none() => self.new_window_menu(hwnd),
                 Hit::Cell(id) | Hit::CellClose(id) => Action::ToggleEmphasis(id),
                 // A window shown small by a row's name is not the row.
                 Hit::Window { .. } | Hit::Top(_) | Hit::TileClose(_) => Action::None,
+                Hit::RulesToggle | Hit::RulePanel | Hit::RuleDelete(_) | Hit::RuleChoice(_) => Action::None,
+                _ if self.rule_flow.is_some() => Action::None,
                 _ => self.row_header_at(x, y).map_or(Action::None, Action::RowMenu),
             },
+            WM_TIMER if wparam.0 == RULE_NOTICE_TIMER_ID => {
+                unsafe { let _ = KillTimer(self.hwnd, RULE_NOTICE_TIMER_ID); }
+                self.rule_notice = None;
+                self.invalidate();
+                Action::None
+            }
             WM_KEYDOWN => self.key_down(wparam.0 as u16),
             WM_TIMER if wparam.0 == PEEK_TIMER_ID => {
                 unsafe { let _ = KillTimer(self.hwnd, PEEK_TIMER_ID); }
@@ -2898,6 +3226,14 @@ impl Board {
             self.invalidate();
             return Action::None;
         }
+        if self.rule_flow.is_some() {
+            if key == VK_ESCAPE.0 {
+                self.rule_flow = None;
+                self.rule_notice = None;
+                self.invalidate();
+            }
+            return Action::None;
+        }
         match key {
             k if k == VK_LEFT.0 => return Action::Step(Dir::Left),
             k if k == VK_RIGHT.0 => return Action::Step(Dir::Right),
@@ -2935,7 +3271,7 @@ impl Board {
         if let Some(press) = &mut self.press {
             // A window is dragged to a cell, a monitor, or a place of the
             // pinned windows (or out of one).
-            let draggable = matches!(&press.hit, Hit::Window { .. } | Hit::Cell(_) | Hit::RowName(_));
+            let draggable = self.rule_flow.is_none() && matches!(&press.hit, Hit::Window { .. } | Hit::Cell(_) | Hit::RowName(_));
             let mut raise = None;
             if !press.dragging && draggable && (x - press.x).hypot(y - press.y) > threshold {
                 press.dragging = true;
@@ -2995,6 +3331,27 @@ impl Board {
         // Let go of, a dragged window's picture flies from under the cursor.
         let flying = self.dragged_window().and_then(|hwnd| Some((hwnd, self.dragged_picture(hwnd)?)));
         let Some(press) = self.press.take() else { return Action::None };
+        if !press.dragging {
+            let released = self.hit_test(x, y);
+            self.hover = released.clone();
+            if released == press.hit {
+                if let Some(action) = self.rule_click(&released) {
+                    self.invalidate();
+                    return action;
+                }
+                if let Hit::Cell(id) = &press.hit {
+                    if matches!(self.rule_flow, Some(RuleFlow::Destination { .. })) {
+                        let action = self.rule_destination(id.clone(), x, y);
+                        self.invalidate();
+                        return action;
+                    }
+                }
+            }
+            if self.rule_flow.is_some() {
+                self.invalidate();
+                return Action::None;
+            }
+        }
         // Where a drag ends is judged by the board as it was dragged over,
         // before the cell released on is peeked at and its windows shown.
         let dropped = press.dragging.then(|| match &press.hit {
@@ -3208,6 +3565,8 @@ impl Board {
             Hit::AddRowTop => Action::AddRow { top: true },
             // Renaming takes a double click.
             Hit::RowName(_) => Action::None,
+            // The rule UI is handled before a click comes this far.
+            Hit::RulesToggle | Hit::RulePanel | Hit::RuleDelete(_) | Hit::RuleChoice(_) => Action::None,
             // A click on nothing dismisses the board, like Task View, at its
             // selection.
             Hit::Nothing => Action::Cancel,
@@ -3385,6 +3744,27 @@ impl Board {
     /// What the line at the bottom says, shown the first time and when ?
     /// is pressed: what can be done with the thing under the cursor.
     fn footer(&self) -> Option<(String, f32)> {
+        if let Some(flow) = &self.rule_flow {
+            let t = crate::i18n::text;
+            let line = match flow {
+                RuleFlow::Words { .. } => t(
+                    "Pick a word in the title   ·   Esc: cancel",
+                    "제목에서 단어를 고르세요   ·   Esc: 취소",
+                    "选择标题中的一个词   ·   Esc：取消",
+                ),
+                RuleFlow::Destination { .. } => t(
+                    "Click a cell on the monitor where they should go   ·   Esc: cancel",
+                    "새 창이 갈 모니터의 지도에서 칸을 누르세요   ·   Esc: 취소",
+                    "在目标显示器地图上点击格子   ·   Esc：取消",
+                ),
+                RuleFlow::Follow { .. } => t(
+                    "Go there with them, or leave them there   ·   Esc: cancel",
+                    "새 창과 함께 갈지, 여기 둘지 고르세요   ·   Esc: 취소",
+                    "选择一起过去还是留在此处   ·   Esc：取消",
+                ),
+            };
+            return Some((line.to_owned(), 0.68));
+        }
         if !self.hints {
             return None;
         }
@@ -3422,6 +3802,9 @@ impl Board {
             Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
             Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
             Hit::AddRow | Hit::AddRowTop => hint("Add a shelf"),
+            Hit::RulesToggle => hint(if self.rules_open { "Click: hide the rules" } else { "Click: show the rules" }),
+            Hit::RuleDelete(_) => hint("Click: forget this rule"),
+            Hit::RulePanel | Hit::RuleChoice(_) => None,
             Hit::Nothing => hint("Point at a cell to see its windows   ·   Drag windows onto the map to move or pin them   ·   ?: hide these hints"),
         }
     }
@@ -3434,9 +3817,101 @@ impl Board {
             let row = grid::row_title(self.model.rows.get(pos.row).map_or("", |row| &row.name), pos.row);
             p.text(&row, &fonts.label, &self.label, white(if self.peek.is_some() { 0.62 } else { 0.86 }));
         }
+        self.draw_rules_toggle(p, fonts);
+        self.draw_rules_panel(p, fonts);
+        self.draw_rule_choices(p, fonts);
         if let Some((line, alpha)) = self.footer() {
             p.text(&line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
         }
+        self.draw_rule_notice(p, fonts);
+    }
+
+    /// The small "Rules (n)" toggle at the upper right of the home monitor.
+    fn draw_rules_toggle(&self, p: &Painter, fonts: &Fonts) {
+        if self.rule_flow.is_some() {
+            return;
+        }
+        let s = self.scale;
+        let area = self.rules_toggle_area();
+        let hot = self.hover == Hit::RulesToggle;
+        if hot {
+            p.fill(&area, 8.0 * s, white(0.06));
+        }
+        p.text(&self.rules_label(), &fonts.centered, &area, white(if hot { 0.86 } else { 0.44 }));
+    }
+
+    /// The open list of rules, newest first, each line with a × to forget
+    /// it. A rule that does nothing now is dimmed and says why.
+    fn draw_rules_panel(&self, p: &Painter, fonts: &Fonts) {
+        let Some(layout) = self.rules_panel_layout() else { return };
+        let s = self.scale;
+        let count = self.grid.new_window_rules.len();
+        self.surface(p, &layout.panel, 12.0 * s, 0.12, 0.96, 1.0);
+        for (shown, (line, delete)) in layout.lines.iter().zip(&layout.deletes).enumerate() {
+            let Some(rule) = self.grid.new_window_rules.get(count - 1 - shown) else { continue };
+            let monitor = self.monitor_number(&rule.monitor);
+            let connected = vd::monitor_bounds(&rule.monitor).is_some();
+            let cell_there = match &rule.cell {
+                RuleCell::Source => true,
+                RuleCell::Fixed(id) => self.grid.find(id).is_some(),
+            };
+            let sleep = rule_sleep(rule, connected, cell_there);
+            let mut text = rule_summary(rule, &self.grid, monitor);
+            match sleep {
+                Some(RuleSleep::MonitorGone) => {
+                    text.push_str("  ");
+                    text.push_str(crate::i18n::text("(monitor not connected)", "(모니터 연결 안 됨)", "(显示器未连接)"));
+                }
+                Some(RuleSleep::CellGone) => {
+                    text.push_str("  ");
+                    text.push_str(crate::i18n::text("(cell removed)", "(셀이 사라짐)", "(格子已删除)"));
+                }
+                None => {}
+            }
+            let text_area = rect(line.left, line.top, line.right - line.left - 26.0 * s, line.bottom - line.top);
+            p.text(&text, &fonts.small, &text_area, white(if sleep.is_some() { 0.42 } else { 0.82 }));
+            let hot = self.hover == Hit::RuleDelete(shown);
+            if hot {
+                p.disc(centre(delete), 9.0 * s, white(0.08));
+            }
+            let (cx, cy) = centre(delete);
+            let arm = 3.0 * s;
+            let ink = white(if hot { 0.90 } else { 0.42 });
+            p.line((cx - arm, cy - arm), (cx + arm, cy + arm), 1.3 * s, ink);
+            p.line((cx - arm, cy + arm), (cx + arm, cy - arm), 1.3 * s, ink);
+        }
+    }
+
+    /// The chips of the rule being made: the words of a title and "any
+    /// title", or the two choices about following it to a fixed cell.
+    fn draw_rule_choices(&self, p: &Painter, fonts: &Fonts) {
+        let Some(layout) = self.rule_choice_layout() else { return };
+        let s = self.scale;
+        let pad = 16.0 * s;
+        self.surface(p, &layout.panel, 14.0 * s, 0.15, 0.98, 1.0);
+        let inner = layout.panel.right - layout.panel.left - 2.0 * pad;
+        let prompt = rect(layout.panel.left + pad, layout.panel.top + pad, inner, 20.0 * s);
+        p.text(&layout.prompt, &fonts.label, &prompt, white(0.92));
+        let sub = rect(layout.panel.left + pad, layout.panel.top + pad + 20.0 * s, inner, 16.0 * s);
+        p.text(&layout.sub, &fonts.small, &sub, white(0.48));
+        for (i, (area, label)) in layout.chips.iter().enumerate() {
+            let hot = self.hover == Hit::RuleChoice(i);
+            self.surface(p, area, 8.0 * s, if hot { 0.18 } else { 0.11 }, 1.0, if hot { 0.5 } else { 0.0 });
+            p.stroke(area, 8.0 * s, 1.0 * s, if hot { accent(0.65) } else { white(0.10) });
+            p.text(label, &fonts.centered, area, white(if hot { 0.96 } else { 0.78 }));
+        }
+    }
+
+    /// Why a rule could not be made, at the bottom of the home monitor for
+    /// a moment.
+    fn draw_rule_notice(&self, p: &Painter, fonts: &Fonts) {
+        let Some((note, at)) = &self.rule_notice else { return };
+        if at.elapsed().as_millis() >= RULE_NOTICE_MS as u128 {
+            return;
+        }
+        let s = self.scale;
+        let (w, h) = size(&self.home);
+        p.text(note, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), danger(0.95));
     }
 
     /// A surface standing off the dark: its soft shadow (`lift` from 0 to
@@ -3604,6 +4079,7 @@ impl Board {
         let dim = if dragged { 0.35 } else { 1.0 };
         let body = if tile.icon_only { tile.frame } else { tile.thumb };
         let (bw, _) = size(&body);
+        let ruled = !rules_for_window(&self.grid.new_window_rules, &window.app, &window.title).is_empty();
         let lift = if window.topmost { 1.0 } else if pointed { 0.4 } else { 0.0 };
         if let Some(glows) = &self.glows {
             if pointed && !dragged {
@@ -3617,6 +4093,9 @@ impl Board {
             match icon {
                 Some(bitmap) => p.bitmap(bitmap, &centred(bw * 0.62), dim),
                 None => p.disc(centre(&body), bw * 0.16, white(0.20 * dim)),
+            }
+            if ruled {
+                self.draw_rule_badge(p, &body, dim);
             }
             return;
         }
@@ -3648,6 +4127,17 @@ impl Board {
             p.fill(&note, 6.0 * s, danger(0.90));
             p.text("Runs as administrator: cannot be changed", &fonts.centered, &note, white(1.0));
         }
+        if ruled {
+            self.draw_rule_badge(p, &body, dim);
+        }
+    }
+
+    /// A tiny mark on a tile whose window is the source of a rule.
+    fn draw_rule_badge(&self, p: &Painter, body: &Rect, dim: f32) {
+        let s = self.scale;
+        let at = (body.left + 8.0 * s, body.top + 8.0 * s);
+        p.disc(at, 4.2 * s, accent(0.28 * dim));
+        p.disc(at, 2.3 * s, accent(0.95 * dim));
     }
 
     /// A tile's two buttons, as small signs: kept above the others (two
@@ -3746,11 +4236,34 @@ impl Board {
             self.shifted(p, base, selection, || self.draw_selection(p, map, cell, true));
         }
 
+        if matches!(self.rule_flow, Some(RuleFlow::Destination { .. })) {
+            self.draw_destination_hint(p, fonts, map);
+        }
         // What is being dragged is drawn only on the monitor the cursor is on.
         if contains(&map.area, self.cursor.0, self.cursor.1) {
             self.draw_drop_hint(p, fonts, map);
             self.draw_drag(p, map);
         }
+    }
+
+    /// While a rule's destination is picked, every map stands out and says
+    /// that a cell on it can be clicked.
+    fn draw_destination_hint(&self, p: &Painter, fonts: &Fonts, map: &Map) {
+        let s = self.scale;
+        let area = grow(&map.layout.bounds, 10.0 * s);
+        p.fill(&area, 14.0 * s, accent(0.05));
+        if let Some(glows) = &self.glows {
+            p.glow(&glows.accent, &area, 26.0 * s, 0.12);
+        }
+        p.stroke(&area, 14.0 * s, 1.5 * s, accent(0.55));
+        let (w, _) = size(&area);
+        let line = rect(area.left, area.top - 26.0 * s, w, 20.0 * s);
+        let text = crate::i18n::text(
+            "Click a cell on the monitor where they should go",
+            "새 창이 갈 모니터의 지도에서 칸을 누르세요",
+            "在目标显示器地图上点击格子",
+        );
+        p.text(text, &fonts.centered, &line, white(0.86));
     }
 
     /// How near the cursor is to `area` of `map` (in its coordinates),
@@ -4387,6 +4900,65 @@ pub(crate) fn icon_bitmap(target: &ID2D1RenderTarget, pixels: &[u8], size: i32) 
         };
         target.CreateBitmap(D2D_SIZE_U { width: size as u32, height: size as u32 }, Some(bits), pitch, &properties).ok()
     }
+}
+
+/// The words of a title, without repeats and without the punctuation at
+/// their ends: the chips a rule's title word is picked from.
+fn title_words(title: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for raw in title.split_whitespace() {
+        let word = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        if word.is_empty() {
+            continue;
+        }
+        if words.iter().any(|known| known.to_lowercase() == word.to_lowercase()) {
+            continue;
+        }
+        words.push(word.to_owned());
+    }
+    words
+}
+
+/// The rules that already fit a window of `exe` titled `title`: one of its
+/// program, whose word the title holds (the empty word fitting any title).
+fn rules_for_window<'a>(rules: &'a [NewWindowRule], exe: &str, title: &str) -> Vec<&'a NewWindowRule> {
+    let title = title.to_lowercase();
+    rules
+        .iter()
+        .filter(|rule| rule.exe.eq_ignore_ascii_case(exe) && title.contains(&rule.title_word.to_lowercase()))
+        .collect()
+}
+
+/// Why a rule does nothing now: its monitor is not there, or the cell it
+/// names was removed. `Source` rules only need their monitor.
+fn rule_sleep(rule: &NewWindowRule, monitor_there: bool, cell_there: bool) -> Option<RuleSleep> {
+    if !monitor_there {
+        return Some(RuleSleep::MonitorGone);
+    }
+    match &rule.cell {
+        RuleCell::Source => None,
+        RuleCell::Fixed(_) => (!cell_there).then_some(RuleSleep::CellGone),
+    }
+}
+
+/// What a cell is called in a rule: its shelf's name and its place in it.
+fn cell_display(grid: &Grid, id: &str) -> Option<String> {
+    let pos = grid.find(id)?;
+    let name = grid.rows.get(pos.row)?;
+    Some(format!("{} · {}", grid::row_title(&name.name, pos.row), pos.col + 1))
+}
+
+/// One line of the rules list: what a rule sends where, on which monitor,
+/// and whether the user follows it.
+fn rule_summary(rule: &NewWindowRule, grid: &Grid, monitor: Option<usize>) -> String {
+    let word = if rule.title_word.is_empty() { "any title".to_owned() } else { format!("'{}'", rule.title_word) };
+    let dest = match &rule.cell {
+        RuleCell::Source => "its own cell".to_owned(),
+        RuleCell::Fixed(id) => cell_display(grid, id).unwrap_or_else(|| "cell removed".to_owned()),
+    };
+    let monitor = monitor.map_or_else(|| "?".to_owned(), |number| (number + 1).to_string());
+    let follow = if rule.follow { "follows" } else { "stays" };
+    format!("{} · {} → {} · monitor {} · {}", rule.exe, word, dest, monitor, follow)
 }
 
 /// Rough width of a line of text at `size` pixels: enough to size a box
@@ -5044,6 +5616,57 @@ mod tests {
             asleep: false,
             cells: cells.iter().map(|id| CellModel { id: id.to_string(), emphasised: false, usage: 0.0, windows: Vec::new() }).collect(),
         }
+    }
+
+    fn rule(exe: &str, word: &str, cell: RuleCell, monitor: &str, follow: bool) -> NewWindowRule {
+        NewWindowRule { exe: exe.into(), title_word: word.into(), cell, monitor: monitor.into(), follow }
+    }
+
+    #[test]
+    fn a_title_is_split_into_words_without_punctuation_or_repeats() {
+        assert_eq!(title_words("Flick — Orca (3)"), ["Flick", "Orca", "3"]);
+        assert_eq!(title_words("Orca orca ORCA"), ["Orca"]);
+        assert!(title_words("  —  ").is_empty());
+    }
+
+    #[test]
+    fn the_rules_of_a_window_are_the_ones_its_exe_and_title_fit() {
+        let rules = [
+            rule("orca.exe", "", RuleCell::Source, "A", false),
+            rule("orca.exe", "flick", RuleCell::Source, "B", false),
+            rule("code.exe", "", RuleCell::Source, "C", false),
+        ];
+        let monitors = |exe: &str, title: &str| {
+            rules_for_window(&rules, exe, title).into_iter().map(|rule| rule.monitor.as_str()).collect::<Vec<_>>()
+        };
+        assert_eq!(monitors("orca.exe", "Flick — Orca"), ["A", "B"]);
+        assert_eq!(monitors("orca.exe", "Mulbit — Orca"), ["A"]);
+        assert_eq!(monitors("ORCA.EXE", "Flick — Orca"), ["A", "B"]);
+        assert!(monitors("explorer.exe", "Downloads").is_empty());
+    }
+
+    #[test]
+    fn a_rule_says_where_it_sends_windows_and_whether_the_user_follows() {
+        let mut grid = Grid::default();
+        grid.rows.push(Row { name: "Work".into(), cells: vec!["a".into(), "b".into()], last: None });
+        let fixed = rule("orca.exe", "flick", RuleCell::Fixed("b".into()), "M", true);
+        assert_eq!(rule_summary(&fixed, &grid, Some(1)), "orca.exe · 'flick' → Work · 2 · monitor 2 · follows");
+        let source = rule("orca.exe", "", RuleCell::Source, "M", false);
+        assert_eq!(rule_summary(&source, &grid, Some(0)), "orca.exe · any title → its own cell · monitor 1 · stays");
+        assert_eq!(rule_summary(&source, &grid, None), "orca.exe · any title → its own cell · monitor ? · stays");
+        let gone = rule("orca.exe", "", RuleCell::Fixed("gone".into()), "M", false);
+        assert_eq!(rule_summary(&gone, &grid, Some(0)), "orca.exe · any title → cell removed · monitor 1 · stays");
+    }
+
+    #[test]
+    fn a_rule_sleeps_without_its_monitor_or_the_cell_it_names() {
+        let fixed = rule("orca.exe", "", RuleCell::Fixed("b".into()), "M", false);
+        assert_eq!(rule_sleep(&fixed, false, true), Some(RuleSleep::MonitorGone));
+        assert_eq!(rule_sleep(&fixed, true, false), Some(RuleSleep::CellGone));
+        assert_eq!(rule_sleep(&fixed, true, true), None);
+        let source = rule("orca.exe", "", RuleCell::Source, "M", false);
+        assert_eq!(rule_sleep(&source, true, false), None);
+        assert_eq!(rule_sleep(&source, false, true), Some(RuleSleep::MonitorGone));
     }
 
     fn overlaps(a: &Rect, b: &Rect) -> bool {

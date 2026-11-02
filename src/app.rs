@@ -2119,6 +2119,12 @@ impl App {
                     row.name = name;
                 }
             }
+            Action::AddNewWindowRule(rule) => self.grid.new_window_rules.push(rule),
+            Action::RemoveNewWindowRule(index) => {
+                if index < self.grid.new_window_rules.len() {
+                    self.grid.new_window_rules.remove(index);
+                }
+            }
         }
         self.commit();
         self.refresh_board();
