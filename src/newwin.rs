@@ -6,6 +6,7 @@
 
 use crate::grid::CellId;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// One rule, as made from a window's tile on the board.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,33 @@ pub fn find<'a>(rules: &'a [NewWindowRule], source_exe: &str, source_title: &str
         .find(|rule| rule.exe == source_exe && title.contains(&rule.title_word.to_lowercase()))
 }
 
+/// How long after a window was in front it can still be the window a new
+/// one came from.
+pub const SOURCE_WINDOW: Duration = Duration::from_secs(2);
+
+/// A window that was in front, and when it came there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontWindow {
+    pub hwnd: isize,
+    pub since: Instant,
+}
+
+/// The window a new window `new` came from: the one just before it in
+/// `history`, while that one is the foreground window still or came there no
+/// longer than `SOURCE_WINDOW` ago. `foreground` is the window with the
+/// keyboard now, 0 for none.
+pub fn source_window(history: &[FrontWindow], new: isize, foreground: isize, now: Instant) -> Option<FrontWindow> {
+    let entry = history.iter().rev().find(|entry| entry.hwnd != new)?;
+    (entry.hwnd == foreground || now.saturating_duration_since(entry.since) <= SOURCE_WINDOW).then_some(*entry)
+}
+
+/// The window in front just before `hwnd` last came to the front, skipping
+/// other entries for `hwnd` itself.
+pub fn previous_window(history: &[FrontWindow], hwnd: isize) -> Option<FrontWindow> {
+    let last = history.iter().rposition(|entry| entry.hwnd == hwnd)?;
+    history[..last].iter().rev().find(|entry| entry.hwnd != hwnd).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +93,31 @@ mod tests {
         assert_eq!(find(&rules, "orca.exe", "mulbit — Orca", "chrome.exe").map(|r| r.monitor.as_str()), Some("A"));
         assert_eq!(find(&rules, "orca.exe", "Flick — Orca", "orca.exe"), None);
         assert_eq!(find(&rules, "explorer.exe", "Downloads", "chrome.exe"), None);
+    }
+
+    fn entry(hwnd: isize, since: std::time::Instant) -> FrontWindow {
+        FrontWindow { hwnd, since }
+    }
+
+    #[test]
+    fn the_source_is_the_window_before_the_new_one_while_it_is_recent() {
+        let now = std::time::Instant::now();
+        let recent = now.checked_sub(Duration::from_millis(500)).unwrap();
+        let old = now.checked_sub(Duration::from_secs(5)).unwrap();
+        let history = [entry(1, old), entry(2, recent), entry(3, recent)];
+        // The new window itself is skipped.
+        assert_eq!(source_window(&history, 3, 3, now).map(|entry| entry.hwnd), Some(2));
+        // Still in front is enough however long ago it came there.
+        assert_eq!(source_window(&history, 4, 2, now).map(|entry| entry.hwnd), Some(3));
+        // Too old and not in front: there is no source.
+        assert_eq!(source_window(&[entry(1, old)], 4, 0, now), None);
+    }
+
+    #[test]
+    fn previous_window_skips_repeats_of_the_window_that_came_to_the_front() {
+        let now = std::time::Instant::now();
+        let history = [entry(1, now), entry(2, now), entry(1, now)];
+        assert_eq!(previous_window(&history, 1).map(|entry| entry.hwnd), Some(2));
+        assert_eq!(previous_window(&history, 9), None);
     }
 }

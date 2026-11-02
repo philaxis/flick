@@ -3,14 +3,15 @@
 use crate::vdapi::{self, Desktop};
 use std::collections::{HashMap, HashSet};
 use windows::{
-    core::{w, HSTRING, PWSTR},
+    core::{w, HSTRING, PCWSTR, PWSTR},
     Win32::{
         Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, TRUE, WPARAM},
         Graphics::{
             Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE},
             Gdi::{
-                EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
-                MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+                EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow,
+                DISPLAY_DEVICEW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+                MONITOR_DEFAULTTOPRIMARY,
             },
         },
         Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
@@ -27,12 +28,13 @@ use windows::{
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
-                EnumWindows, FindWindowExW, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW,
-                GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-                IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, SetWindowPlacement, SetWindowPos,
-                ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOMOVE,
-                SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, SC_CLOSE, WM_SYSCOMMAND,
-                WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                EnumWindows, FindWindowExW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
+                GetShellWindow, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+                GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
+                SetWindowPlacement, SetWindowPos, ShowWindow, WindowFromPoint, EDD_GET_DEVICE_INTERFACE_NAME, GA_ROOT,
+                GA_ROOTOWNER, GWL_EXSTYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE,
+                SWP_ASYNCWINDOWPOS, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE,
+                WINDOWPLACEMENT, SC_CLOSE, WM_SYSCOMMAND, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             },
         },
     },
@@ -133,6 +135,49 @@ thread_local! {
 /// once for each time it was.
 pub fn forced(hwnd: HWND) -> bool {
     FORCED.with(|forced| forced.get() == hwnd.0 && forced.replace(0) != 0)
+}
+
+/// The same, without taking the mark away (`forced`).
+pub fn was_forced(hwnd: HWND) -> bool {
+    FORCED.with(|forced| hwnd.0 != 0 && forced.get() == hwnd.0)
+}
+
+/// Whether the cursor is over `hwnd` or a window it owns.
+pub fn cursor_over(hwnd: HWND) -> bool {
+    unsafe {
+        let mut point = POINT::default();
+        if GetCursorPos(&mut point).is_err() {
+            return false;
+        }
+        let under = WindowFromPoint(point);
+        under.0 != 0 && GetAncestor(under, GA_ROOT) == hwnd
+    }
+}
+
+/// Whether the cursor is over the taskbar or the desktop: a click there
+/// brought a window to the front on purpose, not by a link.
+pub fn cursor_over_shell() -> bool {
+    unsafe {
+        let mut point = POINT::default();
+        if GetCursorPos(&mut point).is_err() {
+            return false;
+        }
+        let under = WindowFromPoint(point);
+        if under.0 == 0 {
+            return true;
+        }
+        let root = GetAncestor(under, GA_ROOT);
+        let root = if root.0 == 0 { under } else { root };
+        if root == GetShellWindow() {
+            return true;
+        }
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(root, &mut class).max(0) as usize;
+        matches!(
+            String::from_utf16_lossy(&class[..len]).as_str(),
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW"
+        )
+    }
 }
 
 /// A programmatic desktop switch leaves keyboard focus on a window of the
@@ -301,6 +346,13 @@ fn exe_path(pid: u32) -> Option<String> {
 /// File name of a process's executable, lower case ("chrome.exe").
 pub fn exe_name(pid: u32) -> Option<String> {
     Some(exe_path(pid)?.rsplit(['\\', '/']).next()?.to_lowercase())
+}
+
+/// The text of a window's title bar.
+pub fn window_title(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    let len = unsafe { GetWindowTextW(hwnd, &mut buffer) }.max(0) as usize;
+    String::from_utf16_lossy(&buffer[..len])
 }
 
 /// The description stored in an executable's version information, which is
@@ -668,12 +720,64 @@ impl WindowPins {
     }
 }
 
+fn same_rect(a: RECT, b: RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+}
+
+/// The text in a fixed-size wide buffer, up to its first zero.
+fn wide_text(text: &[u16]) -> String {
+    let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+    String::from_utf16_lossy(&text[..len])
+}
+
+/// The device id of a monitor: its interface path, which Windows keeps the
+/// same when the monitor is unplugged and plugged in again.
+fn monitor_device_id(monitor: HMONITOR) -> Option<String> {
+    unsafe {
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO { cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32, ..Default::default() },
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+            return None;
+        }
+        let name = PCWSTR(info.szDevice.as_ptr());
+        // With the interface flag the id is the device's interface path
+        // (`\\?\DISPLAY#GSM5B7F#...`), which is the same across replugging.
+        // Some drivers only fill it without the flag; use the plain device
+        // name if neither does.
+        for flags in [EDD_GET_DEVICE_INTERFACE_NAME, 0] {
+            let mut device = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+            if EnumDisplayDevicesW(name, 0, &mut device, flags).as_bool() {
+                let id = wide_text(&device.DeviceID);
+                if !id.is_empty() {
+                    return Some(id);
+                }
+            }
+        }
+        let id = wide_text(&info.szDevice);
+        (!id.is_empty()).then_some(id)
+    }
+}
+
 /// The id of the device of the monitor whose whole screen is `bounds`, the
 /// same each time it is plugged in. Used by the rules for new windows
-/// (`newwin`). Not done yet: the engine of those rules fills it in.
+/// (`newwin`).
 pub fn monitor_id(bounds: RECT) -> Option<String> {
-    let _ = bounds;
-    None
+    unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> BOOL {
+        (*(out.0 as *mut Vec<HMONITOR>)).push(monitor);
+        TRUE
+    }
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut handles as *mut _ as isize));
+    }
+    handles.into_iter().find(|&handle| monitor_info(handle).is_some_and(|info| same_rect(info.rcMonitor, bounds))).and_then(monitor_device_id)
+}
+
+/// The whole screen of the monitor `hwnd` is on.
+pub fn monitor_of_window(hwnd: HWND) -> Option<RECT> {
+    monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }).map(|info| info.rcMonitor)
 }
 
 /// The whole screen of the monitor with device id `id`, while it is there.
