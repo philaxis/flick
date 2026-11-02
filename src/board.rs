@@ -254,6 +254,30 @@ struct RulePick {
     since: Instant,
 }
 
+/// A live window a rule fits, and the cell it is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuleCandidate {
+    hwnd: isize,
+    cell: CellId,
+    pos: Pos,
+}
+
+/// The window a hovered rule is shown to come from.
+#[derive(Clone)]
+struct RuleSourceWindow {
+    hwnd: isize,
+    cell: CellId,
+}
+
+/// A rule line hovered, and what it is shown to do meanwhile.
+struct RuleHover {
+    /// Its place in the list as shown, newest first.
+    shown: usize,
+    /// When the hover began, which the destination's motion is counted from.
+    since: Instant,
+    source: Option<RuleSourceWindow>,
+}
+
 /// Why a rule does nothing now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RuleSleep {
@@ -308,6 +332,12 @@ const PICK_MS: u32 = 16;
 const RULE_PULSE_S: f32 = 1.2;
 /// How much larger than usual a cell is at the top of its pulse.
 const RULE_PULSE: f32 = 0.08;
+/// While a rule line is hovered, its source and destination are shown on the
+/// board; drawn at this interval meanwhile.
+const RULE_HOVER_TIMER_ID: usize = 8;
+const RULE_HOVER_MS: u32 = 16;
+/// How long a following rule's frame takes to go to its cell and back.
+const RULE_FOLLOW_S: f32 = 1.6;
 
 /// While the board is up, how often it checks that nothing came over it.
 const ON_TOP_TIMER_ID: usize = 2;
@@ -1104,6 +1134,10 @@ pub struct Board {
     rules_open: bool,
     /// What the board is saying about a rule for a moment.
     rule_notice: Option<RuleNotice>,
+    /// The rule line pointed at, shown on the board after `PEEK_WAIT_MS`,
+    /// and the line being waited on meanwhile.
+    rule_hover: Option<RuleHover>,
+    rule_hover_wait: Option<(usize, Instant)>,
 }
 
 impl Board {
@@ -1215,6 +1249,8 @@ impl Board {
                 rule_pick: None,
                 rules_open: false,
                 rule_notice: None,
+                rule_hover: None,
+                rule_hover_wait: None,
             })
         }
     }
@@ -1289,6 +1325,7 @@ impl Board {
         self.clock.refresh();
         self.refused = None;
         let _ = self.take_rule_pick();
+        self.clear_rule_hover();
         self.rule_notice = None;
         self.stop_editing();
         self.open = true;
@@ -1338,7 +1375,11 @@ impl Board {
         if lost {
             self.hold = None;
         }
+        let rules_changed = self.grid.new_window_rules != grid.new_window_rules;
         self.grid = grid;
+        if rules_changed {
+            self.clear_rule_hover();
+        }
         if self.grid.find(&self.selected).is_none() {
             self.selected = self.model.current.clone();
         }
@@ -1356,6 +1397,7 @@ impl Board {
         }
         self.hover_under_cursor();
         self.register_thumbnails();
+        self.refresh_rule_source();
         self.update_peek(Instant::now());
         self.invalidate();
     }
@@ -1402,12 +1444,14 @@ impl Board {
         // Keep the D2D target for repeated trigger presses; ensure_canvas handles resizing.
         self.press = None;
         let _ = self.take_rule_pick();
+        self.clear_rule_hover();
         self.rule_notice = None;
         self.stop_motion();
         unsafe {
             let _ = ReleaseCapture();
             let _ = KillTimer(self.hwnd, ON_TOP_TIMER_ID);
             let _ = KillTimer(self.hwnd, RULE_NOTICE_TIMER_ID);
+            let _ = KillTimer(self.hwnd, RULE_HOVER_TIMER_ID);
             ShowWindow(self.hwnd, SW_HIDE);
             for window in self.pushed_aside.drain(..) {
                 crate::vd::put_notice_away(window);
@@ -2171,6 +2215,136 @@ impl Board {
         Some(Hit::RulePanel)
     }
 
+    /// The rule line under the cursor, by its place in the list as shown
+    /// (newest first). Its buttons are part of the line.
+    fn rule_line_under_cursor(&self) -> Option<usize> {
+        let layout = self.rules_panel_layout()?;
+        let (x, y) = self.cursor;
+        layout.lines.iter().position(|line| {
+            contains(&line.text, x, y)
+                || line.follow.as_ref().is_some_and(|(area, _)| contains(area, x, y))
+                || contains(&line.delete, x, y)
+        })
+    }
+
+    /// A rule by its place in the list as shown, newest first.
+    fn rule_at(&self, shown: usize) -> Option<&NewWindowRule> {
+        let count = self.grid.new_window_rules.len();
+        self.grid.new_window_rules.get(count.checked_sub(1 + shown)?)
+    }
+
+    /// The live window a hovered rule is shown to come from: one of its
+    /// program whose title holds its word, on the selected cell, else on the
+    /// cell nearest to it by grid distance.
+    fn source_for_rule(&self, rule: &NewWindowRule) -> Option<RuleSourceWindow> {
+        let word = rule.title_word.to_lowercase();
+        let mut candidates = Vec::new();
+        for row in &self.model.rows {
+            for cell in &row.cells {
+                let Some(pos) = self.grid.find(&cell.id) else { continue };
+                for window in &cell.windows {
+                    if window.app.eq_ignore_ascii_case(&rule.exe) && window.title.to_lowercase().contains(&word) {
+                        candidates.push(RuleCandidate { hwnd: window.hwnd.0, cell: cell.id.clone(), pos });
+                    }
+                }
+            }
+        }
+        let at = pick_source(&candidates, self.grid.find(&self.selected))?;
+        let candidate = candidates.get(at)?;
+        Some(RuleSourceWindow { hwnd: candidate.hwnd, cell: candidate.cell.clone() })
+    }
+
+    /// Finds the source window of the hovered rule anew, as windows come and
+    /// go, or the selected cell moves.
+    fn refresh_rule_source(&mut self) {
+        let Some(shown) = self.rule_hover.as_ref().map(|hover| hover.shown) else { return };
+        let source = self.rule_at(shown).cloned().and_then(|rule| self.source_for_rule(&rule));
+        if let Some(hover) = &mut self.rule_hover {
+            hover.source = source;
+        }
+    }
+
+    /// Stops showing a hovered rule, and the timer that draws it.
+    fn clear_rule_hover(&mut self) -> bool {
+        let had = self.rule_hover.take().is_some() | self.rule_hover_wait.take().is_some();
+        if had {
+            unsafe { let _ = KillTimer(self.hwnd, RULE_HOVER_TIMER_ID); }
+        }
+        had
+    }
+
+    /// Stops showing a hovered rule, the preview going back as it came.
+    fn end_rule_hover(&mut self, now: Instant) {
+        if self.clear_rule_hover() {
+            self.update_peek(now);
+            self.invalidate();
+        }
+    }
+
+    /// Follows the rule line under the cursor: after `PEEK_WAIT_MS` its
+    /// source and destination are shown, and while it stays they move. Off
+    /// every line, or while a rule is picked, they are taken back at once.
+    fn update_rule_hover(&mut self, now: Instant) {
+        if self.rule_pick.is_some() {
+            self.end_rule_hover(now);
+            return;
+        }
+        let Some(shown) = self.rule_line_under_cursor() else {
+            self.end_rule_hover(now);
+            return;
+        };
+        if self.rule_hover.as_ref().is_some_and(|hover| hover.shown == shown) {
+            self.refresh_rule_source();
+            return;
+        }
+        if self.rule_hover.is_some() {
+            self.end_rule_hover(now);
+        }
+        let since = match self.rule_hover_wait {
+            Some((waiting, at)) if waiting == shown => at,
+            _ => now,
+        };
+        let waited = now.saturating_duration_since(since).as_millis().min(u32::MAX as u128) as u32;
+        if waited < PEEK_WAIT_MS {
+            let fresh = !self.rule_hover_wait.is_some_and(|(waiting, _)| waiting == shown);
+            self.rule_hover_wait = Some((shown, since));
+            if fresh {
+                let left = (PEEK_WAIT_MS - waited).max(1);
+                unsafe { SetTimer(self.hwnd, RULE_HOVER_TIMER_ID, left, None); }
+            }
+            return;
+        }
+        self.rule_hover_wait = None;
+        let source = self.rule_at(shown).cloned().and_then(|rule| self.source_for_rule(&rule));
+        self.rule_hover = Some(RuleHover { shown, since: now, source });
+        unsafe { SetTimer(self.hwnd, RULE_HOVER_TIMER_ID, RULE_HOVER_MS, None); }
+        self.update_peek(now);
+        self.invalidate();
+    }
+
+    /// Where a rule line starts, for an arrow with no source window to start
+    /// from.
+    fn rule_line_start(&self, shown: usize) -> Option<(f32, f32)> {
+        let layout = self.rules_panel_layout()?;
+        let line = layout.lines.get(shown)?;
+        Some((line.text.left, centre(&line.text).1))
+    }
+
+    /// The frame of a following rule on `map`, going to its cell and back
+    /// while the rule line is hovered. `None` for a rule that stays, or one
+    /// of another monitor.
+    fn rule_follow_body(&self, map: &Map) -> Option<Rect> {
+        let hover = self.rule_hover.as_ref()?;
+        let rule = self.rule_at(hover.shown)?;
+        let RuleCell::Fixed(id) = &rule.cell else { return None };
+        if !rule.follow || self.monitor_number(&rule.monitor)? != map.monitor {
+            return None;
+        }
+        let dest = map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == *id)?;
+        let from = map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected)?;
+        Some(follow_rect(&from.body, &dest.body, hover.since.elapsed().as_secs_f32(), RULE_FOLLOW_S))
+    }
+
     /// Opens the menu of a window tile, from which a rule for the new
     /// windows it opens is made. Choosing either item starts picking the
     /// cell at once; the rules that already fit it are shown under them.
@@ -2446,22 +2620,30 @@ impl Board {
         let (map, x, y) = self.map_at(self.cursor.0, self.cursor.1);
         let on_map = contains(&map.layout.bounds, x, y);
         let pressed = |id: &CellId| matches!(&self.press, Some(Press { hit: Hit::Cell(on), dragging: false, .. }) if on == id);
-        let wanted = match &self.hover {
-            _ if self.editing.is_some() => None,
-            _ if self.press.is_some() => self.peek.clone().filter(pressed),
-            Hit::Cell(id) | Hit::CellClose(id) => Some(id.clone()).filter(|id| *id != self.selected),
-            _ if on_map => self.peek.clone(),
-            _ => None,
+        let wanted = if self.rule_hover.is_some() {
+            self.rule_hover.as_ref().and_then(|hover| hover.source.as_ref())
+                .map(|source| source.cell.clone())
+                .filter(|id| *id != self.selected)
+        } else {
+            match &self.hover {
+                _ if self.editing.is_some() => None,
+                _ if self.press.is_some() => self.peek.clone().filter(pressed),
+                Hit::Cell(id) | Hit::CellClose(id) => Some(id.clone()).filter(|id| *id != self.selected),
+                _ if on_map => self.peek.clone(),
+                _ => None,
+            }
         };
-        if let Some(id) = wanted.as_ref().filter(|id| self.peek.as_ref() != Some(*id) && self.press.is_none()) {
-            let since = match &self.peek_wait {
-                Some((waiting, at)) if waiting == id => *at,
-                _ => now,
-            };
-            if now.saturating_duration_since(since).as_millis() < PEEK_WAIT_MS as u128 {
-                self.peek_wait = Some((id.clone(), since));
-                unsafe { SetTimer(self.hwnd, PEEK_TIMER_ID, PEEK_WAIT_MS, None); }
-                return;
+        if self.rule_hover.is_none() {
+            if let Some(id) = wanted.as_ref().filter(|id| self.peek.as_ref() != Some(*id) && self.press.is_none()) {
+                let since = match &self.peek_wait {
+                    Some((waiting, at)) if waiting == id => *at,
+                    _ => now,
+                };
+                if now.saturating_duration_since(since).as_millis() < PEEK_WAIT_MS as u128 {
+                    self.peek_wait = Some((id.clone(), since));
+                    unsafe { SetTimer(self.hwnd, PEEK_TIMER_ID, PEEK_WAIT_MS, None); }
+                    return;
+                }
             }
         }
         if self.peek_wait.take().is_some() {
@@ -3115,6 +3297,7 @@ impl Board {
                 self.hover = Hit::Nothing;
                 self.cursor = (-1.0e6, -1.0e6);
                 self.resting = None;
+                self.end_rule_hover(Instant::now());
                 self.update_peek(Instant::now());
                 self.invalidate();
                 Action::None
@@ -3139,6 +3322,15 @@ impl Board {
                     self.invalidate();
                 } else {
                     unsafe { let _ = KillTimer(self.hwnd, PICK_TIMER_ID); }
+                }
+                Action::None
+            }
+            WM_TIMER if wparam.0 == RULE_HOVER_TIMER_ID => {
+                self.update_rule_hover(Instant::now());
+                if self.rule_hover.is_some() {
+                    self.invalidate();
+                } else if self.rule_hover_wait.is_none() {
+                    unsafe { let _ = KillTimer(self.hwnd, RULE_HOVER_TIMER_ID); }
                 }
                 Action::None
             }
@@ -3364,6 +3556,7 @@ impl Board {
             }
         }
         self.update_peek(Instant::now());
+        self.update_rule_hover(Instant::now());
     }
 
     fn mouse_up(&mut self, x: f32, y: f32) -> Action {
@@ -3419,6 +3612,7 @@ impl Board {
         if !matches!(&press, Press { hit: Hit::Cell(id), dragging: false, .. } if *id == self.hover_cell()) {
             self.update_peek(Instant::now());
         }
+        self.update_rule_hover(Instant::now());
         self.invalidate();
         if let Some(action) = dropped {
             if let Some((hwnd, from)) = flying {
@@ -3783,6 +3977,7 @@ impl Board {
         unsafe {
             self.set_transform(target, Matrix3x2::identity());
         }
+        self.draw_rule_hover(&p);
         #[cfg(feature = "motion-probe")]
         if let Some(x) = self.probe_marker.get() { p.fill_square(&rect(x-2.0,20.0,4.0,12.0),rgba(0.0,1.0,0.0,1.0)); }
         Ok(())
@@ -3920,6 +4115,78 @@ impl Board {
             let ink = white(if hot { 0.90 } else { 0.42 });
             p.line((cx - arm, cy - arm), (cx + arm, cy + arm), 1.3 * s, ink);
             p.line((cx - arm, cy + arm), (cx + arm, cy - arm), 1.3 * s, ink);
+        }
+    }
+
+    /// What a hovered rule does, drawn over the board: its source window's
+    /// cell in the preview area, and where its new windows go — a ghost on
+    /// the destination monitor's picture, or its cell on the map, with an
+    /// arrow from the source tile. A following rule's frame moves meanwhile.
+    fn draw_rule_hover(&self, p: &Painter) {
+        let Some(hover) = &self.rule_hover else { return };
+        let Some(rule) = self.rule_at(hover.shown) else { return };
+        let Some(dest_monitor) = self.monitor_number(&rule.monitor) else { return };
+        let s = self.scale;
+        let colour = accent(0.90);
+        let from = hover.source.as_ref().and_then(|source| self.picture(source.hwnd)).map(|r| centre(&r))
+            .or_else(|| self.rule_line_start(hover.shown));
+        match &rule.cell {
+            RuleCell::Source => {
+                let Some(source) = hover.source.as_ref() else { return };
+                let Some(pos) = self.grid.find(&source.cell) else { return };
+                let Some(plate) = self.plates.get(dest_monitor) else { return };
+                let ghost = self.picture_place(pos, dest_monitor).rect(&centred_rect(plate, 0.6));
+                self.draw_ghost(p, &ghost, colour);
+                if let Some(from) = from {
+                    self.draw_arrow(p, from, centre(&ghost), colour);
+                }
+            }
+            RuleCell::Fixed(id) => {
+                let Some(map) = self.maps.iter().find(|map| map.monitor == dest_monitor) else { return };
+                let Some(cell) = map.layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == *id) else { return };
+                let body = shifted_rect(&cell.body, map.area.left, map.area.top);
+                let swing = pulse_once(hover.since.elapsed().as_secs_f32(), RULE_PULSE_S);
+                if swing > 0.0 {
+                    if let Some(glows) = &self.glows {
+                        p.glow(&glows.accent, &grow(&body, 4.0 * s), 24.0 * s, 0.34 * swing);
+                    }
+                    p.stroke(&grow(&body, 3.0 * s), 11.0 * s, (1.0 + 1.5 * swing) * s, accent(0.20 + 0.70 * swing));
+                }
+                let ghost = centred_rect(&body, 0.5);
+                self.draw_ghost(p, &ghost, colour);
+                if let Some(from) = from {
+                    self.draw_arrow(p, from, centre(&ghost), colour);
+                }
+            }
+        }
+    }
+
+    /// A dashed outline standing for a window that is not there yet.
+    fn draw_ghost(&self, p: &Painter, area: &Rect, colour: D2D1_COLOR_F) {
+        let s = self.scale;
+        for (from, to) in dash_segments(area, 7.0 * s, 5.0 * s) {
+            p.line(from, to, 1.5 * s, colour);
+        }
+    }
+
+    /// A curved arrow from `from` to `to`, with a head at its end.
+    fn draw_arrow(&self, p: &Painter, from: (f32, f32), to: (f32, f32), colour: D2D1_COLOR_F) {
+        let s = self.scale;
+        let reach = (to.0 - from.0).hypot(to.1 - from.1);
+        if reach < 4.0 * s {
+            return;
+        }
+        let bend = (reach * 0.18).min(110.0 * s);
+        let points = curve_points(from, arrow_control(from, to, bend), to, 20);
+        for pair in points.windows(2) {
+            p.line(pair[0], pair[1], 1.6 * s, colour);
+        }
+        let Some((tip, back)) = points.last().zip(points.get(points.len().saturating_sub(2))) else { return };
+        let angle = (tip.1 - back.1).atan2(tip.0 - back.0);
+        let head = 9.0 * s;
+        for turn in [-0.45, 0.45] {
+            let a = angle + turn;
+            p.line(*tip, (tip.0 - a.cos() * head, tip.1 - a.sin() * head), 1.6 * s, colour);
         }
     }
 
@@ -4107,6 +4374,7 @@ impl Board {
         let body = if tile.icon_only { tile.frame } else { tile.thumb };
         let (bw, _) = size(&body);
         let ruled = !rules_for_window(&self.grid.new_window_rules, &window.app, &window.title).is_empty();
+        let source = self.rule_hover.as_ref().and_then(|hover| hover.source.as_ref()).is_some_and(|source| source.hwnd == tile.hwnd.0);
         let lift = if window.topmost { 1.0 } else if pointed { 0.4 } else { 0.0 };
         if let Some(glows) = &self.glows {
             if pointed && !dragged {
@@ -4114,6 +4382,12 @@ impl Board {
             }
         }
         self.surface(p, &body, if tile.icon_only { 10.0 * s } else { 8.0 * s }, if pointed { 0.12 } else { 0.085 }, dim, lift);
+        if source {
+            if let Some(glows) = &self.glows {
+                p.glow(&glows.light, &body, 36.0 * s, 0.30);
+            }
+            p.stroke(&body, if tile.icon_only { 10.0 * s } else { 8.0 * s }, 2.0 * s, accent(0.88));
+        }
         let icon = self.icons.get(&tile.hwnd.0).and_then(Option::as_ref);
         let centred = |k: f32| { let (cx, cy) = centre(&body); rect(cx - k / 2.0, cy - k / 2.0, k, k) };
         if tile.icon_only {
@@ -4223,6 +4497,8 @@ impl Board {
         let at = |part: Part| self.motion.offset(&part);
         let (spine, names, selection) = (at(Part::Spine(map.monitor)), at(Part::Names(map.monitor)), at(Part::Selection(map.monitor)));
         let selected = layout.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.id == self.selected);
+        // A following rule moves the selected frame to its cell and back.
+        let follow = self.rule_follow_body(map);
 
         let chips = self.chips(map);
         self.draw_rail(p, fonts, map, &chips);
@@ -4232,7 +4508,8 @@ impl Board {
             p.sheen(&layout.spine, 12.0 * s, 0.018);
         });
         if let Some(cell) = selected {
-            self.shifted(p, base, selection, || self.draw_selection(p, map, cell, false));
+            let (body, shift) = follow.map_or((cell.body, selection), |body| (body, (0.0, 0.0)));
+            self.shifted(p, base, shift, || self.draw_selection(p, map, cell, &body, false));
         }
         for (r, (row, model)) in layout.rows.iter().zip(&self.model.rows).enumerate() {
             let in_selected_row = selected_row == Some(r);
@@ -4260,7 +4537,8 @@ impl Board {
             self.draw_plus(p, &layout.add_row_top, Hit::AddRowTop, on_map);
         });
         if let Some(cell) = selected {
-            self.shifted(p, base, selection, || self.draw_selection(p, map, cell, true));
+            let (body, shift) = follow.map_or((cell.body, selection), |body| (body, (0.0, 0.0)));
+            self.shifted(p, base, shift, || self.draw_selection(p, map, cell, &body, true));
         }
 
         // What is being dragged is drawn only on the monitor the cursor is on.
@@ -4562,9 +4840,9 @@ impl Board {
     /// that it can stay while the row slides under it.
     /// Where a window picked up cannot be dropped on it, it sinks as the
     /// cells do (`draw_cell`).
-    fn draw_selection(&self, p: &Painter, map: &Map, cell: &CellLayout, outline: bool) {
+    fn draw_selection(&self, p: &Painter, map: &Map, cell: &CellLayout, at: &Rect, outline: bool) {
         let s = self.scale;
-        let body = grow(&cell.body, 3.0 * s);
+        let body = grow(at, 3.0 * s);
         let radius = 11.0 * s;
         let sunk = (self.grab_shown - self.openness(map, &Target::Cell(cell.id.clone()))).max(0.0);
         let dim = if self.dragged_cell() == Some(cell.id.as_str()) { 0.35 } else { 1.0 } * (1.0 - 0.4 * sunk);
@@ -4932,6 +5210,106 @@ fn auto_title_word(title: &str) -> String {
         .collect();
     let index = if parts.len() >= 3 { parts.len() - 2 } else { 0 };
     parts.get(index).copied().unwrap_or_default().to_owned()
+}
+
+/// The window a rule is shown to come from: one on the selected cell, else
+/// the one nearest to it by grid distance (the first of equals).
+fn pick_source(candidates: &[RuleCandidate], selected: Option<Pos>) -> Option<usize> {
+    let selected = selected?;
+    if let Some(at) = candidates.iter().position(|candidate| candidate.pos == selected) {
+        return Some(at);
+    }
+    candidates.iter().enumerate().min_by_key(|(_, candidate)| {
+        candidate.pos.row.abs_diff(selected.row) + candidate.pos.col.abs_diff(selected.col)
+    }).map(|(at, _)| at)
+}
+
+/// A rectangle of `share` of `area`'s width and height, about its middle.
+fn centred_rect(area: &Rect, share: f32) -> Rect {
+    let (width, height) = size(area);
+    let (cx, cy) = centre(area);
+    let (w, h) = (width * share, height * share);
+    rect(cx - w / 2.0, cy - h / 2.0, w, h)
+}
+
+/// Where a frame going from `from` to `to` and back is `elapsed` into a
+/// period, easing at each end: at 0 and at `period` it is at `from`.
+fn follow_rect(from: &Rect, to: &Rect, elapsed: f32, period: f32) -> Rect {
+    let phase = (elapsed / period).rem_euclid(1.0);
+    let t = if phase <= 0.5 { phase * 2.0 } else { (1.0 - phase) * 2.0 };
+    let ease = t * t * (3.0 - 2.0 * t);
+    let between = |a: f32, b: f32| a + (b - a) * ease;
+    Rect {
+        left: between(from.left, to.left),
+        top: between(from.top, to.top),
+        right: between(from.right, to.right),
+        bottom: between(from.bottom, to.bottom),
+    }
+}
+
+/// How bright a one-time pulse is `elapsed` into `period`: up and down once,
+/// and nothing afterwards.
+fn pulse_once(elapsed: f32, period: f32) -> f32 {
+    if elapsed < 0.0 || elapsed >= period {
+        0.0
+    } else {
+        (elapsed / period * std::f32::consts::PI).sin()
+    }
+}
+
+/// The control point of a curve from `from` to `to`, bent `bend` to the
+/// left of the way between them.
+fn arrow_control(from: (f32, f32), to: (f32, f32), bend: f32) -> (f32, f32) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length = dx.hypot(dy);
+    let (mx, my) = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+    if length < 0.001 {
+        return (mx, my);
+    }
+    (mx - dy / length * bend, my + dx / length * bend)
+}
+
+/// Points along a quadratic curve, `steps` of them between its ends.
+fn curve_points(from: (f32, f32), control: (f32, f32), to: (f32, f32), steps: usize) -> Vec<(f32, f32)> {
+    let steps = steps.max(1);
+    (0..=steps).map(|i| {
+        let t = i as f32 / steps as f32;
+        let u = 1.0 - t;
+        (
+            u * u * from.0 + 2.0 * u * t * control.0 + t * t * to.0,
+            u * u * from.1 + 2.0 * u * t * control.1 + t * t * to.1,
+        )
+    }).collect()
+}
+
+/// The dashes of a rectangle's outline, going round it.
+fn dash_segments(area: &Rect, dash: f32, gap: f32) -> Vec<((f32, f32), (f32, f32))> {
+    let step = (dash + gap).max(1.0);
+    let edges = [
+        ((area.left, area.top), (area.right, area.top)),
+        ((area.right, area.top), (area.right, area.bottom)),
+        ((area.right, area.bottom), (area.left, area.bottom)),
+        ((area.left, area.bottom), (area.left, area.top)),
+    ];
+    let mut out = Vec::new();
+    for (from, to) in edges {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let length = dx.hypot(dy);
+        if length <= 0.0 {
+            continue;
+        }
+        let (ux, uy) = (dx / length, dy / length);
+        let mut at = 0.0;
+        while at < length {
+            let end = (at + dash).min(length);
+            out.push((
+                (from.0 + ux * at, from.1 + uy * at),
+                (from.0 + ux * end, from.1 + uy * end),
+            ));
+            at += step;
+        }
+    }
+    out
 }
 
 /// The rules that already fit a window of `exe` titled `title`: one of its
@@ -5720,6 +6098,52 @@ mod tests {
         let source = rule("orca.exe", "", RuleCell::Source, "M", false);
         assert_eq!(rule_sleep(&source, true, false), None);
         assert_eq!(rule_sleep(&source, false, true), Some(RuleSleep::MonitorGone));
+    }
+
+    fn candidate(hwnd: isize, cell: &str, row: usize, col: usize) -> RuleCandidate {
+        RuleCandidate { hwnd, cell: cell.into(), pos: Pos { row, col } }
+    }
+
+    #[test]
+    fn a_hovered_rule_takes_the_window_on_the_selected_cell_or_the_nearest_one() {
+        let candidates = [candidate(1, "a", 0, 0), candidate(2, "b", 1, 3), candidate(3, "c", 2, 2)];
+        assert_eq!(pick_source(&candidates, Some(Pos { row: 2, col: 2 })), Some(2));
+        assert_eq!(pick_source(&candidates, Some(Pos { row: 1, col: 0 })), Some(0));
+        assert_eq!(pick_source(&candidates, None), None);
+        assert_eq!(pick_source(&[], Some(Pos { row: 0, col: 0 })), None);
+    }
+
+    #[test]
+    fn a_ghost_is_sixty_percent_of_the_tile_area_about_its_middle() {
+        let plate = rect(100.0, 50.0, 400.0, 200.0);
+        assert_eq!(centred_rect(&plate, 0.6), rect(180.0, 90.0, 240.0, 120.0));
+    }
+
+    #[test]
+    fn an_arrow_bends_off_the_straight_way_between_its_ends() {
+        let control = arrow_control((0.0, 0.0), (100.0, 0.0), 20.0);
+        assert_eq!(control, (50.0, 20.0));
+        let points = curve_points((0.0, 0.0), control, (100.0, 0.0), 4);
+        assert_eq!(points.len(), 5);
+        assert_eq!((points[0], points[4]), ((0.0, 0.0), (100.0, 0.0)));
+        assert!(points[2].1 > 0.0);
+    }
+
+    #[test]
+    fn a_following_frame_goes_to_the_cell_and_comes_back_once_a_period() {
+        let (from, to) = (rect(0.0, 0.0, 10.0, 10.0), rect(100.0, 0.0, 10.0, 10.0));
+        assert_eq!(follow_rect(&from, &to, 0.0, 1.6), from);
+        assert_eq!(follow_rect(&from, &to, 0.8, 1.6), to);
+        assert_eq!(follow_rect(&from, &to, 1.6, 1.6), from);
+        assert_eq!(follow_rect(&from, &to, 0.4, 1.6).left, 50.0);
+    }
+
+    #[test]
+    fn a_destination_pulses_once_and_then_is_still() {
+        assert_eq!(pulse_once(0.0, 1.0), 0.0);
+        assert_eq!(pulse_once(0.5, 1.0), 1.0);
+        assert_eq!(pulse_once(1.0, 1.0), 0.0);
+        assert_eq!(pulse_once(2.0, 1.0), 0.0);
     }
 
     fn overlaps(a: &Rect, b: &Rect) -> bool {
