@@ -81,6 +81,25 @@ pub fn previous_window(history: &[FrontWindow], hwnd: isize) -> Option<FrontWind
     history[..last].iter().rev().find(|entry| entry.hwnd != hwnd).copied()
 }
 
+/// Whether a text read from an address bar looks like an address to open:
+/// a URL or host, with or without its scheme. Search words and empty bars
+/// do not.
+pub fn looks_like_address(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.chars().any(char::is_whitespace) && (value.contains('.') || value.contains(':'))
+}
+
+/// Which of `candidates` a new window should open its page in: the one
+/// that was in front most recently. When none of them is in `history`, the
+/// first, which is the topmost window.
+pub fn merge_target(history: &[FrontWindow], candidates: &[isize]) -> Option<isize> {
+    history
+        .iter()
+        .rev()
+        .find_map(|entry| candidates.contains(&entry.hwnd).then_some(entry.hwnd))
+        .or_else(|| candidates.first().copied())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +140,27 @@ mod tests {
         let history = [entry(1, now), entry(2, now), entry(1, now)];
         assert_eq!(previous_window(&history, 1).map(|entry| entry.hwnd), Some(2));
         assert_eq!(previous_window(&history, 9), None);
+    }
+
+    #[test]
+    fn only_urls_and_hosts_look_like_addresses() {
+        assert!(looks_like_address("https://github.com/x"));
+        assert!(looks_like_address("github.com/x"));
+        assert!(looks_like_address("localhost:3000"));
+        assert!(looks_like_address("  github.com  "));
+        assert!(!looks_like_address(""));
+        assert!(!looks_like_address("Search Google or type a URL"));
+        assert!(!looks_like_address("just some words"));
+        assert!(!looks_like_address("notanaddress"));
+    }
+
+    #[test]
+    fn the_merge_target_is_the_candidate_in_front_most_recently() {
+        let now = std::time::Instant::now();
+        let history = [entry(1, now), entry(2, now), entry(3, now)];
+        assert_eq!(merge_target(&history, &[1, 3]), Some(3));
+        assert_eq!(merge_target(&history, &[1, 2]), Some(2));
+        assert_eq!(merge_target(&history, &[1, 9]), Some(1));
+        assert_eq!(merge_target(&history, &[]), None);
     }
 }
