@@ -667,3 +667,16 @@ impl WindowPins {
         self.0.retain(|hwnd, tag| crate::pin::same_window(*tag, unsafe { GetPropW(HWND(*hwnd), Self::PROPERTY) }.0));
     }
 }
+
+/// The id of the device of the monitor whose whole screen is `bounds`, the
+/// same each time it is plugged in. Used by the rules for new windows
+/// (`newwin`). Not done yet: the engine of those rules fills it in.
+pub fn monitor_id(bounds: RECT) -> Option<String> {
+    let _ = bounds;
+    None
+}
+
+/// The whole screen of the monitor with device id `id`, while it is there.
+pub fn monitor_bounds(id: &str) -> Option<RECT> {
+    monitors().into_iter().map(|m| m.bounds).find(|b| monitor_id(*b).as_deref() == Some(id))
+}
