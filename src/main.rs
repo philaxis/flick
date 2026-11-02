@@ -14,6 +14,7 @@ mod i18n;
 #[cfg(any(windows, test))]
 mod follow;
 mod grid;
+mod newwin;
 mod usage;
 #[cfg(any(windows, test))]
 mod touchpad;

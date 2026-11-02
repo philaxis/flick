@@ -102,6 +102,10 @@ pub struct Grid {
     /// said at its bottom unless asked for (?).
     #[serde(default)]
     pub board_hints_seen: bool,
+    /// Where new windows go (`newwin`), oldest first; the newest that fits
+    /// wins.
+    #[serde(default)]
+    pub new_window_rules: Vec<crate::newwin::NewWindowRule>,
 }
 
 impl Grid {
