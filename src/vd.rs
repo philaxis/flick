@@ -9,7 +9,7 @@ use windows::{
         Graphics::{
             Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWINDOWATTRIBUTE},
             Gdi::{
-                EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow,
+                EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow, MONITOR_DEFAULTTONULL,
                 DISPLAY_DEVICEW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
                 MONITOR_DEFAULTTOPRIMARY,
             },
@@ -725,10 +725,6 @@ impl WindowPins {
     }
 }
 
-fn same_rect(a: RECT, b: RECT) -> bool {
-    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
-}
-
 /// The text in a fixed-size wide buffer, up to its first zero.
 fn wide_text(text: &[u16]) -> String {
     let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
@@ -769,15 +765,10 @@ fn monitor_device_id(monitor: HMONITOR) -> Option<String> {
 /// same each time it is plugged in. Used by the rules for new windows
 /// (`newwin`).
 pub fn monitor_id(bounds: RECT) -> Option<String> {
-    unsafe extern "system" fn collect(monitor: HMONITOR, _: HDC, _: *mut RECT, out: LPARAM) -> BOOL {
-        (*(out.0 as *mut Vec<HMONITOR>)).push(monitor);
-        TRUE
-    }
-    let mut handles: Vec<HMONITOR> = Vec::new();
-    unsafe {
-        EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut handles as *mut _ as isize));
-    }
-    handles.into_iter().find(|&handle| monitor_info(handle).is_some_and(|info| same_rect(info.rcMonitor, bounds))).and_then(monitor_device_id)
+    // The monitor most of `bounds` is on, so that a work area, or a screen
+    // rounded a pixel off by the board's scaling, finds its monitor too.
+    let monitor = unsafe { MonitorFromRect(&bounds, MONITOR_DEFAULTTONULL) };
+    (!monitor.is_invalid()).then_some(monitor).and_then(monitor_device_id)
 }
 
 /// The whole screen of the monitor `hwnd` is on.
