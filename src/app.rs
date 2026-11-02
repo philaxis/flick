@@ -31,13 +31,17 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
         System::{
-            Com::{CoInitializeEx, COINIT_MULTITHREADED},
+            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
             LibraryLoader::GetModuleHandleW,
             SystemInformation::GetTickCount,
             Threading::GetCurrentProcessId,
+            Variant::{VARIANT, VT_I4},
         },
         UI::{
-            Accessibility::{SetWinEventHook, HWINEVENTHOOK},
+            Accessibility::{
+                CUIAutomation, IUIAutomation, IUIAutomationValuePattern, SetWinEventHook, TreeScope_Descendants,
+                UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_ValuePatternId, HWINEVENTHOOK,
+            },
             HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, GetLastInputInfo, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, LASTINPUTINFO,
@@ -108,6 +112,12 @@ const NEW_WINDOW_TIMER_ID: usize = 11;
 /// Apps position their own windows right after showing them: the move waits
 /// this long and then looks again.
 const NEW_WINDOW_MOVE_MS: u32 = 150;
+/// One-shot timer that takes the next step of opening a new window's page in
+/// a tab of a window already at its destination (`App::step_merge`).
+const MERGE_TIMER_ID: usize = 12;
+/// The wait between those steps: enough for the browser to make the tab and
+/// the keyboard to reach it, short enough not to keep the user waiting.
+const MERGE_STEP_MS: u32 = 90;
 /// How long Windows goes on showing a cell after telling it is there
 /// (250 was not always enough on a 23H2 PC with a busy CPU, 400 was).
 const ONWARD_MS: u32 = 400;
@@ -121,6 +131,42 @@ fn keyboard_held_on(id: &str) -> bool {
 /// Whether two screen rectangles are the same monitor.
 fn same_screen(a: RECT, b: RECT) -> bool {
     a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+}
+
+fn int_variant(value: i32) -> VARIANT {
+    let mut variant = VARIANT::default();
+    unsafe {
+        (*variant.Anonymous.Anonymous).vt = VT_I4;
+        (*variant.Anonymous.Anonymous).Anonymous.lVal = value;
+    }
+    variant
+}
+
+/// The address the window shows, from the first Edit control of its UI
+/// Automation tree whose value looks like a URL or host: a browser's address
+/// bar. None for a popup, an app window or another program.
+fn address_of(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+        let root = automation.ElementFromHandle(hwnd).ok()?;
+        let edits = automation
+            .CreatePropertyCondition(UIA_ControlTypePropertyId, int_variant(UIA_EditControlTypeId.0 as i32))
+            .ok()?;
+        let elements = root.FindAll(TreeScope_Descendants, &edits).ok()?;
+        for index in 0..elements.Length().ok()? {
+            let Ok(element) = elements.GetElement(index) else { continue };
+            if element.CurrentIsPassword().is_ok_and(|password| password.as_bool()) {
+                continue;
+            }
+            let Ok(value) = element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) else { continue };
+            let Ok(text) = value.CurrentValue() else { continue };
+            let text = text.to_string();
+            if newwin::looks_like_address(&text) {
+                return Some(text.trim().to_owned());
+            }
+        }
+        None
+    }
 }
 
 fn onward_ms() -> u32 {
@@ -236,6 +282,9 @@ struct App {
     /// one-shot timer that makes it is set.
     pending_windows: Vec<PendingWindow>,
     new_window_timer: bool,
+    /// A new window being opened as a tab of a window already at its
+    /// destination (`App::begin_merge`).
+    merging: Option<PendingMerge>,
     /// Window handles already looked at when shown, so that a second showing
     /// of the same window does not count as a new one.
     seen_windows: HashSet<isize>,
@@ -257,6 +306,38 @@ struct PendingWindow {
     /// The desktop the user was on when the window appeared, to go back to
     /// if Windows follows the window by itself.
     before: String,
+}
+
+/// A new window whose page is being opened in a tab of a window already at
+/// the destination, one timer step at a time.
+struct PendingMerge {
+    /// The new window, to close once its page is in the tab.
+    window: HWND,
+    /// The window already at the destination, which takes the tab.
+    target: HWND,
+    url: String,
+    /// The window the rule came from, and whether the user follows the tab.
+    source: HWND,
+    follow: bool,
+    /// Where the new window goes if the merge fails, and where the user was.
+    desktop: String,
+    monitor: String,
+    before: String,
+    step: MergeStep,
+    /// Whether the foreground was asked for a second time.
+    retried: bool,
+}
+
+#[derive(Clone, Copy)]
+enum MergeStep {
+    /// Waiting for the target window to have the keyboard.
+    Foreground,
+    /// The tab is open and waits for the address.
+    Opened,
+    /// The address is typed and Enter is next.
+    Typed,
+    /// Enter was pressed: the new window can be closed.
+    Submitted,
 }
 
 /// A hold the screen follows (`input::followed`).
@@ -482,6 +563,7 @@ impl App {
             front_history: Vec::new(),
             pending_windows: Vec::new(),
             new_window_timer: false,
+            merging: None,
             seen_windows: HashSet::new(),
             untitled_windows: Vec::new(),
         }
@@ -828,15 +910,15 @@ impl App {
             if !unsafe { IsWindow(item.window) }.as_bool() || !vd::is_app_window(item.window) {
                 continue;
             }
-            self.send_window(item.window, item.source, &item.desktop, &item.monitor, item.follow, &item.before);
+            self.send_window(item.window, item.source, &item.desktop, &item.monitor, item.follow, &item.before, true);
         }
         self.seen_windows.retain(|&hwnd| unsafe { IsWindow(HWND(hwnd)) }.as_bool());
     }
 
-    /// Moves `window` to `desktop` and the monitor `monitor` names, then puts
-    /// the keyboard where the rule says: on the new window when the user
-    /// follows it, otherwise back on the source window.
-    fn send_window(&mut self, window: HWND, source: HWND, desktop: &str, monitor: &str, follow: bool, before: &str) {
+    /// Sends `window` to `desktop` and the monitor `monitor` names. A new
+    /// window of a program already there on the same monitor opens its page
+    /// as a tab of that window instead; everything else is moved.
+    fn send_window(&mut self, window: HWND, source: HWND, desktop: &str, monitor: &str, follow: bool, before: &str, merge: bool) {
         if self.follows_or_pinned(window) {
             debug_log!("newwin: {:x} is pinned or follows, left alone", window.0);
             return;
@@ -850,12 +932,22 @@ impl App {
             debug_log!("newwin: monitor {monitor} is gone, the rule sleeps");
             return;
         };
+        if merge && self.begin_merge(window, source, desktop, monitor, bounds, follow, before, &desktops) {
+            return;
+        }
+        self.send_window_to(window, source, desktop, target, bounds, follow, before, &desktops);
+    }
+
+    /// Moves `window` to `desktop` and the monitor `bounds`, then puts the
+    /// keyboard where the rule says: on the new window when the user follows
+    /// it, otherwise back on the source window.
+    fn send_window_to(&mut self, window: HWND, source: HWND, desktop: &str, target: vdapi::Desktop, bounds: RECT, follow: bool, before: &str, desktops: &Desktops) {
         if let Err(e) = vdapi::move_window_to_desktop(target, window) {
             log(&format!("moving new window {:x} to {desktop} failed: {e:?}", window.0));
             return;
         }
         vd::move_to_monitor(window, bounds);
-        debug_log!("newwin: {:x} to {} on {monitor}", window.0, &desktop[..4.min(desktop.len())]);
+        debug_log!("newwin: {:x} to {} on {}", window.0, &desktop[..4.min(desktop.len())], vd::monitor_id(bounds).unwrap_or_default());
         if follow {
             if desktop == desktops.current {
                 return;
@@ -892,6 +984,164 @@ impl App {
             // The source is gone: give the keyboard to a window of the cell,
             // or Windows would follow the window left behind.
             vd::focus_top_window_of(before);
+        }
+    }
+
+    /// Starts opening `window`'s page in a tab of a window of the same
+    /// program already on the destination desktop and monitor, when the user
+    /// is on that desktop or follows the window there. Returns whether it
+    /// took the window; otherwise the caller moves it as usual.
+    fn begin_merge(&mut self, window: HWND, source: HWND, desktop: &str, monitor: &str, bounds: RECT, follow: bool, before: &str, desktops: &Desktops) -> bool {
+        if self.merging.is_some() {
+            debug_log!("newwin: {:x} moved: another window is already opening as a tab", window.0);
+            return false;
+        }
+        if desktop != desktops.current && !follow {
+            debug_log!("newwin: {:x} not merged: {} is not the current cell", window.0, &desktop[..4.min(desktop.len())]);
+            return false;
+        }
+        let Some(exe) = vd::exe_of_window(window) else { return false };
+        let Some(target) = self.merge_target(window, &exe, desktop, bounds) else {
+            debug_log!("newwin: {:x} has no {exe} window on {} to join", window.0, &desktop[..4.min(desktop.len())]);
+            return false;
+        };
+        let Some(url) = address_of(window) else {
+            debug_log!("newwin: {:x} has no address bar, so it is moved rather than merged", window.0);
+            return false;
+        };
+        if follow && desktop != desktops.current {
+            let Some(to) = desktops.get(desktop) else { return false };
+            if !self.switch(to) {
+                return false;
+            }
+            self.visit(desktop);
+            self.going = Some((desktop.to_owned(), Instant::now()));
+        }
+        debug_log!("newwin: {:x} ({exe}) opens as a tab of {:x} on {}", window.0, target.0, &desktop[..4.min(desktop.len())]);
+        vd::force_foreground(target);
+        self.merging = Some(PendingMerge {
+            window,
+            target,
+            url,
+            source,
+            follow,
+            desktop: desktop.to_owned(),
+            monitor: monitor.to_owned(),
+            before: before.to_owned(),
+            step: MergeStep::Foreground,
+            retried: false,
+        });
+        unsafe { SetTimer(self.hwnd, MERGE_TIMER_ID, MERGE_STEP_MS, None); }
+        true
+    }
+
+    /// The window of `exe` on `desktop` and the monitor `bounds` that was in
+    /// front most recently, which takes the tab.
+    fn merge_target(&self, window: HWND, exe: &str, desktop: &str, bounds: RECT) -> Option<HWND> {
+        let candidates: Vec<isize> = vd::app_windows()
+            .into_iter()
+            .filter(|&other| {
+                other != window
+                    && vd::exe_of_window(other).as_deref() == Some(exe)
+                    && vdapi::get_desktop_by_window(other).is_ok_and(|d| d.id() == desktop)
+                    && vd::monitor_of_window(other).is_some_and(|here| same_screen(here, bounds))
+            })
+            .map(|other| other.0)
+            .collect();
+        newwin::merge_target(&self.front_history, &candidates).map(HWND)
+    }
+
+    /// One step of opening a new window's page as a tab, on a timer so that
+    /// the browser has time to make the tab between the keys.
+    fn step_merge(&mut self) {
+        let _ = unsafe { KillTimer(self.hwnd, MERGE_TIMER_ID) };
+        let Some(mut merge) = self.merging.take() else { return };
+        let target_alive = unsafe { IsWindow(merge.target) }.as_bool();
+        let new_alive = unsafe { IsWindow(merge.window) }.as_bool();
+        match merge.step {
+            MergeStep::Foreground => {
+                if !target_alive {
+                    self.fail_merge(merge, "the window to join is gone");
+                    return;
+                }
+                if unsafe { GetForegroundWindow() } != merge.target {
+                    if merge.retried {
+                        self.fail_merge(merge, "the window to join would not come to the front");
+                        return;
+                    }
+                    merge.retried = true;
+                    vd::force_foreground(merge.target);
+                    self.merging = Some(merge);
+                    unsafe { SetTimer(self.hwnd, MERGE_TIMER_ID, MERGE_STEP_MS, None); }
+                    return;
+                }
+                input::open_tab();
+                merge.step = MergeStep::Opened;
+            }
+            MergeStep::Opened => {
+                if !new_alive {
+                    self.finish_merge(&merge);
+                    return;
+                }
+                if !target_alive {
+                    self.fail_merge(merge, "the window to join is gone");
+                    return;
+                }
+                input::type_text(&merge.url);
+                merge.step = MergeStep::Typed;
+            }
+            MergeStep::Typed => {
+                if !new_alive {
+                    self.finish_merge(&merge);
+                    return;
+                }
+                if !target_alive {
+                    self.fail_merge(merge, "the window to join is gone");
+                    return;
+                }
+                input::press_enter();
+                merge.step = MergeStep::Submitted;
+            }
+            MergeStep::Submitted => {
+                debug_log!("newwin: {:x} opened in {:x} as a tab", merge.window.0, merge.target.0);
+                if new_alive {
+                    let _ = unsafe { PostMessageW(merge.window, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                }
+                self.finish_merge(&merge);
+                return;
+            }
+        }
+        self.merging = Some(merge);
+        unsafe { SetTimer(self.hwnd, MERGE_TIMER_ID, MERGE_STEP_MS, None); }
+    }
+
+    /// The merge could not go on: move the new window as the rule would have,
+    /// unless it is gone by itself.
+    fn fail_merge(&mut self, merge: PendingMerge, why: &str) {
+        let _ = why;
+        debug_log!("newwin: {:x} not merged: {why}; moving it", merge.window.0);
+        if !unsafe { IsWindow(merge.window) }.as_bool() {
+            self.finish_merge(&merge);
+            return;
+        }
+        let Some(desktops) = Desktops::read() else { return };
+        let Some(target) = desktops.get(&merge.desktop) else { return };
+        let Some(bounds) = vd::monitor_bounds(&merge.monitor) else { return };
+        self.send_window_to(merge.window, merge.source, &merge.desktop, target, bounds, merge.follow, &merge.before, &desktops);
+    }
+
+    /// Gives the keyboard back where the rule says after a merge, unless the
+    /// user follows the tab.
+    fn finish_merge(&mut self, merge: &PendingMerge) {
+        if merge.follow {
+            return;
+        }
+        if unsafe { IsWindow(merge.source) }.as_bool()
+            && (vd::pinned_everywhere(merge.source) || vdapi::get_desktop_by_window(merge.source).is_ok_and(|d| d.id() == merge.before))
+        {
+            vd::force_foreground(merge.source);
+        } else {
+            vd::focus_top_window_of(&merge.before);
         }
     }
 
@@ -953,7 +1203,7 @@ impl App {
         let follow = rule.follow;
         let monitor = rule.monitor.clone();
         let before = vdapi::get_desktop_by_window(source).ok().map(|d| d.id()).unwrap_or_else(|| desktops.current.clone());
-        self.send_window(window, source, &desktop, &monitor, follow, &before);
+        self.send_window(window, source, &desktop, &monitor, follow, &before, false);
     }
 
     /// Puts the pinned windows on cell `id`, come to, where they go among its
@@ -2785,6 +3035,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     app.new_window_shown(HWND(window), true);
                 }
             });
+        }
+        WM_TIMER if wparam.0 == MERGE_TIMER_ID => {
+            with_app(App::step_merge);
         }
         WM_TIMER if wparam.0 == RESTACK_TIMER_ID => {
             let _ = KillTimer(hwnd, RESTACK_TIMER_ID);

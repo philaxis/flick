@@ -35,7 +35,7 @@ use windows::Win32::{
         Input::{
             KeyboardAndMouse::{
                 MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-                KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+                KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_T,
             },
             HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
             RID_INPUT, RIM_TYPEHID, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
@@ -1678,6 +1678,47 @@ fn replay(events: &[(u32, bool)]) {
     unsafe {
         SendInput(&events, std::mem::size_of::<INPUT>() as i32);
     }
+}
+
+/// Opens a new tab in the foreground window (Ctrl+T).
+pub fn open_tab() {
+    replay(&[
+        (VK_CONTROL.0 as u32, false),
+        (VK_T.0 as u32, false),
+        (VK_T.0 as u32, true),
+        (VK_CONTROL.0 as u32, true),
+    ]);
+}
+
+/// Types `text` into the foreground window as Unicode key events, so that
+/// every character reaches it whatever the keyboard layout.
+pub fn type_text(text: &str) {
+    let events: Vec<INPUT> = text.encode_utf16().flat_map(|unit| [unicode_event(unit, false), unicode_event(unit, true)]).collect();
+    if !events.is_empty() {
+        unsafe {
+            SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+fn unicode_event(unit: u16, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: KEYBD_EVENT_FLAGS(KEYEVENTF_UNICODE.0 | if up { KEYEVENTF_KEYUP.0 } else { 0 }),
+                time: 0,
+                dwExtraInfo: OWN_INPUT,
+            },
+        },
+    }
+}
+
+/// Presses Enter in the foreground window.
+pub fn press_enter() {
+    replay(&[(VK_RETURN.0 as u32, false), (VK_RETURN.0 as u32, true)]);
 }
 
 /// Keeps the timer that ends the wait for the rest of the chord in step with
