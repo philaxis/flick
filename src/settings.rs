@@ -49,10 +49,10 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const SIZE: (f32, f32) = (560.0, ROWS.0 + (FLICK_ROW + 3.0) * ROWS.1 + 14.0);
 /// The touchpad's row, its notice and the button under it.
 const TOUCHPAD_ROW: f32 = 3.0;
-const TOUCHPAD_NOTICE_ROW: f32 = 4.0;
-const TOUCHPAD_BUTTON_ROW: f32 = 5.0;
+const TOUCHPAD_NOTICE_ROW: f32 = 3.85;
+const TOUCHPAD_BUTTON_ROW: f32 = 5.15;
 /// The flick time's row, under the touchpad.
-const FLICK_ROW: f32 = 6.0;
+const FLICK_ROW: f32 = 6.2;
 /// Top of the first row and the height of each.
 const ROWS: (f32, f32) = (14.0, 44.0);
 /// Left edge of the labels and right edge of the controls.
@@ -129,7 +129,7 @@ impl Layout {
             autostart: rect((EDGES.1 - 44.0) * s, (row(1.0) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
             admin: rect((EDGES.1 - 44.0) * s, (row(2.0) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
             three_finger: rect((EDGES.1 - 44.0) * s, (row(TOUCHPAD_ROW) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
-            touchpad_notice: rect(EDGES.0 * s, row(TOUCHPAD_NOTICE_ROW) * s, (EDGES.1 - EDGES.0) * s, 2.0 * NOTICE_LINE * s),
+            touchpad_notice: rect(EDGES.0 * s, row(TOUCHPAD_NOTICE_ROW) * s, (EDGES.1 - EDGES.0) * s, 3.0 * NOTICE_LINE * s),
             touchpad_settings: rect(EDGES.0 * s, (row(TOUCHPAD_BUTTON_ROW) + (ROWS.1 - 30.0) / 2.0) * s, 260.0 * s, 30.0 * s),
             flick: rect((EDGES.0 + FLICK_LABEL) * s, row(FLICK_ROW) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
         }
