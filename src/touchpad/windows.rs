@@ -25,6 +25,24 @@ pub enum Status {
     Unavailable,
 }
 
+impl Status {
+    /// What it means for the user, in the language Windows is shown in.
+    pub fn words(self) -> &'static str {
+        use crate::i18n::text as tr;
+        match self {
+            Status::Absent => tr("No precision touchpad was found on this PC.", "이 PC에서 정밀 터치패드를 찾지 못했어요.", "此电脑上没有找到精密触摸板。"),
+            Status::Off => tr("Off.", "꺼져 있어요.", "已关闭。"),
+            Status::Conflict => tr(
+                "Windows still uses three fingers itself. In its touchpad settings, under Three-finger gestures, set Swipes and Taps to Nothing. Flick notices the change by itself.",
+                "Windows가 아직 세 손가락 제스처를 쓰고 있어요. Windows 터치패드 설정의 '세 손가락 제스처'에서 '살짝 밀기'와 '탭'을 모두 '없음'으로 바꾸세요. 바꾸면 Flick이 저절로 알아챕니다.",
+                "Windows 仍在使用三指手势。请在其触摸板设置的“三指手势”中，把“轻扫”和“点击”都设为“无”。改好后 Flick 会自动发现。",
+            ),
+            Status::Active => tr("✓ Ready: swipe with three fingers to move, tap with three to see every desktop.", "✓ 준비됐어요. 세 손가락으로 밀면 이동, 톡 치면 모든 데스크톱이 보여요.", "✓ 已就绪：三指滑动切换，三指轻点查看所有桌面。"),
+            Status::Unavailable => tr("This touchpad's input could not be read.", "이 터치패드의 입력을 읽지 못했어요.", "无法读取此触摸板的输入。"),
+        }
+    }
+}
+
 static REGISTRATION_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub fn registration_failed(failed: bool) {
