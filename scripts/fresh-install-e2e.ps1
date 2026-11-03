@@ -30,6 +30,8 @@ function Desktops {
 }
 function Click([int]$ms = 120) { & $drive xbutton down; Start-Sleep -Milliseconds $ms; & $drive xbutton up }
 function Key([string]$vk) { & $drive key down $vk; Start-Sleep -Milliseconds 60; & $drive key up $vk }
+# reg.exe writes its success line to stderr, which PowerShell 5 turns into a terminating error under Stop.
+function Reg([string]$arguments) { cmd /d /c "reg $arguments >nul 2>&1"; $LASTEXITCODE -eq 0 }
 
 $roaming = Join-Path $env:APPDATA 'Flick'
 $local = Join-Path $env:LOCALAPPDATA 'Flick'
@@ -45,9 +47,8 @@ if (Test-Path $local) { Move-Item $local "$backup\local" }
 if (Test-Path $link) { Move-Item $link "$backup\Flick.lnk" }
 $runValue = (Get-ItemProperty $run -Name Flick -ErrorAction SilentlyContinue).Flick
 Remove-ItemProperty $run -Name Flick -ErrorAction SilentlyContinue
-reg query $uninstall *> $null
-$hadUninstall = $LASTEXITCODE -eq 0
-if ($hadUninstall) { reg export $uninstall "$backup\uninstall.reg" /y | Out-Null; reg delete $uninstall /f | Out-Null }
+$hadUninstall = Reg "query `"$uninstall`""
+if ($hadUninstall) { Reg "export `"$uninstall`" `"$backup\uninstall.reg`" /y" | Out-Null; Reg "delete `"$uninstall`" /f" | Out-Null }
 
 $downloads = Join-Path $out 'Downloads'
 New-Item -ItemType Directory -Force $downloads | Out-Null
@@ -105,12 +106,12 @@ try {
     Remove-Item $roaming, $local -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $link -ErrorAction SilentlyContinue
     Remove-ItemProperty $run -Name Flick -ErrorAction SilentlyContinue
-    reg delete $uninstall /f *> $null
+    Reg "delete `"$uninstall`" /f" | Out-Null
     if (Test-Path "$backup\roaming") { Move-Item "$backup\roaming" $roaming }
     if (Test-Path "$backup\local") { Move-Item "$backup\local" $local }
     if (Test-Path "$backup\Flick.lnk") { Move-Item "$backup\Flick.lnk" $link }
     if ($runValue) { Set-ItemProperty $run -Name Flick -Value $runValue }
-    if ($hadUninstall) { reg import "$backup\uninstall.reg" *> $null }
+    if ($hadUninstall) { Reg "import `"$backup\uninstall.reg`"" | Out-Null }
     Remove-Item "$downloads\Flick.exe" -ErrorAction SilentlyContinue
     if ($was) { Start-Process $was }
     Add-Content "$out\report.txt" 'restored'
