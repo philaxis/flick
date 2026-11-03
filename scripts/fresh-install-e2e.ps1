@@ -80,7 +80,7 @@ try {
         Shot '4-let-go'
     } else {
         # Each further step is "wait <s>", "shot <name>", "click", "key <vk hex>", "mouse <x> <y> [down|up]",
-        # "hold <dx> <dy>" (trigger held through a stroke) or "drive <args...>", separated by ';'.
+        # "hold <dx> <dy>" (trigger held through a stroke), "guideclick <x> <y>" or "drive <args...>", separated by ';'.
         foreach ($step in ($Steps -split ';')) {
             $words = @($step.Trim() -split '\s+')
             switch ($words[0]) {
@@ -95,6 +95,14 @@ try {
                     & $drive xbutton up
                 }
                 'drive' { & $drive @($words[1..($words.Count - 1)]) }
+                'guideclick' {
+                    # guideclick <x> <y>: a click inside the setup window, in its unscaled units (560 wide).
+                    $c = @((& $drive client flick.guide) -split '\s+')
+                    $scale = [double]$c[2] / 560
+                    $x = [int]([double]$c[0] + [double]$words[1] * $scale)
+                    $y = [int]([double]$c[1] + [double]$words[2] * $scale)
+                    & $drive mouse $x $y down; Start-Sleep -Milliseconds 80; & $drive mouse $x $y up
+                }
                 default { Add-Content "$out\report.txt" "unknown step $step" }
             }
         }

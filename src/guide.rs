@@ -36,7 +36,7 @@ use windows::{
                 CreateWindowExW, GetClientRect, IsWindowVisible, KillTimer, LoadCursorW, RegisterClassW, SetTimer,
                 SetWindowPos, ShowWindow, HICON, HWND_TOPMOST, IDC_ARROW, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE,
                 SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
+                WM_ACTIVATE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
                 WS_SYSMENU,
             },
         },
@@ -163,6 +163,8 @@ pub struct Words {
     pub skip: &'static str,
     pub back: &'static str,
     pub next: &'static str,
+    /// On the Trigger page while another window has the keyboard: it listens only while in front.
+    pub click_first: &'static str,
 }
 
 const ENGLISH: Words = Words {
@@ -178,7 +180,7 @@ const ENGLISH: Words = Words {
     screen: "your screen",
     tray: ["Flick lives by the clock, maybe inside ^.", "Drag it out to keep it in sight."],
     button: "Got it",
-    balloon: ("Flick is running here", "Right-click this icon for Settings and Setup and how to use."),
+    balloon: ("Flick is running here", "Right-click this icon for Settings and the setup guide."),
     menu: "Setup and how to use",
     admin_front: ("Flick can't hear its button now", "A window run as administrator is in front. Click another window, or enable Run as administrator in Settings."),
     page_trigger: "Choose your Flick button",
@@ -205,6 +207,7 @@ const ENGLISH: Words = Words {
     skip: "Skip",
     back: "Back",
     next: "Next",
+    click_first: "Click this window, then press the button",
 };
 
 const KOREAN: Words = Words {
@@ -220,7 +223,7 @@ const KOREAN: Words = Words {
     screen: "지금 화면",
     tray: ["Flick 은 시계 옆에 있어요. ^ 안에 있을 수도 있어요.", "끌어서 꺼내 두면 늘 보여요."],
     button: "알겠어요",
-    balloon: ("Flick 이 여기서 돌고 있어요", "이 아이콘을 오른쪽 클릭하면 설정과 설정 마법사·쓰는 법이 있어요."),
+    balloon: ("Flick 이 여기서 돌고 있어요", "이 아이콘을 오른쪽 클릭하면 설정과 설정 마법사가 있어요."),
     menu: "설정 마법사와 사용법",
     admin_front: ("지금은 Flick 버튼이 안 들려요", "관리자 권한 창이 앞에 있어요. 다른 창을 누르거나, 설정에서 관리자 권한 실행을 켜세요."),
     page_trigger: "Flick 버튼 정하기",
@@ -247,6 +250,7 @@ const KOREAN: Words = Words {
     skip: "건너뛰기",
     back: "이전",
     next: "다음",
+    click_first: "이 창을 한 번 누른 뒤 버튼을 눌러 보세요",
 };
 
 const CHINESE: Words = Words {
@@ -257,7 +261,7 @@ const CHINESE: Words = Words {
     screen: "你的屏幕",
     tray: ["Flick 在时钟旁边，可能在 ^ 里。", "把它拖出来，随时可见。"],
     button: "知道了",
-    balloon: ("Flick 正在这里运行", "右键点击此图标可打开设置和设置向导·使用方法。"),
+    balloon: ("Flick 正在这里运行", "右键点击此图标可打开设置和设置向导。"),
     menu: "设置向导和用法",
     admin_front: ("Flick 现在听不到按键", "前面是以管理员身份运行的窗口。点一下别的窗口，或在设置中开启以管理员身份运行。"),
     page_trigger: "选择 Flick 按键",
@@ -284,6 +288,7 @@ const CHINESE: Words = Words {
     skip: "跳过",
     back: "上一步",
     next: "下一步",
+    click_first: "先点一下此窗口，再按按键",
 };
 
 /// The words for the language Windows is shown in: Korean, Chinese, or
@@ -507,6 +512,9 @@ impl Guide {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, fitted.left, fitted.top, fitted.right - fitted.left, fitted.bottom - fitted.top, SWP_SHOWWINDOW | quiet);
             SetTimer(self.hwnd, TIMER_ID, FRAME_MS, None);
         }
+        // On every desktop, so that trying a move on the Try page does not
+        // leave it behind on the desktop just left.
+        let _ = crate::vdapi::pin_window(self.hwnd);
         Action::Shown(self.page)
     }
 
@@ -671,6 +679,16 @@ impl Guide {
                 }
             }
             WM_KEYDOWN => Action::None,
+            // Listens only while in front: a side button pressed for another
+            // window (a browser's Back) must not quietly become the trigger.
+            WM_ACTIVATE if self.page == Page::Trigger => {
+                let active = wparam.0 & 0xFFFF != 0;
+                match (active, self.view.listen) {
+                    (true, Listen::Off) => Action::Listen(Listen::Mouse),
+                    (false, Listen::Mouse | Listen::Keys) => Action::Listen(Listen::Off),
+                    _ => Action::None,
+                }
+            }
             WM_DPICHANGED => {
                 unsafe {
                     let to = *(lparam.0 as *const RECT);
@@ -885,7 +903,7 @@ impl Guide {
         } else if self.view.listen == Listen::Mouse {
             (words.listening.to_owned(), white(0.75))
         } else {
-            (String::new(), white(0.75))
+            (words.click_first.to_owned(), white(0.75))
         };
         if !line.is_empty() {
             p.text(&line, &fonts.text, &rect(MARGIN * s, 156.0 * s, WIDTH * s, 24.0 * s), colour);

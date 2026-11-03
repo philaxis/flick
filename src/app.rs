@@ -2829,7 +2829,12 @@ impl App {
             }
             guide::Action::Listen(guide::Listen::Mouse) => self.begin_capture(CaptureFor::Setup, false),
             guide::Action::Listen(guide::Listen::Keys) => self.begin_capture(CaptureFor::Setup, true),
-            guide::Action::ThreeFinger(on) => self.set_config("touchpad.three_finger", if on { "true" } else { "false" }),
+            guide::Action::ThreeFinger(on) => {
+                self.set_config("touchpad.three_finger", if on { "true" } else { "false" });
+                crate::touchpad::poll(on);
+                self.refresh_settings();
+                self.refresh_guide();
+            }
             guide::Action::OpenTouchpadSettings => crate::touchpad::open_windows_settings(),
             guide::Action::MakeDesktops => self.make_desktops(),
         }
@@ -2844,7 +2849,12 @@ impl App {
         match page {
             guide::Page::Trigger => {
                 self.guide_heard = false;
-                self.begin_capture(CaptureFor::Setup, false);
+                let in_front = self.guide.as_ref().is_some_and(|guide| unsafe { GetForegroundWindow() } == guide.hwnd());
+                if in_front {
+                    self.begin_capture(CaptureFor::Setup, false);
+                } else {
+                    self.refresh_guide();
+                }
             }
             guide::Page::Try => {
                 self.guide_moved = false;
