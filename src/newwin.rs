@@ -89,15 +89,66 @@ pub fn looks_like_address(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_whitespace) && (value.contains('.') || value.contains(':'))
 }
 
-/// Which of `candidates` a new window should open its page in: the one
-/// that was in front most recently. When none of them is in `history`, the
-/// first, which is the topmost window.
-pub fn merge_target(history: &[FrontWindow], candidates: &[isize]) -> Option<isize> {
-    history
-        .iter()
-        .rev()
-        .find_map(|entry| candidates.contains(&entry.hwnd).then_some(entry.hwnd))
-        .or_else(|| candidates.first().copied())
+/// A window that could take a new window's page as a tab. `preferred` marks
+/// one on the monitor the new window is going to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeCandidate {
+    pub hwnd: isize,
+    pub preferred: bool,
+}
+
+/// Which of `candidates` a new window should open its page in: one on the
+/// destination monitor if there is one, then the one that was in front most
+/// recently. When none of them is in `history`, the first, which is the
+/// topmost window.
+pub fn merge_target(history: &[FrontWindow], candidates: &[MergeCandidate]) -> Option<isize> {
+    let best = |pool: &[MergeCandidate]| {
+        history
+            .iter()
+            .rev()
+            .find_map(|entry| pool.iter().find(|candidate| candidate.hwnd == entry.hwnd))
+            .or_else(|| pool.first())
+            .map(|candidate| candidate.hwnd)
+    };
+    let preferred: Vec<MergeCandidate> = candidates.iter().copied().filter(|candidate| candidate.preferred).collect();
+    best(&preferred).or_else(|| best(candidates))
+}
+
+/// Why a merge waiting for its cell cannot be made and is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dropped {
+    /// The new window is gone.
+    Window,
+    /// The new window no longer shows the address kept: the user went
+    /// somewhere else in it, or opened more tabs.
+    Address,
+    /// No window of its program is left on the cell to take the tab.
+    Target,
+}
+
+impl Dropped {
+    /// The reason, for the log.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Dropped::Window => "the new window is gone",
+            Dropped::Address => "its address changed since it was read",
+            Dropped::Target => "no window of its program is left on the cell",
+        }
+    }
+}
+
+/// Whether a merge waiting for its cell can go on: `alive` says the new
+/// window is still there, `address` what it shows now (`None` when it cannot
+/// be read) and `target` the window found on the cell to take the tab. The
+/// window to join, or why the merge is dropped.
+pub fn deferred_target(alive: bool, address: Option<&str>, url: &str, target: Option<isize>) -> Result<isize, Dropped> {
+    if !alive {
+        return Err(Dropped::Window);
+    }
+    if address != Some(url) {
+        return Err(Dropped::Address);
+    }
+    target.ok_or(Dropped::Target)
 }
 
 #[cfg(test)]
@@ -158,9 +209,35 @@ mod tests {
     fn the_merge_target_is_the_candidate_in_front_most_recently() {
         let now = std::time::Instant::now();
         let history = [entry(1, now), entry(2, now), entry(3, now)];
-        assert_eq!(merge_target(&history, &[1, 3]), Some(3));
-        assert_eq!(merge_target(&history, &[1, 2]), Some(2));
-        assert_eq!(merge_target(&history, &[1, 9]), Some(1));
+        let here = |hwnd| MergeCandidate { hwnd, preferred: false };
+        assert_eq!(merge_target(&history, &[here(1), here(3)]), Some(3));
+        assert_eq!(merge_target(&history, &[here(1), here(2)]), Some(2));
+        assert_eq!(merge_target(&history, &[here(1), here(9)]), Some(1));
         assert_eq!(merge_target(&history, &[]), None);
+    }
+
+    #[test]
+    fn a_candidate_on_the_destination_monitor_is_chosen_first() {
+        let now = std::time::Instant::now();
+        let history = [entry(1, now), entry(2, now)];
+        let here = |hwnd, preferred| MergeCandidate { hwnd, preferred };
+        // The one in front most recently is on another monitor: the one here
+        // counts first.
+        assert_eq!(merge_target(&history, &[here(1, true), here(2, false)]), Some(1));
+        // None on this monitor: the one in front most recently anywhere.
+        assert_eq!(merge_target(&history, &[here(1, false), here(2, false)]), Some(2));
+        // Not in the history at all: the first of this monitor's.
+        assert_eq!(merge_target(&history, &[here(7, false), here(8, true)]), Some(8));
+    }
+
+    #[test]
+    fn a_waiting_merge_is_dropped_when_it_can_no_longer_be_made() {
+        assert_eq!(deferred_target(true, Some("https://a.com"), "https://a.com", Some(4)), Ok(4));
+        assert_eq!(deferred_target(false, Some("https://a.com"), "https://a.com", Some(4)), Err(Dropped::Window));
+        // The user went elsewhere in the new window, or it cannot be read.
+        assert_eq!(deferred_target(true, Some("https://b.com"), "https://a.com", Some(4)), Err(Dropped::Address));
+        assert_eq!(deferred_target(true, None, "https://a.com", Some(4)), Err(Dropped::Address));
+        // The window that would take the tab is gone.
+        assert_eq!(deferred_target(true, Some("https://a.com"), "https://a.com", None), Err(Dropped::Target));
     }
 }

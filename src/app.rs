@@ -285,6 +285,9 @@ struct App {
     /// A new window being opened as a tab of a window already at its
     /// destination (`App::begin_merge`).
     merging: Option<PendingMerge>,
+    /// Merges waiting for the user to go to the cell the new window was moved
+    /// to (`App::resume_deferred`), oldest first.
+    deferred: Vec<PendingDeferred>,
     /// Window handles already looked at when shown, so that a second showing
     /// of the same window does not count as a new one.
     seen_windows: HashSet<isize>,
@@ -329,6 +332,24 @@ struct PendingMerge {
     step: MergeStep,
     /// Whether the foreground was asked for a second time.
     retried: bool,
+    /// Whether the merge waited for the user to go to the cell: a failed one
+    /// is then left where it is, since the user is there.
+    deferred: bool,
+}
+
+/// A merge put off until the user goes to the cell its new window was moved
+/// to: the address was read before the move and is checked again on arrival
+/// (`newwin::deferred_target`).
+struct PendingDeferred {
+    /// The new window, to close once its page is in a tab.
+    window: HWND,
+    /// Its program, to find the window that takes the tab.
+    exe: String,
+    /// The cell it was moved to, and the monitor of that cell.
+    desktop: String,
+    monitor: String,
+    /// The address it showed before the move.
+    url: String,
 }
 
 #[derive(Clone, Copy)]
@@ -567,6 +588,7 @@ impl App {
             pending_windows: Vec::new(),
             new_window_timer: false,
             merging: None,
+            deferred: Vec::new(),
             seen_windows: HashSet::new(),
             untitled_windows: Vec::new(),
             switched_at: Cell::new(None),
@@ -921,8 +943,9 @@ impl App {
     }
 
     /// Sends `window` to `desktop` and the monitor `monitor` names. A new
-    /// window of a program already there on the same monitor opens its page
-    /// as a tab of that window instead; everything else is moved.
+    /// window of a program already on that cell opens its page as a tab of
+    /// that window instead, now or when the user next goes there; everything
+    /// else is moved.
     fn send_window(&mut self, window: HWND, source: HWND, desktop: &str, monitor: &str, follow: bool, before: &str, merge: bool) {
         if self.follows_or_pinned(window) {
             debug_log!("newwin: {:x} is pinned or follows, left alone", window.0);
@@ -993,30 +1016,45 @@ impl App {
     }
 
     /// Starts opening `window`'s page in a tab of a window of the same
-    /// program already on the destination desktop and monitor, when the user
-    /// is on that desktop or follows the window there. Returns whether it
-    /// took the window; otherwise the caller moves it as usual.
+    /// program already on the destination cell, when the user is on that cell
+    /// or follows the window there. A window of a cell the user stays away
+    /// from is moved as usual and its merge waits for the user to go there
+    /// (`App::resume_deferred`). Returns whether it took the window; otherwise
+    /// the caller moves it as usual.
     fn begin_merge(&mut self, window: HWND, source: HWND, desktop: &str, monitor: &str, bounds: RECT, follow: bool, before: &str, desktops: &Desktops) -> bool {
-        if self.merging.is_some() {
-            debug_log!("newwin: {:x} moved: another window is already opening as a tab", window.0);
-            return false;
-        }
-        if desktop != desktops.current && !follow {
-            debug_log!("newwin: {:x} not merged: {} is not the current cell", window.0, &desktop[..4.min(desktop.len())]);
-            return false;
-        }
-        let Some(exe) = vd::exe_of_window(window) else { return false };
-        let Some(target) = self.merge_target(window, &exe, desktop, bounds) else {
-            debug_log!("newwin: {:x} has no {exe} window on {} to join", window.0, &desktop[..4.min(desktop.len())]);
+        let Some(exe) = vd::exe_of_window(window) else {
+            debug_log!("newwin: {:x} has no program name, so it is moved rather than merged", window.0);
             return false;
         };
+        // Read the address before the window moves: a merge waiting for its
+        // cell keeps it to check on arrival.
         let Some(url) = address_of(window) else {
             debug_log!("newwin: {:x} has no address bar, so it is moved rather than merged", window.0);
             return false;
         };
+        let Some(target) = self.merge_target(window, &exe, desktop, bounds) else {
+            debug_log!("newwin: {:x} has no {exe} window on {} to join", window.0, &desktop[..4.min(desktop.len())]);
+            return false;
+        };
+        if desktop != desktops.current && !follow {
+            debug_log!(
+                "newwin: {:x} ({exe}) waits to open as a tab of {:x} on {}: the user is not there",
+                window.0,
+                target.0,
+                &desktop[..4.min(desktop.len())]
+            );
+            self.deferred.push(PendingDeferred { window, exe, desktop: desktop.to_owned(), monitor: monitor.to_owned(), url });
+            // The window is moved as usual; the tab follows on arrival.
+            return false;
+        }
+        if self.merging.is_some() {
+            debug_log!("newwin: {:x} moved: another window is already opening as a tab", window.0);
+            return false;
+        }
         if follow && desktop != desktops.current {
             let Some(to) = desktops.get(desktop) else { return false };
             if !self.switch(to) {
+                debug_log!("newwin: {:x} moved: the switch to {} failed", window.0, &desktop[..4.min(desktop.len())]);
                 return false;
             }
             self.visit(desktop);
@@ -1035,25 +1073,84 @@ impl App {
             before: before.to_owned(),
             step: MergeStep::Foreground,
             retried: false,
+            deferred: false,
         });
         unsafe { SetTimer(self.hwnd, MERGE_TIMER_ID, MERGE_STEP_MS, None); }
         true
     }
 
-    /// The window of `exe` on `desktop` and the monitor `bounds` that was in
-    /// front most recently, which takes the tab.
+    /// The window of `exe` on `desktop` that takes the tab: one on the
+    /// monitor `bounds` preferred, then the one in front most recently.
     fn merge_target(&self, window: HWND, exe: &str, desktop: &str, bounds: RECT) -> Option<HWND> {
-        let candidates: Vec<isize> = vd::app_windows()
+        let candidates: Vec<newwin::MergeCandidate> = vd::app_windows()
             .into_iter()
             .filter(|&other| {
                 other != window
                     && vd::exe_of_window(other).as_deref() == Some(exe)
                     && vdapi::get_desktop_by_window(other).is_ok_and(|d| d.id() == desktop)
-                    && vd::monitor_of_window(other).is_some_and(|here| same_screen(here, bounds))
             })
-            .map(|other| other.0)
+            .map(|other| newwin::MergeCandidate {
+                hwnd: other.0,
+                preferred: vd::monitor_of_window(other).is_some_and(|here| same_screen(here, bounds)),
+            })
             .collect();
         newwin::merge_target(&self.front_history, &candidates).map(HWND)
+    }
+
+    /// The user is on `desktop`: the oldest merge waiting for it goes on, if
+    /// none is running. One that can no longer be made is dropped with the
+    /// reason (`newwin::deferred_target`).
+    fn resume_deferred(&mut self, desktop: &str) {
+        // Mid-gesture the keyboard is the hand's: the release goes on with it
+        // (`App::finish_gesture`).
+        if self.merging.is_some() || self.in_gesture || self.in_flight.is_some() {
+            return;
+        }
+        self.deferred.retain(|wait| {
+            let alive = unsafe { IsWindow(wait.window) }.as_bool() && vd::is_app_window(wait.window);
+            if !alive {
+                debug_log!("newwin: {:x} ({}) is gone; its waiting merge is dropped", wait.window.0, wait.exe);
+            }
+            alive
+        });
+        let Some(at) = self.deferred.iter().position(|wait| wait.desktop == desktop) else { return };
+        let wait = self.deferred.remove(at);
+        let address = address_of(wait.window);
+        let target = vd::monitor_bounds(&wait.monitor)
+            .and_then(|bounds| self.merge_target(wait.window, &wait.exe, desktop, bounds));
+        let target = match newwin::deferred_target(true, address.as_deref(), &wait.url, target.map(|target| target.0)) {
+            Ok(target) => HWND(target),
+            Err(why) => {
+                let reason = why.reason();
+                debug_log!("newwin: {:x} ({}) is not merged on {}: {}", wait.window.0, wait.exe, &desktop[..4.min(desktop.len())], reason);
+                let _ = reason;
+                self.resume_deferred_here();
+                return;
+            }
+        };
+        debug_log!("newwin: {:x} ({}) opens as a tab of {:x} on {}", wait.window.0, wait.exe, target.0, &desktop[..4.min(desktop.len())]);
+        vd::force_foreground(target);
+        self.merging = Some(PendingMerge {
+            window: wait.window,
+            target,
+            url: wait.url,
+            source: wait.window,
+            follow: false,
+            desktop: desktop.to_owned(),
+            monitor: wait.monitor,
+            before: desktop.to_owned(),
+            step: MergeStep::Foreground,
+            retried: false,
+            deferred: true,
+        });
+        unsafe { SetTimer(self.hwnd, MERGE_TIMER_ID, MERGE_STEP_MS, None); }
+    }
+
+    /// Goes on with the next merge waiting for the cell the user is on, if any.
+    fn resume_deferred_here(&mut self) {
+        if let Some(desktops) = Desktops::read() {
+            self.resume_deferred(&desktops.current);
+        }
     }
 
     /// One step of opening a new window's page as a tab, on a timer so that
@@ -1113,6 +1210,7 @@ impl App {
                     let _ = unsafe { PostMessageW(merge.window, WM_CLOSE, WPARAM(0), LPARAM(0)) };
                 }
                 self.finish_merge(&merge);
+                self.resume_deferred_here();
                 return;
             }
         }
@@ -1121,24 +1219,32 @@ impl App {
     }
 
     /// The merge could not go on: move the new window as the rule would have,
-    /// unless it is gone by itself.
+    /// unless it is gone by itself or was already moved to wait for the user's
+    /// arrival on its cell.
     fn fail_merge(&mut self, merge: PendingMerge, why: &str) {
         let _ = why;
+        if merge.deferred {
+            debug_log!("newwin: {:x} not merged: {why}; left where the rule put it", merge.window.0);
+            self.resume_deferred_here();
+            return;
+        }
         debug_log!("newwin: {:x} not merged: {why}; moving it", merge.window.0);
         if !unsafe { IsWindow(merge.window) }.as_bool() {
             self.finish_merge(&merge);
+            self.resume_deferred_here();
             return;
         }
         let Some(desktops) = Desktops::read() else { return };
         let Some(target) = desktops.get(&merge.desktop) else { return };
         let Some(bounds) = vd::monitor_bounds(&merge.monitor) else { return };
         self.send_window_to(merge.window, merge.source, &merge.desktop, target, bounds, merge.follow, &merge.before, &desktops);
+        self.resume_deferred_here();
     }
 
     /// Gives the keyboard back where the rule says after a merge, unless the
-    /// user follows the tab.
+    /// user follows the tab or was already on the cell it opened on.
     fn finish_merge(&mut self, merge: &PendingMerge) {
-        if merge.follow {
+        if merge.follow || merge.deferred {
             return;
         }
         if unsafe { IsWindow(merge.source) }.as_bool()
@@ -1791,6 +1897,7 @@ impl App {
                 }
             }
             self.save();
+            self.resume_deferred_here();
         }
     }
 
@@ -2123,6 +2230,7 @@ impl App {
         let Some(desktops) = self.sync() else { return };
         self.record_arrival(&desktops.current);
         self.visit(new);
+        self.resume_deferred(new);
         self.bring_followers(&desktops, new);
         self.arrange_pinned(new);
         self.arranged = None;
