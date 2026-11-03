@@ -191,6 +191,13 @@ const DESKTOPS_WAIT_MS: u64 = 180_000;
 /// do the same carrying the active window, and this one opens the pin menu.
 const PIN_HOTKEY_ID: i32 = 8;
 
+/// Which window is waiting for a new trigger to be pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureFor {
+    Settings,
+    Setup,
+}
+
 struct App {
     hwnd: HWND,
     config: Config,
@@ -214,10 +221,15 @@ struct App {
     /// still go back on it.
     going: Option<(String, Instant)>,
     settings: Settings,
-    /// The window showing how Flick is used; none in pictures drawn offscreen.
+    /// The window showing the setup wizard; none in pictures drawn offscreen.
     guide: Option<Guide>,
-    /// The settings window is waiting for the new trigger to be pressed.
-    capturing: bool,
+    /// The window waiting for a new trigger to be pressed, and whether keys
+    /// count too (the settings window) or only mouse buttons (the wizard).
+    capture: Option<(CaptureFor, bool)>,
+    /// What the wizard's Trigger and Try pages have seen.
+    guide_heard: bool,
+    guide_moved: bool,
+    guide_board_opened: bool,
     /// Set to run as administrator (`admin`), and to start with Windows.
     /// Kept here because asking Windows for either takes a moment.
     admin: bool,
@@ -559,7 +571,10 @@ impl App {
             going: None,
             settings,
             guide: None,
-            capturing: false,
+            capture: None,
+            guide_heard: false,
+            guide_moved: false,
+            guide_board_opened: false,
             admin: false,
             autostart: false,
             config_seen: None,
@@ -2238,6 +2253,10 @@ impl App {
         let view = self.view(&desktops.current);
         self.minimap.update(view);
         self.refresh_board();
+        if self.guide_page() == Some(guide::Page::Try) {
+            self.guide_moved = true;
+            self.refresh_guide();
+        }
     }
 
     // ---- the board ------------------------------------------------------------
@@ -2339,6 +2358,10 @@ impl App {
         debug_log!("ui: board foreground");
         vd::force_foreground(self.board.hwnd());
         debug_log!("ui: board opened");
+        if self.guide_page() == Some(guide::Page::Try) {
+            self.guide_board_opened = true;
+            self.refresh_guide();
+        }
     }
 
     fn refresh_board(&mut self) {
@@ -2674,7 +2697,7 @@ impl App {
     fn settings_view(&self) -> settings::View {
         settings::View {
             trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
-            capturing: self.capturing,
+            capturing: matches!(self.capture, Some((CaptureFor::Settings, _))),
             autostart: self.autostart,
             admin: self.admin,
             three_finger: self.config.touchpad.three_finger,
@@ -2716,27 +2739,69 @@ impl App {
     }
 
     fn close_settings(&mut self) {
-        self.capture_trigger(false);
+        if matches!(self.capture, Some((CaptureFor::Settings, _))) {
+            self.end_capture();
+        }
         self.settings.close();
     }
 
-    /// Shows how Flick is used. `asked`: the user asked for it just now, and
-    /// it takes the keyboard; shown unasked (the first run), it does not, or
-    /// the Enter or Esc of what they were typing would put it away unseen.
-    fn open_guide(&mut self, asked: bool) {
-        let trigger = self.settings_view().trigger;
-        if let Some(guide) = &mut self.guide {
-            guide.set_trigger(trigger);
-            guide.open(asked);
-            if asked {
-                vd::force_foreground(guide.hwnd());
-            }
+    /// What the setup wizard shows.
+    fn guide_view(&self) -> guide::View {
+        let listen = match self.capture {
+            Some((CaptureFor::Setup, false)) => guide::Listen::Mouse,
+            Some((CaptureFor::Setup, true)) => guide::Listen::Keys,
+            _ => guide::Listen::Off,
+        };
+        let known: usize = self.grid.rows.iter().map(|row| row.cells.len()).sum();
+        let existing = Desktops::read().map_or(0, |desktops| desktops.ids().len());
+        guide::View {
+            trigger: triggers(&self.config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
+            listen,
+            heard: self.guide_heard,
+            touchpad: crate::touchpad::status(),
+            three_finger: self.config.touchpad.three_finger,
+            desktops: existing.max(known),
+            moved: self.guide_moved,
+            board_opened: self.guide_board_opened,
         }
     }
 
-    /// Puts the guide away, for good unless asked for again, and points at
+    fn refresh_guide(&mut self) {
+        if !self.guide.as_ref().is_some_and(|guide| guide.is_open()) {
+            return;
+        }
+        let view = self.guide_view();
+        if let Some(guide) = &mut self.guide {
+            guide.set_view(view);
+        }
+    }
+
+    fn guide_page(&self) -> Option<guide::Page> {
+        self.guide.as_ref().filter(|guide| guide.is_open()).map(|guide| guide.page())
+    }
+
+    /// Shows the setup wizard. `asked`: the user asked for it just now, and
+    /// it takes the keyboard; shown unasked (a later start-up), it does not,
+    /// or the Enter or Esc of what they were typing would put it away unseen.
+    fn open_guide(&mut self, asked: bool) {
+        self.guide_heard = false;
+        self.guide_moved = false;
+        self.guide_board_opened = false;
+        let view = self.guide_view();
+        let Some(guide) = &mut self.guide else { return };
+        let action = guide.open(view, asked);
+        if asked {
+            vd::force_foreground(guide.hwnd());
+        }
+        self.guide_action(action);
+    }
+
+    /// Puts the wizard away, for good unless asked for again, and points at
     /// the tray icon it told of.
     fn close_guide(&mut self) {
+        if matches!(self.capture, Some((CaptureFor::Setup, _))) {
+            self.end_capture();
+        }
         let Some(guide) = &mut self.guide else { return };
         guide.close();
         let (title, text) = guide.words().balloon;
@@ -2747,30 +2812,113 @@ impl App {
     }
 
     fn guide_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
-        match self.guide.as_mut()?.handle(message, wparam, lparam)? {
-            guide::Action::None => {}
-            guide::Action::Close => self.close_guide(),
-        }
+        let action = self.guide.as_mut()?.handle(message, wparam, lparam)?;
+        self.guide_action(action);
         Some(LRESULT(0))
     }
 
-    /// Starts or stops waiting for the user to press the new trigger.
-    fn capture_trigger(&mut self, on: bool) {
-        self.capturing = on;
-        if on {
-            input::begin_capture(true);
-        } else {
+    fn guide_action(&mut self, action: guide::Action) {
+        match action {
+            guide::Action::None => {}
+            guide::Action::Close => self.close_guide(),
+            guide::Action::Shown(page) => self.guide_shown(page),
+            guide::Action::Listen(guide::Listen::Off) => {
+                if matches!(self.capture, Some((CaptureFor::Setup, _))) {
+                    self.end_capture();
+                }
+            }
+            guide::Action::Listen(guide::Listen::Mouse) => self.begin_capture(CaptureFor::Setup, false),
+            guide::Action::Listen(guide::Listen::Keys) => self.begin_capture(CaptureFor::Setup, true),
+            guide::Action::ThreeFinger(on) => self.set_config("touchpad.three_finger", if on { "true" } else { "false" }),
+            guide::Action::OpenTouchpadSettings => crate::touchpad::open_windows_settings(),
+            guide::Action::MakeDesktops => self.make_desktops(),
+        }
+    }
+
+    /// Starts listening again when the Trigger page is shown, and stops when
+    /// it is left; the Try page starts its checklist afresh.
+    fn guide_shown(&mut self, page: guide::Page) {
+        if matches!(self.capture, Some((CaptureFor::Setup, _))) {
+            self.end_capture();
+        }
+        match page {
+            guide::Page::Trigger => {
+                self.guide_heard = false;
+                self.begin_capture(CaptureFor::Setup, false);
+            }
+            guide::Page::Try => {
+                self.guide_moved = false;
+                self.guide_board_opened = false;
+                self.refresh_guide();
+            }
+            _ => self.refresh_guide(),
+        }
+    }
+
+    /// Creates desktops in the current shelf until it has three, as the
+    /// board's + does.
+    fn make_desktops(&mut self) {
+        let Some(desktops) = self.sync() else { return };
+        let Some(pos) = self.grid.find(&desktops.current) else { return };
+        let row = pos.row;
+        while self.grid.rows.get(row).is_some_and(|row| row.cells.len() < 3) {
+            let before = self.grid.rows[row].cells.len();
+            self.add_cell(row, false);
+            if self.grid.rows[row].cells.len() == before {
+                break;
+            }
+        }
+        self.commit();
+        self.refresh_board();
+        self.refresh_guide();
+    }
+
+    fn begin_capture(&mut self, who: CaptureFor, keys: bool) {
+        self.capture = Some((who, keys));
+        input::begin_capture(keys);
+        self.refresh_settings();
+        self.refresh_guide();
+    }
+
+    fn end_capture(&mut self) {
+        if self.capture.take().is_some() {
             input::cancel_capture();
         }
         self.refresh_settings();
+        self.refresh_guide();
+    }
+
+    /// Starts or stops waiting for the settings window's new trigger.
+    fn capture_trigger(&mut self, on: bool) {
+        if on {
+            self.begin_capture(CaptureFor::Settings, true);
+        } else if matches!(self.capture, Some((CaptureFor::Settings, _))) {
+            self.end_capture();
+        }
     }
 
     /// The user pressed what the trigger should be from now on.
     fn trigger_chosen(&mut self) {
-        self.capture_trigger(false);
         if let Some(value) = input::take_captured() {
             self.set_config("trigger", &format!("\"{value}\""));
         }
+    }
+
+    /// The capture hook answered: `chosen` is false when it was cancelled.
+    fn captured(&mut self, chosen: bool) {
+        let Some((who, _)) = self.capture.take() else { return };
+        input::cancel_capture();
+        self.refresh_settings();
+        if chosen {
+            self.trigger_chosen();
+        }
+        if who == CaptureFor::Setup {
+            self.guide_heard |= chosen;
+            if self.guide_page() == Some(guide::Page::Trigger) {
+                self.begin_capture(CaptureFor::Setup, false);
+            }
+        }
+        self.refresh_guide();
     }
 
     /// Writes one value to the config file and applies the file.
@@ -2844,9 +2992,8 @@ impl App {
         }
         self.minimap.set_enabled(config.minimap);
         self.config = config;
-        let trigger = self.settings_view().trigger;
-        if let Some(guide) = &mut self.guide { guide.set_trigger(trigger); }
         self.refresh_settings();
+        self.refresh_guide();
     }
 
     /// Ctrl+Alt+Win with an arrow moves, with Shift added it carries the
@@ -3065,7 +3212,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(|app| app.open_guide(true));
         }
         WM_CAPTURED => {
-            with_app(|app| if wparam.0 == 1 { app.trigger_chosen() } else { app.capture_trigger(false) });
+            with_app(|app| app.captured(wparam.0 == 1));
         }
         WM_HOTKEY if wparam.0 as i32 == PIN_HOTKEY_ID => {
             let window = GetForegroundWindow();
@@ -3129,6 +3276,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                 let status = crate::touchpad::poll(app.config.touchpad.three_finger);
                 if status != before {
                     app.refresh_settings();
+                    app.refresh_guide();
                 }
                 app.usage_tick();
                 // Piggyback on the existing timer, at most once per half minute.
@@ -3378,8 +3526,11 @@ pub fn run(first_run: bool) {
         SetTimer(hwnd, CONFIG_TIMER_ID, CONFIG_CHECK_MS, None);
     }
     tray::add(hwnd, WM_TRAY);
-    // Until it has been seen once: how Flick is used, and where it is.
-    if !app.grid.guide_seen {
+    // Until it has been seen once: how Flick is used, and where it is. The
+    // first run was just launched by the installer, so it takes the keyboard.
+    if first_run {
+        app.open_guide(true);
+    } else if !app.grid.guide_seen {
         app.open_guide(false);
     }
     APP.with(|slot| *slot.borrow_mut() = Some(app));
@@ -3707,11 +3858,74 @@ pub fn show_guide_of_running() {
 }
 
 /// Renders the guide `seconds` into its playing into `path` (see
-/// `write_raw`), without showing it.
+/// `write_raw`), without showing it. `FLICK_GUIDE_PAGE` names the page
+/// (trigger, touchpad, try or tour; tour when unset), and
+/// `FLICK_GUIDE_SAMPLE=2` asks for the second sample of it.
 pub fn render_guide(path: &str, seconds: f32) {
     let Ok(mut window) = Guide::new(wndproc, Default::default()) else { return };
-    if let Some((size, pixels)) = window.render_to_pixels(seconds, 1.5) {
+    let page = match std::env::var("FLICK_GUIDE_PAGE").unwrap_or_default().as_str() {
+        "trigger" => guide::Page::Trigger,
+        "touchpad" => guide::Page::Touchpad,
+        "try" => guide::Page::Try,
+        _ => guide::Page::Tour,
+    };
+    let second = std::env::var("FLICK_GUIDE_SAMPLE").is_ok_and(|value| value == "2");
+    let view = guide_sample_view(page, second);
+    if let Some((size, pixels)) = window.render_to_pixels(view, page, seconds, 1.5) {
         write_raw(path, size, &pixels);
+    }
+}
+
+fn guide_sample_view(page: guide::Page, second: bool) -> guide::View {
+    let trigger = Trigger::XButton2.describe().to_string();
+    let touchpad = match page {
+        guide::Page::Touchpad => {
+            if second { crate::touchpad::Status::Active } else { crate::touchpad::Status::Conflict }
+        }
+        guide::Page::Try if second => crate::touchpad::Status::Active,
+        _ => crate::touchpad::Status::Absent,
+    };
+    match page {
+        guide::Page::Trigger => guide::View {
+            trigger,
+            listen: guide::Listen::Mouse,
+            heard: second,
+            touchpad,
+            three_finger: false,
+            desktops: 1,
+            moved: false,
+            board_opened: false,
+        },
+        guide::Page::Touchpad => guide::View {
+            trigger,
+            listen: guide::Listen::Off,
+            heard: false,
+            touchpad,
+            three_finger: true,
+            desktops: 1,
+            moved: false,
+            board_opened: false,
+        },
+        guide::Page::Try => guide::View {
+            trigger,
+            listen: guide::Listen::Off,
+            heard: false,
+            touchpad,
+            three_finger: second,
+            desktops: if second { 3 } else { 1 },
+            moved: true,
+            board_opened: second,
+        },
+        guide::Page::Tour => guide::View {
+            trigger,
+            listen: guide::Listen::Off,
+            heard: false,
+            touchpad: crate::touchpad::Status::Absent,
+            three_finger: false,
+            desktops: 1,
+            moved: false,
+            board_opened: false,
+        },
     }
 }
 
