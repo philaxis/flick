@@ -2677,6 +2677,8 @@ impl App {
             capturing: self.capturing,
             autostart: self.autostart,
             admin: self.admin,
+            three_finger: self.config.touchpad.three_finger,
+            touchpad: crate::touchpad::status(),
             flick_ms: self.config.experimental.flick_ms,
         }
     }
@@ -2785,6 +2787,12 @@ impl App {
             settings::Action::Set(key, value) => self.set_config(key, &value),
             settings::Action::Capture(on) => self.capture_trigger(on),
             settings::Action::Autostart(on) => self.set_autostart(on),
+            settings::Action::ThreeFinger(on) => {
+                self.set_config("touchpad.three_finger", if on { "true" } else { "false" });
+                crate::touchpad::poll(on);
+                self.refresh_settings();
+            }
+            settings::Action::OpenTouchpadSettings => crate::touchpad::open_windows_settings(),
             settings::Action::Admin(on) => {
                 if on {
                     let taken_over = admin::turn_on(self.autostart);
@@ -3712,11 +3720,25 @@ pub fn render_guide(path: &str, seconds: f32) {
 pub fn render_settings(path: &str) {
     let Ok(mut window) = Settings::new(wndproc, Default::default()) else { return };
     let config = Config::default();
+    let touchpad = match std::env::var("FLICK_TOUCHPAD").as_deref() {
+        Ok("absent") => crate::touchpad::Status::Absent,
+        Ok("off") => crate::touchpad::Status::Off,
+        Ok("conflict") => crate::touchpad::Status::Conflict,
+        Ok("active") => crate::touchpad::Status::Active,
+        _ => crate::touchpad::status(),
+    };
+    let three_finger = match std::env::var("FLICK_THREE_FINGER").as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        Err(_) => config.touchpad.three_finger,
+    };
     let view = settings::View {
         trigger: triggers(&config).0.iter().map(Trigger::describe).collect::<Vec<_>>().join(", "),
         capturing: false,
         autostart: true,
         admin: false,
+        three_finger,
+        touchpad,
         flick_ms: config.experimental.flick_ms,
     };
     if let Some((size, pixels)) = window.render_to_pixels(view, 1.5) {

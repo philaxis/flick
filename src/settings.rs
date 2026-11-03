@@ -18,8 +18,8 @@ use windows::{
         Graphics::{
             Direct2D::{ID2D1Factory, ID2D1RenderTarget},
             DirectWrite::{
-                IDWriteTextFormat, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-                DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
+                IDWriteTextFormat, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT_CENTER,
+                DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_WORD_WRAPPING_WRAP,
             },
             Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE},
             Gdi::{BitBlt, GetDC, InvalidateRect, ReleaseDC, ValidateRect, SRCCOPY},
@@ -45,14 +45,20 @@ use windows::{
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Size of the window's inside, in unscaled units: the rows, the note under
-/// the last and a margin.
+/// the touchpad and the one under the last row, and a margin.
 const SIZE: (f32, f32) = (560.0, ROWS.0 + (FLICK_ROW + 3.0) * ROWS.1 + 14.0);
-/// The flick time's row, under the trigger and the two switches.
-const FLICK_ROW: f32 = 3.0;
+/// The touchpad's row, its notice and the button under it.
+const TOUCHPAD_ROW: f32 = 3.0;
+const TOUCHPAD_NOTICE_ROW: f32 = 4.0;
+const TOUCHPAD_BUTTON_ROW: f32 = 5.0;
+/// The flick time's row, under the touchpad.
+const FLICK_ROW: f32 = 6.0;
 /// Top of the first row and the height of each.
 const ROWS: (f32, f32) = (14.0, 44.0);
 /// Left edge of the labels and right edge of the controls.
 const EDGES: (f32, f32) = (28.0, 532.0);
+/// The height of one line of the touchpad notice.
+const NOTICE_LINE: f32 = 19.0;
 /// How long a flick may take (`experimental.flick_ms`), in milliseconds:
 /// what the slider spans and the step it moves in.
 const FLICK_MS: (i32, i32, i32) = (80, 500, 10);
@@ -70,6 +76,10 @@ pub struct View {
     pub capturing: bool,
     pub autostart: bool,
     pub admin: bool,
+    /// Whether three fingers on the touchpad are a trigger, and what the
+    /// touchpad is doing.
+    pub three_finger: bool,
+    pub touchpad: crate::touchpad::Status,
     /// See `config::Experimental::flick_ms`.
     pub flick_ms: u32,
 }
@@ -83,6 +93,8 @@ pub enum Action {
     Capture(bool),
     Autostart(bool),
     Admin(bool),
+    ThreeFinger(bool),
+    OpenTouchpadSettings,
     Close,
 }
 
@@ -93,6 +105,8 @@ enum Hit {
     Trigger,
     Autostart,
     Admin,
+    ThreeFinger,
+    TouchpadSettings,
     FlickMs,
 }
 
@@ -101,6 +115,9 @@ struct Layout {
     trigger: Rect,
     autostart: Rect,
     admin: Rect,
+    three_finger: Rect,
+    touchpad_notice: Rect,
+    touchpad_settings: Rect,
     flick: Rect,
 }
 
@@ -111,16 +128,29 @@ impl Layout {
             trigger: rect((EDGES.1 - 64.0) * s, (row(0.0) + (ROWS.1 - 30.0) / 2.0) * s, 64.0 * s, 30.0 * s),
             autostart: rect((EDGES.1 - 44.0) * s, (row(1.0) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
             admin: rect((EDGES.1 - 44.0) * s, (row(2.0) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
+            three_finger: rect((EDGES.1 - 44.0) * s, (row(TOUCHPAD_ROW) + (ROWS.1 - 24.0) / 2.0) * s, 44.0 * s, 24.0 * s),
+            touchpad_notice: rect(EDGES.0 * s, row(TOUCHPAD_NOTICE_ROW) * s, (EDGES.1 - EDGES.0) * s, 2.0 * NOTICE_LINE * s),
+            touchpad_settings: rect(EDGES.0 * s, (row(TOUCHPAD_BUTTON_ROW) + (ROWS.1 - 30.0) / 2.0) * s, 260.0 * s, 30.0 * s),
             flick: rect((EDGES.0 + FLICK_LABEL) * s, row(FLICK_ROW) * s, (EDGES.1 - EDGES.0 - FLICK_LABEL - VALUE) * s, ROWS.1 * s),
         }
     }
 
-    fn controls(&self) -> [(Rect, Hit); 4] {
-        [(self.trigger, Hit::Trigger), (self.autostart, Hit::Autostart), (self.admin, Hit::Admin), (self.flick, Hit::FlickMs)]
+    fn controls(&self, conflict: bool) -> Vec<(Rect, Hit)> {
+        let mut controls = vec![
+            (self.trigger, Hit::Trigger),
+            (self.autostart, Hit::Autostart),
+            (self.admin, Hit::Admin),
+            (self.three_finger, Hit::ThreeFinger),
+        ];
+        if conflict {
+            controls.push((self.touchpad_settings, Hit::TouchpadSettings));
+        }
+        controls.push((self.flick, Hit::FlickMs));
+        controls
     }
 
-    fn hit(&self, x: f32, y: f32) -> Hit {
-        self.controls().into_iter()
+    fn hit(&self, x: f32, y: f32, conflict: bool) -> Hit {
+        self.controls(conflict).into_iter()
             .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
             .map_or(Hit::Nothing, |(_, hit)| hit)
     }
@@ -131,6 +161,7 @@ struct Fonts {
     value: IDWriteTextFormat,
     button: IDWriteTextFormat,
     notice: IDWriteTextFormat,
+    touchpad_notice: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -138,11 +169,17 @@ impl Fonts {
         let factory = paint::dwrite_factory()?;
         let notice = paint::text_format(&factory, 13.5 * s, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?;
         unsafe { notice.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?; }
+        let touchpad_notice = paint::text_format(&factory, 13.5 * s, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?;
+        unsafe {
+            touchpad_notice.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP)?;
+            touchpad_notice.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+        }
         Ok(Fonts {
             label: paint::text_format(&factory, 13.5 * s, 400, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             value: paint::text_format(&factory, 13.5 * s, 600, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             button: paint::text_format(&factory, 12.5 * s, 600, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             notice,
+            touchpad_notice,
         })
     }
 }
@@ -309,7 +346,8 @@ impl Settings {
             }
             WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => Action::Close,
             _ if pressed(VK_TAB.0 as u8) => {
-                self.focus = next_focus(&Layout::new(self.scale).controls(), self.focus, unsafe { GetKeyState(0x10) } < 0);
+                let controls = Layout::new(self.scale).controls(self.conflict());
+                self.focus = next_focus(&controls, self.focus, unsafe { GetKeyState(0x10) } < 0);
                 self.invalidate();
                 Action::None
             }
@@ -350,7 +388,7 @@ impl Settings {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32) -> Action {
-        let hit = Layout::new(self.scale).hit(x, y);
+        let hit = Layout::new(self.scale).hit(x, y, self.conflict());
         self.focus = if hit == Hit::Nothing { self.focus } else { hit };
         self.press = Some(Press { hit, before: self.view.flick_ms as i32 });
         unsafe {
@@ -365,7 +403,7 @@ impl Settings {
         if self.press.is_some() {
             return self.drag(x);
         }
-        let hover = Layout::new(self.scale).hit(x, y);
+        let hover = Layout::new(self.scale).hit(x, y, self.conflict());
         if hover != self.hover {
             self.hover = hover;
             self.invalidate();
@@ -393,7 +431,7 @@ impl Settings {
             let now = self.view.flick_ms as i32;
             return if now == before { Action::None } else { Action::Set("experimental.flick_ms", now.to_string()) };
         }
-        if Layout::new(self.scale).hit(x, y) != hit {
+        if Layout::new(self.scale).hit(x, y, self.conflict()) != hit {
             return Action::None;
         }
         self.activate(hit)
@@ -404,8 +442,16 @@ impl Settings {
             Hit::Trigger => Action::Capture(!self.view.capturing),
             Hit::Autostart => Action::Autostart(!self.view.autostart),
             Hit::Admin => Action::Admin(!self.view.admin),
+            Hit::ThreeFinger if self.view.touchpad != crate::touchpad::Status::Absent => {
+                Action::ThreeFinger(!self.view.three_finger)
+            }
+            Hit::TouchpadSettings if self.conflict() => Action::OpenTouchpadSettings,
             _ => Action::None,
         }
+    }
+
+    fn conflict(&self) -> bool {
+        self.view.touchpad == crate::touchpad::Status::Conflict
     }
 
     fn adjust_slider(&mut self, direction: i32) -> Action {
@@ -480,9 +526,15 @@ impl Settings {
         self.draw_button(&p, fonts, &layout.trigger, if view.capturing { tr("Cancel", "취소", "取消") } else { tr("Change", "변경", "更改") }, Hit::Trigger);
 
         label(1.0, tr("Start with Windows", "Windows와 함께 시작", "随 Windows 启动"));
-        self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart);
+        self.draw_switch(&p, &layout.autostart, view.autostart, Hit::Autostart, false);
         label(2.0, tr("Run as administrator (off takes effect after restart)", "관리자 권한 실행 (끄기는 재시작 후 적용)", "以管理员身份运行（关闭后重启生效）"));
-        self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin);
+        self.draw_switch(&p, &layout.admin, view.admin, Hit::Admin, false);
+        label(TOUCHPAD_ROW, tr("Three-finger touchpad", "터치패드 세 손가락", "触摸板三指"));
+        self.draw_switch(&p, &layout.three_finger, view.three_finger, Hit::ThreeFinger, view.touchpad == crate::touchpad::Status::Absent);
+        p.text(view.touchpad.words(), &fonts.touchpad_notice, &layout.touchpad_notice, white(0.62));
+        if self.conflict() {
+            self.draw_button(&p, fonts, &layout.touchpad_settings, tr("Open Windows touchpad settings", "Windows 터치패드 설정 열기", "打开 Windows 触摸板设置"), Hit::TouchpadSettings);
+        }
 
         label(FLICK_ROW, tr("Flick time", "넘김 인정 시간", "翻页判定时间"));
         let flick_words = format!("{} ms", view.flick_ms);
@@ -492,19 +544,20 @@ impl Settings {
             "在此时间内快速移动并松开，画面不缩小地切换一格。继续按住，画面从该时间的 60% 起缓缓后退，移动多少就走多远。越短越容易精细移动。"),
             &fonts.notice, &Rect { bottom: row(FLICK_ROW + 1.0).top + 2.0 * ROWS.1 * s, ..row(FLICK_ROW + 1.0) }, white(0.62));
 
-        if let Some((area, _)) = layout.controls().into_iter().find(|(_, hit)| *hit == self.focus) {
+        if let Some((area, _)) = layout.controls(self.conflict()).into_iter().find(|(_, hit)| *hit == self.focus) {
             let ring = Rect { left: area.left - 3.0 * s, top: area.top - 3.0 * s, right: area.right + 3.0 * s, bottom: area.bottom + 3.0 * s };
             p.stroke(&ring, 5.0 * s, 2.0 * s, accent(1.0));
         }
         Ok(())
     }
 
-    fn draw_switch(&self, p: &Painter, switch: &Rect, on: bool, hit: Hit) {
+    fn draw_switch(&self, p: &Painter, switch: &Rect, on: bool, hit: Hit, dim: bool) {
         let h = switch.bottom - switch.top;
-        let hot = self.hover == hit;
-        p.fill(switch, h / 2.0, if on { accent(0.95) } else { white(if hot { 0.22 } else { 0.14 }) });
+        let hot = !dim && self.hover == hit;
+        let (on_colour, off) = if dim { (0.35, 0.06) } else { (0.95, if hot { 0.22 } else { 0.14 }) };
+        p.fill(switch, h / 2.0, if on { accent(on_colour) } else { white(off) });
         let knob = if on { switch.right - h / 2.0 } else { switch.left + h / 2.0 };
-        p.disc((knob, switch.top + h / 2.0), h / 2.0 - 3.0 * self.scale, white(0.95));
+        p.disc((knob, switch.top + h / 2.0), h / 2.0 - 3.0 * self.scale, white(if dim { 0.45 } else { 0.95 }));
     }
 
     fn draw_button(&self, p: &Painter, fonts: &Fonts, area: &Rect, text: &str, hit: Hit) {
@@ -574,11 +627,20 @@ mod tests {
     use super::*;
     #[test]
     fn focus_visits_every_control_and_wraps_both_ways() {
-        let controls = Layout::new(1.0).controls();
+        let controls = Layout::new(1.0).controls(false);
         assert_eq!(next_focus(&controls, Hit::Trigger, false), Hit::Autostart);
-        assert_eq!(next_focus(&controls, Hit::Admin, false), Hit::FlickMs);
+        assert_eq!(next_focus(&controls, Hit::Admin, false), Hit::ThreeFinger);
+        assert_eq!(next_focus(&controls, Hit::ThreeFinger, false), Hit::FlickMs);
         assert_eq!(next_focus(&controls, Hit::FlickMs, false), Hit::Trigger);
         assert_eq!(next_focus(&controls, Hit::Trigger, true), Hit::FlickMs);
+    }
+    #[test]
+    fn the_touchpad_settings_button_is_focused_only_when_windows_conflicts() {
+        let layout = Layout::new(1.0);
+        let calm = layout.controls(false);
+        assert!(!calm.iter().any(|(_, hit)| *hit == Hit::TouchpadSettings));
+        let conflict = layout.controls(true);
+        assert!(conflict.iter().any(|(_, hit)| *hit == Hit::TouchpadSettings));
     }
     #[test]
     fn the_flick_time_slider_clamps() {
