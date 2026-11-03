@@ -1,7 +1,8 @@
 # A first run on a PC that has never had Flick: the downloaded exe is started from a download folder.
 # Flick's folders, autostart value, uninstall entry and shortcut are set aside first and put back after.
 # Run after `cargo build --release`; screenshots and logs land in .\fresh-install.
-param([string]$Steps = 'baseline')
+# -Desktops n: a fresh PC has one virtual desktop; the count is set to n for the run and put back after.
+param([string]$Steps = 'baseline', [int]$Desktops = 0)
 $ErrorActionPreference = 'Stop'
 $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
 $flick = Join-Path $target 'release\Flick.exe'
@@ -55,8 +56,10 @@ New-Item -ItemType Directory -Force $downloads | Out-Null
 Copy-Item $flick "$downloads\Flick.exe"
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 $middle = @([int]($screen.Left + $screen.Width / 2), [int]($screen.Top + $screen.Height / 2))
+$desktopsBefore = Desktops
 try {
-    Add-Content "$out\report.txt" "steps $Steps; desktops before $(Desktops)"
+    if ($Desktops -gt 0) { & $drive desks $Desktops | Add-Content "$out\report.txt" }
+    Add-Content "$out\report.txt" "steps $Steps; desktops before $desktopsBefore, at start $(Desktops)"
     Start-Process "$downloads\Flick.exe"
     Start-Sleep 8
     Shot '1-first-run'
@@ -103,6 +106,7 @@ try {
     Get-Process Flick -ErrorAction SilentlyContinue | Stop-Process -Force
     & $drive xbutton up
     Start-Sleep 1
+    if ($Desktops -gt 0) { & $drive desks $desktopsBefore | Add-Content "$out\report.txt" }
     Remove-Item $roaming, $local -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $link -ErrorAction SilentlyContinue
     Remove-ItemProperty $run -Name Flick -ErrorAction SilentlyContinue

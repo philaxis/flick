@@ -453,6 +453,20 @@ fn main() {
                     _ => println!("not removed: no such desktop, or it is the current one"),
                 }
             }
+            Some("desks") => {
+                // desks <n>: removes desktops other than the current one, or makes new ones, until there are n.
+                vdapi::select(false);
+                let wanted: usize = args[2].parse().unwrap();
+                let all = vdapi::get_desktops().unwrap_or_default();
+                let current = vdapi::get_current_desktop().unwrap();
+                for desktop in all.iter().filter(|d| **d != current).skip(wanted.saturating_sub(1)) {
+                    let _ = vdapi::remove_desktop(*desktop, current);
+                }
+                for _ in all.len()..wanted {
+                    let _ = vdapi::create_desktop();
+                }
+                println!("desks {}", vdapi::get_desktops().map_or(0, |d| d.len()));
+            }
             _ => println!("app window: {:?}", app),
         }
     }
