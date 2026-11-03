@@ -4071,8 +4071,9 @@ impl Board {
             return None;
         }
         let hint = |text: &str| Some((text.to_owned(), 0.46));
+        let said = |en: &str, ko: &str, zh: &str| hint(crate::i18n::text(en, ko, zh));
         if self.editing.is_some() {
-            return hint("Enter: save   ·   Esc: cancel");
+            return said("Enter: save   ·   Esc: cancel", "Enter: 저장   ·   Esc: 취소", "Enter：保存   ·   Esc：取消");
         }
         if let Some(hwnd) = self.dragged_window() {
             // What dropping it does, where: on the previews only one pinned
@@ -4094,22 +4095,43 @@ impl Board {
         match &self.hover {
             Hit::Top(hwnd) => {
                 let on = self.model.window(*hwnd).is_some_and(|(w, _)| w.topmost);
-                hint(if on { "Always on top: on   ·   Click: turn off" } else { "Click: keep above other windows" })
+                if on {
+                    said("Always on top: on   ·   Click: turn off", "항상 위: 켜짐   ·   클릭: 끄기", "置顶：开   ·   单击：关闭")
+                } else {
+                    said("Click: keep above other windows", "클릭: 다른 창 위에 두기", "单击：保持在其他窗口之上")
+                }
             }
-            Hit::TileClose(_) => hint("Click: close the window"),
-            Hit::Window { .. } => hint("Click: go to it   ·   Drag: to a cell, or onto the rail or by a shelf's name to pin it"),
+            Hit::TileClose(_) => said("Click: close the window", "클릭: 창 닫기", "单击：关闭窗口"),
+            Hit::Window { .. } => said(
+                "Click: go to it   ·   Drag: to a cell, or onto the rail or by a shelf's name to pin it",
+                "클릭: 그 창으로   ·   끌기: 셀로 옮기기, 레일이나 셸프 이름 옆에 놓으면 고정",
+                "单击：前往   ·   拖动：移到格子，放到细轨或架子名称旁即固定",
+            ),
             Hit::Cell(_) | Hit::CellClose(_) => {
-                hint("Hover: show windows   ·   Click: go   ·   Drag: move   ·   Right-click: highlight")
+                said(
+                    "Hover: show windows   ·   Click: go   ·   Drag: move   ·   Right-click: highlight",
+                    "올려 두기: 창 보기   ·   클릭: 이동   ·   끌기: 옮기기   ·   오른쪽 클릭: 강조",
+                    "悬停：显示窗口   ·   单击：前往   ·   拖动：移动   ·   右键：突出显示",
+                )
             }
-            Hit::RowName(_) => hint("Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove"),
-            Hit::Plus(_) | Hit::PlusLeft(_) => hint("Add a cell"),
-            Hit::AddRow | Hit::AddRowTop => hint("Add a shelf"),
-            Hit::RulesToggle => hint(if self.rules_open { "Click: hide the rules" } else { "Click: show the rules" }),
-            Hit::RuleDelete(_) => hint("Click: forget this rule"),
-            Hit::RuleFollow(_) => hint("Click: follow the new windows there, or stay"),
-            Hit::RuleUndo => hint("Click: take back the rule just added"),
+            Hit::RowName(_) => said(
+                "Drag: reorder   ·   Double-click: rename   ·   Right-click: close windows, remove",
+                "끌기: 순서 바꾸기   ·   더블클릭: 이름 바꾸기   ·   오른쪽 클릭: 창 닫기, 지우기",
+                "拖动：调整顺序   ·   双击：重命名   ·   右键：关闭窗口、删除",
+            ),
+            Hit::Plus(_) | Hit::PlusLeft(_) => said("Add a cell", "셀 추가", "添加格子"),
+            Hit::AddRow | Hit::AddRowTop => said("Add a shelf", "셸프 추가", "添加架子"),
+            Hit::RulesToggle if self.rules_open => said("Click: hide the rules", "클릭: 규칙 숨기기", "单击：隐藏规则"),
+            Hit::RulesToggle => said("Click: show the rules", "클릭: 규칙 보기", "单击：显示规则"),
+            Hit::RuleDelete(_) => said("Click: forget this rule", "클릭: 이 규칙 지우기", "单击：删除此规则"),
+            Hit::RuleFollow(_) => said("Click: follow the new windows there, or stay", "클릭: 새 창을 따라가기 또는 여기 있기", "单击：跟随新窗口，或留在原处"),
+            Hit::RuleUndo => said("Click: take back the rule just added", "클릭: 방금 만든 규칙 되돌리기", "单击：撤销刚添加的规则"),
             Hit::RulePanel => None,
-            Hit::Nothing => hint("Point at a cell to see its windows   ·   Drag windows onto the map to move or pin them   ·   ?: hide these hints"),
+            Hit::Nothing => said(
+                "Point at a cell to see its windows   ·   Drag windows onto the map to move or pin them   ·   ?: hide these hints",
+                "셀에 마우스를 올리면 그 칸의 창이 보여요   ·   창을 지도로 끌어 옮기거나 고정   ·   ?: 안내 숨기기",
+                "指向格子查看其窗口   ·   把窗口拖到地图上移动或固定   ·   ?：隐藏提示",
+            ),
         }
     }
 
