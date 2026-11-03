@@ -152,6 +152,14 @@ pub fn poll(enabled: bool) -> Status {
     })
 }
 
+/// Opens Windows' own touchpad page, where its three-finger gestures are set.
+pub fn open_windows_settings() {
+    use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    unsafe {
+        ShellExecuteW(None, w!("open"), w!("ms-settings:devices-touchpad"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
 pub fn status() -> Status {
     KNOWN.with(|known| known.borrow().1)
 }

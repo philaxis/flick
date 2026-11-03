@@ -469,9 +469,9 @@ impl Trigger {
     /// How this trigger is called when talking to the user.
     pub fn describe(&self) -> String {
         match self {
-            Trigger::XButton1 => "Mouse back button".into(),
-            Trigger::XButton2 => "Mouse forward button".into(),
-            Trigger::Middle => "Mouse wheel button".into(),
+            Trigger::XButton1 => crate::i18n::text("Mouse back button", "마우스 뒤로 버튼", "鼠标后退键").into(),
+            Trigger::XButton2 => crate::i18n::text("Mouse forward button", "마우스 앞으로 버튼", "鼠标前进键").into(),
+            Trigger::Middle => crate::i18n::text("Mouse wheel button", "마우스 휠 버튼", "鼠标滚轮键").into(),
             _ => self.to_config().to_uppercase(),
         }
     }
@@ -552,9 +552,14 @@ impl Settings {
 /// While set, the next button or key combination pressed is reported as the
 /// new trigger instead of being acted on.
 static CAPTURING: AtomicBool = AtomicBool::new(false);
+/// Whether keys count too. Without, only mouse buttons do, and keys go on to
+/// where they were typed: the setup window listens for a mouse button while
+/// Enter, Tab and Esc still work its buttons.
+static CAPTURING_KEYS: AtomicBool = AtomicBool::new(true);
 static CAPTURED: Mutex<Option<String>> = Mutex::new(None);
 
-pub fn begin_capture() {
+pub fn begin_capture(keys: bool) {
+    CAPTURING_KEYS.store(keys, Ordering::SeqCst);
     CAPTURING.store(true, Ordering::SeqCst);
 }
 
@@ -1762,7 +1767,7 @@ unsafe extern "system" fn chord_timeout(_: HWND, _: u32, _: usize, _: u32) {
 }
 
 fn on_key(s: &Settings, key: u32, up: bool) -> bool {
-    if CAPTURING.load(Ordering::SeqCst) {
+    if CAPTURING.load(Ordering::SeqCst) && CAPTURING_KEYS.load(Ordering::SeqCst) {
         return capture_key(s, key, up);
     }
     // Keys of a choice that was given up must not count towards the next.

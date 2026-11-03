@@ -2756,7 +2756,7 @@ impl App {
     fn capture_trigger(&mut self, on: bool) {
         self.capturing = on;
         if on {
-            input::begin_capture();
+            input::begin_capture(true);
         } else {
             input::cancel_capture();
         }
