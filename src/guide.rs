@@ -1163,6 +1163,7 @@ mod wording_tests {
             words.skip,
             words.back,
             words.next,
+            words.click_first,
         ];
         all.extend(words.scenes);
         all
