@@ -1260,7 +1260,7 @@ impl App {
     /// changed from the window a rule fits to that window, without the user
     /// asking. It is moved as a new window would be.
     fn tab_followed(&mut self, window: HWND) {
-        if self.board.is_open()
+        if self.board.open_within(newwin::SOURCE_WINDOW)
             || self.in_flight.is_some()
             || self.gliding.is_some()
             || self.going.as_ref().is_some_and(|(_, when)| when.elapsed() < Duration::from_millis(GOING_SETTLES_MS))
@@ -1319,6 +1319,12 @@ impl App {
             &desktop[..4.min(desktop.len())],
             rule.monitor
         );
+        // Only a browser opens a link as a tab of a window it had: any other
+        // window come to the front is the user's doing, and stays.
+        if address_of(window).is_none() {
+            debug_log!("newwin: {:x} ({new_exe}) came to the front but has no address bar: not a tab, left alone", window.0);
+            return;
+        }
         let follow = rule.follow;
         let monitor = rule.monitor.clone();
         let before = vdapi::get_desktop_by_window(source).ok().map(|d| d.id()).unwrap_or_else(|| desktops.current.clone());

@@ -1080,6 +1080,9 @@ pub struct Board {
     thumbnail_updates: Cell<usize>,
     fonts: Option<Fonts>,
     open: bool,
+    /// When the board last closed: a window coming to the front right
+    /// after was put there by the board or the user, not by a link.
+    closed_at: Option<Instant>,
     model: Model,
     /// The app's grid as last supplied, for laying out and labelling cells.
     grid: Grid,
@@ -1232,6 +1235,7 @@ impl Board {
                 thumbnail_updates: Cell::new(0),
                 fonts: None,
                 open: false,
+                closed_at: None,
                 model: Model { rows: Vec::new(), pinned: Vec::new(), current: String::new() },
                 grid: Grid::default(),
                 selected: String::new(),
@@ -1280,6 +1284,11 @@ impl Board {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Whether the board is open or closed less than `within` ago.
+    pub fn open_within(&self, within: Duration) -> bool {
+        self.open || self.closed_at.is_some_and(|at| at.elapsed() < within)
     }
 
     /// What a shelf's menu is headed with: its name, how many windows
@@ -1446,6 +1455,7 @@ impl Board {
             return;
         }
         self.open = false;
+        self.closed_at = Some(Instant::now());
         self.hold = None;
         crate::input::set_board_open(false);
         self.end_peek();

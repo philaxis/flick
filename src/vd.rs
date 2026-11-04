@@ -122,7 +122,10 @@ pub fn app_windows() -> Vec<HWND> {
 
 /// Request activation without joining another application's input queue.
 pub fn force_foreground(hwnd: HWND) {
-    FORCED.set(hwnd.0);
+    FORCED.with_borrow_mut(|forced| {
+        forced.retain(|&(other, at)| other != hwnd.0 && at.elapsed() < FORCED_KEEP);
+        forced.push((hwnd.0, std::time::Instant::now()));
+    });
     unsafe {
         if GetForegroundWindow() != hwnd {
             // AttachThreadInput makes even SetFocus wait indefinitely on the other UI thread.
@@ -132,19 +135,27 @@ pub fn force_foreground(hwnd: HWND) {
 }
 
 thread_local! {
-    /// The window Flick last brought to the front (`force_foreground`).
-    static FORCED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// The windows Flick brought to the front lately (`force_foreground`),
+    /// and when. Several, so that one brought after another does not wipe
+    /// out the mark of the first while its showing is still on its way.
+    static FORCED: std::cell::RefCell<Vec<(isize, std::time::Instant)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// How long a window brought to the front by Flick stays marked.
+const FORCED_KEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether `hwnd`, come to the front, was brought there by Flick; asked
 /// once for each time it was.
 pub fn forced(hwnd: HWND) -> bool {
-    FORCED.with(|forced| forced.get() == hwnd.0 && forced.replace(0) != 0)
+    FORCED.with_borrow_mut(|forced| {
+        let at = forced.iter().position(|&(other, at)| other == hwnd.0 && at.elapsed() < FORCED_KEEP);
+        at.map(|at| forced.remove(at)).is_some()
+    })
 }
 
 /// The same, without taking the mark away (`forced`).
 pub fn was_forced(hwnd: HWND) -> bool {
-    FORCED.with(|forced| hwnd.0 != 0 && forced.get() == hwnd.0)
+    hwnd.0 != 0 && FORCED.with_borrow(|forced| forced.iter().any(|&(other, at)| other == hwnd.0 && at.elapsed() < FORCED_KEEP))
 }
 
 /// Whether the cursor is over `hwnd` or a window it owns.
