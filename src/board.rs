@@ -352,6 +352,21 @@ fn rules_panel_rect(home: &Rect, toggle: &Rect, width: f32, count: usize, scale:
     rect(home.right - 40.0 * scale - width, toggle.bottom + 6.0 * scale, width, 2.0 * pad + count as f32 * line_h)
 }
 
+/// The tile area left beside or below the open rules list, whichever is larger.
+fn room_for_rules(area: &Rect, panel: &Rect, gap: f32) -> Rect {
+    let overlaps = area.left < panel.right && panel.left < area.right && area.top < panel.bottom && panel.top < area.bottom;
+    if !overlaps {
+        return *area;
+    }
+    let below = Rect { top: panel.bottom + gap, ..*area };
+    let beside = Rect { right: panel.left - gap, ..*area };
+    let room = |r: &Rect| {
+        let (w, h) = size(r);
+        w.max(0.0) * h.max(0.0)
+    };
+    if room(&below) >= room(&beside) { below } else { beside }
+}
+
 /// The rule notice's box, in window coordinates.
 fn rule_notice_rect(home: &Rect, width: f32, scale: f32) -> Rect {
     let (home_w, home_h) = size(home);
@@ -1437,16 +1452,20 @@ impl Board {
         self.end_peek();
         // What changed is not a move: it is shown as it is. A strip that
         // moves goes on (a hold may be under way), with its cells anew.
-        self.motion.stop();
-        self.relayout();
-        if self.strip_on {
-            self.lay_out_strip(None);
+        if rules_changed {
+            self.relayout_gliding();
+        } else {
+            self.motion.stop();
+            self.relayout();
+            if self.strip_on {
+                self.lay_out_strip(None);
+            }
+            self.hover_under_cursor();
+            self.register_thumbnails();
+            self.update_peek(Instant::now());
+            self.invalidate();
         }
-        self.hover_under_cursor();
-        self.register_thumbnails();
         self.refresh_rule_source();
-        self.update_peek(Instant::now());
-        self.invalidate();
     }
 
     /// Takes what is under the cursor now as hovered. The board opening or
@@ -2001,6 +2020,7 @@ impl Board {
         let s = self.scale;
         let margin = 40.0 * s;
         let anchors = map_anchors(&self.grid, &self.selected);
+        let rules_panel = self.rules_panel_layout().map(|layout| layout.panel);
         let mut maps = Vec::new();
         let mut areas = Vec::new();
         for (m, monitor) in self.monitors.iter().enumerate() {
@@ -2010,12 +2030,18 @@ impl Board {
             let layout = layout_map(&self.model, &anchors, (w, h - FOOTER * s), s, &|window| self.monitor_of(window) == m);
             // The home monitor has the shelf's name above its tiles; the
             // rail of the map is under them.
-            areas.push(Rect {
+            let mut area = Rect {
                 left: monitor.left + margin,
                 top: monitor.top + if is_home { 62.0 * s } else { margin },
                 right: monitor.right - margin,
                 bottom: monitor.top + layout.rail.top - 12.0 * s,
-            });
+            };
+            if is_home {
+                if let Some(panel) = &rules_panel {
+                    area = room_for_rules(&area, panel, 16.0 * s);
+                }
+            }
+            areas.push(area);
             maps.push(Map { monitor: m, area: *monitor, layout });
         }
         maps.sort_by_key(|map| map.area != self.home);
@@ -2042,6 +2068,26 @@ impl Board {
         }
         self.tiles = tiles;
         self.maps = maps;
+    }
+
+    /// Lays out again as the rules list changes, the parts gliding to their
+    /// new places.
+    fn relayout_gliding(&mut self) {
+        let now = Instant::now();
+        let before = self.marks();
+        self.relayout();
+        self.motion.moved(&before, &self.marks(), now);
+        if self.strip_on {
+            self.lay_out_strip(None);
+        }
+        self.hover_under_cursor();
+        self.register_thumbnails();
+        if self.motion.is_moving() || self.strip_on {
+            self.start_motion();
+        } else {
+            self.update_peek(now);
+            self.invalidate();
+        }
     }
 
     /// The own windows of cell `id` laid out as when it is selected, in the
@@ -2476,7 +2522,7 @@ impl Board {
         unsafe {
             SetTimer(self.hwnd, PICK_TIMER_ID, PICK_MS, None);
         }
-        self.invalidate();
+        self.relayout_gliding();
         Action::None
     }
 
@@ -2485,7 +2531,7 @@ impl Board {
         match hit {
             Hit::RulesToggle => {
                 self.rules_open = !self.rules_open;
-                self.invalidate();
+                self.relayout_gliding();
                 Some(Action::None)
             }
             Hit::RuleDelete(shown) => {
@@ -2555,7 +2601,11 @@ impl Board {
         let pick = self.rule_pick.take();
         if pick.is_some() {
             unsafe { let _ = KillTimer(self.hwnd, PICK_TIMER_ID); }
-            self.invalidate();
+            if self.open {
+                self.relayout_gliding();
+            } else {
+                self.invalidate();
+            }
         }
         pick
     }
@@ -6726,5 +6776,19 @@ mod tests {
         for area in [toggle, panel, notice] {
             assert!(inside(&area, &home), "{area:?} off the home monitor {home:?}");
         }
+    }
+
+    #[test]
+    fn the_tile_area_makes_room_beside_or_below_the_rules_list() {
+        let area = rect(0.0, 0.0, 1600.0, 900.0);
+        let gap = 16.0;
+        let short = rect(1100.0, 100.0, 400.0, 80.0);
+        let below = room_for_rules(&area, &short, gap);
+        assert_eq!(below, rect(area.left, short.bottom + gap, size(&area).0, area.bottom - short.bottom - gap));
+        let tall = rect(1100.0, 100.0, 400.0, 600.0);
+        let beside = room_for_rules(&area, &tall, gap);
+        assert_eq!(beside, rect(area.left, area.top, tall.left - gap - area.left, size(&area).1));
+        let clear = rect(1700.0, 100.0, 200.0, 200.0);
+        assert_eq!(room_for_rules(&area, &clear, gap), area);
     }
 }
