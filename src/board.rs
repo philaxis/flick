@@ -5127,11 +5127,23 @@ impl Board {
     /// one, as by an arrow key, and the picture is that many milliseconds
     /// into the motion.
     #[allow(clippy::too_many_arguments)]
-    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>, glide: Option<(grid::Pos, u64)>, step: Option<(grid::Pos, u64)>) -> Option<Vec<u8>> {
+    pub fn render_to_pixels(&mut self, model: Model, grid: Grid, size: (i32, i32), scale: f32, hover: Option<grid::Pos>, glide: Option<(grid::Pos, u64)>, step: Option<(grid::Pos, u64)>) -> Option<((i32, i32), Vec<u8>)> {
         self.size = size;
         self.scale = scale;
         self.home = rect(0.0, 0.0, size.0 as f32, size.1 as f32);
         self.monitors = vec![self.home];
+        // FLICK_LEFT_MONITOR=WxH: another monitor left of the home one, as
+        // when the primary monitor is not the leftmost.
+        let left = std::env::var("FLICK_LEFT_MONITOR").ok().and_then(|value| {
+            let (w, h) = value.split_once('x')?;
+            Some((w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?))
+        });
+        if let Some((w, h)) = left {
+            self.home = rect(w as f32, 0.0, size.0 as f32, size.1 as f32);
+            self.monitors = vec![rect(0.0, 0.0, w as f32, h as f32), self.home];
+            self.size = (w + size.0, h.max(size.1));
+        }
+        self.rules_open = std::env::var_os("FLICK_RULES").is_some();
         self.selected = model.current.clone();
         self.model = model;
         self.source_sizes.borrow_mut().clear();
@@ -5169,7 +5181,8 @@ impl Board {
         }
         let point_at = |board: &mut Self, pos: Option<grid::Pos>| {
             board.hover = Hit::Nothing;
-            if let Some(cell) = pos.and_then(|pos| board.maps[0].layout.rows.get(pos.row)?.cells.get(pos.col)) {
+            let home = board.home_index();
+            if let Some(cell) = pos.and_then(|pos| board.maps.iter().find(|map| map.monitor == home)?.layout.rows.get(pos.row)?.cells.get(pos.col)) {
                 board.cursor = centre(&cell.body);
                 board.hover = Hit::Cell(cell.id.clone());
             }
@@ -5184,7 +5197,7 @@ impl Board {
         self.hints = std::env::var_os("FLICK_HINTS").is_some();
         self.fonts = None;
         let _ = self.draw_to_canvas()?;
-        Some(self.canvas.as_ref()?.dib.pixels().to_vec())
+        Some((self.size, self.canvas.as_ref()?.dib.pixels().to_vec()))
     }
 }
 

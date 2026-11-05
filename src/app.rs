@@ -3849,8 +3849,16 @@ pub fn render_board(path: &str, sizes: Option<&str>) {
     if step.is_some() {
         app.grid.visit(&desktops.current);
     }
-    let size = (2560, 1440);
-    if let Some(pixels) = app.board.render_to_pixels(model, app.grid.clone(), size, 1.5, hover, glide, step) {
+    // FLICK_RULES=n: n made-up rules, their list open.
+    let rules = std::env::var("FLICK_RULES").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+    app.grid.new_window_rules.extend((0..rules).map(|i| crate::newwin::NewWindowRule {
+        exe: format!("sample{i}.exe"),
+        title_word: String::new(),
+        cell: crate::newwin::RuleCell::Fixed(desktops.current.clone()),
+        monitor: "made-up monitor".into(),
+        follow: i % 2 == 0,
+    }));
+    if let Some((size, pixels)) = app.board.render_to_pixels(model, app.grid.clone(), (2560, 1440), 1.5, hover, glide, step) {
         write_raw(path, size, &pixels);
     }
 }
