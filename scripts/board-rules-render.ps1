@@ -9,6 +9,12 @@ foreach ($left in '', '1920x1080') {
     $name = if ($left) { 'left-monitor' } else { 'one-monitor' }
     if ($left) { $env:FLICK_LEFT_MONITOR = $left } else { Remove-Item Env:FLICK_LEFT_MONITOR -ErrorAction SilentlyContinue }
     Start-Process -Wait -FilePath $flick -ArgumentList '--render-board', "$out\$name.raw"
+    # Made-up windows in the current cell, to see whether a preview overlaps the list.
+    foreach ($rules in '2', '9') {
+        $env:FLICK_RULES = $rules
+        Start-Process -Wait -FilePath $flick -ArgumentList '--render-board', "$out\$name-windows-$rules.raw", '2400x1300,1400x900'
+    }
+    $env:FLICK_RULES = '2'
 }
 Get-ChildItem $out | ForEach-Object { "$($_.Name) $($_.Length)" }
 exit 0
