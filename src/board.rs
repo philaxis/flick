@@ -312,7 +312,7 @@ struct RuleLineLayout {
     delete: Rect,
 }
 
-/// The open list of rules, in the home monitor's coordinates.
+/// The open list of rules, in window coordinates.
 struct RulePanelLayout {
     panel: Rect,
     /// One line per rule, newest first.
@@ -327,7 +327,8 @@ struct RuleNotice {
     undo: Option<usize>,
 }
 
-/// Where the notice at the bottom of the home monitor is drawn.
+/// Where the notice at the bottom of the home monitor is drawn, in window
+/// coordinates.
 struct RuleNoticeLayout {
     panel: Rect,
     text: Rect,
@@ -338,6 +339,24 @@ struct RuleNoticeLayout {
 /// Height of the line at the bottom that says what the thing under the
 /// cursor is or does (shown the first time, and with ?), in unscaled units.
 const FOOTER: f32 = 44.0;
+
+/// The rules toggle's box, in window coordinates.
+fn rules_toggle_rect(home: &Rect, width: f32, scale: f32) -> Rect {
+    rect(home.right - 40.0 * scale - width, home.top + 18.0 * scale, width, 22.0 * scale)
+}
+
+/// The open rules panel's box, in window coordinates.
+fn rules_panel_rect(home: &Rect, toggle: &Rect, width: f32, count: usize, scale: f32) -> Rect {
+    let pad = 12.0 * scale;
+    let line_h = 24.0 * scale;
+    rect(home.right - 40.0 * scale - width, toggle.bottom + 6.0 * scale, width, 2.0 * pad + count as f32 * line_h)
+}
+
+/// The rule notice's box, in window coordinates.
+fn rule_notice_rect(home: &Rect, width: f32, scale: f32) -> Rect {
+    let (home_w, home_h) = size(home);
+    rect(home.left + (home_w - width) / 2.0, home.top + home_h - (FOOTER + 38.0) * scale, width, 30.0 * scale)
+}
 
 /// How long a note about a rule added, or one that could not be made,
 /// stays up.
@@ -2131,15 +2150,16 @@ impl Board {
     }
 
     /// Where the rules toggle is drawn, at the upper right of the home
-    /// monitor, clear of the shelf's name.
+    /// monitor, clear of the shelf's name. In window coordinates.
     fn rules_toggle_area(&self) -> Rect {
         let s = self.scale;
         let label = self.rules_label();
         let width = (text_width(&label, 12.0 * s) + 20.0 * s).max(54.0 * s);
-        rect(self.home.right - 40.0 * s - width, self.home.top + 18.0 * s, width, 22.0 * s)
+        rules_toggle_rect(&self.home, width, s)
     }
 
-    /// The open list of rules, newest first, under the toggle.
+    /// The open list of rules, newest first, under the toggle, in window
+    /// coordinates.
     fn rules_panel_layout(&self) -> Option<RulePanelLayout> {
         if !self.rules_open || self.rule_pick.is_some() {
             return None;
@@ -2154,7 +2174,7 @@ impl Board {
         let pad = 12.0 * s;
         let line_h = 24.0 * s;
         let toggle = self.rules_toggle_area();
-        let panel = rect(self.home.right - 40.0 * s - width, toggle.bottom + 6.0 * s, width, 2.0 * pad + count as f32 * line_h);
+        let panel = rules_panel_rect(&self.home, &toggle, width, count, s);
         let lines = (0..count)
             .map(|shown| {
                 let rule = &self.grid.new_window_rules[count - 1 - shown];
@@ -2174,20 +2194,20 @@ impl Board {
     }
 
     /// Where the notice at the bottom of the home monitor is drawn, if it is
-    /// still to be seen.
+    /// still to be seen. In window coordinates.
     fn rule_notice_layout(&self) -> Option<RuleNoticeLayout> {
         let notice = self.rule_notice.as_ref()?;
         if notice.at.elapsed().as_millis() >= RULE_NOTICE_MS as u128 {
             return None;
         }
         let s = self.scale;
-        let (home_w, h) = size(&self.home);
+        let (home_w, _) = size(&self.home);
         let pad = 14.0 * s;
         let gap = 12.0 * s;
         let undo_w = notice.undo.map_or(0.0, |_| text_width(crate::i18n::text("Undo", "되돌리기", "撤销"), 12.0 * s) + 20.0 * s);
         let wanted = text_width(&notice.text, 12.0 * s) + if notice.undo.is_some() { gap + undo_w } else { 0.0 } + 2.0 * pad;
         let width = wanted.min(home_w - 40.0 * s);
-        let panel = rect((home_w - width) / 2.0, h - (FOOTER + 38.0) * s, width, 30.0 * s);
+        let panel = rule_notice_rect(&self.home, width, s);
         let text_w = (width - 2.0 * pad - if notice.undo.is_some() { gap + undo_w } else { 0.0 }).max(0.0);
         let text = rect(panel.left + pad, panel.top, text_w, panel.bottom - panel.top);
         let undo = notice.undo.map(|_| rect(text.right + gap, panel.top + 3.0 * s, undo_w, 24.0 * s));
@@ -4050,6 +4070,9 @@ impl Board {
         unsafe {
             self.set_transform(target, Matrix3x2::identity());
         }
+        self.draw_rules_toggle(&p, fonts);
+        self.draw_rules_panel(&p, fonts);
+        self.draw_rule_notice(&p, fonts);
         self.draw_rule_hover(&p);
         #[cfg(feature = "motion-probe")]
         if let Some(x) = self.probe_marker.get() { p.fill_square(&rect(x-2.0,20.0,4.0,12.0),rgba(0.0,1.0,0.0,1.0)); }
@@ -4143,12 +4166,9 @@ impl Board {
             let row = grid::row_title(self.model.rows.get(pos.row).map_or("", |row| &row.name), pos.row);
             p.text(&row, &fonts.label, &self.label, white(if self.peek.is_some() { 0.62 } else { 0.86 }));
         }
-        self.draw_rules_toggle(p, fonts);
-        self.draw_rules_panel(p, fonts);
         if let Some((line, alpha)) = self.footer() {
             p.text(&line, &fonts.centered, &rect(0.0, h - (FOOTER - 8.0) * s, w, 26.0 * s), white(alpha));
         }
-        self.draw_rule_notice(p, fonts);
     }
 
     /// The small "Rules (n)" toggle at the upper right of the home monitor.
@@ -6685,5 +6705,16 @@ mod tests {
         assert_eq!(window_drop("a", Pin::Everywhere, false, &other(None, None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
         assert_eq!(window_drop("a", Pin::Off, false, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: Some(Pin::Everywhere), cell: None, monitor: true });
         assert_eq!(window_drop("", Pin::Everywhere, false, &other(Some(PinSlot::All), None)), WindowDrop::Place { pin: None, cell: None, monitor: true });
+    }
+
+    #[test]
+    fn rule_ui_stays_on_the_home_monitor_when_it_is_not_the_leftmost() {
+        let home = rect(1920.0, 0.0, 2560.0, 1440.0);
+        let toggle = rules_toggle_rect(&home, 80.0, 1.0);
+        let panel = rules_panel_rect(&home, &toggle, 600.0, 3, 1.0);
+        let notice = rule_notice_rect(&home, 500.0, 1.0);
+        for area in [toggle, panel, notice] {
+            assert!(inside(&area, &home), "{area:?} off the home monitor {home:?}");
+        }
     }
 }
