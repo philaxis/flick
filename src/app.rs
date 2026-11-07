@@ -240,6 +240,17 @@ struct App {
     /// to when one of them left keyboard focus behind on the one it came from.
     in_gesture: bool,
     unsettled: Option<String>,
+    /// The cell come to rest on, and the one rested on before it, which a
+    /// double click of the trigger goes back to (`go_back`). A move counts
+    /// from where it set off to where it came to rest, not the cells passed
+    /// on the way, however it was made (`come_to_rest`).
+    resting: Option<String>,
+    previous: Option<String>,
+    /// The desktop Windows last told of being on.
+    arrived: Option<String>,
+    /// The last click of the trigger opened the board: a double click goes
+    /// back from there.
+    clicked_open: bool,
     /// The desktop Windows was last asked to switch to, until it tells of
     /// having done so, and the cell to go to after it. A switch asked for
     /// while another is under way makes Windows show the one before again
@@ -580,6 +591,10 @@ impl App {
             config_seen: None,
             in_gesture: false,
             unsettled: None,
+            resting: None,
+            previous: None,
+            arrived: None,
+            clicked_open: false,
             in_flight: None,
             queued: None,
             focus_on_arrival: None,
@@ -1896,6 +1911,8 @@ impl App {
         self.focus_on_arrival = None;
         if let Some(desktops) = self.sync() {
             self.record_arrival(&desktops.current);
+            self.arrived = Some(desktops.current.clone());
+            self.come_to_rest();
             self.visit(passed);
             let view = self.view(&desktops.current);
             self.minimap.update(view);
@@ -1919,7 +1936,33 @@ impl App {
             }
             self.save();
             self.resume_deferred_here();
+            self.come_to_rest();
         }
+    }
+
+    /// Nothing under way any more (a gesture, a switch, one waiting behind
+    /// it), the desktop Windows is on is where the app came to rest: the
+    /// cell it rested on before becomes the one to go back to.
+    fn come_to_rest(&mut self) {
+        if self.in_gesture || self.in_flight.is_some() || self.queued.is_some() || self.arrived == self.resting {
+            return;
+        }
+        self.previous = std::mem::replace(&mut self.resting, self.arrived.clone());
+        debug_log!("app: at rest; back goes to {:?}", self.previous.as_deref().map(|id| &id[..4.min(id.len())]));
+    }
+
+    /// A double click of the trigger: back to the cell rested on before this
+    /// one, at once, as a flick lands. The board the first click opened goes;
+    /// with no cell to go back to, the app only shows where it is.
+    fn go_back(&mut self) {
+        let here = self.board_opened_on.clone();
+        let back = self.previous.clone().filter(|id| *id != here && self.grid.find(id).is_some());
+        debug_log!("app: double click, back to {:?}", back.as_deref().map(|id| &id[..4.min(id.len())]));
+        let to = back.unwrap_or_else(|| here.clone());
+        self.leave_board(&to, None);
+        let view = self.view(&to);
+        self.minimap.show(view, self.grid.find(&here));
+        self.minimap.hide_after(LINGER_RELEASE_MS);
     }
 
     // ---- the screen following the hand ----------------------------------------
@@ -2250,6 +2293,8 @@ impl App {
         }
         let Some(desktops) = self.sync() else { return };
         self.record_arrival(&desktops.current);
+        self.arrived = Some(desktops.current.clone());
+        self.come_to_rest();
         self.visit(new);
         self.resume_deferred(new);
         self.bring_followers(&desktops, new);
@@ -2387,9 +2432,32 @@ impl App {
         }
     }
 
+    /// A click of the trigger (hold `hold`); `double`, the second of a
+    /// double click.
+    fn click(&mut self, hold: u32, double: bool) {
+        let opened = std::mem::take(&mut self.clicked_open);
+        if self.board.moved(hold) {
+            // A hold over the board that went to another cell is a move,
+            // however little the hand strayed.
+            self.let_go_board();
+            self.finish_gesture();
+        } else if double {
+            // Only the click that opened the board goes back with the next:
+            // one that went to the board's cell is answered, and a click so
+            // soon after it no click of its own.
+            if opened && self.board.is_open() && !self.board.is_modal() {
+                self.go_back();
+            } else {
+                debug_log!("app: double click ignored, its first click not having opened the board");
+            }
+        } else {
+            self.clicked_open = self.toggle_board();
+        }
+    }
+
     /// A click of the trigger opens the board; the next one goes to the
-    /// selected cell.
-    fn toggle_board(&mut self) {
+    /// selected cell. Returns whether it opened the board.
+    fn toggle_board(&mut self) -> bool {
         if self.board.is_modal() {
             // The question that is up is about the board as it is: it stays
             // until answered.
@@ -2399,7 +2467,9 @@ impl App {
             self.perform(Action::Go(selected, None));
         } else {
             self.open_board();
+            return self.board.is_open();
         }
+        false
     }
 
     fn board_message(&mut self, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -3176,16 +3246,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         WM_CLICK => {
             #[cfg(feature = "debug-log")]
             let started = Instant::now();
-            // A hold over the board that went to another cell is a move,
-            // however little the hand strayed.
-            let taken = with_app(|app| {
-                if app.board.moved(lparam.0 as u32) {
-                    app.let_go_board();
-                    app.finish_gesture();
-                } else {
-                    app.toggle_board();
-                }
-            });
+            let taken = with_app(|app| app.click(lparam.0 as u32, wparam.0 == 1));
             input::forget_hold(lparam.0 as u32);
             debug_log!("app: click {} in {:?}", if taken.is_some() { "taken" } else { "ignored, the app being busy (a menu or a question is up)" }, started.elapsed());
             let _ = taken;
@@ -3532,6 +3593,8 @@ pub fn run(first_run: bool) {
             app.visit(&desktops.current);
         }
         app.record_arrival(&desktops.current);
+        app.arrived = Some(desktops.current.clone());
+        app.resting = app.arrived.clone();
         app.commit();
     }
     app.record_foreground(unsafe { GetForegroundWindow() });

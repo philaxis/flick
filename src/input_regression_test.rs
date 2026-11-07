@@ -136,6 +136,7 @@ fn reset() {
     LAST_ABSOLUTE.set(None);
     LAST_CLICK.set(None);
     LAST_TAP.set(None);
+    PAIRED.set(false);
 }
 
 const EDGES: [(u32, u32, u32, u32); 5] = [
@@ -702,4 +703,52 @@ fn a_flick_within_a_clicks_slack_is_no_click() {
         release(&s, Source::XButton2);
         assert_eq!((posted(WM_RELEASE), posted(WM_CLICK)), (1 - click, click), "{by}");
     }
+}
+
+/// Two clicks within the double-click time are a double click, a third
+/// begins another pair; a mouse button double-clicked as fast as a hand can
+/// is one, while trigger keys clicked that fast are a button repeating its
+/// key combination and do not count.
+#[test]
+fn a_second_click_soon_after_is_a_double_click() {
+    let _guard = INPUT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let clicks = || api::CALLS.with(|c| c.borrow().messages.iter().filter(|(m, _)| *m == WM_CLICK).map(|(_, w)| *w).collect::<Vec<_>>());
+    let click = |s: &Settings, source: Source, after: u64| {
+        std::thread::sleep(std::time::Duration::from_millis(after));
+        press(source);
+        release(s, source);
+    };
+    reset();
+    let s = settings();
+    click(&s, Source::XButton2, 0);
+    click(&s, Source::XButton2, 60);
+    click(&s, Source::XButton2, 60);
+    click(&s, Source::XButton2, 60);
+    assert_eq!(clicks(), [0, 1, 0, 1]);
+    // Apart by more than the double-click time: two single clicks.
+    click(&s, Source::XButton2, 600);
+    click(&s, Source::XButton2, 600);
+    assert_eq!(clicks(), [0, 1, 0, 1, 0, 0]);
+
+    reset();
+    click(&s, Source::XButton2, 0);
+    // A flick, as `a_flick_within_a_clicks_slack_is_no_click` makes one.
+    press(Source::XButton2);
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        travel(&s, 20, 0);
+    }
+    release(&s, Source::XButton2);
+    assert_eq!(api::CALLS.with(|c| c.borrow().messages.iter().filter(|(m, _)| *m == WM_RELEASE).count()), 1);
+    click(&s, Source::XButton2, 60);
+    assert_eq!(clicks(), [0, 0], "a move between two clicks parts them");
+
+    reset();
+    let key = Source::Key(0x7B);
+    click(&s, key, 0);
+    click(&s, key, 30);
+    click(&s, key, 30);
+    assert_eq!(clicks(), [0], "a key repeating fast is one click");
+    click(&s, key, 200);
+    assert_eq!(clicks(), [0, 1], "a key clicked again as a hand does is a double click");
 }

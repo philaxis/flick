@@ -16,6 +16,8 @@
 
 **Tap to see everything.** Tap the trigger for the windows on this desktop and a small map of all of them. Drag a window onto the map to move it.
 
+**Double-tap to go back.** Tap the trigger twice quickly to jump back to the desktop you were on before your last move, however many desktops that move went past. Double-tap again to return.
+
 **Any button you like.** It starts as the mouse "forward" button. Click the tray icon for Settings → *Change* and press whatever you want instead, even several keys at once.
 
 **Small and free.** One exe under 1 MB. No account, no installer to click through. Open source, MIT.
