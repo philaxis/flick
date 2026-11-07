@@ -87,6 +87,24 @@ fn main() {
                 let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { mouseData: 2, dwFlags: flags, ..Default::default() } } };
                 SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
             }
+            Some("xclick") => {
+                // xclick <count> <apart ms>: clicks of the "forward" side button sent from
+                // this one process, so that a double click is as quick as a hand's.
+                use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT};
+                let (count, apart): (u32, u64) = (args[2].parse().unwrap(), args[3].parse().unwrap());
+                let send = |flags| {
+                    let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { mouseData: 2, dwFlags: flags, ..Default::default() } } };
+                    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                };
+                for i in 0..count {
+                    if i > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(apart));
+                    }
+                    send(MOUSEEVENTF_XDOWN);
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    send(MOUSEEVENTF_XUP);
+                }
+            }
             Some("shot") => {
                 let (x, y) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
                 let (w, h) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
@@ -451,6 +469,15 @@ fn main() {
                 match (all.into_iter().find(|d| d.id().starts_with(&wanted)), current) {
                     (Some(desktop), Ok(current)) if desktop != current => println!("{:?}", vdapi::remove_desktop(desktop, current)),
                     _ => println!("not removed: no such desktop, or it is the current one"),
+                }
+            }
+            Some("todesk") => {
+                // todesk <id prefix>: switches to a desktop, as Windows' own shortcuts do.
+                vdapi::select(false);
+                let wanted = args[2].to_ascii_uppercase();
+                match vdapi::get_desktops().unwrap_or_default().into_iter().find(|d| d.id().starts_with(&wanted)) {
+                    Some(desktop) => println!("{:?}", vdapi::switch_desktop(desktop)),
+                    None => println!("no such desktop"),
                 }
             }
             Some("desks") => {
