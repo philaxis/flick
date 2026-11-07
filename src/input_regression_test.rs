@@ -732,9 +732,14 @@ fn a_second_click_soon_after_is_a_double_click() {
 
     reset();
     click(&s, Source::XButton2, 0);
+    // A flick, as `a_flick_within_a_clicks_slack_is_no_click` makes one.
     press(Source::XButton2);
-    travel(&s, s.step_x, 0);
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        travel(&s, 20, 0);
+    }
     release(&s, Source::XButton2);
+    assert_eq!(api::CALLS.with(|c| c.borrow().messages.iter().filter(|(m, _)| *m == WM_RELEASE).count()), 1);
     click(&s, Source::XButton2, 60);
     assert_eq!(clicks(), [0, 0], "a move between two clicks parts them");
 
