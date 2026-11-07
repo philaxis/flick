@@ -60,7 +60,8 @@ pub(crate) use tests::api::{GetRawInputData, RegisterRawInputDevices};
 /// One step in a direction, as a hotkey takes it; sent by the test driver
 /// (examples/drive.rs). wparam: direction index (see `dir_from_index`).
 pub const WM_STEP: u32 = WM_APP + 1;
-/// The trigger was pressed and released without travelling a step.
+/// The trigger was pressed and released without travelling a step. wparam:
+/// 1 when it is the second click of a double click (`double_click_ms`).
 pub const WM_CLICK: u32 = WM_APP + 2;
 /// The trigger was released after at least one step.
 pub const WM_RELEASE: u32 = WM_APP + 3;
@@ -89,10 +90,10 @@ const WM_RELOAD: u32 = WM_APP + 20;
 /// held when it went to sleep is not any more, and the hooks may be gone.
 const WM_WOKE: u32 = WM_APP + 21;
 const WM_TOUCHPAD: u32 = WM_APP + 22;
-/// Two clicks of the trigger closer together than this are one.
-const CLICK_APART_MS: u128 = 300;
-/// Clicks following each other faster than this are a held button sending
-/// its key combination over and over, not a hand: none of them counts.
+/// Clicks of a trigger key following each other faster than this are a
+/// held button sending its key combination over and over, not a hand: none
+/// of them counts. Mouse buttons are not held to it: a hand double-clicks
+/// that fast.
 const REPEAT_APART_MS: u128 = 120;
 /// A mouse hold let go of before it is clear whether it is a flick goes on
 /// being read this long (ms), the cursor still held: a hand flicking as it
@@ -685,11 +686,14 @@ thread_local! {
     static FLICK: RefCell<(Option<Instant>, crate::quick::Judge)> = RefCell::new((None, crate::quick::Judge::default()));
     /// A hold let go of but still read (`GRACE_MS`): its timer, and how it
     /// was let go of (`finish_release`).
-    static GRACE: Cell<Option<(usize, Option<bool>)>> = const { Cell::new(None) };
+    static GRACE: Cell<Option<(usize, Option<bool>, bool)>> = const { Cell::new(None) };
     /// When a click of the trigger was last taken, and when the trigger was
     /// last clicked at all.
     static LAST_CLICK: Cell<Option<Instant>> = const { Cell::new(None) };
     static LAST_TAP: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The click last taken was the second of a double click, or a move came
+    /// after it: the next one begins another.
+    static PAIRED: Cell<bool> = const { Cell::new(false) };
     /// When the first key of the chord was held back.
     static CHORD_BEGAN: Cell<Option<Instant>> = const { Cell::new(None) };
     /// The key event being handled was sent by software, not a keyboard.
@@ -1101,13 +1105,16 @@ fn finish_release(s: &Settings, source: Source, tap: Option<bool>) {
     let ended = HELD.with(|held| held.borrow_mut().release(source));
     debug_log!("up {source:?}{}", if ended { ": hold ends" } else { "" });
     if !ended { return; }
+    // Only a trigger key may be a button sending its key combination over
+    // and over (`REPEAT_APART_MS`).
+    let keyed = matches!(source, Source::Key(_) | Source::Chord);
     let unclear = || FLICK.with(|flick| flick.borrow().1.mind == crate::quick::Mind::Deciding);
     if GRACE_MS > 0 && source != Source::Touchpad && !STEPPED.get() && crate::quick::mode() != crate::config::QuickFlick::Off && unclear() {
         debug_log!("let go of before it is clear: read on for {GRACE_MS} ms");
-        GRACE.set(Some((unsafe { SetTimer(None, 0, GRACE_MS, Some(grace_over)) }, tap)));
+        GRACE.set(Some((unsafe { SetTimer(None, 0, GRACE_MS, Some(grace_over)) }, tap, keyed)));
         return;
     }
-    conclude_release(s, tap);
+    conclude_release(s, tap, keyed);
 }
 
 unsafe extern "system" fn grace_over(_: HWND, _: u32, _: usize, _: u32) {
@@ -1116,18 +1123,19 @@ unsafe extern "system" fn grace_over(_: HWND, _: u32, _: usize, _: u32) {
 
 /// Ends the hold let go of only just, if there is one.
 fn end_grace() {
-    let Some((timer, tap)) = GRACE.take() else { return };
+    let Some((timer, tap, keyed)) = GRACE.take() else { return };
     unsafe {
         let _ = KillTimer(None, timer);
     }
     with_settings(|s| {
-        conclude_release(s, tap);
+        conclude_release(s, tap, keyed);
         false
     });
 }
 
-/// The hold let go of is over: a click or a move.
-fn conclude_release(s: &Settings, tap: Option<bool>) {
+/// The hold let go of is over: a click or a move. `keyed`: let go of was a
+/// trigger key or chord.
+fn conclude_release(s: &Settings, tap: Option<bool>, keyed: bool) {
     debug_log!(
         "hold ended as a {}; cursor movements held back meanwhile: {}",
         if STEPPED.get() { "move" } else { "click" },
@@ -1153,27 +1161,46 @@ fn conclude_release(s: &Settings, tap: Option<bool>) {
     if !stayed && !STEPPED.get() {
         debug_log!("no click: the mouse had strayed {} (a click stays within {slack})", STRAYED.get().1);
     }
-    // Nor is a click right upon a click one: nobody opens the board and
-    // answers it that fast, but a button set up to send a key combination
-    // may send it over and over while it is held. Only a click that was
-    // taken counts here: a hand clicking away quickly must not find
-    // every click after the first ignored for as long as it goes on.
+    // A click right upon a click is the second of a double click, timed as
+    // Windows times one; the click after that begins another. But a button
+    // set up to send a key combination may send it over and over while it
+    // is held: trigger keys clicked faster than a hand clicks are no clicks.
+    // Only a click that was taken counts here: a hand clicking away quickly
+    // must not find every click after the first ignored for as long as it
+    // goes on.
     let now = Instant::now();
     let within = |last: Option<Instant>, ms: u128| last.is_some_and(|last| now.duration_since(last).as_millis() < ms);
     // Even those are not ignored for longer than a second on end.
-    let again = stayed
-        && (within(LAST_CLICK.get(), CLICK_APART_MS) || (within(LAST_TAP.get(), REPEAT_APART_MS) && within(LAST_CLICK.get(), 1000)));
-    if again {
-        debug_log!("click ignored: one was taken less than {CLICK_APART_MS} ms ago, or they come faster than a hand clicks");
+    let repeated = stayed && keyed && within(LAST_TAP.get(), REPEAT_APART_MS) && within(LAST_CLICK.get(), 1000);
+    if repeated {
+        debug_log!("click ignored: trigger keys clicked faster than a hand clicks");
     }
-    let click = stayed && !again;
+    let click = stayed && !repeated;
+    let double = click && !PAIRED.get() && within(LAST_CLICK.get(), double_click_ms());
     if stayed {
         LAST_TAP.set(Some(now));
+    } else {
+        PAIRED.set(true);
     }
     if click {
         LAST_CLICK.set(Some(now));
+        PAIRED.set(double);
     }
-    post(s, if click { WM_CLICK } else { WM_RELEASE }, 0);
+    if double {
+        debug_log!("a double click");
+    }
+    post(s, if click { WM_CLICK } else { WM_RELEASE }, double as usize);
+}
+
+/// Two clicks of the trigger closer together than this (ms) are a double
+/// click: Windows' own double-click time, as set in its mouse settings.
+#[cfg(not(test))]
+fn double_click_ms() -> u128 {
+    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() }.into()
+}
+#[cfg(test)]
+fn double_click_ms() -> u128 {
+    500
 }
 
 /// A trigger seen let go of by raw input, which tells of it as well as the
